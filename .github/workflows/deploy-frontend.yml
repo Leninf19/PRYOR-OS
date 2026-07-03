@@ -1,0 +1,29 @@
+name: Deploy Frontend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dashboard/**'
+      - '!dashboard/reviews.db'
+      - '!dashboard/reviews.csv'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Build and deploy to Vercel
+        run: |
+          cd dashboard
+          npm ci
+          npm run build
+          npx vercel --prod --yes --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: team_mDA28eSShEIgPIQlduF4GJVH
+          VERCEL_PROJECT_ID: prj_8Lj4p2UgPOVVwEZoRuuEpKy9L5gp
