@@ -10,13 +10,14 @@ import TrendsAnalytics from './pages/TrendsAnalytics.jsx'
 import ActionItems, { useUnansweredCount } from './pages/ActionItems.jsx'
 import ScraperStatus   from './pages/ScraperStatus.jsx'
 import Reports         from './pages/Reports.jsx'
-import ComplaintIntelligence from './pages/ComplaintIntelligence.jsx'
+import ComplaintIntelligence  from './pages/ComplaintIntelligence.jsx'
+import CompetitorIntelligence from './pages/CompetitorIntelligence.jsx'
 import { useReviewsData }    from './hooks/useReviewsData.js'
 import { useGlobalPrefetch } from './hooks/useIntelligence.js'
 import { filterReviews, getDefaultDateRange, getDateBounds } from './utils/dataUtils.js'
 
 // Pages that don't use the global filter bar
-const NO_FILTER_PATHS = ['/actions', '/scraper-status', '/reports', '/intelligence']
+const NO_FILTER_PATHS = ['/actions', '/scraper-status', '/reports', '/intelligence', '/competitive']
 
 function buildDefaultFilters(reviews) {
   const dr = getDefaultDateRange(reviews)
@@ -155,6 +156,7 @@ export default function App() {
         <Route path="explorer"       element={<RExplorer />} />
         <Route path="actions"        element={<RActions />} />
         <Route path="intelligence"   element={<RIntelligence />} />
+        <Route path="competitive"    element={<RCompetitive />} />
         <Route path="trends"         element={<RTrends />} />
         <Route path="scraper-status" element={<RScraper />} />
         <Route path="reports"        element={<Reports />} />
@@ -175,3 +177,4 @@ function RTrends()        { const c = useOutletContext(); return <TrendsAnalytic
 function RActions()       { const { allReviews } = useOutletContext(); return <ActionItems allReviews={allReviews} /> }
 function RScraper()       { const { allReviews } = useOutletContext(); return <ScraperStatus allReviews={allReviews} /> }
 function RIntelligence()  { return <ComplaintIntelligence /> }
+function RCompetitive()   { return <CompetitorIntelligence /> }

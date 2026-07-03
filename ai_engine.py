@@ -209,6 +209,63 @@ def batch_generate_drafts(
 
 
 # ---------------------------------------------------------------------------
+# Competitive intelligence weekly briefing
+# ---------------------------------------------------------------------------
+
+def generate_competitive_briefing(data: dict) -> dict | None:
+    """
+    data keys: period, location_count, metrics (dict of metric objects),
+               best_performer, worst_performer, most_improved,
+               top_complaint, top_praise
+    Returns parsed JSON dict or None if AI unavailable.
+    """
+    h = _data_hash(data)
+    metrics = data.get("metrics", {})
+
+    def mc(key):
+        v = metrics.get(key, {})
+        val = v.get("value", "N/A")
+        chg = v.get("change", "")
+        return f"{val} ({chg})" if chg else str(val)
+
+    prompt = f"""You are Future Insights, an AI business intelligence consultant for Los Tres Amigos, a {data.get('location_count', 21)}-location Mexican restaurant group.
+
+Period analyzed: {data.get('period', 'last 30 days')}
+
+Performance summary:
+- Average rating: {mc('avgRating')}★ vs prior period
+- Reviews received: {mc('reviewCount')}
+- 5-star reviews: {mc('fiveStarCount')}
+- Positive guest sentiment: {mc('positiveRate')}%
+- Review response rate: {mc('responseRate')}%
+- Highest rated location: {data.get('best_performer', 'N/A')}
+- Location needing attention: {data.get('worst_performer', 'N/A')}
+- Most improved location: {data.get('most_improved', 'N/A')}
+- Top complaint theme: {data.get('top_complaint', 'service speed')}
+- Top praise theme: {data.get('top_praise', 'food quality')}
+
+Return ONLY a JSON object — no markdown, no explanation, no code fences:
+{{"executiveSummary":"3-4 sentence consultant-style briefing using actual numbers, present tense, no bullets","biggestWin":"One sentence — biggest positive development this period","biggestThreat":"One sentence — most significant concern requiring attention","mostImproved":"One sentence — strongest positive momentum area","largestDecline":"One sentence — biggest decline or what to monitor if nothing declined","marketingOpportunity":"One actionable sentence — specific marketing opportunity based on the data","operationalPriority":"One sentence — single highest-priority operational improvement","projectedTrend":"One sentence — where the business is headed in the next 30 days","recommendation":"2-3 sentence executive action recommendation, specific, professional, and actionable"}}"""
+
+    text = _call(prompt, model="claude-sonnet-4-6", max_tokens=900)
+    if text is None:
+        return None
+
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+    try:
+        parsed = json.loads(text.strip())
+    except json.JSONDecodeError:
+        parsed = {"executiveSummary": text}
+
+    parsed.update({"hash": h, "generatedAt": _now_iso()})
+    return parsed
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

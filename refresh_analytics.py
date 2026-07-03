@@ -711,6 +711,313 @@ def rankings(period_reviews: list, prev_reviews: list, locations: dict) -> list:
     return out
 
 
+def _ratings_by_week(reviews: list, n_weeks: int = 8) -> list:
+    """Aggregate average rating by calendar week for the timeline."""
+    now = datetime.now(timezone.utc)
+    result = []
+    for i in range(n_weeks):
+        end_dt   = (now - timedelta(days=i * 7)).date().isoformat()
+        start_dt = (now - timedelta(days=(i + 1) * 7)).date().isoformat()
+        week_revs = [
+            r for r in reviews
+            if r.get("review_date") and start_dt <= r["review_date"] < end_dt
+            and r.get("star_rating") is not None
+        ]
+        if week_revs:
+            avg = sum(r["star_rating"] for r in week_revs) / len(week_revs)
+            result.append({"weekStart": start_dt, "count": len(week_revs), "avg": round(avg, 2)})
+    return result
+
+
+def _make_metric(value, prev, is_lower_better=False, fmt="int") -> dict:
+    """Return a metric object with value, prev, change, changePct, and direction."""
+    if value is None or prev is None:
+        return {"value": value, "prev": prev, "change": None, "changePct": None, "direction": "stable"}
+    diff = value - prev
+    pct  = diff / prev * 100 if prev else 0
+    if fmt == "float2":
+        chg_str = f"{diff:+.2f}"
+        val_out = round(value, 2)
+        prev_out = round(prev, 2)
+    elif fmt == "float1":
+        chg_str = f"{diff:+.1f}"
+        val_out = round(value, 1)
+        prev_out = round(prev, 1)
+    else:
+        chg_str = f"{diff:+.0f}"
+        val_out = int(round(value))
+        prev_out = int(round(prev))
+    direction = (
+        ("down" if diff < 0 else "up" if diff > 0 else "stable") if is_lower_better
+        else ("up" if diff > 0 else "down" if diff < 0 else "stable")
+    )
+    return {
+        "value": val_out, "prev": prev_out,
+        "change": chg_str, "changePct": f"{pct:+.0f}%",
+        "direction": direction,
+    }
+
+
+def build_competitive_intelligence(
+    reviews: list,
+    period: list,
+    prev_period: list,
+    loc_stats: list,
+    locations: dict,
+    top_complaint: str | None,
+    top_praise: str | None,
+) -> dict:
+    """Assemble the competitive intelligence payload for the CI page."""
+    now = datetime.now(timezone.utc)
+    d30 = (now - timedelta(days=30)).date().isoformat()
+
+    def rated(revs):
+        return [r for r in revs if r.get("star_rating") is not None]
+
+    def avg_r(revs):
+        r = rated(revs)
+        return round(sum(x["star_rating"] for x in r) / len(r), 2) if r else None
+
+    def pos_rate(revs):
+        return len([r for r in revs if (r.get("star_rating") or 0) >= 4]) / max(1, len(revs)) * 100
+
+    def resp_rate(revs):
+        neg = [r for r in revs if (r.get("star_rating") or 5) <= 2]
+        if not neg:
+            return 100.0
+        return len([r for r in neg if (r.get("owner_response") or "").strip()]) / len(neg) * 100
+
+    # ── Metrics ──────────────────────────────────────────────────────────────
+    avg_cur   = avg_r(period)
+    avg_prev  = avg_r(prev_period)
+    five_cur  = len([r for r in period if r.get("star_rating") == 5])
+    five_prev = len([r for r in prev_period if r.get("star_rating") == 5])
+    pos_cur,  pos_prev  = pos_rate(period),  pos_rate(prev_period)
+    resp_cur, resp_prev = resp_rate(period), resp_rate(prev_period)
+    unanswered = sum(
+        1 for r in reviews
+        if (r.get("star_rating") or 5) <= 2 and not (r.get("owner_response") or "").strip()
+    )
+    metrics = {
+        "avgRating":    _make_metric(avg_cur,  avg_prev, fmt="float2"),
+        "reviewCount":  _make_metric(len(period), len(prev_period)),
+        "fiveStarCount": _make_metric(five_cur,  five_prev),
+        "positiveRate": _make_metric(pos_cur,   pos_prev, fmt="float1"),
+        "responseRate": _make_metric(resp_cur,  resp_prev, fmt="float1"),
+        "unanswered":   {"value": unanswered, "prev": None, "change": None, "changePct": None,
+                         "direction": "down" if unanswered > 10 else "stable"},
+    }
+
+    # ── Location Rankings ─────────────────────────────────────────────────────
+    valid = [s for s in loc_stats if s.get("periodSentiment", {}).get("avgRating") is not None]
+    valid.sort(key=lambda s: s["periodSentiment"]["avgRating"], reverse=True)
+
+    by_name_prev: dict = defaultdict(list)
+    for r in prev_period:
+        by_name_prev[r.get("location_name", "")].append(r)
+    prev_avgs = {name: avg_r(revs) for name, revs in by_name_prev.items() if avg_r(revs) is not None}
+    prev_ranked = sorted(prev_avgs, key=lambda n: prev_avgs[n], reverse=True)
+    prev_rank_map = {n: i + 1 for i, n in enumerate(prev_ranked)}
+
+    location_rankings = []
+    for i, loc in enumerate(valid):
+        rank = i + 1
+        name = loc["name"]
+        pr   = prev_rank_map.get(name)
+        location_rankings.append({
+            "rank":         rank,
+            "prevRank":     pr,
+            "rankChange":   (pr - rank) if pr else 0,
+            "name":         name,
+            "avgRating":    loc["periodSentiment"]["avgRating"],
+            "reviewCount":  loc["periodSentiment"]["n"],
+            "positiveRate": round(loc["periodSentiment"]["positive"], 1),
+            "healthScore":  (loc.get("healthScore") or {}).get("score"),
+            "grade":        (loc.get("healthScore") or {}).get("grade"),
+            "ratingDelta":  (loc.get("healthScore") or {}).get("ratingDelta"),
+        })
+
+    # ── Change Detection ──────────────────────────────────────────────────────
+    changes = []
+    for loc in location_rankings:
+        delta = loc["ratingDelta"] or 0
+        if abs(delta) >= 0.15:
+            direction = "up" if delta > 0 else "down"
+            changes.append({
+                "id": f"rating_{slugify(loc['name'])}",
+                "type": "rating_change", "direction": direction,
+                "title": f"{loc['name']} rating {'improved' if direction == 'up' else 'declined'} {abs(delta):.2f}★",
+                "body": f"Now averaging {loc['avgRating']:.2f}★ ({delta:+.2f} vs prior 30 days).",
+                "location": loc["name"],
+                "magnitude": "significant" if abs(delta) >= 0.3 else "notable",
+            })
+        rc = loc["rankChange"] or 0
+        if abs(rc) >= 2 and loc["prevRank"]:
+            direction = "up" if rc > 0 else "down"
+            changes.append({
+                "id": f"rank_{slugify(loc['name'])}",
+                "type": "rank_change", "direction": direction,
+                "title": f"{loc['name']} {'climbed' if rc > 0 else 'dropped'} to #{loc['rank']} in performance rankings",
+                "body": f"Moved from #{loc['prevRank']} to #{loc['rank']} ({abs(rc)} position{'s' if abs(rc) > 1 else ''}).",
+                "location": loc["name"], "magnitude": "notable",
+            })
+    if len(period) and len(prev_period):
+        vol_d = len(period) - len(prev_period)
+        vol_pct = vol_d / max(1, len(prev_period)) * 100
+        if abs(vol_pct) >= 15:
+            direction = "up" if vol_d > 0 else "down"
+            changes.append({
+                "id": "volume_change", "type": "review_volume", "direction": direction,
+                "title": f"Review volume {'increased' if direction == 'up' else 'decreased'} {abs(vol_pct):.0f}%",
+                "body": f"{len(period)} reviews this period vs {len(prev_period)} prior.",
+                "location": None, "magnitude": "notable",
+            })
+    changes.sort(key=lambda c: 0 if c.get("magnitude") == "significant" else 1)
+
+    # ── Alerts ────────────────────────────────────────────────────────────────
+    alerts = []
+    if location_rankings:
+        top = location_rankings[0]
+        alerts.append({
+            "id": "top_performer", "type": "top_performer", "severity": "positive",
+            "title": f"{top['name']} leads all locations at {top['avgRating']:.2f}★",
+            "body": f"Health grade {top['grade']} · {top['reviewCount']} reviews this period.",
+        })
+    if avg_cur and avg_prev:
+        diff = avg_cur - avg_prev
+        if diff >= 0.05:
+            alerts.append({
+                "id": "rating_up", "type": "rating_trend", "severity": "positive",
+                "title": f"Overall rating improved to {avg_cur:.2f}★ ({diff:+.2f})",
+                "body": "Customer satisfaction is trending upward across all locations.",
+            })
+        elif diff <= -0.05:
+            alerts.append({
+                "id": "rating_down", "type": "rating_trend", "severity": "warning",
+                "title": f"Overall rating softened to {avg_cur:.2f}★ ({diff:+.2f})",
+                "body": f"Review top complaint themes — focus on {top_complaint or 'service and quality'}.",
+            })
+    if five_cur >= 10:
+        alerts.append({
+            "id": "five_star", "type": "five_star", "severity": "positive",
+            "title": f"Earned {five_cur} five-star reviews this period",
+            "body": f"{five_cur - five_prev:+d} vs prior period." if five_prev else None,
+        })
+    resp_diff = resp_cur - resp_prev
+    if abs(resp_diff) >= 8:
+        alerts.append({
+            "id": "response_rate", "type": "response_rate",
+            "severity": "positive" if resp_diff > 0 else "warning",
+            "title": f"Response rate {'improved to' if resp_diff > 0 else 'dropped to'} {resp_cur:.0f}%",
+            "body": "Keep responding — it accelerates rating recovery." if resp_diff < 0 else "Excellent customer feedback responsiveness.",
+        })
+    if unanswered >= 15:
+        alerts.append({
+            "id": "unanswered", "type": "unanswered", "severity": "danger",
+            "title": f"{unanswered} negative reviews have not received a response",
+            "body": "Visit Response Center to prioritize and deploy AI-drafted replies.",
+        })
+
+    # ── Trend Timeline ────────────────────────────────────────────────────────
+    timeline = []
+    weeks = _ratings_by_week(reviews, n_weeks=8)
+    if weeks:
+        best_w = max(weeks, key=lambda w: w["avg"])
+        if best_w["avg"] >= 4.4:
+            timeline.append({
+                "date": best_w["weekStart"], "type": "positive",
+                "title": f"Best rated week: {best_w['avg']:.2f}★",
+                "body": f"{best_w['count']} reviews averaging {best_w['avg']:.2f}★.",
+            })
+    if location_rankings:
+        improved = [l for l in location_rankings if (l["ratingDelta"] or 0) >= 0.2]
+        declined = [l for l in location_rankings if (l["ratingDelta"] or 0) <= -0.2]
+        if improved:
+            top_i = max(improved, key=lambda l: l["ratingDelta"])
+            timeline.append({
+                "date": d30, "type": "positive",
+                "title": f"{top_i['name']} improved {top_i['ratingDelta']:+.2f}★",
+                "body": "Strongest single-location improvement this period.",
+            })
+        if declined:
+            top_d = min(declined, key=lambda l: l["ratingDelta"])
+            timeline.append({
+                "date": d30, "type": "warning",
+                "title": f"{top_d['name']} declined {top_d['ratingDelta']:+.2f}★",
+                "body": "Needs operational review and proactive response engagement.",
+            })
+    if len(period) > 40:
+        timeline.append({
+            "date": d30, "type": "neutral",
+            "title": f"Strong review volume: {len(period)} reviews this period",
+            "body": "High engagement signals active customer base.",
+        })
+    timeline.sort(key=lambda t: t["date"], reverse=True)
+
+    # ── Predictive Insights ───────────────────────────────────────────────────
+    insights = []
+    if avg_cur and avg_prev:
+        delta = avg_cur - avg_prev
+        if delta > 0.05:
+            insights.append({
+                "confidence": "moderate", "timeframe": "30 days", "type": "positive",
+                "title": "Rating trajectory is positive",
+                "body": f"Continuing current trends ({delta:+.2f}★/period), overall satisfaction is expected to improve further.",
+                "location": None,
+            })
+        elif delta < -0.05:
+            insights.append({
+                "confidence": "moderate", "timeframe": "30 days", "type": "warning",
+                "title": "Rating is showing a downward trend",
+                "body": f"The {delta:+.2f}★ change, if unchecked, projects to continued softening. Prioritize complaint resolution.",
+                "location": None,
+            })
+    if unanswered >= 12:
+        insights.append({
+            "confidence": "high", "timeframe": "ongoing", "type": "warning",
+            "title": f"{unanswered} unanswered reviews pose a retention risk",
+            "body": "Customers who receive no owner response are significantly less likely to update their rating upward.",
+            "location": None,
+        })
+    positives = [l for l in location_rankings if (l["ratingDelta"] or 0) >= 0.2]
+    if positives:
+        p = positives[0]
+        insights.append({
+            "confidence": "moderate", "timeframe": "30 days", "type": "positive",
+            "title": f"{p['name']} is on a strong upward trajectory",
+            "body": f"With {p['ratingDelta']:+.2f}★ momentum and a grade {p['grade']}, this location is well positioned to hold its #{p['rank']} ranking.",
+            "location": p["name"],
+        })
+
+    # ── Build briefing input for AI ───────────────────────────────────────────
+    best_loc  = location_rankings[0]  if location_rankings else None
+    worst_loc = location_rankings[-1] if location_rankings else None
+    most_imp  = max(location_rankings, key=lambda l: l["ratingDelta"] or 0) if location_rankings else None
+    period_str = f"{(now - timedelta(days=30)).strftime('%B %d')} – {now.strftime('%B %d, %Y')}"
+
+    return {
+        "generatedAt":        now.isoformat(),
+        "period":             period_str,
+        "metrics":            metrics,
+        "locationRankings":   location_rankings,
+        "changeDetection":    changes[:10],
+        "alerts":             alerts[:8],
+        "trendTimeline":      timeline[:6],
+        "predictiveInsights": insights[:5],
+        "weeklyBriefing":     None,
+        "_briefingInput": {
+            "period":           period_str,
+            "location_count":   len(locations),
+            "metrics":          metrics,
+            "best_performer":   f"{best_loc['name']} ({best_loc['avgRating']:.2f}★)" if best_loc else "N/A",
+            "worst_performer":  f"{worst_loc['name']} ({worst_loc['avgRating']:.2f}★)" if worst_loc else "N/A",
+            "most_improved":    f"{most_imp['name']} ({(most_imp['ratingDelta'] or 0):+.2f}★)" if most_imp else "N/A",
+            "top_complaint":    top_complaint or "service speed",
+            "top_praise":       top_praise or "food quality",
+        },
+    }
+
+
 def set_cache(conn, key: str, payload) -> None:
     new_json = json.dumps(payload, default=str)
     existing = conn.execute(
@@ -789,6 +1096,8 @@ def main():
     # --- Complaint intelligence ---
     intel = build_complaint_intelligence(reviews, period, prev_period)
     set_cache(conn, "complaint_intelligence", intel)
+    _top_complaint = intel["complaints"][0]["name"] if intel["complaints"] else None
+    _top_praise    = intel["praises"][0]["name"]    if intel["praises"]    else None
 
     # --- Location-level intelligence ---
     by_loc_all    = defaultdict(list)
@@ -883,8 +1192,8 @@ def main():
                              key=lambda s: s["periodSentiment"]["avgRating"] or 0)
         worst = sorted_locs[0]
         best  = sorted_locs[-1]
-        top_complaint_name = intel["complaints"][0]["name"] if intel["complaints"] else "none identified"
-        top_praise_name    = intel["praises"][0]["name"] if intel["praises"] else "none identified"
+        top_complaint_name = _top_complaint or "none identified"
+        top_praise_name    = _top_praise    or "none identified"
         sent30 = sentiment(period)
 
         ai_data = {
@@ -923,6 +1232,17 @@ def main():
         set_cache(conn, key, draft)
     if new_drafts:
         print(f"[ai] Generated {len(new_drafts)} new response drafts")
+
+    # --- Competitive intelligence ---
+    comp_intel = build_competitive_intelligence(
+        reviews, period, prev_period, loc_stats, locations,
+        _top_complaint, _top_praise,
+    )
+    briefing = ai_engine.generate_competitive_briefing(comp_intel["_briefingInput"]) if ai_engine.is_available() else None
+    if briefing:
+        comp_intel["weeklyBriefing"] = briefing
+    del comp_intel["_briefingInput"]
+    set_cache(conn, "competitive_intelligence", comp_intel)
 
     conn.commit()
     conn.close()

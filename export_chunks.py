@@ -240,6 +240,10 @@ def export_intelligence(conn) -> None:
             slug = key[len("location_detail_"):]
             write_json(f"intelligence/locations/{slug}.json", payload)
 
+    # Competitive intelligence
+    if "competitive_intelligence" in by_key:
+        write_json("intelligence/competitive-intelligence.json", by_key["competitive_intelligence"])
+
     # Response drafts — group into one file keyed by review_id for easy lookup
     drafts = {}
     for key, payload in by_key.items():

@@ -18,6 +18,7 @@ export function useCompanySummary()     { return useQuery({ queryKey: ['company-
 export function usePredictiveAlerts()   { return useQuery({ queryKey: ['predictive-alerts'],   queryFn: () => fetchJSON('/data/intelligence/predictive-alerts.json'),      ...OPTS }) }
 export function useResponseDrafts()     { return useQuery({ queryKey: ['response-drafts'],     queryFn: () => fetchJSON('/data/intelligence/response-drafts.json'),        ...OPTS }) }
 export function useScraperStatusData()  { return useQuery({ queryKey: ['scraper-status'],      queryFn: () => fetchJSON('/data/scraper-status.json'),                      ...OPTS }) }
+export function useCompetitorIntel()    { return useQuery({ queryKey: ['competitor-intel'],      queryFn: () => fetchJSON('/data/intelligence/competitive-intelligence.json'), ...OPTS }) }
 export function useWeeklyReportData()   { return useQuery({ queryKey: ['weekly-report'],       queryFn: () => fetchJSON('/data/reports/weekly-summary.json'),              ...OPTS }) }
 export function useActionItems()        { return useQuery({ queryKey: ['action-items'],        queryFn: () => fetchJSON('/data/action-items.json'),                        ...OPTS }) }
 
@@ -43,6 +44,7 @@ export function useGlobalPrefetch() {
       ['company-summary',   '/data/intelligence/company-summary.json'],
       ['predictive-alerts', '/data/intelligence/predictive-alerts.json'],
       ['response-drafts',   '/data/intelligence/response-drafts.json'],
+      ['competitor-intel',  '/data/intelligence/competitive-intelligence.json'],
       ['action-items',      '/data/action-items.json'],
     ]
     files.forEach(([key, path]) => {
