@@ -9,6 +9,7 @@ async function fetchJSON(path) {
 
 const OPTS = { staleTime: 1000 * 60 * 10 } // 10 min cache
 
+export function useMeta()               { return useQuery({ queryKey: ['meta'],               queryFn: () => fetchJSON('/data/meta.json'),                                ...OPTS }) }
 export function useKPIs()               { return useQuery({ queryKey: ['kpis'],               queryFn: () => fetchJSON('/data/analytics/kpis.json'),                      ...OPTS }) }
 export function useMonthlyTrend()       { return useQuery({ queryKey: ['monthly-trend'],       queryFn: () => fetchJSON('/data/analytics/monthly-trend.json'),             ...OPTS }) }
 export function useLocationStats()      { return useQuery({ queryKey: ['location-stats'],      queryFn: () => fetchJSON('/data/analytics/location-stats.json'),            ...OPTS }) }
@@ -46,6 +47,7 @@ export function useGlobalPrefetch() {
       ['response-drafts',   '/data/intelligence/response-drafts.json'],
       ['competitor-intel',  '/data/intelligence/competitive-intelligence.json'],
       ['action-items',      '/data/action-items.json'],
+      ['meta',              '/data/meta.json'],
     ]
     files.forEach(([key, path]) => {
       qc.prefetchQuery({

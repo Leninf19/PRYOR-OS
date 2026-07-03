@@ -1,23 +1,32 @@
 import { useMemo, useEffect, useState } from 'react'
 import { Routes, Route, Navigate, Outlet, useLocation, useOutletContext } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
-import Layout          from './components/Layout.jsx'
-import GlobalFilters   from './components/GlobalFilters.jsx'
-import Overview        from './pages/Overview.jsx'
-import LocationDetail  from './pages/LocationDetail.jsx'
-import ReviewExplorer  from './pages/ReviewExplorer.jsx'
-import TrendsAnalytics from './pages/TrendsAnalytics.jsx'
+import Layout               from './components/Layout.jsx'
+import GlobalFilters        from './components/GlobalFilters.jsx'
+import Overview             from './pages/Overview.jsx'
+import LocationDetail       from './pages/LocationDetail.jsx'
+import ReviewExplorer       from './pages/ReviewExplorer.jsx'
+import TrendsAnalytics      from './pages/TrendsAnalytics.jsx'
 import ActionItems, { useUnansweredCount } from './pages/ActionItems.jsx'
-import ScraperStatus   from './pages/ScraperStatus.jsx'
-import Reports         from './pages/Reports.jsx'
-import ComplaintIntelligence  from './pages/ComplaintIntelligence.jsx'
-import CompetitorIntelligence from './pages/CompetitorIntelligence.jsx'
+import ScraperStatus        from './pages/ScraperStatus.jsx'
+import Reports              from './pages/Reports.jsx'
+import ComplaintIntelligence   from './pages/ComplaintIntelligence.jsx'
+import CompetitorIntelligence  from './pages/CompetitorIntelligence.jsx'
+import Alerts               from './pages/Alerts.jsx'
+import AIAdvisor            from './pages/AIAdvisor.jsx'
+import MarketingIntelligence   from './pages/MarketingIntelligence.jsx'
+import EmployeeIntelligence    from './pages/EmployeeIntelligence.jsx'
+import ExecutiveReports     from './pages/ExecutiveReports.jsx'
+import Settings             from './pages/Settings.jsx'
 import { useReviewsData }    from './hooks/useReviewsData.js'
 import { useGlobalPrefetch } from './hooks/useIntelligence.js'
-import { filterReviews, getDefaultDateRange, getDateBounds } from './utils/dataUtils.js'
+import { filterReviews, getDefaultDateRange } from './utils/dataUtils.js'
 
-// Pages that don't use the global filter bar
-const NO_FILTER_PATHS = ['/actions', '/scraper-status', '/reports', '/intelligence', '/competitive']
+// Pages that don't use the global review filter bar
+const NO_FILTER_PATHS = [
+  '/actions', '/scraper-status', '/reports', '/intelligence', '/competitive',
+  '/alerts', '/advisor', '/marketing-intel', '/employee-intel', '/executive-reports', '/settings',
+]
 
 function buildDefaultFilters(reviews) {
   const dr = getDefaultDateRange(reviews)
@@ -150,31 +159,35 @@ export default function App() {
   return (
     <Routes>
       <Route element={<RootLayout />}>
-        <Route index                 element={<Navigate to="/overview" replace />} />
-        <Route path="overview"       element={<ROverview />} />
-        <Route path="locations"      element={<RLocations />} />
-        <Route path="explorer"       element={<RExplorer />} />
-        <Route path="actions"        element={<RActions />} />
-        <Route path="intelligence"   element={<RIntelligence />} />
-        <Route path="competitive"    element={<RCompetitive />} />
-        <Route path="trends"         element={<RTrends />} />
-        <Route path="scraper-status" element={<RScraper />} />
-        <Route path="reports"        element={<Reports />} />
+        <Route index                    element={<Navigate to="/overview" replace />} />
+        <Route path="overview"          element={<ROverview />} />
+        <Route path="locations"         element={<RLocations />} />
+        <Route path="explorer"          element={<RExplorer />} />
+        <Route path="actions"           element={<RActions />} />
+        <Route path="intelligence"      element={<ComplaintIntelligence />} />
+        <Route path="competitive"       element={<CompetitorIntelligence />} />
+        <Route path="marketing-intel"   element={<MarketingIntelligence />} />
+        <Route path="employee-intel"    element={<EmployeeIntelligence />} />
+        <Route path="advisor"           element={<AIAdvisor />} />
+        <Route path="trends"            element={<RTrends />} />
+        <Route path="alerts"            element={<Alerts />} />
+        <Route path="executive-reports" element={<ExecutiveReports />} />
+        <Route path="reports"           element={<Reports />} />
+        <Route path="scraper-status"    element={<RScraper />} />
+        <Route path="settings"          element={<Settings />} />
         {/* Legacy redirects */}
-        <Route path="rankings"   element={<Navigate to="/trends" replace />} />
+        <Route path="rankings"   element={<Navigate to="/trends"      replace />} />
         <Route path="insights"   element={<Navigate to="/intelligence" replace />} />
         <Route path="validation" element={<Navigate to="/scraper-status" replace />} />
-        <Route path="*"          element={<Navigate to="/overview" replace />} />
+        <Route path="*"          element={<Navigate to="/overview"    replace />} />
       </Route>
     </Routes>
   )
 }
 
-function ROverview()      { const { allReviews, filtered } = useOutletContext(); return <Overview allReviews={allReviews} filtered={filtered} /> }
-function RLocations()     { const c = useOutletContext(); return <LocationDetail allReviews={c.allReviews} filtered={c.filtered} filters={c.filters} /> }
-function RExplorer()      { const { allReviews, filtered } = useOutletContext(); return <ReviewExplorer allReviews={allReviews} filtered={filtered} /> }
-function RTrends()        { const c = useOutletContext(); return <TrendsAnalytics allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} /> }
-function RActions()       { const { allReviews } = useOutletContext(); return <ActionItems allReviews={allReviews} /> }
-function RScraper()       { const { allReviews } = useOutletContext(); return <ScraperStatus allReviews={allReviews} /> }
-function RIntelligence()  { return <ComplaintIntelligence /> }
-function RCompetitive()   { return <CompetitorIntelligence /> }
+function ROverview()   { const { allReviews, filtered } = useOutletContext(); return <Overview allReviews={allReviews} filtered={filtered} /> }
+function RLocations()  { const c = useOutletContext(); return <LocationDetail allReviews={c.allReviews} filtered={c.filtered} filters={c.filters} /> }
+function RExplorer()   { const { allReviews, filtered } = useOutletContext(); return <ReviewExplorer allReviews={allReviews} filtered={filtered} /> }
+function RTrends()     { const c = useOutletContext(); return <TrendsAnalytics allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} /> }
+function RActions()    { const { allReviews } = useOutletContext(); return <ActionItems allReviews={allReviews} /> }
+function RScraper()    { const { allReviews } = useOutletContext(); return <ScraperStatus allReviews={allReviews} /> }
