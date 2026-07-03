@@ -33,20 +33,20 @@ export default async function handler(req, res) {
   }
 
   const toneGuide = TONE_GUIDES[tone] ?? TONE_GUIDES.friendly
+  const locationName = location || 'our restaurant'
 
-  const prompt = `You are the owner of Los Tres Amigos, a Mexican restaurant group with 21 locations. Write a response to this Google review.
+  const prompt = `You are the manager of ${locationName}, a Mexican restaurant. Write a response to this Google review on behalf of ${locationName} only — do not reference or name any other restaurant or chain.
 
 TONE: ${toneGuide}
 
 REVIEWER: ${reviewerName || 'A guest'}
 STAR RATING: ${stars ?? 1} out of 5
-LOCATION: ${location || 'our restaurant'}
 REVIEW TEXT: ${reviewText || '(Rating only — no written review)'}
 
-CURRENT DRAFT (for reference — improve and match the requested tone):
+CURRENT DRAFT (improve it to match the tone above):
 ${currentDraft || '(No draft — write from scratch)'}
 
-Write ONLY the response text. No quotes, no labels, no "Here is the response:" preamble. Sign off naturally. Maximum 4096 characters.`
+Write ONLY the response text. No quotes, no labels, no preamble. Sign off as '— The ${locationName} Team'. Maximum 4096 characters.`
 
   try {
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {

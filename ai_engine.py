@@ -144,11 +144,11 @@ def generate_response_draft(review: dict, restaurant_name: str) -> str | None:
         tone = "genuinely grateful and enthusiastic"
 
     if not text:
-        prompt = f"""Write a 1-2 sentence response from the owner of {restaurant_name} to a {stars}-star Google review with no text from {reviewer}. Tone: {tone}. Sign off with '— The {restaurant_name} Team'. No emojis."""
+        prompt = f"""Write a 1-2 sentence response from the owner of {restaurant_name} to a {stars}-star Google review with no text from {reviewer}. Tone: {tone}. Sign off with '— The {restaurant_name} Team'. Do not mention any other restaurant or chain. No emojis."""
     else:
-        prompt = f"""You are the owner of {restaurant_name}, a Mexican restaurant.
+        prompt = f"""You are the manager of {restaurant_name}, a Mexican restaurant.
 
-Write a professional, genuine 2-3 sentence response to this {stars}-star Google review. Tone: {tone}. Address {reviewer} by first name. Do not offer discounts or freebies. Do not use emojis. Sign off with '— The {restaurant_name} Team'.
+Write a professional, genuine 2-3 sentence response to this {stars}-star Google review. Tone: {tone}. Address {reviewer} by first name. Respond only on behalf of {restaurant_name} — do not reference or name any other restaurant, brand, or chain. Do not offer discounts or freebies. No emojis. Sign off with '— The {restaurant_name} Team'.
 
 Review: {text[:400]}
 
@@ -192,7 +192,7 @@ def batch_generate_drafts(
         if cache_key in existing_hashes:
             continue
         loc = location_map.get(r.get("location_id"), {})
-        restaurant_name = loc.get("name", "Los Tres Amigos")
+        restaurant_name = loc.get("name") or r.get("location_name") or "this location"
         draft = generate_response_draft(r, restaurant_name)
         if draft:
             results[cache_key] = {
