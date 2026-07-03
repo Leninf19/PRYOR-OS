@@ -155,6 +155,7 @@ function ReviewCard({ r, draft, wsEntry, onUpdate }) {
   const [activeTone, setActiveTone] = useState(null)
   const [rewriting,  setRewriting]  = useState(false)
   const [rewriteErr, setRewriteErr] = useState(null)
+  const [publishing, setPublishing] = useState(false)
   const [copied,     setCopied]     = useState(false)
   const textRef = useRef(null)
 
@@ -205,10 +206,31 @@ function ReviewCard({ r, draft, wsEntry, onUpdate }) {
     }
   }
 
-  function handlePublish() {
-    // GBP API not connected — surface explicit error
-    onUpdate({ status: 'failed', failReason: 'not_connected' })
-    setOpen(true)
+  async function handlePublish() {
+    if (!localDraft || publishing) return
+    setPublishing(true)
+    try {
+      const res = await fetch('/api/google/publish', {
+        method:  'POST',
+        headers: { 'content-type': 'application/json' },
+        body:    JSON.stringify({
+          locationName: r.location_name,
+          reviewerName: r.reviewer_name,
+          replyText:    localDraft,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok) {
+        onUpdate({ status: 'published', publishedAt: new Date().toISOString(), failReason: null })
+        setOpen(false)
+      } else {
+        onUpdate({ status: 'failed', failReason: data.error || 'api_error' })
+      }
+    } catch {
+      onUpdate({ status: 'failed', failReason: 'network_error' })
+    } finally {
+      setPublishing(false)
+    }
   }
 
   function handleMarkPublished() {
@@ -387,8 +409,8 @@ function ReviewCard({ r, draft, wsEntry, onUpdate }) {
 
           {/* Action buttons */}
           <div className="pt-2 border-t flex items-center gap-2 flex-wrap" style={{ borderColor: 'var(--color-border)' }}>
-            <Button variant="primary" onClick={handlePublish}>
-              Publish to Google
+            <Button variant="primary" onClick={handlePublish} disabled={!localDraft || publishing}>
+              {publishing ? 'Publishing…' : 'Publish to Google'}
             </Button>
             <Button
               variant={copied ? 'accent' : 'secondary'}

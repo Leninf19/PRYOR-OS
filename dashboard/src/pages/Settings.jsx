@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 
 // ── Google Business Profile integration section ───────────────────────────────
@@ -26,7 +26,7 @@ const GBP_STEPS = [
   {
     n: 4,
     title: 'Create OAuth 2.0 credentials',
-    body: 'Go to Credentials → Create credentials → OAuth 2.0 Client ID. Set application type to "Web Application." Add your Future Insights domain as an authorized redirect URI. This gives you a Client ID and Client Secret.',
+    body: 'Go to Credentials → Create credentials → OAuth 2.0 Client ID. Set application type to "Web Application." Under "Authorized redirect URIs" add: https://[your-domain]/api/google/callback (replace [your-domain] with your Vercel production URL). This gives you a Client ID and Client Secret.',
     tag: 'After approval',
   },
   {
@@ -45,8 +45,30 @@ const PLANNED_GBP = [
   'Failure alerts with exact reason (permission missing, review removed, etc.)',
 ]
 
+function useGoogleStatus() {
+  const [status, setStatus] = useState({ loading: true })
+  useEffect(() => {
+    fetch('/api/google/status')
+      .then(r => r.json())
+      .then(d => setStatus({ loading: false, ...d }))
+      .catch(() => setStatus({ loading: false, connected: false, state: 'error' }))
+  }, [])
+  return status
+}
+
 function GBPSection() {
   const [stepsOpen, setStepsOpen] = useState(false)
+  const status = useGoogleStatus()
+
+  const badge = status.loading
+    ? { label: '…', variant: 'neutral' }
+    : status.connected
+      ? { label: 'Connected', variant: 'success' }
+      : status.state === 'needs_token'
+        ? { label: 'Ready to Connect', variant: 'info' }
+        : status.state === 'invalid_credentials'
+          ? { label: 'Auth Error', variant: 'danger' }
+          : { label: 'Not Connected', variant: 'neutral' }
 
   return (
     <div className="space-y-4">
@@ -70,30 +92,54 @@ function GBPSection() {
                 Google Business Profile
               </p>
               <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
-                Read and reply to reviews via the official GBP API
+                {status.connected
+                  ? `Connected as ${status.accountName || 'Google Business Profile'}`
+                  : 'Read and reply to reviews via the official GBP API'}
               </p>
             </div>
           </div>
-          <Badge variant="neutral">Not Connected</Badge>
+          <Badge variant={badge.variant}>{badge.label}</Badge>
         </div>
 
         <div className="px-6 py-4 border-t" style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-2)' }}>
-          <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)', lineHeight: 1.75 }}>
-            Once connected, one Google account covers all 21 locations. Future Insights can publish
-            responses directly to Google, sync new reviews automatically, and track publish status
-            for every response your team sends.
-          </p>
-          <div className="mt-3 flex items-center gap-3 flex-wrap">
-            <button
-              onClick={() => setStepsOpen(s => !s)}
-              className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
-              style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }}>
-              {stepsOpen ? 'Hide setup guide' : 'View setup guide (5 steps)'}
-            </button>
-            <span className="text-[10px]" style={{ color: 'var(--color-text-3)' }}>
-              Requires Google API approval · 1–5 business days
-            </span>
-          </div>
+          {status.connected ? (
+            <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)', lineHeight: 1.75 }}>
+              One-click publishing is active for all 21 locations. To disconnect, remove
+              <code className="mx-1 text-[10px] px-1.5 py-0.5 rounded"
+                    style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
+                GOOGLE_REFRESH_TOKEN
+              </code>
+              from Vercel environment variables.
+            </p>
+          ) : (
+            <>
+              <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)', lineHeight: 1.75 }}>
+                Once connected, one Google account covers all 21 locations. Future Insights can publish
+                responses directly to Google, sync new reviews automatically, and track publish status
+                for every response your team sends.
+              </p>
+              <div className="mt-3 flex items-center gap-3 flex-wrap">
+                {status.state === 'needs_token' && (
+                  <a href="/api/google/auth"
+                     className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
+                     style={{ background: 'var(--color-accent)', borderColor: 'var(--color-accent)', color: 'white' }}>
+                    Connect Google Account →
+                  </a>
+                )}
+                <button
+                  onClick={() => setStepsOpen(s => !s)}
+                  className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
+                  style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }}>
+                  {stepsOpen ? 'Hide setup guide' : 'View setup guide (5 steps)'}
+                </button>
+                {status.state !== 'needs_token' && (
+                  <span className="text-[10px]" style={{ color: 'var(--color-text-3)' }}>
+                    Requires Google API approval · 1–5 business days
+                  </span>
+                )}
+              </div>
+            </>
+          )}
         </div>
       </div>
 
