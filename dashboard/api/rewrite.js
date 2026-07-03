@@ -3,6 +3,25 @@
 // POST /api/rewrite  { tone, reviewText, currentDraft, reviewerName, location, stars }
 // Returns           { rewritten: string }
 
+const CONTACT_EMAIL = 'advertising@l3amigos.com'
+
+const SERIOUS_KEYWORDS = [
+  'sick', 'ill', 'vomit', 'threw up', 'food poison', 'diarrhea', 'stomach',
+  'hospital', 'doctor', 'health department', 'health code',
+  'cockroach', 'roach', 'rat', 'mouse', 'rodent', 'insect', 'bug', 'pest',
+  'injury', 'injured', 'hurt', 'unsafe', 'accident',
+  'discrimination', 'racist', 'racism', 'harassment', 'rude', 'hostile', 'threatening',
+  'lawsuit', 'lawyer', 'attorney', 'sue', 'legal',
+  'police', 'fight', 'assault', 'stole', 'stolen', 'theft',
+  'never coming back', 'health violation', 'shut down', 'report',
+]
+
+function isSeriousIssue(reviewText, stars) {
+  if (!reviewText) return false
+  const lower = reviewText.toLowerCase()
+  return SERIOUS_KEYWORDS.some(kw => lower.includes(kw)) || Number(stars) === 1
+}
+
 const TONE_GUIDES = {
   friendly:     'Warm, conversational, and approachable. Like a friendly local business owner who genuinely cares.',
   professional: 'Formal, polished, and business-appropriate. Represent the brand with professionalism.',
@@ -11,7 +30,7 @@ const TONE_GUIDES = {
   apologetic:   'Lead with a sincere, specific apology. Own the experience fully and promise concrete improvement.',
   personal:     'Personal and human. Address them by name. Write as if you personally know this guest.',
   seo:          'Weave in natural keywords: restaurant name, city, Mexican food, hospitality, dining experience. No keyword stuffing.',
-  spanish:      'Write entirely in Spanish. Warm and professional tone. Do not include any English.',
+  spanish:      'Warm and professional tone.',
 }
 
 export default async function handler(req, res) {
@@ -32,21 +51,43 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing required field: tone' })
   }
 
-  const toneGuide = TONE_GUIDES[tone] ?? TONE_GUIDES.friendly
+  const toneGuide    = TONE_GUIDES[tone] ?? TONE_GUIDES.friendly
   const locationName = location || 'our restaurant'
+  const serious      = isSeriousIssue(reviewText, stars)
+  const numStars     = Number(stars) || 3
+
+  const langNote = tone === 'spanish'
+    ? 'Language: Write entirely in Spanish. Do not include any English.'
+    : 'Language: Write in English, regardless of the language of the current draft or the original review.'
+
+  const lengthGuide = tone === 'short'
+    ? 'Length: 2 sentences maximum.'
+    : numStars >= 4
+      ? 'Length: 1–2 sentences. Brief and grateful.'
+      : numStars === 3
+        ? 'Length: 2–3 sentences. Appreciative but acknowledge room to improve.'
+        : serious
+          ? 'Length: 3–4 sentences. Sincere and specific — this is a serious concern.'
+          : 'Length: 2–3 sentences. Sincere and to the point.'
+
+  const contactNote = serious
+    ? `At the end (before the sign-off), invite them to reach out directly: "Please contact us at ${CONTACT_EMAIL} so we can make this right." Do not add anything after the sign-off.`
+    : ''
 
   const prompt = `You are the manager of ${locationName}, a Mexican restaurant. Write a response to this Google review on behalf of ${locationName} only — do not reference or name any other restaurant or chain.
 
 TONE: ${toneGuide}
-
+${langNote}
+${lengthGuide}
+${contactNote ? contactNote + '\n' : ''}
 REVIEWER: ${reviewerName || 'A guest'}
-STAR RATING: ${stars ?? 1} out of 5
+STAR RATING: ${numStars} out of 5
 REVIEW TEXT: ${reviewText || '(Rating only — no written review)'}
 
-CURRENT DRAFT (improve it to match the tone above):
+CURRENT DRAFT (improve it to match the tone and length above):
 ${currentDraft || '(No draft — write from scratch)'}
 
-Write ONLY the response text. No quotes, no labels, no preamble. Sign off as '— The ${locationName} Team'. Maximum 4096 characters.`
+Write ONLY the response text. No quotes, no labels, no preamble. Sign off as '— The ${locationName} Team'.`
 
   try {
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {
@@ -58,7 +99,7 @@ Write ONLY the response text. No quotes, no labels, no preamble. Sign off as '�
       },
       body: JSON.stringify({
         model:      'claude-haiku-4-5-20251001',
-        max_tokens: 400,
+        max_tokens: 300,
         messages:   [{ role: 'user', content: prompt }],
       }),
     })

@@ -130,31 +130,74 @@ Write the location summary now:"""
 # Response drafts
 # ---------------------------------------------------------------------------
 
+_SERIOUS_KEYWORDS = [
+    "sick", "ill", "vomit", "threw up", "food poison", "diarrhea", "stomach",
+    "hospital", "doctor", "health department", "health code",
+    "cockroach", "roach", "rat", "mouse", "rodent", "insect", "bug", "pest",
+    "injury", "injured", "hurt", "unsafe", "accident",
+    "discrimination", "racist", "racism", "harassment", "rude", "hostile", "threatening",
+    "lawsuit", "lawyer", "attorney", "sue", "legal",
+    "police", "fight", "assault", "stole", "stolen", "theft",
+    "never coming back", "health violation", "shut down", "report",
+]
+_CONTACT_EMAIL = "advertising@l3amigos.com"
+
+
+def _is_serious(text: str, stars: int) -> bool:
+    if stars == 1:
+        return True
+    lower = (text or "").lower()
+    return any(kw in lower for kw in _SERIOUS_KEYWORDS)
+
+
 def generate_response_draft(review: dict, restaurant_name: str) -> str | None:
     """Generate a professional owner-response draft for a single review."""
-    stars = review.get("star_rating") or 3
-    reviewer = (review.get("reviewer_name") or "Guest").split()[0]  # first name only
-    text = (review.get("review_text") or "").strip()
+    stars    = review.get("star_rating") or 3
+    reviewer = (review.get("reviewer_name") or "Guest").split()[0]
+    text     = (review.get("review_text") or "").strip()
+    serious  = _is_serious(text, stars)
 
     if stars <= 2:
-        tone = "sincere, apologetic, and solution-focused. Acknowledge the specific issue without being defensive"
+        tone = "sincere and apologetic. Acknowledge the specific issue without being defensive"
     elif stars == 3:
         tone = "warm and appreciative while acknowledging there is room to improve"
     else:
-        tone = "genuinely grateful and enthusiastic"
+        tone = "genuinely grateful and brief"
+
+    if stars >= 4:
+        length = "1-2 sentences"
+    elif stars == 3:
+        length = "2-3 sentences"
+    elif serious:
+        length = "3-4 sentences"
+    else:
+        length = "2-3 sentences"
+
+    contact = (
+        f" At the end, before the sign-off, invite them to reach out: "
+        f"'Please contact us at {_CONTACT_EMAIL} so we can make this right.'"
+        if serious else ""
+    )
 
     if not text:
-        prompt = f"""Write a 1-2 sentence response from the owner of {restaurant_name} to a {stars}-star Google review with no text from {reviewer}. Tone: {tone}. Sign off with '— The {restaurant_name} Team'. Do not mention any other restaurant or chain. No emojis."""
+        prompt = (
+            f"Write a {length} response from the owner of {restaurant_name} to a {stars}-star "
+            f"Google review with no text from {reviewer}. Tone: {tone}. "
+            f"Do not mention any other restaurant or chain. No emojis. "
+            f"Sign off with '— The {restaurant_name} Team'."
+        )
     else:
-        prompt = f"""You are the manager of {restaurant_name}, a Mexican restaurant.
+        prompt = (
+            f"You are the manager of {restaurant_name}, a Mexican restaurant.\n\n"
+            f"Write a professional, genuine {length} response to this {stars}-star Google review. "
+            f"Tone: {tone}. Address {reviewer} by first name. "
+            f"Respond only on behalf of {restaurant_name} — do not reference or name any other restaurant, brand, or chain. "
+            f"Do not offer discounts or freebies. No emojis.{contact} "
+            f"Sign off with '— The {restaurant_name} Team'.\n\n"
+            f"Review: {text[:400]}\n\nWrite the response now:"
+        )
 
-Write a professional, genuine 2-3 sentence response to this {stars}-star Google review. Tone: {tone}. Address {reviewer} by first name. Respond only on behalf of {restaurant_name} — do not reference or name any other restaurant, brand, or chain. Do not offer discounts or freebies. No emojis. Sign off with '— The {restaurant_name} Team'.
-
-Review: {text[:400]}
-
-Write the response now:"""
-
-    return _call(prompt, model="claude-haiku-4-5-20251001", max_tokens=160)
+    return _call(prompt, model="claude-haiku-4-5-20251001", max_tokens=200)
 
 
 # ---------------------------------------------------------------------------
