@@ -115,7 +115,7 @@ function RootLayout() {
     return `${filters.start} — ${filters.end}`
   }, [filters])
 
-  const unansweredCount = useUnansweredCount(allReviews || [])
+  const unansweredCount = useUnansweredCount()
 
   if (isLoading || !filters) return <LoadingScreen />
   if (isError) return <ErrorScreen />
@@ -189,5 +189,5 @@ function ROverview()   { const { allReviews, filtered } = useOutletContext(); re
 function RLocations()  { const c = useOutletContext(); return <LocationDetail allReviews={c.allReviews} filtered={c.filtered} filters={c.filters} /> }
 function RExplorer()   { const { allReviews, filtered } = useOutletContext(); return <ReviewExplorer allReviews={allReviews} filtered={filtered} /> }
 function RTrends()     { const c = useOutletContext(); return <TrendsAnalytics allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} /> }
-function RActions()    { const { allReviews } = useOutletContext(); return <ActionItems allReviews={allReviews} /> }
+function RActions()    { return <ActionItems /> }
 function RScraper()    { const { allReviews } = useOutletContext(); return <ScraperStatus allReviews={allReviews} /> }
