@@ -866,68 +866,293 @@ def append_to_csv(new_rows: list):
 # ---------------------------------------------------------------------------
 
 def build_email_html(new_rows: list, failed_locs: list[dict] | None = None) -> str:
-    """Build HTML for the new-reviews notification email.
-    failed_locs is a list of {name, error} dicts (failures that produced no reviews)."""
+    """Build premium HTML email for the new-reviews notification.
+    Reviews are NEVER truncated. failed_locs: list of {name, error} dicts."""
+    import html as _html
+
+    # ── Topic + action detection ─────────────────────────────────────────────
+    _TOPIC_MAP = [
+        ("Service",          ["server", "staff", "waiter", "waitress", "employee"]),
+        ("Wrong Order",      ["wrong order", "wrong dish", "incorrect order", "messed up", "wrong item"]),
+        ("Wait Time",        ["wait", "slow", "long time", "forever", "took too long"]),
+        ("Refills",          ["refill", "refills"]),
+        ("Food Quality",     ["cold food", "bland", "raw", "overcooked", "stale", "undercooked", "bad food"]),
+        ("Cleanliness",      ["dirty", "filthy", "cockroach", "roach", "rat", "pest", "gross"]),
+        ("Payment/Receipt",  ["card machine", "payment", "receipt", "cash", "card reader"]),
+        ("Atmosphere",       ["atmosphere", "noise", "noisy", "loud", "crowded", "parking"]),
+        ("Health Concern",   ["sick", "ill", "vomit", "food poison", "diarrhea", "hospital"]),
+        ("Price / Value",    ["expensive", "overpriced", "overcharged"]),
+        ("Staff Attitude",   ["rude", "hostile", "disrespectful", "unprofessional", "attitude"]),
+    ]
+    _ACTION_MAP = [
+        (["server", "staff", "waiter", "waitress", "employee"],   "Identify the staff member involved and follow up with management."),
+        (["wrong order", "wrong dish", "incorrect", "messed up"], "Review order accuracy procedures with the kitchen team."),
+        (["refill"],                                               "Reinforce refill and table-check standards with front-of-house staff."),
+        (["card machine", "payment", "receipt"],                   "Inspect payment terminals and ensure receipts are available on request."),
+        (["dirty", "filthy", "cockroach", "roach", "rat", "pest"],"Schedule an immediate deep-clean and pest inspection."),
+        (["sick", "food poison", "vomit", "hospital"],             "Escalate to management — potential food safety issue. Contact advertising@l3amigos.com."),
+        (["wait", "slow", "long time", "forever"],                 "Review staffing levels and service pace during peak hours."),
+        (["rude", "hostile", "disrespectful"],                     "Address customer service standards with the team."),
+    ]
+
+    def _detect_topics(text):
+        if not text:
+            return []
+        lower = text.lower()
+        return [t for t, kws in _TOPIC_MAP if any(kw in lower for kw in kws)][:6]
+
+    def _actions(text, stars):
+        if not text:
+            return []
+        lower = text.lower()
+        found = [a for kws, a in _ACTION_MAP if any(kw in lower for kw in kws)]
+        if int(stars or 0) == 1:
+            found.append("Consider reaching out directly to the customer to offer a resolution.")
+        return found[:5] or ["Draft a professional, empathetic reply on Google."]
+
+    def _safe(s):
+        return _html.escape(str(s or ""), quote=False)
+
+    def _stars_bar(n):
+        n = max(0, min(5, int(n or 0)))
+        return (
+            f'<span style="color:#f59e0b;font-size:17px;letter-spacing:2px">{"&#9733;" * n}</span>'
+            f'<span style="color:#d1d5db;font-size:17px;letter-spacing:2px">{"&#9734;" * (5 - n)}</span>'
+        )
+
+    def _fmt_date(s):
+        try:
+            from datetime import date as _d
+            return _d.fromisoformat(str(s or "")[:10]).strftime("%B %d, %Y")
+        except Exception:
+            return str(s or "Unknown date")
+
+    def _nl2p(text):
+        """HTML-escape text and convert newlines to paragraph/br tags without truncation."""
+        escaped = _safe(text)
+        normalized = re.sub(r'\n{2,}', '\n\n', escaped.strip())
+        parts = [p.strip() for p in normalized.split('\n\n') if p.strip()]
+        if not parts:
+            return '<span style="color:#94a3b8;font-style:normal">No written content.</span>'
+        if len(parts) == 1:
+            return parts[0].replace('\n', '<br>')
+        return ''.join(
+            f'<p style="margin:0 0 12px 0">{p.replace(chr(10), "<br>")}</p>'
+            for p in parts
+        )
+
+    def _star_theme(n):
+        n = int(n or 0)
+        if n <= 1: return '#dc2626', '#fff1f2', 'Very Negative'
+        if n == 2: return '#f97316', '#fff7ed', 'Negative'
+        if n == 3: return '#d97706', '#fffbeb', 'Mixed'
+        if n == 4: return '#16a34a', '#f0fdf4', 'Positive'
+        return '#15803d', '#f0fdf4', 'Very Positive'
+
+    def _review_card(r):
+        reviewer = _safe(r.get("reviewer_name") or "Anonymous")
+        stars    = int(r.get("star_rating") or 0)
+        date_s   = _fmt_date(r.get("review_date"))
+        text     = (r.get("review_text") or "").strip()
+        url      = r.get("review_url") or ""
+        is_low   = stars <= 2
+
+        accent, badge_bg, sentiment = _star_theme(stars)
+        topics  = _detect_topics(text)
+        actions = _actions(text, stars) if is_low else []
+
+        chips = "".join(
+            f'<span style="display:inline-block;background:#f0f9ff;color:#0369a1;'
+            f'border:1px solid #bae6fd;border-radius:20px;padding:3px 12px;margin:3px;'
+            f'font-size:12px;font-weight:600">{t}</span>'
+            for t in topics
+        ) if topics else '<span style="font-size:12px;color:#94a3b8;font-style:italic">None detected</span>'
+
+        action_rows = "".join(
+            '<tr>'
+            '<td style="width:14px;vertical-align:top;padding:4px 0;color:#d97706;font-size:13px">&#8226;</td>'
+            f'<td style="padding:4px 0 4px 8px;font-size:13px;color:#1e293b;line-height:1.55">{a}</td>'
+            '</tr>'
+            for a in actions
+        )
+
+        actions_section = (
+            '<tr><td style="padding:14px 22px;border-bottom:1px solid #f1f5f9">'
+            '<p style="margin:0 0 8px;font-size:10px;font-weight:700;color:#64748b;'
+            'text-transform:uppercase;letter-spacing:.08em">Recommended Actions</p>'
+            f'<table width="100%" cellpadding="0" cellspacing="0">{action_rows}</table>'
+            '</td></tr>'
+        ) if action_rows else ""
+
+        view_link = (
+            f'<a href="{_safe(url)}" '
+            'style="display:inline-block;background:#0f172a;color:white;text-decoration:none;'
+            'border-radius:7px;padding:9px 16px;font-size:12px;font-weight:600;margin-right:8px;'
+            'margin-bottom:6px">&#128279;&nbsp;View Review</a>'
+        ) if url else ""
+
+        # Pre-compute to avoid backslash inside f-string expression
+        no_text_fallback = '<span style="color:#94a3b8;font-style:normal">Rating only — no written review.</span>'
+        review_body = _nl2p(text) if text else no_text_fallback
+
+        return "".join([
+            '<table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;'
+            'border:1.5px solid #e2e8f0;border-radius:12px;overflow:hidden;background:white;'
+            'border-collapse:separate">',
+
+            # Header row — reviewer + sentiment badge
+            '<tr><td style="background:#0f172a;padding:16px 22px;border-radius:12px 12px 0 0">',
+            '<table width="100%" cellpadding="0" cellspacing="0"><tr>',
+            f'<td><p style="margin:0 0 2px;font-size:14px;font-weight:700;color:white">{reviewer}</p>',
+            f'<p style="margin:0;font-size:12px;color:#94a3b8">{date_s}</p></td>',
+            '<td style="text-align:right;white-space:nowrap">',
+            f'<span style="background:{badge_bg};color:{accent};border-radius:6px;'
+            f'padding:5px 12px;font-size:12px;font-weight:700">{stars}&#9733;&nbsp;{sentiment}</span>',
+            '</td></tr></table></td></tr>',
+
+            # Stars bar row
+            '<tr><td style="padding:8px 22px 10px;background:#f8fafc;border-bottom:1px solid #f1f5f9">',
+            _stars_bar(stars),
+            f'<span style="font-size:12px;color:#64748b;font-weight:600;vertical-align:middle;margin-left:8px">{stars} / 5</span>',
+            '</td></tr>',
+
+            # Full review — never truncated
+            '<tr><td style="padding:16px 22px;border-bottom:1px solid #f1f5f9">',
+            '<p style="margin:0 0 8px;font-size:10px;font-weight:700;color:#64748b;'
+            'text-transform:uppercase;letter-spacing:.08em">Full Review</p>',
+            f'<div style="background:#f8fafc;border-left:3px solid {accent};'
+            'border-radius:0 8px 8px 0;padding:14px 16px;font-size:14px;'
+            'color:#1e293b;line-height:1.8;font-style:italic">',
+            review_body,
+            '</div></td></tr>',
+
+            # Detected topics
+            '<tr><td style="padding:14px 22px;border-bottom:1px solid #f1f5f9">',
+            '<p style="margin:0 0 8px;font-size:10px;font-weight:700;color:#64748b;'
+            'text-transform:uppercase;letter-spacing:.08em">Detected Topics</p>',
+            f'<div>{chips}</div></td></tr>',
+
+            # Recommended actions (low-star reviews only)
+            actions_section,
+
+            # Quick links
+            f'<tr><td style="padding:14px 22px">{view_link}</td></tr>',
+
+            '</table>',
+        ])
+
+    # ── Assemble email ───────────────────────────────────────────────────────
     by_loc = defaultdict(list)
     for r in new_rows:
         by_loc[r["location_name"]].append(r)
 
-    stars_html = lambda n: ("&#9733;" * n) + ("&#9734;" * (5 - n))
+    total    = len(new_rows)
+    low_star = sum(1 for r in new_rows if int(r.get("star_rating") or 0) <= 2)
+    date_str = datetime.now().strftime("%B %d, %Y")
+    year_now = datetime.now().year
 
-    sections = []
-    for loc_name, reviews in sorted(by_loc.items()):
-        items = ""
-        for r in reviews[:10]:
-            stars   = int(r["star_rating"]) if r["star_rating"] else 0
-            snippet = (r["review_text"] or "")[:200]
-            if len(r["review_text"] or "") > 200:
-                snippet += "..."
-            items += f"""
-            <tr>
-              <td style="padding:8px 0;border-bottom:1px solid #eee">
-                <strong>{r['reviewer_name']}</strong>
-                <span style="color:#f4a400;margin-left:8px">{stars_html(stars)}</span>
-                <span style="color:#777;margin-left:8px;font-size:12px">{r['review_date']}</span><br>
-                <span style="color:#333;font-size:13px">{snippet}</span>
-              </td>
-            </tr>"""
-        more = f"<p style='color:#777;font-size:12px'>+ {len(reviews)-10} more reviews</p>" if len(reviews) > 10 else ""
-        sections.append(f"""
-        <h3 style="color:#2c5282;margin:20px 0 8px">{loc_name} ({len(reviews)} new)</h3>
-        <table style="width:100%;border-collapse:collapse">{items}</table>
-        {more}""")
+    MAX_CARDS   = 15
+    cards_built = 0
+    overflow    = 0
+    loc_sections = []
 
-    # Scraper failure summary block (only when there are failures)
+    # Low-star locations first, then alphabetical within each tier
+    sorted_locs = sorted(
+        by_loc.items(),
+        key=lambda x: (-sum(1 for r in x[1] if int(r.get("star_rating") or 5) <= 2), x[0])
+    )
+
+    for loc_name, reviews in sorted_locs:
+        # Within each location: lowest stars first
+        sorted_revs = sorted(reviews, key=lambda r: int(r.get("star_rating") or 5))
+        loc_cards = []
+        for r in sorted_revs:
+            if cards_built >= MAX_CARDS:
+                overflow += 1
+                continue
+            loc_cards.append(_review_card(r))
+            cards_built += 1
+        if not loc_cards:
+            continue
+        safe_loc = _safe(loc_name)
+        loc_sections.append(
+            f'<p style="margin:28px 0 12px;font-size:11px;font-weight:700;color:#64748b;'
+            f'text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid #e2e8f0;'
+            f'padding-bottom:8px">&#128205;&nbsp;{safe_loc}'
+            f'<span style="font-size:11px;font-weight:400;color:#94a3b8;margin-left:6px">'
+            f'({len(reviews)} new)</span></p>'
+            + "".join(loc_cards)
+        )
+
+    overflow_note = (
+        f'<p style="text-align:center;font-size:13px;color:#64748b;margin:0 0 24px;'
+        f'padding:14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px">'
+        f'&#43; {overflow} more review{"s" if overflow != 1 else ""} not shown — '
+        f'open the dashboard to see all.</p>'
+    ) if overflow > 0 else ""
+
     failure_block = ""
     if failed_locs:
         items_html = "".join(
-            f"<li style='margin:4px 0'><strong>{f['name']}</strong> — "
-            f"<span style='color:#555;font-size:12px'>{f['error'][:200]}</span></li>"
+            f"<li style='margin:4px 0;font-size:13px'>"
+            f"<strong>{_safe(f['name'])}</strong> — "
+            f"<span style='color:#555'>{_safe(f['error'][:200])}</span></li>"
             for f in failed_locs[:21]
         )
-        failure_block = f"""
-        <div style="background:#fff7ed;border-left:4px solid #f97316;padding:16px 20px;margin:20px 0;border-radius:0 8px 8px 0">
-          <p style="margin:0 0 6px;font-size:11px;font-weight:700;color:#c2410c;text-transform:uppercase">
-            Scraper — {len(failed_locs)} location(s) failed</p>
-          <p style="margin:0 0 10px;font-size:13px;color:#374151">
-            The following locations could not be scraped this run. See GitHub Actions logs for screenshots.</p>
-          <ul style="margin:0;padding-left:20px;font-size:13px;color:#374151">{items_html}</ul>
-        </div>"""
+        failure_block = (
+            '<table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:24px">'
+            '<tr><td style="background:#fff7ed;border-left:4px solid #f97316;'
+            'padding:16px 20px;border-radius:0 8px 8px 0">'
+            f'<p style="margin:0 0 6px;font-size:11px;font-weight:700;color:#c2410c;'
+            f'text-transform:uppercase">&#9888;&#65039;&nbsp;Scraper — '
+            f'{len(failed_locs)} location(s) could not be scraped this run</p>'
+            f'<ul style="margin:6px 0 0;padding-left:20px">{items_html}</ul>'
+            '</td></tr></table>'
+        )
 
-    total     = len(new_rows)
-    date_str  = datetime.now().strftime("%B %d, %Y at %I:%M %p")
-    return f"""
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
-      <h2 style="background:#2c5282;color:white;padding:16px;margin:0">
-        {total} New Review{'s' if total != 1 else ''} – LTA Dashboard
-      </h2>
-      <p style="color:#555;padding:12px">Detected on {date_str}</p>
-      {failure_block}
-      {''.join(sections)}
-      <p style="margin-top:24px;padding:12px;background:#f7f7f7;font-size:12px;color:#777">
-        LTA Review Dashboard – auto-generated notification
-      </p>
-    </div>"""
+    ls_badge = (
+        f'<div style="background:#fff1f2;border:1.5px solid #fecaca;border-radius:8px;'
+        f'padding:12px 16px;margin-bottom:20px;font-size:13px;color:#991b1b;font-weight:600">'
+        f'&#9888;&#65039;&nbsp;{low_star} low-star review{"s" if low_star != 1 else ""} '
+        f'{"require" if low_star != 1 else "requires"} a response — aim to reply within 24&nbsp;hours.'
+        f'</div>'
+    ) if low_star > 0 else ""
+
+    return (
+        '<!DOCTYPE html><html lang="en"><head>'
+        '<meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+        f'<title>{total} New Review{"s" if total != 1 else ""} — LTA Dashboard</title>'
+        '</head>'
+        '<body style="margin:0;padding:0;background:#f1f5f9;'
+        'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Arial,sans-serif;'
+        '-webkit-text-size-adjust:100%">'
+        '<div style="max-width:640px;margin:0 auto;padding:20px 12px">'
+
+        '<div style="background:#0f172a;border-radius:14px 14px 0 0;padding:28px 32px;text-align:center">'
+        '<p style="margin:0 0 6px;font-size:10px;font-weight:800;letter-spacing:3px;'
+        'color:#f59e0b;text-transform:uppercase">LTA Review Dashboard</p>'
+        f'<h1 style="margin:0 0 6px;font-size:22px;font-weight:800;color:white;letter-spacing:-0.3px">'
+        f'{total} New Review{"s" if total != 1 else ""}</h1>'
+        f'<p style="margin:0;font-size:12px;color:#64748b">{date_str}</p>'
+        '</div>'
+
+        '<div style="background:white;border-radius:0 0 14px 14px;padding:24px 28px 32px">'
+        + failure_block
+        + ls_badge
+        + "".join(loc_sections)
+        + overflow_note
+        + '</div>'
+
+        '<div style="text-align:center;padding:16px 0 4px">'
+        f'<p style="font-size:11px;color:#94a3b8;margin:0;line-height:1.6">'
+        f'LTA Review Dashboard &mdash; Auto-generated notification<br>'
+        f'&copy; {year_now} Future Marketing Studio. All rights reserved.</p>'
+        '</div>'
+
+        '</div>'
+        '</body></html>'
+    )
 
 
 def write_github_output(new_count: int, email_html: str):
