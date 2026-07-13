@@ -87,7 +87,7 @@ function MetricCard({ label, value, unit, metric }) {
 
 const SEVERITY_STYLES = {
   positive: { border: 'var(--color-success)', icon: '↑', badge: 'success' },
-  warning:  { border: '#d97706',              icon: '!', badge: 'warning' },
+  warning:  { border: 'var(--color-grade-c)',              icon: '!', badge: 'warning' },
   danger:   { border: 'var(--color-danger)',  icon: '!', badge: 'danger'  },
   info:     { border: 'var(--color-info)',    icon: 'i', badge: 'info'    },
 }
@@ -115,7 +115,7 @@ function AlertCard({ alert }) {
 
 const GRADE_COLORS = {
   A: 'var(--color-success)', B: 'var(--color-info)',
-  C: '#d97706',              D: 'var(--color-warning)', F: 'var(--color-danger)',
+  C: 'var(--color-grade-c)',              D: 'var(--color-warning)', F: 'var(--color-danger)',
 }
 
 function RankRow({ loc, isTop, isSelected }) {
@@ -435,7 +435,7 @@ function BecomeNumber1({ selectedLoc, rankings, metrics, briefing }) {
   const difficulty = ratingGap > 0.3
     ? { label: 'Significant effort needed', bg: 'rgba(239,68,68,0.08)', color: 'var(--color-danger)', border: 'rgba(239,68,68,0.2)' }
     : ratingGap > 0.1
-    ? { label: 'Achievable with focus',     bg: 'rgba(217,119,6,0.08)',  color: '#d97706',             border: 'rgba(217,119,6,0.2)' }
+    ? { label: 'Achievable with focus',     bg: 'rgba(217,119,6,0.08)',  color: 'var(--color-grade-c)',             border: 'rgba(217,119,6,0.2)' }
     : { label: 'Within reach',              bg: 'rgba(16,185,129,0.08)', color: 'var(--color-success)', border: 'rgba(16,185,129,0.2)' }
 
   const actions = []

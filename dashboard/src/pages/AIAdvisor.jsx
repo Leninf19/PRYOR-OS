@@ -23,7 +23,7 @@ function fmtDate() {
 
 function PriorityItem({ n, title, sub, severity }) {
   const dot = severity === 'urgent' ? 'var(--color-danger)'
-    : severity === 'warning' ? '#d97706'
+    : severity === 'warning' ? 'var(--color-grade-c)'
     : severity === 'good' ? 'var(--color-success)'
     : 'var(--color-info)'
   return (

@@ -32,6 +32,8 @@
   --color-warning-bg:#FEF3C7;
   --color-danger:    #991B1B;
   --color-danger-bg: #FEE2E2;
+  --color-danger-border: #FECACA;
+  --color-success-border: #BBF7D0;
   --color-info:      #1E40AF;
   --color-info-bg:   #DBEAFE;
 
@@ -70,6 +72,137 @@
   /* Easing */
   --ease-out:    cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in-out: cubic-bezier(0.45, 0, 0.55, 1);
+
+  /* AI card (dark gradient panel, intentionally theme-independent in light
+     mode -- see dark-mode override below for why it can't just stay this
+     same near-black gradient once the whole page is already dark) */
+  --ai-card-bg:     linear-gradient(135deg, #1A1714 0%, #2C2218 100%);
+  --ai-card-border: #3A2E25;
+  --ai-card-text:   #F0EDE8;
+  --ai-card-text-2: #D4C9BC;
+  --ai-draft-bg:    #1A1714;
+  --ai-draft-border:#3A2E25;
+  --ai-draft-text:  #D4C9BC;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   DARK MODE
+   Same warm espresso/gold identity, inverted -- not a generic blue-gray dark
+   theme. Defaults to OS preference; an explicit toggle (data-theme) wins over
+   that in either direction. Kept as one variable set applied two ways so the
+   system-preference and manual-toggle paths can never drift apart.
+────────────────────────────────────────────────────────────────────────────── */
+:root[data-theme="dark"] {
+  --color-bg:        #14100D;
+  --color-surface:   #1C1712;
+  --color-surface-2: #241E17;
+  --color-border:    #332B22;
+  --color-border-2:  #453A2E;
+
+  --color-text-1:    #F3EFE9;
+  --color-text-2:    #B8AFA3;
+  --color-text-3:    #7D766B;
+
+  --color-accent:    #E0A526;
+  --color-accent-lt: #3A2E12;
+  --color-accent-md: #6B5420;
+
+  --color-success:   #4ADE80;
+  --color-success-bg:#14291B;
+  --color-warning:   #FBBF24;
+  --color-warning-bg:#2E2410;
+  --color-danger:    #F87171;
+  --color-danger-bg: #2E1516;
+  --color-danger-border: #5C2626;
+  --color-success-border: #1F4A2E;
+  --color-info:      #60A5FA;
+  --color-info-bg:   #142235;
+
+  --color-grade-a: #4ADE80;
+  --color-grade-b: #A3E635;
+  --color-grade-c: #FBBF24;
+  --color-grade-d: #FB923C;
+  --color-grade-f: #F87171;
+  --color-star-1: #F87171;
+  --color-star-2: #FB923C;
+  --color-star-3: #FBBF24;
+  --color-star-4: #A3E635;
+  --color-star-5: #4ADE80;
+
+  --shadow-xs: 0 1px 2px rgba(0,0,0,0.3);
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.3);
+  --shadow-md: 0 4px 6px rgba(0,0,0,0.35), 0 2px 4px rgba(0,0,0,0.3);
+  --shadow-lg: 0 10px 15px rgba(0,0,0,0.4), 0 4px 6px rgba(0,0,0,0.3);
+
+  /* On a dark page, the light-mode "dark gradient AI panel" trick loses its
+     contrast -- so dark mode gets a gold-tinted elevated panel instead of
+     literally the same near-black gradient, so it still reads as distinct. */
+  --ai-card-bg:     linear-gradient(135deg, #2A2110 0%, #3A2E12 100%);
+  --ai-card-border: #6B5420;
+  --ai-card-text:   #F3EFE9;
+  --ai-card-text-2: #E8D9B8;
+  --ai-draft-bg:    #14100D;
+  --ai-draft-border:#453A2E;
+  --ai-draft-text:  #E8D9B8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg:        #14100D;
+    --color-surface:   #1C1712;
+    --color-surface-2: #241E17;
+    --color-border:    #332B22;
+    --color-border-2:  #453A2E;
+
+    --color-text-1:    #F3EFE9;
+    --color-text-2:    #B8AFA3;
+    --color-text-3:    #7D766B;
+
+    --color-accent:    #E0A526;
+    --color-accent-lt: #3A2E12;
+    --color-accent-md: #6B5420;
+
+    --color-success:   #4ADE80;
+    --color-success-bg:#14291B;
+    --color-warning:   #FBBF24;
+    --color-warning-bg:#2E2410;
+    --color-danger:    #F87171;
+    --color-danger-bg: #2E1516;
+    --color-danger-border: #5C2626;
+    --color-success-border: #1F4A2E;
+    --color-info:      #60A5FA;
+    --color-info-bg:   #142235;
+
+    --color-grade-a: #4ADE80;
+    --color-grade-b: #A3E635;
+    --color-grade-c: #FBBF24;
+    --color-grade-d: #FB923C;
+    --color-grade-f: #F87171;
+    --color-star-1: #F87171;
+    --color-star-2: #FB923C;
+    --color-star-3: #FBBF24;
+    --color-star-4: #A3E635;
+    --color-star-5: #4ADE80;
+
+    --shadow-xs: 0 1px 2px rgba(0,0,0,0.3);
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.3);
+    --shadow-md: 0 4px 6px rgba(0,0,0,0.35), 0 2px 4px rgba(0,0,0,0.3);
+    --shadow-lg: 0 10px 15px rgba(0,0,0,0.4), 0 4px 6px rgba(0,0,0,0.3);
+
+    --ai-card-bg:     linear-gradient(135deg, #2A2110 0%, #3A2E12 100%);
+    --ai-card-border: #6B5420;
+    --ai-card-text:   #F3EFE9;
+    --ai-card-text-2: #E8D9B8;
+    --ai-draft-bg:    #14100D;
+    --ai-draft-border:#453A2E;
+    --ai-draft-text:  #E8D9B8;
+  }
+}
+
+/* Smooth, cheap theme transition -- only color-ish properties, so layout/
+   animation performance elsewhere is untouched. */
+body, .card, .badge, .nav-item, .ai-card {
+  transition: background-color 0.15s var(--ease-out), border-color 0.15s var(--ease-out), color 0.15s var(--ease-out);
 }
 
 /* ─── Base reset ─── */
@@ -196,10 +329,10 @@ body {
 
 /* ─── AI card ─── */
 .ai-card {
-  background: linear-gradient(135deg, #1A1714 0%, #2C2218 100%);
-  border: 1px solid #3A2E25;
+  background: var(--ai-card-bg);
+  border: 1px solid var(--ai-card-border);
   border-radius: var(--radius-lg);
-  color: #F0EDE8;
+  color: var(--ai-card-text);
   position: relative;
   overflow: hidden;
 }

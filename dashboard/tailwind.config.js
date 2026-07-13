@@ -1,6 +1,11 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ['./index.html', './src/**/*.{js,jsx}'],
+  // Gate `dark:` variants off the same [data-theme="dark"] attribute the
+  // theme toggle (useTheme.js) sets on <html> -- lets pages built with raw
+  // Tailwind neutrals (stone/white) opt into dark mode via `dark:` classes
+  // without rewriting them to the CSS-variable pattern used elsewhere.
+  darkMode: ['selector', '[data-theme="dark"]'],
   theme: {
     extend: {
       fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },

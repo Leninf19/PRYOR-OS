@@ -17,7 +17,7 @@ export default function HealthRing({ score, grade, size = 88 }) {
   const r       = 42
   const circ    = 2 * Math.PI * r   // ≈ 263.9
   const offset  = circ - (score / 100) * circ
-  const color   = GRADE_COLOR[grade] ?? '#9A6B00'
+  const color   = GRADE_COLOR[grade] ?? 'var(--color-accent)'
   const stroke  = Math.min(size / 10, 8)
 
   return (

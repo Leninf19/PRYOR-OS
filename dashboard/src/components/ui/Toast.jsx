@@ -24,7 +24,7 @@ export function ToastProvider({ children }) {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: 8, scale: 0.95 }}
               transition={{ duration: 0.18 }}
-              className="bg-stone-900 text-white text-xs font-medium px-4 py-2.5 rounded-lg shadow-lg"
+              className="bg-stone-900 text-white text-xs font-medium px-4 py-2.5 rounded-lg shadow-lg dark:border dark:border-[var(--color-border-2)]"
             >
               {t.message}
             </motion.div>

@@ -290,7 +290,7 @@ function ReviewDetailPanel({ r, draft, allReviews, onClose }) {
             <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>{r.reviewer_name || 'Anonymous'}</p>
             <p className="text-xs" style={{ color: 'var(--color-text-3)' }}>{r.location_name} · {r.review_date}</p>
           </div>
-          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-stone-100" aria-label="Close panel"
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-stone-100 dark:hover:bg-[var(--color-surface-2)]" aria-label="Close panel"
                   style={{ color: 'var(--color-text-2)' }}>
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12"/>
@@ -315,7 +315,7 @@ function ReviewDetailPanel({ r, draft, allReviews, onClose }) {
           {r.ai_sentiment_reason && (
             <div className="ai-card p-3">
               <p className="ai-label mb-1">✦ Why this sentiment</p>
-              <p className="text-xs leading-relaxed" style={{ color: '#D4C9BC' }}>{r.ai_sentiment_reason}</p>
+              <p className="text-xs leading-relaxed" style={{ color: 'var(--ai-card-text-2)' }}>{r.ai_sentiment_reason}</p>
             </div>
           )}
 
@@ -348,7 +348,7 @@ function ReviewDetailPanel({ r, draft, allReviews, onClose }) {
                 Owner Response
               </p>
               <div className="p-3 rounded-xl text-xs leading-relaxed italic"
-                   style={{ background: 'var(--color-accent-lt)', border: '1px solid #FDE68A', color: 'var(--color-text-2)' }}>
+                   style={{ background: 'var(--color-accent-lt)', border: '1px solid var(--color-accent-md)', color: 'var(--color-text-2)' }}>
                 {r.owner_response}
               </div>
             </div>
@@ -359,7 +359,7 @@ function ReviewDetailPanel({ r, draft, allReviews, onClose }) {
             <div>
               <p className="text-[10px] font-bold uppercase tracking-wider mb-1.5 ai-label">✦ Suggested Reply</p>
               <div className="p-3 rounded-xl text-xs leading-relaxed"
-                   style={{ background: '#1A1714', color: '#D4C9BC', border: '1px solid #3A2E25' }}>
+                   style={{ background: 'var(--ai-draft-bg)', color: 'var(--ai-draft-text)', border: '1px solid var(--ai-draft-border)' }}>
                 {draft.draft}
               </div>
               <button

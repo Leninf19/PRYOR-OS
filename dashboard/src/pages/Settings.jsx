@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import Badge from '../components/ui/Badge.jsx'
+import ThemeToggle from '../components/ui/ThemeToggle.jsx'
 
 // ── Google Business Profile integration section ───────────────────────────────
 
@@ -167,7 +168,7 @@ function GBPSection() {
                       {step.title}
                     </p>
                     <span className="text-[9px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wide"
-                          style={{ background: 'rgba(217,119,6,0.07)', color: '#d97706', border: '1px solid rgba(217,119,6,0.15)' }}>
+                          style={{ background: 'rgba(217,119,6,0.07)', color: 'var(--color-grade-c)', border: '1px solid rgba(217,119,6,0.15)' }}>
                       {step.tag}
                     </span>
                   </div>
@@ -306,6 +307,23 @@ export default function Settings() {
           Integrations and configuration for Future Insights
         </p>
       </div>
+
+      <section className="space-y-3">
+        <p className="text-[10px] font-bold uppercase tracking-[0.18em]"
+           style={{ color: 'var(--color-text-3)' }}>
+          Appearance
+        </p>
+        <div className="rounded-2xl border p-5 flex items-center justify-between gap-4 flex-wrap"
+             style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+          <div>
+            <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Theme</p>
+            <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
+              Auto follows your system's light/dark setting and updates automatically if it changes.
+            </p>
+          </div>
+          <ThemeToggle />
+        </div>
+      </section>
 
       <section className="space-y-3">
         <p className="text-[10px] font-bold uppercase tracking-[0.18em]"

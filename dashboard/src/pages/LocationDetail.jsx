@@ -72,7 +72,7 @@ function AISummaryCard({ detail }) {
   return (
     <div className="ai-card p-5">
       <p className="ai-label mb-2">✦ AI Location Summary</p>
-      <p className="text-sm leading-relaxed" style={{ color: '#D4C9BC' }}>
+      <p className="text-sm leading-relaxed" style={{ color: 'var(--ai-card-text-2)' }}>
         {detail.aiSummary.text}
       </p>
     </div>
@@ -137,7 +137,7 @@ function EmployeeRecognition({ staff }) {
             {positive.map(s => (
               <div key={s.name}
                    className="flex items-center gap-2 px-3 py-1.5 rounded-full"
-                   style={{ background: 'var(--color-success-bg)', border: '1px solid #BBF7D0' }}
+                   style={{ background: 'var(--color-success-bg)', border: '1px solid var(--color-success-border)' }}
                    title={`${s.name}: ${s.count} mentions`}>
                 <span className="text-xs font-semibold" style={{ color: 'var(--color-success)' }}>
                   {s.name}
@@ -158,7 +158,7 @@ function EmployeeRecognition({ staff }) {
             {negative.map(s => (
               <div key={s.name}
                    className="flex items-center gap-2 px-3 py-1.5 rounded-full"
-                   style={{ background: 'var(--color-danger-bg)', border: '1px solid #FECACA' }}>
+                   style={{ background: 'var(--color-danger-bg)', border: '1px solid var(--color-danger-border)' }}>
                 <span className="text-xs font-semibold" style={{ color: 'var(--color-danger)' }}>
                   {s.name}
                 </span>

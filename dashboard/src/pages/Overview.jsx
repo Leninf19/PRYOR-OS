@@ -31,9 +31,9 @@ function AISummaryCard({ summary, loading }) {
           <Skeleton className="h-4 w-4/6" />
         </div>
       ) : summary?.text ? (
-        <p className="text-sm leading-relaxed" style={{ color: '#D4C9BC' }}>{summary.text}</p>
+        <p className="text-sm leading-relaxed" style={{ color: 'var(--ai-card-text-2)' }}>{summary.text}</p>
       ) : (
-        <p className="text-sm italic" style={{ color: 'rgba(212,201,188,0.5)' }}>
+        <p className="text-sm italic" style={{ color: 'var(--ai-card-text-2)', opacity: 0.5 }}>
           AI summary will appear here once ANTHROPIC_API_KEY is added to GitHub secrets.
         </p>
       )}
@@ -186,7 +186,7 @@ function PriorityQueue({ items, loading }) {
         <div className="space-y-2">
           {urgent.map((r, i) => (
             <div key={i} className="p-3 rounded-xl"
-                 style={{ background: 'var(--color-danger-bg)', borderLeft: '3px solid #FECACA' }}>
+                 style={{ background: 'var(--color-danger-bg)', borderLeft: '3px solid var(--color-danger-border)' }}>
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
                   <p className="text-xs font-semibold truncate" style={{ color: 'var(--color-text-1)' }}>
@@ -272,11 +272,11 @@ function LocationLeaderboard({ stats, loading }) {
         const avg    = loc.periodSentiment.avgRating ?? 0
         const health = loc.healthScore
         const barPct = `${((avg - 1) / 4) * 100}%`
-        const barColor = avg >= 4.5 ? '#16a34a' : avg >= 4.0 ? '#65a30d' : avg >= 3.5 ? '#d97706' : '#dc2626'
+        const barColor = avg >= 4.5 ? 'var(--color-star-5)' : avg >= 4.0 ? 'var(--color-star-4)' : avg >= 3.5 ? 'var(--color-grade-c)' : 'var(--color-star-1)'
 
         return (
           <div key={loc.name}
-               className="flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-stone-50 transition-colors cursor-default">
+               className="flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-stone-50 dark:bg-[var(--color-surface-2)] dark:hover:bg-[var(--color-surface-2)] transition-colors cursor-default">
             <span className="text-[10px] font-bold w-5 text-right flex-shrink-0"
                   style={{ color: 'var(--color-text-3)' }}>
               {i + 1}
@@ -317,7 +317,7 @@ function AlertBanner({ alerts }) {
     <div className="space-y-2">
       {alerts.slice(0, 2).map((a, i) => (
         <div key={i} className="flex items-start gap-3 p-4 rounded-xl border"
-             style={{ background: 'var(--color-danger-bg)', borderColor: '#FECACA' }}>
+             style={{ background: 'var(--color-danger-bg)', borderColor: 'var(--color-danger-border)' }}>
           <span className="text-lg flex-shrink-0">⚡</span>
           <div>
             <p className="text-xs font-bold" style={{ color: 'var(--color-danger)' }}>Predictive Alert</p>

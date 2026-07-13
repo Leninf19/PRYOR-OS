@@ -35,10 +35,10 @@ function RankingsTab() {
               <Bar dataKey="curAvgRating" radius={[0, 4, 4, 0]}>
                 {rated.map(r => (
                   <Cell key={r.name}
-                        fill={(r.curAvgRating ?? 0) >= 4.5 ? '#22c55e'
-                              : (r.curAvgRating ?? 0) >= 4.0 ? '#84cc16'
-                              : (r.curAvgRating ?? 0) >= 3.5 ? '#d97706'
-                              : '#ef4444'} />
+                        fill={(r.curAvgRating ?? 0) >= 4.5 ? 'var(--color-star-5)'
+                              : (r.curAvgRating ?? 0) >= 4.0 ? 'var(--color-star-4)'
+                              : (r.curAvgRating ?? 0) >= 3.5 ? 'var(--color-grade-c)'
+                              : 'var(--color-star-1)'} />
                 ))}
               </Bar>
             </BarChart>
@@ -158,7 +158,7 @@ function PredictionsTab() {
           <p className="text-label" style={{ color: 'var(--color-text-2)' }}>Active Alerts</p>
           {alerts.map((a, i) => (
             <div key={i} className="flex items-start gap-3 p-4 rounded-xl"
-                 style={{ background: 'var(--color-danger-bg)', border: '1px solid #FECACA' }}>
+                 style={{ background: 'var(--color-danger-bg)', border: '1px solid var(--color-danger-border)' }}>
               <span className="text-xl">⚡</span>
               <div>
                 <p className="text-sm font-semibold" style={{ color: 'var(--color-danger)' }}>

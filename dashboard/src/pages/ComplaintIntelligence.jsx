@@ -58,7 +58,7 @@ function CategoryCard({ cat, type }) {
               style={{
                 width: `${Math.min(100, cat.pct * 3)}%`,
                 background: isComplaint
-                  ? (cat.severity === 3 ? 'var(--color-danger)' : cat.severity === 2 ? '#d97706' : 'var(--color-info)')
+                  ? (cat.severity === 3 ? 'var(--color-danger)' : cat.severity === 2 ? 'var(--color-grade-c)' : 'var(--color-info)')
                   : 'var(--color-success)',
               }}
             />

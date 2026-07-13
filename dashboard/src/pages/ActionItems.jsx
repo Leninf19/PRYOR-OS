@@ -108,7 +108,7 @@ function computeTrendAlerts(current, prior) {
 }
 
 function Stars({ n }) {
-  const color = n <= 1 ? 'var(--color-danger)' : n === 2 ? '#d97706' : n === 3 ? '#92400e' : 'var(--color-success)'
+  const color = n <= 1 ? 'var(--color-danger)' : n === 2 ? 'var(--color-grade-c)' : n === 3 ? 'var(--color-warning)' : 'var(--color-success)'
   return (
     <span className="text-sm font-bold" style={{ color, letterSpacing: '0.02em' }}>
       {'★'.repeat(n)}{'☆'.repeat(5 - n)}
@@ -144,7 +144,7 @@ function GBPBanner() {
          style={{ background: 'rgba(217,119,6,0.05)', borderColor: 'rgba(217,119,6,0.2)' }}>
       <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5"
            style={{ background: 'rgba(217,119,6,0.1)' }}>
-        <svg className="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor" style={{ color: '#d97706' }}>
+        <svg className="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor" style={{ color: 'var(--color-grade-c)' }}>
           <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd"/>
         </svg>
       </div>
@@ -337,7 +337,7 @@ function ReviewCard({ r, draft, wsEntry, onUpdate }) {
         {/* Fail reason */}
         {failReason && (
           <div className="mt-3 px-3 py-2.5 rounded-lg text-xs leading-relaxed"
-               style={{ background: 'var(--color-danger-bg)', color: 'var(--color-danger)', border: '1px solid #FECACA' }}>
+               style={{ background: 'var(--color-danger-bg)', color: 'var(--color-danger)', border: '1px solid var(--color-danger-border)' }}>
             <strong>Publish failed:</strong> {FAIL_REASONS[failReason] ?? failReason}
           </div>
         )}
@@ -396,9 +396,9 @@ function ReviewCard({ r, draft, wsEntry, onUpdate }) {
               rows={5}
               className="w-full rounded-xl px-4 py-3 text-sm resize-y focus:outline-none transition-colors"
               style={{
-                background:  '#1A1714',
-                color:       '#D4C9BC',
-                border:      `1px solid ${charOver ? 'var(--color-danger)' : '#3A2E25'}`,
+                background:  'var(--ai-draft-bg)',
+                color:       'var(--ai-draft-text)',
+                border:      `1px solid ${charOver ? 'var(--color-danger)' : 'var(--ai-draft-border)'}`,
                 lineHeight:  1.75,
                 fontFamily:  'inherit',
                 minHeight:   96,
@@ -491,7 +491,7 @@ function WorkspaceStats({ reviews, ws, draftByReviewId, loading }) {
       {[
         { label: 'Awaiting Response', value: total,     color: 'var(--color-danger)'  },
         { label: 'AI Draft Ready',    value: withDraft, color: 'var(--color-accent)'  },
-        { label: '1★ Urgent',         value: urgent,    color: '#d97706'              },
+        { label: '1★ Urgent',         value: urgent,    color: 'var(--color-grade-c)'              },
         { label: 'Completed',         value: done,      color: 'var(--color-success)' },
       ].map(s => (
         <div key={s.label} className="rounded-2xl p-4 border"
@@ -644,7 +644,7 @@ export default function ActionItems({ filtered = [], prevFiltered = [] }) {
             <div key={i} className="flex items-start gap-3 p-4 rounded-xl border"
                  style={{
                    background:  t.delta > 0 ? 'var(--color-success-bg)' : 'var(--color-warning-bg)',
-                   borderColor: t.delta > 0 ? '#BBF7D0' : '#FDE68A',
+                   borderColor: t.delta > 0 ? 'var(--color-success-border)' : 'var(--color-accent-md)',
                  }}>
               <span className="text-xl flex-shrink-0">{t.delta > 0 ? '↑' : '↓'}</span>
               <div className="min-w-0">

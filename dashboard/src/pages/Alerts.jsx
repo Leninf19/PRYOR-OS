@@ -120,7 +120,7 @@ function buildAlerts(predictive, actionItems, scraperRuns, competitorIntel) {
 
 const SEV = {
   danger:   { border: 'var(--color-danger)',  badge: 'danger',  icon: '!' },
-  warning:  { border: '#d97706',              badge: 'warning', icon: '!' },
+  warning:  { border: 'var(--color-grade-c)',              badge: 'warning', icon: '!' },
   info:     { border: 'var(--color-info)',    badge: 'info',    icon: 'i' },
   positive: { border: 'var(--color-success)', badge: 'success', icon: '↑' },
 }
