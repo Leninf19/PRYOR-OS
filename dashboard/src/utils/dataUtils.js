@@ -92,20 +92,15 @@ export function getDateBounds(reviews) {
 }
 
 export function getDefaultDateRange(reviews) {
+  // Rolling 7-day window ending today -- "the day of and a week before" --
+  // rather than snapping to the latest complete calendar month found in the
+  // data, which made the default view look frozen on whatever month the
+  // most recent review happened to land in.
+  const now   = new Date()
+  const end   = now.toISOString().slice(0, 10)
+  const start = new Date(now.getTime() - 7 * 86_400_000).toISOString().slice(0, 10)
   const { max } = getDateBounds(reviews)
-  if (!max) return { start: '', end: '' }
-  const latestYM = max.slice(0, 7)
-  const now      = new Date()
-  const curYM    = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
-  // If latest data is current month it's partial; else use it as complete month
-  const isPartial = latestYM === curYM
-  const defaultYM = isPartial
-    ? (() => { const d = new Date(now.getFullYear(), now.getMonth() - 1, 1); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}` })()
-    : latestYM
-  const [y, m] = defaultYM.split('-').map(Number)
-  const start  = `${defaultYM}-01`
-  const end    = new Date(y, m, 0).toISOString().slice(0, 10)  // last day of month
-  return { start, end, defaultYM, isPartial, latestDate: max }
+  return { start, end, latestDate: max }
 }
 
 // ── Filter reviews ────────────────────────────────────────────────────────────
