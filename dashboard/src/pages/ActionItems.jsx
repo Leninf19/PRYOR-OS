@@ -76,6 +76,37 @@ function reviewId(r) {
   return r.review_id || r.review_url || `${r.review_date}-${r.reviewer_name}`
 }
 
+// Rating trend alerts, recomputed from whatever date range is currently
+// selected (via the global filter bar) instead of the pipeline's fixed
+// 30-vs-60-day window -- same thresholds (n>=5 both sides, |delta|>=0.2)
+// as export_action_items.py so behavior matches the prior "All time" default.
+function computeTrendAlerts(current, prior) {
+  const curByLoc = {}, priorByLoc = {}
+  current.forEach(r => {
+    if (r.star_rating == null) return
+    (curByLoc[r.location_name] ??= []).push(r.star_rating)
+  })
+  prior.forEach(r => {
+    if (r.star_rating == null) return
+    (priorByLoc[r.location_name] ??= []).push(r.star_rating)
+  })
+  const avg = arr => arr.reduce((s, n) => s + n, 0) / arr.length
+  const alerts = []
+  for (const name of Object.keys(curByLoc)) {
+    const cur = curByLoc[name], prev = priorByLoc[name]
+    if (!prev || cur.length < 5 || prev.length < 5) continue
+    const avgCur = avg(cur), avgPrev = avg(prev)
+    const delta = avgCur - avgPrev
+    if (Math.abs(delta) >= 0.2) {
+      alerts.push({
+        name, avgCur: +avgCur.toFixed(2), avgPrev: +avgPrev.toFixed(2),
+        delta: +delta.toFixed(2), curN: cur.length, prevN: prev.length,
+      })
+    }
+  }
+  return alerts.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+}
+
 function Stars({ n }) {
   const color = n <= 1 ? 'var(--color-danger)' : n === 2 ? '#d97706' : n === 3 ? '#92400e' : 'var(--color-success)'
   return (
@@ -490,11 +521,13 @@ const TABS = [
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-export default function ActionItems() {
+export default function ActionItems({ filtered = [], prevFiltered = [] }) {
   const { data: items,  isLoading: lItems  } = useActionItems()
   const { data: drafts, isLoading: lDrafts  } = useResponseDrafts()
   const [ws, setWsEntry] = useWorkspace()
   const [tab, setTab]    = useState('all')
+
+  const trendAlerts = useMemo(() => computeTrendAlerts(filtered, prevFiltered), [filtered, prevFiltered])
 
   const draftByReviewId = useMemo(() => {
     if (!drafts) return {}
@@ -597,11 +630,15 @@ export default function ActionItems() {
         </div>
       )}
 
-      {/* Trend alerts */}
-      {!isLoading && (items?.trendAlerts?.length ?? 0) > 0 && (
+      {/* Trend alerts -- scoped to the selected date range, vs. an equal-length
+          prior period (the "Awaiting Response" backlog above stays unbounded
+          on purpose, since it's a worklist, not a date-filtered report). */}
+      {!isLoading && trendAlerts.length > 0 && (
         <div className="space-y-3 pt-2">
-          <h3 className="text-label" style={{ color: 'var(--color-text-2)' }}>Rating Trend Alerts</h3>
-          {items.trendAlerts.map((t, i) => (
+          <h3 className="text-label" style={{ color: 'var(--color-text-2)' }}>
+            Rating Trend Alerts <span style={{ color: 'var(--color-text-3)', fontWeight: 400 }}>· selected period vs. prior</span>
+          </h3>
+          {trendAlerts.map((t, i) => (
             <div key={i} className="flex items-start gap-3 p-4 rounded-xl border"
                  style={{
                    background:  t.delta > 0 ? 'var(--color-success-bg)' : 'var(--color-warning-bg)',

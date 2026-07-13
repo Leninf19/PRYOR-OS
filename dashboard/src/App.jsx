@@ -24,7 +24,7 @@ import { filterReviews, getDefaultDateRange } from './utils/dataUtils.js'
 
 // Pages that don't use the global review filter bar
 const NO_FILTER_PATHS = [
-  '/actions', '/scraper-status', '/reports', '/intelligence', '/competitive',
+  '/scraper-status', '/reports', '/intelligence', '/competitive',
   '/alerts', '/advisor', '/marketing-intel', '/employee-intel', '/executive-reports', '/settings',
 ]
 
@@ -189,5 +189,5 @@ function ROverview()   { const { allReviews, filtered, prevFiltered } = useOutle
 function RLocations()  { const c = useOutletContext(); return <LocationDetail allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} filters={c.filters} /> }
 function RExplorer()   { const { allReviews, filtered } = useOutletContext(); return <ReviewExplorer allReviews={allReviews} filtered={filtered} /> }
 function RTrends()     { const c = useOutletContext(); return <TrendsAnalytics allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} /> }
-function RActions()    { return <ActionItems /> }
+function RActions()    { const { filtered, prevFiltered } = useOutletContext(); return <ActionItems filtered={filtered} prevFiltered={prevFiltered} /> }
 function RScraper()    { const { allReviews } = useOutletContext(); return <ScraperStatus allReviews={allReviews} /> }
