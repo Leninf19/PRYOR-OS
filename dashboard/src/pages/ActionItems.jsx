@@ -522,7 +522,6 @@ const TABS = [
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 export default function ActionItems({ filtered = [], prevFiltered = [] }) {
-  const { data: items,  isLoading: lItems  } = useActionItems()
   const { data: drafts, isLoading: lDrafts  } = useResponseDrafts()
   const [ws, setWsEntry] = useWorkspace()
   const [tab, setTab]    = useState('all')
@@ -536,10 +535,13 @@ export default function ActionItems({ filtered = [], prevFiltered = [] }) {
     return out
   }, [drafts])
 
-  const allReviews = useMemo(
-    () => [...(items?.unanswered ?? [])].sort((a, b) => priority(b) - priority(a)),
-    [items]
-  )
+  // Unanswered ≤2★ reviews within the selected date range (global filter bar) --
+  // was previously the pipeline's unbounded all-time backlog regardless of
+  // what range was picked.
+  const allReviews = useMemo(() => {
+    const unanswered = filtered.filter(r => (r.star_rating ?? 5) <= 2 && !(r.owner_response || '').trim())
+    return [...unanswered].sort((a, b) => priority(b) - priority(a))
+  }, [filtered])
 
   const counts = useMemo(() => ({
     all:      allReviews.length,
@@ -557,7 +559,7 @@ export default function ActionItems({ filtered = [], prevFiltered = [] }) {
     return allReviews
   }, [allReviews, tab, draftByReviewId, ws])
 
-  const isLoading = lItems || lDrafts
+  const isLoading = lDrafts
 
   return (
     <div className="space-y-6 max-w-[900px]">
@@ -568,7 +570,7 @@ export default function ActionItems({ filtered = [], prevFiltered = [] }) {
           AI Review Workspace
         </h1>
         <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
-          Review, edit, and respond to customer reviews — {allReviews.length} awaiting a response
+          Review, edit, and respond to customer reviews — {allReviews.length} awaiting a response in the selected period
         </p>
       </div>
 
@@ -610,7 +612,7 @@ export default function ActionItems({ filtered = [], prevFiltered = [] }) {
           icon={tab === 'done' ? '✓' : counts.all === 0 ? '✓' : '🔍'}
           title={counts.all === 0 ? 'All caught up!' : tab === 'done' ? 'Nothing completed yet' : 'No reviews in this filter'}
           body={counts.all === 0
-            ? 'No unanswered reviews. Great work keeping up with responses!'
+            ? 'No unanswered reviews in the selected date range. Try widening it, or great work keeping up!'
             : 'Switch to a different tab to see reviews.'}
         />
       ) : (
