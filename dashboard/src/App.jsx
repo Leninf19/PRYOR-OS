@@ -185,8 +185,8 @@ export default function App() {
   )
 }
 
-function ROverview()   { const { allReviews, filtered } = useOutletContext(); return <Overview allReviews={allReviews} filtered={filtered} /> }
-function RLocations()  { const c = useOutletContext(); return <LocationDetail allReviews={c.allReviews} filtered={c.filtered} filters={c.filters} /> }
+function ROverview()   { const { allReviews, filtered, prevFiltered } = useOutletContext(); return <Overview allReviews={allReviews} filtered={filtered} prevFiltered={prevFiltered} /> }
+function RLocations()  { const c = useOutletContext(); return <LocationDetail allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} filters={c.filters} /> }
 function RExplorer()   { const { allReviews, filtered } = useOutletContext(); return <ReviewExplorer allReviews={allReviews} filtered={filtered} /> }
 function RTrends()     { const c = useOutletContext(); return <TrendsAnalytics allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} /> }
 function RActions()    { return <ActionItems /> }

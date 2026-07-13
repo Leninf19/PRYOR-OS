@@ -2,7 +2,10 @@
  * Animated SVG ring showing a 0-100 health score with letter grade.
  * Uses a CSS variable for the ring-in animation.
  */
-const GRADE_COLOR = { A: '#166534', B: '#3f6212', C: '#d97706', D: '#c2410c', F: '#991b1b' }
+const GRADE_COLOR = {
+  A: 'var(--color-grade-a)', B: 'var(--color-grade-b)', C: 'var(--color-grade-c)',
+  D: 'var(--color-grade-d)', F: 'var(--color-grade-f)',
+}
 
 export default function HealthRing({ score, grade, size = 88 }) {
   if (score == null) {

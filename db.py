@@ -168,12 +168,44 @@ def _migrate_schema(conn: sqlite3.Connection):
     """Apply additive schema migrations that can't go in CREATE TABLE IF NOT EXISTS."""
     migrations = [
         "ALTER TABLE locations ADD COLUMN maps_url TEXT",
+        "ALTER TABLE reviews ADD COLUMN ai_sentiment TEXT",
+        "ALTER TABLE reviews ADD COLUMN ai_sentiment_reason TEXT",
+        "ALTER TABLE reviews ADD COLUMN ai_priority TEXT",
+        "ALTER TABLE reviews ADD COLUMN ai_hash TEXT",
     ]
     for sql in migrations:
         try:
             conn.execute(sql)
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+
+def review_content_hash(review_text: str, star_rating) -> str:
+    """Hash of the fields that drive AI classification -- used to detect a
+    review that needs (re)classification, e.g. new reviews or edited text."""
+    import hashlib
+    raw = f"{(review_text or '').strip()}|{star_rating}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def get_reviews_needing_classification(conn, limit: int | None = None) -> list:
+    """Reviews whose ai_hash doesn't match their current content -- i.e. never
+    classified, or edited since the last classification pass."""
+    rows = conn.execute(
+        """SELECT id, review_text, star_rating, ai_hash FROM reviews
+           WHERE is_deleted = 0 AND review_text IS NOT NULL AND review_text != ''"""
+    ).fetchall()
+    needing = [dict(r) for r in rows if review_content_hash(r["review_text"], r["star_rating"]) != (r["ai_hash"] or "")]
+    needing.sort(key=lambda r: r["id"])
+    return needing[:limit] if limit else needing
+
+
+def save_ai_classification(conn, review_id: int, sentiment: str, reason: str, priority: str, content_hash: str) -> None:
+    conn.execute(
+        """UPDATE reviews SET ai_sentiment = ?, ai_sentiment_reason = ?, ai_priority = ?, ai_hash = ?
+           WHERE id = ?""",
+        (sentiment, reason, priority, content_hash, review_id),
+    )
 
 
 def get_or_create_location(conn, name: str, city: str = "", brand: str = "", search_query: str = "", maps_url: str = "") -> int:

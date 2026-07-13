@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueries, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 
 async function fetchJSON(path) {
@@ -72,6 +72,27 @@ export function usePrefetchLocationDetails(stats) {
       })
     })
   }, [stats, qc])
+}
+
+// Network-wide staff-mention data lives per-location, in intelligence/locations/{slug}.json
+// (there is no staff field on location-stats.json). This fetches every location's
+// detail file at once -- reusing the same ['location-detail', slug] cache key
+// usePrefetchLocationDetails() already primes, so on most navigations this resolves
+// from cache instantly instead of firing 20+ new requests.
+export function useAllLocationDetails(stats) {
+  const slugs = (stats ?? []).map(s => s.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''))
+  const results = useQueries({
+    queries: slugs.map(slug => ({
+      queryKey: ['location-detail', slug],
+      queryFn: () => fetchJSON(`/data/intelligence/locations/${slug}.json`),
+      enabled: !!slug,
+      ...OPTS,
+    })),
+  })
+  return {
+    data: results.map(r => r.data).filter(Boolean),
+    isLoading: slugs.length > 0 && results.some(r => r.isLoading),
+  }
 }
 
 export function useLocationReviews(slug) {

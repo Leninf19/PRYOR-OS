@@ -1,7 +1,14 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
+import { useOutletContext } from 'react-router-dom'
 import Badge from '../components/ui/Badge.jsx'
+import Card from '../components/ui/Card.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import PeriodComparison from '../components/ui/PeriodComparison.jsx'
+import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
+import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
+import { filterReviews } from '../utils/dataUtils.js'
+import { exportCSV, printReport } from '../utils/exportUtils.js'
 import {
   useWeeklyReportData, useKPIs, useCompanySummary,
   useComplaintIntel, useCompetitorIntel,
@@ -12,15 +19,6 @@ import {
 function fmt(n, decimals = 2) {
   if (n == null) return '—'
   return typeof n === 'number' ? n.toFixed(decimals) : n
-}
-
-function exportTxt(title, lines) {
-  const text = [`Future Insights — ${title}`, `Generated: ${new Date().toLocaleString()}`, '', ...lines].join('\n')
-  const blob = new Blob([text], { type: 'text/plain' })
-  const url  = URL.createObjectURL(blob)
-  const a    = document.createElement('a')
-  a.href = url; a.download = `${title.toLowerCase().replace(/\s+/g, '-')}.txt`; a.click()
-  URL.revokeObjectURL(url)
 }
 
 // ── Building blocks ───────────────────────────────────────────────────────────
@@ -67,19 +65,28 @@ function BulletList({ items, color }) {
   )
 }
 
-function ExportButton({ onClick }) {
+function ToolbarButton({ onClick, icon, children }) {
   return (
     <button onClick={onClick}
             className="flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-lg border transition-opacity hover:opacity-75"
             style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-2)',
                      background: 'var(--color-surface-2)' }}>
-      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
-      </svg>
-      Export
+      {icon}
+      {children}
     </button>
   )
 }
+
+const EXPORT_ICON = (
+  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+  </svg>
+)
+const PRINT_ICON = (
+  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m10 0v4a1 1 0 01-1 1H8a1 1 0 01-1-1v-4m10 0H7m3-13h4a1 1 0 011 1v3H9V5a1 1 0 011-1z"/>
+  </svg>
+)
 
 function ReportShell({ title, badge, children, onExport, isLoading }) {
   return (
@@ -91,7 +98,12 @@ function ReportShell({ title, badge, children, onExport, isLoading }) {
           <h2 className="text-title" style={{ color: 'var(--color-text-1)' }}>{title}</h2>
           {badge && <Badge variant={badge.variant}>{badge.label}</Badge>}
         </div>
-        {onExport && !isLoading && <ExportButton onClick={onExport} />}
+        {!isLoading && (
+          <div className="no-print flex items-center gap-2">
+            {onExport && <ToolbarButton onClick={onExport} icon={EXPORT_ICON}>Export CSV</ToolbarButton>}
+            <ToolbarButton onClick={printReport} icon={PRINT_ICON}>Print / Save PDF</ToolbarButton>
+          </div>
+        )}
       </div>
       <div className="px-6 py-5 space-y-6">
         {isLoading
@@ -127,21 +139,15 @@ function WeeklyPanel({ weekly, kpis }) {
   })
 
   function handleExport() {
-    const lines = [
-      `Period: ${weekly.weekStr}`,
-      `New reviews this week: ${weekly.totalNew}`,
-      `Unanswered 1–2★: ${weekly.unanswered}`,
-      '',
-      'WINS:',
-      ...wins.map(w => `• ${w}`),
-      '',
-      'RISKS:',
-      ...risks.map(r => `• ${r}`),
-      '',
-      'NEW REVIEWS BY LOCATION:',
-      ...topLocs.map(([n, c]) => `• ${n}: ${c}`),
+    const rows = [
+      ['Summary', 'New reviews this week', weekly.totalNew],
+      ['Summary', 'Unanswered 1-2 star', weekly.unanswered],
+      ['Summary', 'Locations active', Object.keys(weekly.byLocation ?? {}).length],
+      ...wins.map(w => ['Win', w, '']),
+      ...risks.map(r => ['Risk', r, '']),
+      ...topLocs.map(([n, c]) => ['New reviews by location', n, c]),
     ]
-    exportTxt('Weekly Report', lines)
+    exportCSV(`weekly-report-${(weekly.weekStr || 'current').replace(/\s+/g, '-')}`, ['Section', 'Detail', 'Value'], rows)
   }
 
   return (
@@ -209,14 +215,11 @@ function ComplaintPanel({ complaint }) {
   const top5p = complaint.praises?.slice(0, 5) ?? []
 
   function handleExport() {
-    const lines = [
-      'TOP COMPLAINTS:',
-      ...top5.map(c => `• ${c.name}: ${c.count} mentions (${c.pct}%) — ${c.trend}`),
-      '',
-      'TOP PRAISE:',
-      ...top5p.map(p => `• ${p.name}: ${p.count} mentions (${p.pct}%)`),
+    const rows = [
+      ...top5.map(c => ['Complaint', c.name, c.count, `${c.pct}%`, c.trend]),
+      ...top5p.map(p => ['Praise', p.name, p.count, `${p.pct}%`, p.trend ?? '']),
     ]
-    exportTxt('Complaint Trend Report', lines)
+    exportCSV('complaint-trend-report', ['Type', 'Category', 'Count', 'Percent', 'Trend'], rows)
   }
 
   return (
@@ -255,17 +258,8 @@ function CompetitorPanel({ competitor }) {
   const metrics = competitor.metrics ?? {}
 
   function handleExport() {
-    const lines = [
-      `Period: ${competitor.period}`,
-      `Avg rating: ${metrics.avgRating?.value?.toFixed(2)}★`,
-      `Response rate: ${metrics.responseRate?.value?.toFixed(0)}%`,
-      '',
-      'RANKINGS:',
-      ...top3.map(l => `#${l.rank} ${l.name} — ${l.avgRating?.toFixed(2)}★ (${l.grade})`),
-      '',
-      b.recommendation ? `AI RECOMMENDATION:\n${b.recommendation}` : '',
-    ]
-    exportTxt('Competitor Report', lines)
+    const rows = top3.map(l => [l.rank, l.name, l.avgRating?.toFixed(2), l.reviewCount, l.grade])
+    exportCSV('competitor-report', ['Rank', 'Location', 'Avg Rating', 'Review Count', 'Grade'], rows)
   }
 
   return (
@@ -315,12 +309,76 @@ function NetworkSummaryPanel({ summary }) {
     <EmptyState icon="🏢" title="Network summary not yet available"
                 body="Run the analytics pipeline with AI enabled to generate the network summary." />
   )
-  function handleExport() {
-    exportTxt('Network Summary', [text, '', `Generated at: ${summary?.generatedAt ?? 'unknown'}`])
-  }
   return (
-    <ReportShell title="Network Summary" badge={{ variant: 'accent', label: 'AI' }} onExport={handleExport}>
+    <ReportShell title="Network Summary" badge={{ variant: 'accent', label: 'AI' }}>
       <p className="text-sm leading-relaxed" style={{ color: 'var(--color-text-1)', lineHeight: 1.85 }}>{text}</p>
+    </ReportShell>
+  )
+}
+
+// ── Custom period report (Weekly / Monthly / Quarterly / Yearly presets) ──────
+
+const PERIOD_PRESETS = [
+  { id: 'weekly',    label: 'Weekly',    days: 7   },
+  { id: 'monthly',   label: 'Monthly',   days: 30  },
+  { id: 'quarterly', label: 'Quarterly', days: 90  },
+  { id: 'yearly',    label: 'Yearly',    days: 365 },
+]
+
+function CustomPeriodPanel({ allReviews }) {
+  const [preset, setPreset] = useState('monthly')
+  const days = PERIOD_PRESETS.find(p => p.id === preset)?.days ?? 30
+
+  const { current, prior, label } = useMemo(() => {
+    const end = new Date()
+    const start = new Date(Date.now() - days * 86_400_000)
+    const priorEnd = new Date(start.getTime() - 1)
+    const priorStart = new Date(priorEnd.getTime() - days * 86_400_000)
+    const iso = d => d.toISOString().slice(0, 10)
+    return {
+      current: filterReviews(allReviews, { start: iso(start), end: iso(end) }),
+      prior:   filterReviews(allReviews, { start: iso(priorStart), end: iso(priorEnd) }),
+      label:   `${iso(start)} to ${iso(end)}`,
+    }
+  }, [allReviews, days])
+
+  function handleExport() {
+    const rows = [5, 4, 3, 2, 1].map(star => {
+      const count = current.filter(r => r.star_rating === star).length
+      return ['Star Breakdown', `${star}★`, count, current.length ? `${(count / current.length * 100).toFixed(1)}%` : '0%']
+    })
+    exportCSV(`${preset}-period-report-${label.replace(/\s+/g, '')}`, ['Section', 'Metric', 'Value', 'Percent'], rows)
+  }
+
+  return (
+    <ReportShell
+      title={`${PERIOD_PRESETS.find(p => p.id === preset)?.label} Report`}
+      badge={{ variant: 'neutral', label }}
+      onExport={handleExport}
+    >
+      <div className="no-print flex gap-1 p-1 rounded-xl w-fit" style={{ background: 'var(--color-surface-2)' }}>
+        {PERIOD_PRESETS.map(p => (
+          <button key={p.id} onClick={() => setPreset(p.id)}
+                  className="px-3 py-1.5 text-xs font-medium rounded-lg transition-all"
+                  style={preset === p.id
+                    ? { background: 'var(--color-surface)', color: 'var(--color-text-1)', boxShadow: 'var(--shadow-sm)' }
+                    : { color: 'var(--color-text-2)' }}>
+            {p.label}
+          </button>
+        ))}
+      </div>
+
+      {current.length === 0 ? (
+        <EmptyState icon="📅" title="No reviews in this period" body="Try a longer preset." />
+      ) : (
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <SentimentBreakdown reviews={current} />
+            <RatingBreakdown reviews={current} prevReviews={prior} title={`${PERIOD_PRESETS.find(p => p.id === preset)?.label} rating breakdown`} />
+          </div>
+          <PeriodComparison reviews={current} prevReviews={prior} periodLabel={label} prevPeriodLabel="prior equal-length period" />
+        </div>
+      )}
     </ReportShell>
   )
 }
@@ -328,6 +386,7 @@ function NetworkSummaryPanel({ summary }) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 const TABS = [
+  { id: 'custom',    label: 'Custom Period' },
   { id: 'weekly',    label: 'Weekly'      },
   { id: 'complaint', label: 'Complaints'  },
   { id: 'competitor',label: 'Competitive' },
@@ -335,14 +394,15 @@ const TABS = [
 ]
 
 export default function ExecutiveReports() {
+  const { allReviews = [] } = useOutletContext() ?? {}
   const { data: weekly,     isLoading: lW } = useWeeklyReportData()
   const { data: kpis,       isLoading: lK } = useKPIs()
   const { data: summary,    isLoading: lS } = useCompanySummary()
   const { data: complaint,  isLoading: lC } = useComplaintIntel()
   const { data: competitor, isLoading: lR } = useCompetitorIntel()
-  const [tab, setTab] = useState('weekly')
+  const [tab, setTab] = useState('custom')
 
-  const loading = { weekly: lW, complaint: lC, competitor: lR, network: lS }
+  const loading = { custom: false, weekly: lW, complaint: lC, competitor: lR, network: lS }
 
   return (
     <div className="space-y-6 max-w-[900px]">
@@ -354,7 +414,7 @@ export default function ExecutiveReports() {
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 p-1 rounded-xl w-fit flex-wrap" style={{ background: 'var(--color-surface-2)' }}>
+      <div className="no-print flex gap-1 p-1 rounded-xl w-fit flex-wrap" style={{ background: 'var(--color-surface-2)' }}>
         {TABS.map(t => (
           <button key={t.id} onClick={() => setTab(t.id)}
                   className="px-4 py-2 text-sm font-medium rounded-lg transition-all"
@@ -374,6 +434,7 @@ export default function ExecutiveReports() {
         </div>
       ) : (
         <>
+          {tab === 'custom'     && <CustomPeriodPanel allReviews={allReviews} />}
           {tab === 'weekly'     && <WeeklyPanel     weekly={weekly}       kpis={kpis} />}
           {tab === 'complaint'  && <ComplaintPanel  complaint={complaint} />}
           {tab === 'competitor' && <CompetitorPanel competitor={competitor} />}

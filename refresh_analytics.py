@@ -219,6 +219,26 @@ def classify_review(text: str, star_rating: int | None) -> dict:
 COMPLAINT_META = {c[0]: {"name": c[1], "severity": c[2]} for c in COMPLAINT_CATEGORIES}
 PRAISE_META    = {p[0]: {"name": p[1]}                    for p in PRAISE_CATEGORIES}
 
+# Operational recommendation shown alongside each complaint category so the
+# page tells management what to *do*, not just what customers said.
+SUGGESTED_ACTIONS = {
+    "wait_time":     "Add a host or extra seating staff during the identified peak hours to reduce guest wait times.",
+    "slow_service":  "Review server-to-table ratios during peak shifts and reinforce table-check cadence training.",
+    "poor_service":  "Schedule a service-recovery training refresh with front-of-house staff on greeting and attentiveness.",
+    "cold_food":     "Audit expo/plating times between kitchen and table — check heat-lamp usage and ticket times during rush.",
+    "wrong_order":   "Reinforce order read-back at POS entry and at expo before dishes leave the kitchen.",
+    "food_quality":  "Schedule a kitchen quality check-in with the head chef and spot-check consistency across shifts.",
+    "cleanliness":   "Increase bussing frequency and add a mid-shift floor and table cleanliness check.",
+    "restrooms":     "Add a scheduled hourly restroom check during peak hours.",
+    "pricing":       "Review menu pricing and portion sizing against guest value perception for the affected items.",
+    "noise":         "Evaluate music volume levels and consider acoustic dampening during peak dinner hours.",
+    "management":    "Schedule manager coaching focused on guest recovery and complaint ownership.",
+    "drink_quality": "Audit bar recipes and pour standards, and review ice-to-liquor ratios with bartenders.",
+    "parking":       "Review parking signage and consider valet or overflow parking arrangements during peak hours.",
+    "reservation":   "Audit the reservation system and host-stand process to ensure reservations are honored on arrival.",
+    "consistency":   "Standardize recipes and prep procedures across shifts to reduce quality variance.",
+}
+
 
 def build_complaint_intelligence(reviews: list, period_reviews: list, prev_reviews: list) -> dict:
     """
@@ -286,6 +306,7 @@ def build_complaint_intelligence(reviews: list, period_reviews: list, prev_revie
             "trend": trend,
             "topLocations": [{"name": n, "count": c} for n, c in loc_counts.most_common(3)],
             "examples": cr_cur.get(cat_id, []),
+            "suggestedAction": SUGGESTED_ACTIONS.get(cat_id),
         })
 
     complaints_out.sort(key=lambda x: (-x["severity"], -x["count"]))
@@ -410,6 +431,102 @@ def rating_trend_alert(reviews: list, location_name: str) -> dict | None:
             "message": f"{location_name} shows a declining trend ({current:.2f}★ → projected {pred:.2f}★).",
         }
     return None
+
+
+def negative_spike_alert(reviews: list, location_name: str) -> dict | None:
+    """5+ negative (<=2-star) reviews landing on the same calendar day -- the
+    finest granularity the data supports, since review timestamps (not just
+    dates) aren't captured by the source."""
+    by_day = defaultdict(int)
+    for r in reviews:
+        if r.get("review_date") and (r.get("star_rating") or 5) <= 2:
+            by_day[r["review_date"]] += 1
+    worst_day, worst_n = max(by_day.items(), key=lambda kv: kv[1], default=(None, 0))
+    if worst_n < 5:
+        return None
+    return {
+        "type": "negative_spike",
+        "severity": "critical",
+        "title": f"{location_name}: negative review spike",
+        "location": location_name,
+        "date": worst_day,
+        "count": worst_n,
+        "message": f"{location_name} received {worst_n} negative reviews on {worst_day}.",
+    }
+
+
+def volume_drop_alert(period_reviews: list, prev_reviews: list, location_name: str) -> dict | None:
+    """Review volume dropped 40%+ vs. the prior period (distinct from the
+    rating-delta trend alert -- a location can hold its rating while going
+    quiet, which is its own early-warning signal)."""
+    prev_n = len(prev_reviews)
+    cur_n = len(period_reviews)
+    if prev_n < 5:
+        return None
+    drop_pct = (prev_n - cur_n) / prev_n * 100
+    if drop_pct < 40:
+        return None
+    return {
+        "type": "volume_drop",
+        "severity": "warning",
+        "title": f"{location_name}: review volume dropped",
+        "location": location_name,
+        "current": cur_n,
+        "prev": prev_n,
+        "dropPct": round(drop_pct),
+        "message": f"{location_name}'s review volume dropped {round(drop_pct)}% ({prev_n} → {cur_n} reviews) vs. the prior period.",
+    }
+
+
+def stale_reply_alert(reviews: list, location_name: str, days_threshold: int = 5, max_age_days: int = 90) -> dict | None:
+    """A negative review has *recently* gone stale (5-90 days unanswered).
+    Bounded at the top end so this stays a "this needs attention now" signal
+    rather than restating years-old permanent backlog that's already visible
+    in the Response Center / Action Items -- that's a distinct, calmer view."""
+    today = datetime.now(timezone.utc).date()
+    oldest_stale = None
+    for r in reviews:
+        if (r.get("star_rating") or 5) > 2 or (r.get("owner_response") or "").strip():
+            continue
+        if not r.get("review_date"):
+            continue
+        try:
+            age_days = (today - datetime.fromisoformat(r["review_date"]).date()).days
+        except ValueError:
+            continue
+        if days_threshold <= age_days <= max_age_days and (oldest_stale is None or age_days > oldest_stale):
+            oldest_stale = age_days
+    if oldest_stale is None:
+        return None
+    return {
+        "type": "stale_reply",
+        "severity": "warning",
+        "title": f"{location_name}: unanswered review aging",
+        "location": location_name,
+        "daysUnanswered": oldest_stale,
+        "message": f"{location_name} has a negative review that has gone {oldest_stale} days without an owner reply.",
+    }
+
+
+def sentiment_shift_alert(period_reviews: list, prev_reviews: list, location_name: str) -> dict | None:
+    """Sentiment (AI-derived, not just stars) swung 20+ points period-over-period."""
+    cur = sentiment(period_reviews)
+    prev = sentiment(prev_reviews)
+    if cur["n"] < 5 or prev["n"] < 5:
+        return None
+    delta = cur["positive"] - prev["positive"]
+    if abs(delta) < 20:
+        return None
+    direction = "improved" if delta > 0 else "declined"
+    return {
+        "type": "sentiment_shift",
+        "severity": "positive" if delta > 0 else "warning",
+        "title": f"{location_name}: sentiment shift",
+        "location": location_name,
+        "delta": round(delta, 1),
+        "direction": direction,
+        "message": f"{location_name}'s guest sentiment {direction} sharply -- {round(prev['positive'])}% → {round(cur['positive'])}% positive vs. the prior period.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -542,15 +659,33 @@ def find_staff_names(reviews: list, top_n: int = 10) -> list:
     ][:top_n]
 
 
+def _sentiment_bucket(r: dict) -> str | None:
+    """AI-derived sentiment when available (judges actual review text, not
+    just stars); falls back to star-based bucketing for reviews the pipeline
+    hasn't classified yet (e.g. brand new since the last run)."""
+    ai = r.get("ai_sentiment")
+    if ai in ("positive", "neutral", "negative"):
+        return ai
+    stars = r.get("star_rating")
+    if stars is None:
+        return None
+    if stars >= 4:
+        return "positive"
+    if stars == 3:
+        return "neutral"
+    return "negative"
+
+
 def sentiment(reviews: list) -> dict:
     n = len(reviews)
     if n == 0:
         return {"n": 0, "positiveN": 0, "neutralN": 0, "badN": 0,
                 "positive": 0, "neutral": 0, "bad": 0, "avgRating": None}
     rated = [r for r in reviews if r.get("star_rating") is not None]
-    positive_n = sum(1 for r in reviews if (r.get("star_rating") or 0) >= 4)
-    neutral_n  = sum(1 for r in reviews if r.get("star_rating") == 3)
-    bad_n      = sum(1 for r in reviews if (r.get("star_rating") or 0) and r["star_rating"] <= 2)
+    buckets = [_sentiment_bucket(r) for r in reviews]
+    positive_n = buckets.count("positive")
+    neutral_n  = buckets.count("neutral")
+    bad_n      = buckets.count("negative")
     avg = round(sum(r["star_rating"] for r in rated) / len(rated), 2) if rated else None
     return {
         "n": n, "positiveN": positive_n, "neutralN": neutral_n, "badN": bad_n,
@@ -1036,6 +1171,12 @@ def set_cache(conn, key: str, payload) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+# Cap AI sentiment/priority classification per pipeline run so a large backlog
+# (e.g. right after enabling this feature) can't blow past rate limits or
+# stall the 6-hour cadence -- backfill_sentiment.py handles the full history.
+CLASSIFY_LIMIT_PER_RUN = 300
+
+
 def main():
     conn = db.get_connection()
     db.init_schema(conn)
@@ -1047,6 +1188,29 @@ def main():
     ).fetchall()
     reviews  = [dict(r) for r in rows]
     locations = {row["id"]: dict(row) for row in conn.execute("SELECT * FROM locations").fetchall()}
+
+    # --- AI sentiment + priority classification (server-side, cached by content hash) ---
+    if ai_engine.is_available():
+        to_classify = db.get_reviews_needing_classification(conn, limit=CLASSIFY_LIMIT_PER_RUN)
+        if to_classify:
+            classified = ai_engine.classify_reviews_batch(to_classify)
+            for r in to_classify:
+                result = classified.get(r["id"])
+                if not result:
+                    continue
+                content_hash = db.review_content_hash(r["review_text"], r["star_rating"])
+                db.save_ai_classification(
+                    conn, r["id"], result["sentiment"], result["reason"], result["priority"], content_hash,
+                )
+            conn.commit()
+            print(f"[ai] Classified {len(classified)}/{len(to_classify)} reviews this run")
+            # Re-fetch so downstream analytics see the freshly classified rows
+            rows = conn.execute(
+                """SELECT r.*, l.name AS location_name, l.city AS city, l.brand AS brand
+                   FROM reviews r JOIN locations l ON l.id = r.location_id
+                   WHERE r.is_deleted = 0"""
+            ).fetchall()
+            reviews = [dict(r) for r in rows]
 
     now   = datetime.now(timezone.utc)
     today = now.date().isoformat()
@@ -1176,11 +1340,30 @@ def main():
         })
 
     # --- Predictive alerts (company-wide) ---
+    by_loc_prev = defaultdict(list)
+    for r in prev_period:
+        by_loc_prev[r["location_id"]].append(r)
+    by_loc_recent_90 = defaultdict(list)
+    for r in reviews:
+        if r.get("review_date") and r["review_date"] >= d90:
+            by_loc_recent_90[r["location_id"]].append(r)
+
     alerts = []
     for loc_id, loc in locations.items():
-        alert = rating_trend_alert(by_loc_all[loc_id], loc["name"])
-        if alert:
-            alerts.append(alert)
+        loc_all    = by_loc_all[loc_id]
+        loc_cur    = by_loc_30[loc_id]
+        loc_prev   = by_loc_prev[loc_id]
+        loc_recent = by_loc_recent_90[loc_id]
+        for alert_fn, args in (
+            (rating_trend_alert,     (loc_all, loc["name"])),
+            (negative_spike_alert,   (loc_recent, loc["name"])),  # recent window -- an old spike isn't "actionable today"
+            (volume_drop_alert,      (loc_cur, loc_prev, loc["name"])),
+            (stale_reply_alert,      (loc_all, loc["name"])),
+            (sentiment_shift_alert,  (loc_cur, loc_prev, loc["name"])),
+        ):
+            alert = alert_fn(*args)
+            if alert:
+                alerts.append(alert)
     set_cache(conn, "predictive_alerts", alerts)
 
     # --- Company AI executive summary ---

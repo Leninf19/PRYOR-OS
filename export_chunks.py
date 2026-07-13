@@ -53,6 +53,9 @@ def review_to_dict(r, loc) -> dict:
         "response_status": "responded" if (r["owner_response"] or "").strip() else "unanswered",
         "review_id": db.canonical_review_id(r["review_url"] or "") or "",
         "last_checked_at": r["last_seen_at"] or "",
+        "ai_sentiment": r["ai_sentiment"] if "ai_sentiment" in r.keys() else None,
+        "ai_sentiment_reason": r["ai_sentiment_reason"] if "ai_sentiment_reason" in r.keys() else None,
+        "ai_priority": r["ai_priority"] if "ai_priority" in r.keys() else None,
     }
 
 
@@ -285,6 +288,9 @@ def export_location_detail_reviews(conn, locations: dict) -> None:
                 "last_checked_at": rd.get("last_seen_at") or "",
                 "complaint_tags": tags["complaints"],
                 "praise_tags": tags["praises"],
+                "ai_sentiment": rd.get("ai_sentiment"),
+                "ai_sentiment_reason": rd.get("ai_sentiment_reason"),
+                "ai_priority": rd.get("ai_priority"),
             })
         write_json(f"reviews/by-location/{slugify(loc['name'])}.json", reviews_out)
 

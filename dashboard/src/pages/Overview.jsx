@@ -5,6 +5,9 @@ import Card from '../components/ui/Card.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import HealthRing from '../components/ui/HealthRing.jsx'
 import Badge from '../components/ui/Badge.jsx'
+import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
+import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
+import PeriodComparison from '../components/ui/PeriodComparison.jsx'
 import {
   useKPIs, useCompanySummary, useMonthlyTrend, useLocationStats,
   usePredictiveAlerts, useComplaintIntel, useActionItems,
@@ -328,7 +331,7 @@ function AlertBanner({ alerts }) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-export default function Overview() {
+export default function Overview({ filtered = [], prevFiltered = [] }) {
   const { data: kpis,    isLoading: lKpis    } = useKPIs()
   const { data: summary, isLoading: lSummary  } = useCompanySummary()
   const { data: trend,   isLoading: lTrend    } = useMonthlyTrend()
@@ -353,11 +356,21 @@ export default function Overview() {
 
       <KPIGrid kpis={kpis} loading={lKpis} />
 
+      {/* Review classification + rating breakdown — driven live by the global
+          filter bar (date/brand/location/stars), unlike the KPI row above
+          which reflects the pipeline's fixed trailing-30-day snapshot. */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <SentimentBreakdown reviews={filtered} />
+        <RatingBreakdown reviews={filtered} prevReviews={prevFiltered} title="Rating Breakdown (selected period)" />
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <TrendCard trend={trend} loading={lTrend} />
         <PriorityQueue items={actions} loading={lActions} />
         <ComplaintSnapshot intel={intel} loading={lIntel} />
       </div>
+
+      <PeriodComparison reviews={filtered} prevReviews={prevFiltered} />
 
       <Card className="p-5">
         <div className="flex items-center justify-between mb-4">

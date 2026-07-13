@@ -127,6 +127,91 @@ Write the location summary now:"""
 
 
 # ---------------------------------------------------------------------------
+# Per-review sentiment + priority classification
+# ---------------------------------------------------------------------------
+# Star ratings alone are a poor sentiment signal (a 5-star review can describe
+# real problems; a 3-star review can be substantively positive). This reads
+# the actual review text and returns an independent sentiment judgment plus
+# an operational priority, batched to keep cost/latency low.
+
+_CLASSIFY_BATCH_SIZE = 20
+
+_CLASSIFY_PROMPT_HEADER = """You are a sentiment and priority classification engine for a restaurant review platform. Judge each review by its actual written content, not by its star rating -- a 5-star review can be neutral or negative if the text describes real problems (e.g. slow service, a rude employee), and a 3-star review can be positive if the text is largely complimentary.
+
+For each review, return:
+- "sentiment": "positive", "neutral", or "negative" -- based on what the customer actually described.
+- "reason": one short sentence (under 15 words) grounded in specifics from the review text.
+- "priority": "critical", "high", "medium", or "low":
+  - critical: food poisoning/illness, injury, discrimination, harassment, health-code or safety violations, legal threats
+  - high: repeated or serious complaints, a very angry customer, an explicit request for a manager to follow up
+  - medium: an ordinary complaint or mixed feedback that deserves a reply
+  - low: a simple compliment or a review needing no operational action
+
+Reviews (numbered, do not skip any, respond in the same order):
+"""
+
+_CLASSIFY_FOOTER = """
+Return ONLY a JSON array of {n} objects, no markdown, no explanation, one object per review in order:
+[{{"sentiment":"...","reason":"...","priority":"..."}}, ...]"""
+
+
+def classify_reviews_batch(reviews: list) -> dict:
+    """
+    reviews: list of {"id": <review row id>, "review_text": str, "star_rating": int|None}
+    Returns {review_id: {"sentiment", "reason", "priority"}} for every review
+    the model successfully classified (missing/malformed entries are simply
+    omitted so the caller can retry or fall back to star-based sentiment).
+    """
+    client = _get_client()
+    if not client or not reviews:
+        return {}
+
+    results = {}
+    for i in range(0, len(reviews), _CLASSIFY_BATCH_SIZE):
+        batch = reviews[i:i + _CLASSIFY_BATCH_SIZE]
+        lines = [
+            f"{j+1}. [{'★' * (r.get('star_rating') or 0)}] {(r.get('review_text') or '')[:500]}"
+            for j, r in enumerate(batch)
+        ]
+        prompt = _CLASSIFY_PROMPT_HEADER + "\n".join(lines) + _CLASSIFY_FOOTER.format(n=len(batch))
+
+        text = _call(prompt, model="claude-haiku-4-5-20251001", max_tokens=200 + 60 * len(batch))
+        if text is None:
+            continue
+
+        text = text.strip()
+        if text.startswith("```"):
+            lines_ = text.split("\n")
+            text = "\n".join(lines_[1:-1] if lines_[-1].strip() == "```" else lines_[1:])
+
+        try:
+            parsed = json.loads(text.strip())
+        except json.JSONDecodeError:
+            print(f"[ai] classify_reviews_batch: bad JSON for batch at offset {i}, skipping")
+            continue
+
+        if not isinstance(parsed, list) or len(parsed) != len(batch):
+            print(f"[ai] classify_reviews_batch: expected {len(batch)} results, got "
+                  f"{len(parsed) if isinstance(parsed, list) else type(parsed)} -- skipping batch")
+            continue
+
+        for r, item in zip(batch, parsed):
+            sentiment = item.get("sentiment")
+            priority = item.get("priority")
+            if sentiment not in ("positive", "neutral", "negative"):
+                continue
+            if priority not in ("critical", "high", "medium", "low"):
+                priority = "low"
+            results[r["id"]] = {
+                "sentiment": sentiment,
+                "reason": (item.get("reason") or "").strip()[:200],
+                "priority": priority,
+            }
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Response drafts
 # ---------------------------------------------------------------------------
 

@@ -74,9 +74,37 @@ function CategoryCard({ cat, type }) {
         </svg>
       </div>
 
-      {/* Expanded examples */}
-      {open && cat.examples?.length > 0 && (
-        <div className="mt-4 space-y-2 border-t pt-3" style={{ borderColor: 'var(--color-border)' }}>
+      {/* Expanded detail */}
+      {open && (cat.examples?.length > 0 || cat.topLocations?.length > 0 || cat.suggestedAction) && (
+        <div className="mt-4 space-y-4 border-t pt-3" style={{ borderColor: 'var(--color-border)' }}>
+
+          {isComplaint && cat.suggestedAction && (
+            <div className="rounded-lg px-3 py-2.5"
+                 style={{ background: 'var(--color-accent-lt)', border: '1px solid var(--color-accent-md)' }}>
+              <p className="text-[10px] uppercase tracking-widest font-bold mb-1" style={{ color: 'var(--color-accent)' }}>
+                Suggested Action
+              </p>
+              <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-1)' }}>{cat.suggestedAction}</p>
+            </div>
+          )}
+
+          {cat.topLocations?.length > 0 && (
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-wider mb-2" style={{ color: 'var(--color-text-3)' }}>
+                Most Affected Locations
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {cat.topLocations.map(l => (
+                  <span key={l.name} className="badge badge-neutral">
+                    {l.name} · {l.count}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {cat.examples?.length > 0 && (
+          <div className="space-y-2">
           <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>
             Example Reviews
           </p>
@@ -105,6 +133,8 @@ function CategoryCard({ cat, type }) {
               )}
             </div>
           ))}
+          </div>
+          )}
         </div>
       )}
     </div>

@@ -35,6 +35,20 @@
   --color-info:      #1E40AF;
   --color-info-bg:   #DBEAFE;
 
+  /* Health-score grade (A-F) and star-rating bar colors -- distinct shades
+     from the semantic success/warning/danger tokens above, so both are
+     tokenized here rather than left as hardcoded hex in HealthRing/charts. */
+  --color-grade-a: #166534;
+  --color-grade-b: #3f6212;
+  --color-grade-c: #d97706;
+  --color-grade-d: #c2410c;
+  --color-grade-f: #991b1b;
+  --color-star-1: #ef4444;
+  --color-star-2: #f97316;
+  --color-star-3: #fbbf24;
+  --color-star-4: #84cc16;
+  --color-star-5: #22c55e;
+
   /* Shadows */
   --shadow-xs: 0 1px 2px rgba(26,23,20,0.06);
   --shadow-sm: 0 1px 3px rgba(26,23,20,0.08), 0 1px 2px rgba(26,23,20,0.05);
@@ -90,6 +104,33 @@ body {
 
 /* ─── Selection ─── */
 ::selection { background: var(--color-accent-lt); color: var(--color-accent); }
+
+/* ─── Typography scale ─── */
+/* .text-heading/.text-title/.text-label are referenced across every page
+   (page titles, location names, card section headers) but were previously
+   undefined -- headings silently inherited the 14px body size with no
+   weight/scale distinction. Colors stay controlled per-usage (inline style
+   or a text-color-* class); this only owns size/weight/line-height. */
+.text-heading {
+  font-size: 1.375rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+.text-title {
+  font-size: 1.0625rem;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+  line-height: 1.3;
+}
+.text-label {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+@media (max-width: 640px) {
+  .text-heading { font-size: 1.1875rem; }
+}
 
 /* ─── Card ─── */
 .card {
@@ -266,3 +307,18 @@ body {
 }
 .recharts-cartesian-grid line { stroke: var(--color-border) !important; }
 .recharts-tooltip-label { color: var(--color-text-1) !important; font-weight: 600 !important; }
+
+/* ─── Print (Executive Reports → browser "Print/Save as PDF") ─── */
+/* .no-print marks chrome that should never appear in a printed report:
+   sidebar, mobile topbar, snapshot bar, tab switchers, export/print buttons. */
+@media print {
+  .no-print { display: none !important; }
+  html, body { background: #fff !important; }
+  main { padding: 0 !important; margin: 0 !important; }
+  .card, .rounded-2xl {
+    box-shadow: none !important;
+    border: 1px solid #ddd !important;
+    break-inside: avoid;
+  }
+  a[href]::after { content: none !important; }
+}

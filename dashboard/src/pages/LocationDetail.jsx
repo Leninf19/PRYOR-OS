@@ -6,6 +6,9 @@ import Badge from '../components/ui/Badge.jsx'
 import HealthRing from '../components/ui/HealthRing.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
+import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
+import PeriodComparison from '../components/ui/PeriodComparison.jsx'
 import { useLocationStats, useLocationDetail, usePrefetchLocationDetails } from '../hooks/useIntelligence.js'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -14,7 +17,7 @@ function slugify(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
 }
 
-const STAR_COLORS = ['#ef4444','#f97316','#fbbf24','#84cc16','#22c55e']
+const STAR_COLORS = ['var(--color-star-1)','var(--color-star-2)','var(--color-star-3)','var(--color-star-4)','var(--color-star-5)']
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
@@ -223,7 +226,7 @@ function LocationPicker({ stats, selected, onSelect }) {
 
 // ─── Location dashboard ───────────────────────────────────────────────────────
 
-function LocationDashboard({ loc, detail, loading }) {
+function LocationDashboard({ loc, detail, loading, locationReviews = [], locationPrevReviews = [] }) {
   if (loading) {
     return (
       <div className="space-y-4">
@@ -301,6 +304,16 @@ function LocationDashboard({ loc, detail, loading }) {
         </Card>
       </div>
 
+      {/* Live classification + rating breakdown for the selected date/star
+          filters — unlike the cards above, which reflect the pipeline's
+          fixed trailing-30-day snapshot for this location. */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <SentimentBreakdown reviews={locationReviews} />
+        <RatingBreakdown reviews={locationReviews} prevReviews={locationPrevReviews} title="Rating Breakdown (selected period)" />
+      </div>
+
+      <PeriodComparison reviews={locationReviews} prevReviews={locationPrevReviews} />
+
       {/* Intelligence row */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <ComplaintList complaints={detail?.complaints} type="complaint" />
@@ -318,7 +331,7 @@ function LocationDashboard({ loc, detail, loading }) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-export default function LocationDetail({ allReviews = [], filtered = [], filters = {} }) {
+export default function LocationDetail({ allReviews = [], filtered = [], prevFiltered = [], filters = {} }) {
   const { data: stats, isLoading: lStats } = useLocationStats()
   usePrefetchLocationDetails(stats)
   const [selected, setSelected] = useState(null)
@@ -329,6 +342,19 @@ export default function LocationDetail({ allReviews = [], filtered = [], filters
   )
   const slug = selectedLoc ? slugify(selectedLoc.name) : null
   const { data: detail, isLoading: lDetail } = useLocationDetail(slug)
+
+  // Scope the globally-filtered review set (date/brand/stars, from the
+  // filter bar above) down to just this location, for the live classification
+  // /rating-breakdown/period-comparison cards -- everything else on this page
+  // reads the pipeline's precomputed 30-day snapshot instead.
+  const locationReviews     = useMemo(
+    () => selectedLoc ? filtered.filter(r => r.location_name === selectedLoc.name) : [],
+    [filtered, selectedLoc]
+  )
+  const locationPrevReviews = useMemo(
+    () => selectedLoc ? prevFiltered.filter(r => r.location_name === selectedLoc.name) : [],
+    [prevFiltered, selectedLoc]
+  )
 
   // Auto-select first on load
   useMemo(() => {
@@ -363,7 +389,10 @@ export default function LocationDetail({ allReviews = [], filtered = [], filters
               </Badge>
             )}
           </div>
-          <LocationDashboard loc={selectedLoc} detail={detail} loading={lDetail} />
+          <LocationDashboard
+            loc={selectedLoc} detail={detail} loading={lDetail}
+            locationReviews={locationReviews} locationPrevReviews={locationPrevReviews}
+          />
         </div>
       )}
     </div>

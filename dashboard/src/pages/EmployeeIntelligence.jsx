@@ -2,41 +2,33 @@ import { useState } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
-import { useLocationStats, useCompetitorIntel } from '../hooks/useIntelligence.js'
+import { useLocationStats, useAllLocationDetails } from '../hooks/useIntelligence.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Extract staff mentions from review text using simple name-detection heuristics.
-// The pipeline doesn't yet aggregate staff across all locations, so we parse
-// from raw location stats if they carry staff fields, or show an empty state.
-function extractStaff(locationStats) {
-  if (!locationStats) return []
+// Aggregates the real per-location staff-mention data (name-detection over
+// review text, computed by find_staff_names() in refresh_analytics.py) across
+// every location's intelligence/locations/{slug}.json file into one network-wide
+// leaderboard. Each entry is {name, count, sentiment: positive|negative|mixed, reviews}.
+function extractStaff(locationDetails) {
+  if (!locationDetails?.length) return []
 
-  // Check if location stats have staff fields (set by the pipeline's AI analysis)
-  const staff = []
   const byName = {}
 
-  locationStats.forEach(loc => {
-    const staffMentions = loc.staff ?? loc.topStaff ?? loc.employeeMentions ?? []
-    staffMentions.forEach(s => {
+  locationDetails.forEach(detail => {
+    (detail.staffMentions ?? []).forEach(s => {
       const key = s.name?.toLowerCase?.()
       if (!key) return
       if (!byName[key]) {
-        byName[key] = {
-          name: s.name,
-          mentions: 0,
-          positive: 0,
-          locations: [],
-          examples: [],
-          tags: new Set(),
-        }
+        byName[key] = { name: s.name, mentions: 0, positive: 0, locations: [], examples: [], tags: new Set() }
       }
-      byName[key].mentions     += s.count ?? s.mentions ?? 1
-      byName[key].positive     += s.positive ?? (s.sentiment === 'positive' ? (s.count ?? 1) : 0)
-      byName[key].locations.push(loc.name ?? loc.location_name)
-      if (s.examples) byName[key].examples.push(...s.examples)
-      if (s.tags)     s.tags.forEach(t => byName[key].tags.add(t))
-      if (s.praised_for) s.praised_for.forEach(t => byName[key].tags.add(t))
+      const count = s.count ?? 0
+      byName[key].mentions += count
+      byName[key].positive += s.sentiment === 'positive' ? count : s.sentiment === 'mixed' ? Math.round(count / 2) : 0
+      byName[key].locations.push(detail.name)
+      if (s.reviews) {
+        byName[key].examples.push(...s.reviews.map(r => ({ text: r.review_text, location_name: detail.name })))
+      }
     })
   })
 
@@ -134,9 +126,10 @@ function EmployeeCard({ emp, rank }) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 export default function EmployeeIntelligence() {
-  const { data: locationStats, isLoading: lL } = useLocationStats()
+  const { data: locationStats, isLoading: lStats }   = useLocationStats()
+  const { data: locationDetails, isLoading: lDetails } = useAllLocationDetails(locationStats)
 
-  if (lL) {
+  if (lStats || lDetails) {
     return (
       <div className="space-y-3 max-w-[860px]">
         <Skeleton className="h-7 w-64" />
@@ -145,8 +138,7 @@ export default function EmployeeIntelligence() {
     )
   }
 
-  const statsArr = Array.isArray(locationStats) ? locationStats : (locationStats?.locations ?? [])
-  const staff    = extractStaff(statsArr)
+  const staff = extractStaff(locationDetails)
 
   return (
     <div className="space-y-6 max-w-[860px]">

@@ -103,7 +103,7 @@ function SnapshotBar() {
   ].filter(Boolean)
 
   return (
-    <div className="hidden lg:flex items-center gap-4 px-8 py-2 flex-shrink-0 overflow-x-auto"
+    <div className="no-print hidden lg:flex items-center gap-4 px-8 py-2 flex-shrink-0 overflow-x-auto"
          style={{ background: 'var(--color-surface)', borderBottom: '1px solid var(--color-border)' }}>
       {pills.map((p, i) => (
         <div key={i} className="flex items-center gap-1.5 flex-shrink-0">
@@ -201,7 +201,7 @@ export default function Layout({ unansweredCount = 0, children }) {
 
       {/* ── Fixed desktop sidebar ───────────────────────────────────────────── */}
       <aside
-        className="hidden lg:flex flex-col fixed inset-y-0 left-0 z-30"
+        className="no-print hidden lg:flex flex-col fixed inset-y-0 left-0 z-30"
         style={{ width: 'var(--sidebar-w)', background: 'var(--color-surface)', borderRight: '1px solid var(--color-border)' }}
       >
         <SidebarContent unansweredCount={unansweredCount} />
@@ -245,7 +245,7 @@ export default function Layout({ unansweredCount = 0, children }) {
       <div className="flex-1 flex flex-col min-w-0 lg:pl-[228px]">
 
         {/* Mobile topbar */}
-        <header className="lg:hidden sticky top-0 z-40 flex items-center gap-3 px-4 h-14 flex-shrink-0"
+        <header className="no-print lg:hidden sticky top-0 z-40 flex items-center gap-3 px-4 h-14 flex-shrink-0"
                 style={{ background: 'var(--color-surface)', borderBottom: '1px solid var(--color-border)', boxShadow: 'var(--shadow-sm)' }}>
           <button onClick={() => setMobileOpen(true)}
                   className="p-1.5 rounded-lg"

@@ -29,12 +29,27 @@ export function getConfidence(n) {
 }
 
 // ── Sentiment ─────────────────────────────────────────────────────────────────
+// AI-derived sentiment judges the actual review text (a 5★ review can read as
+// negative, a 3★ review can read as positive) -- see ai_engine.py's
+// classify_reviews_batch. Falls back to star-based bucketing only for reviews
+// the pipeline hasn't classified yet (brand new since the last run).
+export function sentimentBucket(r) {
+  if (r.ai_sentiment === 'positive' || r.ai_sentiment === 'neutral' || r.ai_sentiment === 'negative') {
+    return r.ai_sentiment
+  }
+  if (r.star_rating == null) return null
+  if (r.star_rating >= 4) return 'positive'
+  if (r.star_rating === 3) return 'neutral'
+  return 'negative'
+}
+
 export function getSentiment(reviews) {
   const n = reviews.length
   if (n === 0) return { n: 0, positiveN: 0, neutralN: 0, badN: 0, positive: 0, neutral: 0, bad: 0 }
-  const positiveN = reviews.filter(r => r.star_rating >= 4).length
-  const neutralN  = reviews.filter(r => r.star_rating === 3).length
-  const badN      = reviews.filter(r => r.star_rating <= 2).length
+  const buckets = reviews.map(sentimentBucket)
+  const positiveN = buckets.filter(b => b === 'positive').length
+  const neutralN  = buckets.filter(b => b === 'neutral').length
+  const badN      = buckets.filter(b => b === 'negative').length
   return {
     n, positiveN, neutralN, badN,
     positive: positiveN / n * 100,
@@ -199,4 +214,76 @@ export function getUniqueLocations(reviews) {
 }
 export function getUniqueBrands(reviews) {
   return [...new Set(reviews.map(r => getBrand(r.location_name)))].filter(b => b !== 'Other').sort()
+}
+
+// ── Rating breakdown (★5→★1 with trend vs. a prior period) ────────────────────
+export function getRatingBreakdown(reviews, prevReviews = []) {
+  const n = reviews.length
+  const prevN = prevReviews.length
+  return [5, 4, 3, 2, 1].map(star => {
+    const count = reviews.filter(r => r.star_rating === star).length
+    const prevCount = prevReviews.filter(r => r.star_rating === star).length
+    const pct = n ? count / n * 100 : 0
+    const prevPct = prevN ? prevCount / prevN * 100 : 0
+    const delta = pct - prevPct
+    return {
+      star, count, pct, prevCount, prevPct,
+      delta: +delta.toFixed(1),
+      trend: prevN === 0 ? null : delta > 1 ? 'up' : delta < -1 ? 'down' : 'stable',
+    }
+  })
+}
+
+// ── Period comparison metrics ──────────────────────────────────────────────────
+// Note: "response time" (how long it took to reply) isn't computable — the
+// review schema only captures whether/what the owner replied, not when, since
+// that timestamp isn't exposed by the data source. Every other metric here
+// is real and filter-reactive.
+function daySpan(reviews) {
+  const dates = reviews.map(r => r.review_date).filter(Boolean).sort()
+  if (!dates.length) return 0
+  const start = new Date(dates[0]).getTime()
+  const end   = new Date(dates[dates.length - 1]).getTime()
+  return Math.max(1, Math.round((end - start) / 86_400_000) + 1)
+}
+
+function metric(value, prev) {
+  const pctChange = (value != null && prev != null && prev !== 0) ? +((value - prev) / prev * 100).toFixed(1) : null
+  return { value, prev, pctChange }
+}
+
+export function computePeriodMetrics(reviews, prevReviews = []) {
+  const sent     = getSentiment(reviews)
+  const prevSent = getSentiment(prevReviews)
+
+  const rated     = reviews.filter(r => r.star_rating != null)
+  const prevRated = prevReviews.filter(r => r.star_rating != null)
+  const avgRating     = rated.length     ? rated.reduce((s, r) => s + r.star_rating, 0) / rated.length         : null
+  const prevAvgRating = prevRated.length ? prevRated.reduce((s, r) => s + r.star_rating, 0) / prevRated.length : null
+
+  const negative     = reviews.filter(r => r.star_rating != null && r.star_rating <= 2)
+  const prevNegative = prevReviews.filter(r => r.star_rating != null && r.star_rating <= 2)
+  const negReplied     = negative.filter(r => (r.owner_response || '').trim())
+  const prevNegReplied = prevNegative.filter(r => (r.owner_response || '').trim())
+  const responseRate     = negative.length     ? negReplied.length     / negative.length     * 100 : null
+  const prevResponseRate = prevNegative.length ? prevNegReplied.length / prevNegative.length * 100 : null
+
+  const allReplied     = reviews.filter(r => (r.owner_response || '').trim())
+  const prevAllReplied = prevReviews.filter(r => (r.owner_response || '').trim())
+
+  const days     = daySpan(reviews)
+  const prevDays = daySpan(prevReviews)
+
+  return {
+    reviews:       metric(reviews.length, prevReviews.length),
+    avgRating:     metric(avgRating != null ? +avgRating.toFixed(2) : null, prevAvgRating != null ? +prevAvgRating.toFixed(2) : null),
+    positivePct:   metric(+sent.positive.toFixed(1), +prevSent.positive.toFixed(1)),
+    neutralPct:    metric(+sent.neutral.toFixed(1),  +prevSent.neutral.toFixed(1)),
+    negativePct:   metric(+sent.bad.toFixed(1),      +prevSent.bad.toFixed(1)),
+    responseRate:  metric(responseRate != null ? +responseRate.toFixed(1) : null, prevResponseRate != null ? +prevResponseRate.toFixed(1) : null),
+    reviewsPerDay: metric(+(reviews.length / days).toFixed(2), prevDays ? +(prevReviews.length / prevDays).toFixed(2) : null),
+    ownerReplies:  metric(allReplied.length, prevAllReplied.length),
+    unanswered:    metric(negative.length - negReplied.length, prevNegative.length - prevNegReplied.length),
+    netSentiment:  metric(+(sent.positive - sent.bad).toFixed(1), +(prevSent.positive - prevSent.bad).toFixed(1)),
+  }
 }
