@@ -1,6 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 import ThemeToggle from '../components/ui/ThemeToggle.jsx'
+import { useCompanyGoals } from '../hooks/useCompanyGoals.js'
+import { useGoogleStatus } from '../hooks/useGoogleStatus.js'
 
 // ── Google Business Profile integration section ───────────────────────────────
 
@@ -45,17 +47,6 @@ const PLANNED_GBP = [
   'Full status tracking: Approved → Published → Confirmed on Google',
   'Failure alerts with exact reason (permission missing, review removed, etc.)',
 ]
-
-function useGoogleStatus() {
-  const [status, setStatus] = useState({ loading: true })
-  useEffect(() => {
-    fetch('/api/google/status')
-      .then(r => r.json())
-      .then(d => setStatus({ loading: false, ...d }))
-      .catch(() => setStatus({ loading: false, connected: false, state: 'error' }))
-  }, [])
-  return status
-}
 
 function GBPSection() {
   const [stepsOpen, setStepsOpen] = useState(false)
@@ -248,14 +239,14 @@ function AIRewriteSection() {
         <div>
           <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>AI Rewrite</p>
           <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
-            Tone rewriting in the Review Workspace · requires Anthropic API key in Vercel
+            Tone rewriting in the Customer Experience Center · requires Anthropic API key in Vercel
           </p>
         </div>
         <Badge variant="warning">Setup needed</Badge>
       </div>
       <div className="px-6 pb-5 pt-4 border-t space-y-3" style={{ borderColor: 'var(--color-border)' }}>
         <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)', lineHeight: 1.75 }}>
-          The tone rewrite buttons in the Review Workspace call a serverless function at{' '}
+          The tone rewrite buttons in the Customer Experience Center call a serverless function at{' '}
           <code className="text-[10px] px-1.5 py-0.5 rounded"
                 style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)' }}>
             /api/rewrite
@@ -280,6 +271,52 @@ function AIRewriteSection() {
             </div>
           ))}
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Company Goals ──────────────────────────────────────────────────────────────
+
+const GOAL_FIELDS = [
+  { key: 'avgRating',               label: 'Average Rating',                    unit: '★',      direction: '≥', step: 0.1 },
+  { key: 'negativePct',              label: 'Negative Reviews (1–2★)',           unit: '%',      direction: '≤', step: 1   },
+  { key: 'responseRate',             label: 'Response Rate',                     unit: '%',      direction: '≥', step: 1   },
+  { key: 'avgResponseHours',         label: 'Average Response Time',             unit: 'hours',  direction: '≤', step: 1   },
+  { key: 'criticalResolutionHours',  label: 'Critical Reviews Resolved Within',  unit: 'hours',  direction: '≤', step: 1   },
+]
+
+function GoalsSection() {
+  const { goals, setGoals } = useCompanyGoals()
+
+  return (
+    <div className="rounded-2xl border overflow-hidden"
+         style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <div className="px-6 py-5">
+        <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Company Goals</p>
+        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
+          Targets shown as progress on the Executive Dashboard — answers "are we meeting our goals?"
+        </p>
+      </div>
+      <div className="px-6 pb-6 space-y-3 border-t pt-4" style={{ borderColor: 'var(--color-border)' }}>
+        {GOAL_FIELDS.map(f => (
+          <div key={f.key} className="flex items-center justify-between gap-4">
+            <label className="text-xs" style={{ color: 'var(--color-text-2)' }}>
+              {f.label} <span style={{ color: 'var(--color-text-3)' }}>({f.direction})</span>
+            </label>
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              <input
+                type="number"
+                step={f.step}
+                value={goals[f.key]}
+                onChange={e => setGoals({ [f.key]: e.target.value === '' ? '' : Number(e.target.value) })}
+                className="w-20 text-sm text-right px-2 py-1.5 rounded-lg border focus:outline-none"
+                style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
+              />
+              <span className="text-xs w-10" style={{ color: 'var(--color-text-3)' }}>{f.unit}</span>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   )
@@ -323,6 +360,14 @@ export default function Settings() {
           </div>
           <ThemeToggle />
         </div>
+      </section>
+
+      <section className="space-y-3">
+        <p className="text-[10px] font-bold uppercase tracking-[0.18em]"
+           style={{ color: 'var(--color-text-3)' }}>
+          Company Goals
+        </p>
+        <GoalsSection />
       </section>
 
       <section className="space-y-3">

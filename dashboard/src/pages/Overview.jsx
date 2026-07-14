@@ -5,18 +5,28 @@ import Card from '../components/ui/Card.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import HealthRing from '../components/ui/HealthRing.jsx'
 import Badge from '../components/ui/Badge.jsx'
+import Stat from '../components/ui/Stat.jsx'
 import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
 import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
 import CXIndexGrid from '../components/ui/CXIndexGrid.jsx'
+import ExplainableScore from '../components/ui/ExplainableScore.jsx'
 import {
   useKPIs, useCompanySummary, useMonthlyTrend, useLocationStats,
   usePredictiveAlerts, useComplaintIntel, useActionItems, useCXIndex,
 } from '../hooks/useIntelligence.js'
+import { useExecutiveBrief } from '../hooks/useExecutiveBrief.js'
+import { mirroredPrevRange, explainHealthScore } from '../utils/dataUtils.js'
 
 // ─── AI Summary ──────────────────────────────────────────────────────────────
+// Prefers the live, filter-reactive briefing (regenerates as the date/brand/
+// location filters change); falls back to the last pipeline-generated
+// summary if the live endpoint errors or no API key is configured -- same
+// graceful-degradation pattern used on "What Changed?".
 
-function AISummaryCard({ summary, loading }) {
+function AISummaryCard({ brief, summary, loading, periodLabel }) {
+  const aiSummaryText = summary?.summary ?? summary?.narrative ?? summary?.text ?? null
+
   return (
     <div className="ai-card p-6">
       <div className="flex items-center gap-2 mb-3">
@@ -25,14 +35,28 @@ function AISummaryCard({ summary, loading }) {
           {summary?.generatedAt ? new Date(summary.generatedAt).toLocaleDateString() : ''}
         </span>
       </div>
-      {loading ? (
+      {brief.loading || loading ? (
         <div className="space-y-2 opacity-30">
           <Skeleton className="h-4 w-full" />
           <Skeleton className="h-4 w-5/6" />
           <Skeleton className="h-4 w-4/6" />
         </div>
-      ) : summary?.text ? (
-        <p className="text-sm leading-relaxed" style={{ color: 'var(--ai-card-text-2)' }}>{summary.text}</p>
+      ) : brief.text ? (
+        <>
+          <p className="text-sm leading-relaxed" style={{ color: 'var(--ai-card-text-2)' }}>{brief.text}</p>
+          {periodLabel && (
+            <p className="text-[10px] mt-2 opacity-50">Generated live for {periodLabel}</p>
+          )}
+        </>
+      ) : aiSummaryText ? (
+        <>
+          <p className="text-sm leading-relaxed" style={{ color: 'var(--ai-card-text-2)' }}>{aiSummaryText}</p>
+          <p className="text-[10px] mt-2 opacity-50">
+            {brief.error
+              ? 'Live briefing unavailable — showing the last pipeline-generated summary instead.'
+              : 'From the last analytics pipeline run (trailing 30 days).'}
+          </p>
+        </>
       ) : (
         <p className="text-sm italic" style={{ color: 'var(--ai-card-text-2)', opacity: 0.5 }}>
           AI summary will appear here once ANTHROPIC_API_KEY is added to GitHub secrets.
@@ -43,20 +67,10 @@ function AISummaryCard({ summary, loading }) {
 }
 
 // ─── KPI row ─────────────────────────────────────────────────────────────────
-
-function KPICard({ label, children, sub, link }) {
-  const inner = (
-    <div className="card p-4 flex flex-col gap-1.5 min-w-0 h-full">
-      <p className="text-[10px] font-bold uppercase tracking-widest" style={{ color: 'var(--color-text-3)' }}>
-        {label}
-      </p>
-      {children}
-      {sub && <p className="text-xs" style={{ color: 'var(--color-text-3)' }}>{sub}</p>}
-    </div>
-  )
-  if (link) return <Link to={link} className="block card-hover rounded-[14px]">{inner}</Link>
-  return inner
-}
+// Shared chrome (card/label/link/sub) comes from ui/Stat.jsx; each card below
+// passes its own bespoke value markup as children (health ring, colored
+// thresholds, inline badges) since those aren't uniform enough for Stat's
+// built-in value/unit/delta rendering.
 
 function KPIGrid({ kpis, loading }) {
   const sent   = kpis?.period30dSentiment
@@ -71,11 +85,13 @@ function KPIGrid({ kpis, loading }) {
 
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-      <KPICard label="Health Score">
-        <HealthRing score={health?.score} grade={health?.grade} size={68} />
-      </KPICard>
+      <Stat label="Health Score">
+        <ExplainableScore label="Health Score" score={health?.score} explanation={explainHealthScore(health)}>
+          <HealthRing score={health?.score} grade={health?.grade} size={68} />
+        </ExplainableScore>
+      </Stat>
 
-      <KPICard label="Avg Rating (30d)" sub={delta !== 0 ? `${delta >= 0 ? '+' : ''}${delta} vs prior period` : 'Stable'}>
+      <Stat label="Avg Rating (30d)" sub={delta !== 0 ? `${delta >= 0 ? '+' : ''}${delta} vs prior period` : 'Stable'}>
         <div className="flex items-baseline gap-1">
           <span className="text-3xl font-black tracking-tight" style={{ color: 'var(--color-text-1)', fontWeight: 800 }}>
             {kpis?.avgRating30d?.toFixed(2) ?? '—'}
@@ -87,23 +103,23 @@ function KPIGrid({ kpis, loading }) {
             {delta > 0 ? '↑' : '↓'} {Math.abs(delta)}
           </span>
         )}
-      </KPICard>
+      </Stat>
 
-      <KPICard label="Positive Sentiment" sub={sent ? `${sent.positiveN} of ${sent.n} reviews` : ''}>
+      <Stat label="Positive Sentiment" sub={sent ? `${sent.positiveN} of ${sent.n} reviews` : ''}>
         <span className="text-3xl font-black tracking-tight"
               style={{ color: (sent?.positive ?? 0) >= 75 ? 'var(--color-success)' : 'var(--color-text-1)', fontWeight: 800 }}>
           {sent ? `${sent.positive.toFixed(0)}%` : '—'}
         </span>
-      </KPICard>
+      </Stat>
 
-      <KPICard label="Reviews (30d)" sub={`${kpis?.totalReviews?.toLocaleString() ?? '—'} lifetime`}>
+      <Stat label="Reviews (30d)" sub={`${kpis?.totalReviews?.toLocaleString() ?? '—'} lifetime`}>
         <span className="text-3xl font-black tracking-tight" style={{ color: 'var(--color-text-1)', fontWeight: 800 }}>
           {sent?.n?.toLocaleString() ?? '—'}
         </span>
-      </KPICard>
+      </Stat>
 
-      <KPICard label="Needs Response" link="/actions"
-               sub="unanswered ≤2★ reviews">
+      <Stat label="Needs Response" link="/actions"
+            sub="unanswered ≤2★ reviews">
         <div className="flex items-baseline gap-1.5">
           <span className="text-3xl font-black tracking-tight"
                 style={{ color: (kpis?.unansweredCount ?? 0) > 5 ? 'var(--color-danger)' : 'var(--color-text-1)', fontWeight: 800 }}>
@@ -113,7 +129,7 @@ function KPIGrid({ kpis, loading }) {
             <span className="badge badge-danger">urgent</span>
           )}
         </div>
-      </KPICard>
+      </Stat>
     </div>
   )
 }
@@ -296,12 +312,14 @@ function LocationLeaderboard({ stats, loading }) {
               </div>
             </div>
             {health?.grade && (
-              <Badge
-                variant={health.grade === 'A' ? 'success' : health.grade === 'B' ? 'info' : health.grade === 'C' ? 'warning' : 'danger'}
-                className="flex-shrink-0"
-              >
-                {health.grade}
-              </Badge>
+              <ExplainableScore label={`${loc.name} Health Score`} score={health.score} explanation={explainHealthScore(health)}>
+                <Badge
+                  variant={health.grade === 'A' ? 'success' : health.grade === 'B' ? 'info' : health.grade === 'C' ? 'warning' : 'danger'}
+                  className="flex-shrink-0"
+                >
+                  {health.grade}
+                </Badge>
+              </ExplainableScore>
             )}
           </div>
         )
@@ -332,7 +350,7 @@ function AlertBanner({ alerts }) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-export default function Overview({ filtered = [], prevFiltered = [] }) {
+export default function Overview({ filtered = [], prevFiltered = [], filters = {} }) {
   const { data: kpis,    isLoading: lKpis    } = useKPIs()
   const { data: summary, isLoading: lSummary  } = useCompanySummary()
   const { data: trend,   isLoading: lTrend    } = useMonthlyTrend()
@@ -342,17 +360,21 @@ export default function Overview({ filtered = [], prevFiltered = [] }) {
   const { data: actions, isLoading: lActions  } = useActionItems()
   const { data: cxIndex, isLoading: lCX       } = useCXIndex()
 
+  const periodLabel = filters?.start && filters?.end ? `${filters.start} — ${filters.end}` : null
+  const prevPeriodLabel = mirroredPrevRange(filters)
+  const brief = useExecutiveBrief(filtered, prevFiltered, periodLabel, prevPeriodLabel)
+
   return (
     <div className="space-y-6 max-w-[1400px]">
 
       <div>
-        <h2 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Command Center</h2>
+        <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Command Center</h1>
         <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
           Real-time reputation intelligence · Los Tres Amigos · 21 Locations
         </p>
       </div>
 
-      <AISummaryCard summary={summary} loading={lSummary} />
+      <AISummaryCard brief={brief} summary={summary} loading={lSummary} periodLabel={periodLabel} />
 
       <AlertBanner alerts={alerts} />
 

@@ -1,8 +1,11 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useScraperStatus } from '../hooks/useScraperStatus.js'
+import { useCompanySummary } from '../hooks/useIntelligence.js'
+import { useGoogleStatus } from '../hooks/useGoogleStatus.js'
 import Card from '../components/ui/Card.jsx'
+import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
-import DataValidation from './DataValidation.jsx'
+import DataValidation, { buildReport } from './DataValidation.jsx'
 
 const SUBTABS = [
   { id: 'runs',       label: 'Scrape Runs' },
@@ -21,6 +24,74 @@ function StatusBadge({ status }) {
     <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full uppercase tracking-wide ${style}`}>
       {status || 'unknown'}
     </span>
+  )
+}
+
+// ── Data Health summary header ──────────────────────────────────────────────
+// Composes signals that today are split across this page (run history),
+// DataValidation.jsx (duplicate/missing-data checks), and Alerts.jsx/Settings
+// (Google connection) into one glanceable freshness verdict.
+
+const CADENCE_HOURS = 6 // matches update-reviews.yml's cron
+
+function freshness(lastRunStartedAt) {
+  if (!lastRunStartedAt) return { label: 'Unknown', variant: 'neutral' }
+  const hours = (Date.now() - new Date(lastRunStartedAt).getTime()) / 3_600_000
+  if (hours <= CADENCE_HOURS * 1.5) return { label: 'Fresh', variant: 'success', hours }
+  if (hours <= CADENCE_HOURS * 4)   return { label: 'Stale', variant: 'warning', hours }
+  return { label: 'Critical', variant: 'danger', hours }
+}
+
+function HealthStat({ label, value, sub, variant }) {
+  const color = variant === 'danger' ? 'var(--color-danger)' : variant === 'warning' ? 'var(--color-grade-c)' : variant === 'success' ? 'var(--color-success)' : 'var(--color-text-1)'
+  return (
+    <div className="rounded-xl p-4" style={{ background: 'var(--color-surface-2)' }}>
+      <p className="text-[9px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>{label}</p>
+      <p className="text-lg font-bold mt-0.5" style={{ color }}>{value}</p>
+      {sub && <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-3)' }}>{sub}</p>}
+    </div>
+  )
+}
+
+function DataHealthHeader({ allReviews }) {
+  const { data: runs, isLoading } = useScraperStatus()
+  const { data: summary } = useCompanySummary()
+  const googleStatus = useGoogleStatus()
+
+  const validation = useMemo(() => buildReport(allReviews ?? []), [allReviews])
+
+  if (isLoading) return <Skeleton className="h-32 w-full rounded-2xl" />
+
+  const lastRun = runs?.[0]
+  const fresh = freshness(lastRun?.started_at)
+  const failedLocs = (lastRun?.locations || []).filter(l => l.status !== 'success').length
+
+  return (
+    <Card className="p-5">
+      <div className="flex items-center justify-between flex-wrap gap-2 mb-4">
+        <div className="flex items-center gap-2">
+          <Badge variant={fresh.variant}>{fresh.label}</Badge>
+          <p className="text-xs" style={{ color: 'var(--color-text-2)' }}>
+            {lastRun ? `Last sync ${new Date(lastRun.started_at).toLocaleString()}` : 'No sync recorded yet'}
+          </p>
+        </div>
+        <Badge variant={googleStatus.connected ? 'success' : 'neutral'}>
+          {googleStatus.loading ? 'Checking Google…' : googleStatus.connected ? 'Google Connected' : 'Google Not Connected'}
+        </Badge>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+        <HealthStat label="Pipeline Status" value={lastRun?.status ?? '—'}
+                    variant={lastRun?.status === 'success' ? 'success' : lastRun?.status === 'failed' ? 'danger' : 'warning'} />
+        <HealthStat label="Reviews This Run" value={lastRun?.new_reviews_count ?? 0} sub="new reviews found" />
+        <HealthStat label="Locations Updated" value={`${lastRun?.locations_succeeded ?? 0}/${lastRun?.locations_attempted ?? 0}`}
+                    variant={failedLocs > 0 ? 'warning' : 'success'} sub={failedLocs > 0 ? `${failedLocs} failed` : 'all succeeded'} />
+        <HealthStat label="Last AI Analysis" value={summary?.generatedAt ? new Date(summary.generatedAt).toLocaleDateString() : '—'} />
+        <HealthStat label="Duplicate Reviews" value={validation.duplicateCount}
+                    variant={validation.duplicateCount > 0 ? 'warning' : 'success'} />
+        <HealthStat label="Missing Data" value={validation.missingText} sub="reviews with no text"
+                    variant={validation.missingText > 0 ? 'warning' : 'success'} />
+      </div>
+    </Card>
   )
 }
 
@@ -108,8 +179,17 @@ export default function ScraperStatus({ allReviews }) {
 
   return (
     <div className="space-y-5">
+      <div>
+        <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Data Health</h1>
+        <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
+          Is the data trustworthy right now? Sync freshness, pipeline status, and data quality in one place.
+        </p>
+      </div>
+
+      <DataHealthHeader allReviews={allReviews} />
+
       <div className="border-b border-stone-200 dark:border-[var(--color-border)]">
-        <nav className="flex gap-1" role="tablist" aria-label="Scraper Status sections">
+        <nav className="flex gap-1" role="tablist" aria-label="Data Health sections">
           {SUBTABS.map(t => (
             <button
               key={t.id}

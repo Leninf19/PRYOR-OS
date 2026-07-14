@@ -1,4 +1,5 @@
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useToast } from '../components/ui/Toast.jsx'
 import Card from '../components/ui/Card.jsx'
@@ -6,34 +7,175 @@ import Badge from '../components/ui/Badge.jsx'
 import Button from '../components/ui/Button.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
 import { sentimentBucket } from '../utils/dataUtils.js'
+import { exportCSV } from '../utils/exportUtils.js'
 import { useResponseDrafts } from '../hooks/useIntelligence.js'
+import { useReviewWorkspace } from '../hooks/useReviewWorkspace.js'
 
 const PAGE_SIZE = 40
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Response workspace constants (ported from the former ActionItems.jsx) ────
 
-function exportCSV(rows) {
-  const headers = ['Date','Location','City','Stars','AI Sentiment','AI Priority','Reviewer','Review','Owner Response','Response Status','Review URL']
-  const escape  = v => `"${(v ?? '').toString().replace(/"/g, '""')}"`
-  const lines   = [
-    headers.join(','),
-    ...rows.map(r => [
-      r.review_date, r.location_name, r.city, r.star_rating,
-      sentimentBucket(r) ?? '', r.ai_priority ?? '',
-      r.reviewer_name, r.review_text, r.owner_response,
-      r.response_status || (r.owner_response ? 'responded' : 'unanswered'),
-      r.review_url,
-    ].map(escape).join(',')),
-  ]
-  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' })
-  const a = Object.assign(document.createElement('a'), {
-    href: URL.createObjectURL(blob),
-    download: `lta-reviews-${new Date().toISOString().slice(0, 10)}.csv`,
-  })
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
+const STATUS_META = {
+  needs_review:  { label: 'Needs Review',   variant: 'warning', done: false },
+  draft_ready:   { label: 'AI Draft Ready', variant: 'accent',  done: false },
+  edited:        { label: 'Edited',         variant: 'info',    done: false },
+  approved:      { label: 'Approved',       variant: 'success', done: false },
+  published:     { label: 'Published',      variant: 'success', done: true  },
+  failed:        { label: 'Failed',         variant: 'danger',  done: false },
+  taken_care_of: { label: 'Done',           variant: 'neutral', done: true  },
 }
+
+const TONES = [
+  { id: 'friendly',     label: 'Friendly'      },
+  { id: 'professional', label: 'Professional'  },
+  { id: 'short',        label: 'Short'         },
+  { id: 'warm',         label: 'Warm'          },
+  { id: 'apologetic',   label: 'Apologetic'    },
+  { id: 'personal',     label: 'Personal'      },
+  { id: 'seo',          label: 'SEO Boost'     },
+  { id: 'spanish',      label: 'En Español'    },
+]
+
+const FAIL_REASONS = {
+  not_connected:     'Google Business Profile is not connected. Complete the setup in Settings → Google Integration.',
+  missing_permission:'The connected Google account does not have Manager or Owner access to this location.',
+  api_error:         'Google API returned an error. Try again or contact support.',
+  review_gone:       'This review no longer exists on Google — it may have been removed.',
+  network_error:     'Network error. Check your connection and try again.',
+  location_mismatch: 'Could not match this review to a verified Google location.',
+  already_replied:   'This review already has an owner response on Google.',
+}
+
+function reviewId(r) {
+  return r.review_id || r.review_url || `${r.review_date}-${r.reviewer_name}`
+}
+
+function fmtWhen(iso) {
+  if (!iso) return ''
+  return new Date(iso).toLocaleString()
+}
+
+function priority(r) {
+  const stars   = Number(r.star_rating) || 3
+  const daysOld = (Date.now() - new Date((r.review_date || '2020-01-01') + 'T12:00:00').getTime()) / 86400000
+  return (6 - stars) * 10 + Math.min(daysOld, 60)
+}
+
+// Rating trend alerts, recomputed from whatever date range is currently
+// selected (via the global filter bar) instead of a fixed 30-vs-60-day window.
+function computeTrendAlerts(current, prior) {
+  const curByLoc = {}, priorByLoc = {}
+  current.forEach(r => {
+    if (r.star_rating == null) return
+    (curByLoc[r.location_name] ??= []).push(r.star_rating)
+  })
+  prior.forEach(r => {
+    if (r.star_rating == null) return
+    (priorByLoc[r.location_name] ??= []).push(r.star_rating)
+  })
+  const avg = arr => arr.reduce((s, n) => s + n, 0) / arr.length
+  const alerts = []
+  for (const name of Object.keys(curByLoc)) {
+    const cur = curByLoc[name], prev = priorByLoc[name]
+    if (!prev || cur.length < 5 || prev.length < 5) continue
+    const avgCur = avg(cur), avgPrev = avg(prev)
+    const delta = avgCur - avgPrev
+    if (Math.abs(delta) >= 0.2) {
+      alerts.push({
+        name, avgCur: +avgCur.toFixed(2), avgPrev: +avgPrev.toFixed(2),
+        delta: +delta.toFixed(2), curN: cur.length, prevN: prev.length,
+      })
+    }
+  }
+  return alerts.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+}
+
+async function callRewrite(payload) {
+  const res = await fetch('/api/rewrite', {
+    method:  'POST',
+    headers: { 'content-type': 'application/json' },
+    body:    JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const msg = await res.text().catch(() => 'Unknown error')
+    throw new Error(msg)
+  }
+  const data = await res.json()
+  if (!data.rewritten) throw new Error('Empty response from AI')
+  return data.rewritten
+}
+
+// ─── GBP connection banner ─────────────────────────────────────────────────────
+
+function GBPBanner() {
+  const [dismissed, setDismissed] = useState(
+    () => localStorage.getItem('gbp_banner_v1') === '1'
+  )
+  if (dismissed) return null
+
+  return (
+    <div className="rounded-xl p-4 flex items-start gap-3 border"
+         style={{ background: 'rgba(217,119,6,0.05)', borderColor: 'rgba(217,119,6,0.2)' }}>
+      <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5"
+           style={{ background: 'rgba(217,119,6,0.1)' }}>
+        <svg className="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor" style={{ color: 'var(--color-grade-c)' }}>
+          <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd"/>
+        </svg>
+      </div>
+      <div className="flex-1 min-w-0">
+        <p className="text-xs font-semibold" style={{ color: 'var(--color-text-1)' }}>
+          Google Business Profile not connected
+        </p>
+        <p className="text-xs mt-0.5 leading-relaxed" style={{ color: 'var(--color-text-2)' }}>
+          Use <strong>Copy Response</strong> + <strong>Open Google</strong> to paste manually.
+          For one-click publishing, see{' '}
+          <a href="/settings" className="underline" style={{ color: 'var(--color-accent)' }}>
+            Settings → Google Integration
+          </a>.
+        </p>
+      </div>
+      <button
+        onClick={() => { setDismissed(true); localStorage.setItem('gbp_banner_v1', '1') }}
+        className="text-[10px] flex-shrink-0 mt-0.5"
+        style={{ color: 'var(--color-text-3)' }}>
+        Dismiss
+      </button>
+    </div>
+  )
+}
+
+// ─── Workspace stats bar (shown when the "Needs Response" quick filter is active) ──
+
+function WorkspaceStats({ reviews, ws, draftByReviewId }) {
+  const total     = reviews.length
+  const withDraft = reviews.filter(r => draftByReviewId[r.review_id || r.review_url || '']).length
+  const urgent    = reviews.filter(r => (r.star_rating ?? 5) <= 1).length
+  const done      = reviews.filter(r => STATUS_META[ws[reviewId(r)]?.status]?.done).length
+
+  return (
+    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      {[
+        { label: 'Awaiting Response', value: total,     color: 'var(--color-danger)'  },
+        { label: 'AI Draft Ready',    value: withDraft, color: 'var(--color-accent)'  },
+        { label: '1★ Urgent',         value: urgent,    color: 'var(--color-grade-c)' },
+        { label: 'Completed',         value: done,      color: 'var(--color-success)' },
+      ].map(s => (
+        <div key={s.label} className="rounded-2xl p-4 border"
+             style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+          <p className="text-2xl font-black" style={{ color: s.value > 0 ? s.color : 'var(--color-text-1)', fontWeight: 800 }}>
+            {s.value}
+          </p>
+          <p className="text-[10px] font-bold uppercase tracking-wider mt-1"
+             style={{ color: 'var(--color-text-3)' }}>
+            {s.label}
+          </p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function StarBadge({ n }) {
   const cls = n >= 4 ? 'star-4' : n === 3 ? 'star-3' : 'star-1'
@@ -183,23 +325,27 @@ function FilterBar({
 
 // ─── Review row (click opens the side panel) ──────────────────────────────────
 
-function ReviewRow({ r, selected, onSelect }) {
+function ReviewRow({ r, selected, onSelect, wsStatus }) {
   const needsReply = !r.owner_response && (r.star_rating ?? 5) <= 2
   const tags = r.complaint_tags ?? []
+  const doneMeta = wsStatus ? STATUS_META[wsStatus] : null
 
   const statusBadge = r.owner_response
     ? <Badge variant="success">✓ Replied</Badge>
-    : needsReply
-      ? <Badge variant="danger">Needs reply</Badge>
-      : <Badge variant="neutral">No reply</Badge>
+    : doneMeta?.done
+      ? <Badge variant={doneMeta.variant}>{doneMeta.label}</Badge>
+      : needsReply
+        ? <Badge variant="danger">Needs reply</Badge>
+        : <Badge variant="neutral">No reply</Badge>
 
   return (
     <div
       className={`flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 px-4 py-3 border-b cursor-pointer transition-colors ${needsReply ? 'border-l-4' : ''}`}
       style={{
         borderColor: 'var(--color-border)',
-        borderLeftColor: needsReply ? 'var(--color-danger)' : undefined,
+        borderLeftColor: needsReply && !doneMeta?.done ? 'var(--color-danger)' : undefined,
         background: selected ? 'var(--color-surface-2)' : 'var(--color-surface)',
+        opacity: doneMeta?.done ? 0.6 : 1,
       }}
       onClick={onSelect}
       role="button"
@@ -251,9 +397,274 @@ function ReviewRow({ r, selected, onSelect }) {
   )
 }
 
+// ─── Response workspace section (inside the side panel) ───────────────────────
+
+function ResponseWorkspace({ r, draft, wsEntry, onUpdate }) {
+  const rid            = reviewId(r)
+  const initialStatus  = draft ? 'draft_ready' : 'needs_review'
+  const status         = wsEntry?.status ?? initialStatus
+  const statusMeta     = STATUS_META[status] ?? STATUS_META.needs_review
+  const isDone         = statusMeta.done
+  const failReason     = wsEntry?.failReason ?? null
+
+  const [localDraft, setLocalDraft] = useState(wsEntry?.editedDraft ?? draft?.draft ?? '')
+  const [activeTone, setActiveTone] = useState(null)
+  const [rewriting,  setRewriting]  = useState(false)
+  const [rewriteErr, setRewriteErr] = useState(null)
+  const [publishing, setPublishing] = useState(false)
+  const [copied,     setCopied]     = useState(false)
+
+  function onTextChange(val) {
+    setLocalDraft(val)
+    onUpdate(rid, { editedDraft: val, status: 'edited' })
+  }
+
+  function handleCopy() {
+    if (!localDraft) return
+    navigator.clipboard?.writeText(localDraft)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2500)
+  }
+
+  async function handleRewrite(tone) {
+    if (rewriting) return
+    setActiveTone(tone)
+    setRewriting(true)
+    setRewriteErr(null)
+    try {
+      const rewritten = await callRewrite({
+        tone,
+        reviewText:   r.review_text  || '',
+        currentDraft: localDraft,
+        reviewerName: r.reviewer_name || 'Guest',
+        location:     r.location_name || 'our restaurant',
+        stars:        r.star_rating   ?? 1,
+      })
+      setLocalDraft(rewritten)
+      onUpdate(rid, { editedDraft: rewritten, status: 'edited' })
+    } catch (e) {
+      setRewriteErr(
+        e.message?.includes('ANTHROPIC_API_KEY') || e.message?.includes('401')
+          ? 'AI rewrite unavailable — add ANTHROPIC_API_KEY to Vercel environment variables.'
+          : (e.message || 'Rewrite failed. Try again.')
+      )
+    } finally {
+      setRewriting(false)
+      setActiveTone(null)
+    }
+  }
+
+  async function handlePublish() {
+    if (!localDraft || publishing) return
+    setPublishing(true)
+    try {
+      const res = await fetch('/api/google/publish', {
+        method:  'POST',
+        headers: { 'content-type': 'application/json' },
+        body:    JSON.stringify({
+          locationName: r.location_name,
+          reviewerName: r.reviewer_name,
+          replyText:    localDraft,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok) {
+        onUpdate(rid, { status: 'published', publishedAt: new Date().toISOString(), failReason: null }, 'Published to Google')
+      } else {
+        onUpdate(rid, { status: 'failed', failReason: data.error || 'api_error' }, 'Publish failed')
+      }
+    } catch {
+      onUpdate(rid, { status: 'failed', failReason: 'network_error' }, 'Publish failed')
+    } finally {
+      setPublishing(false)
+    }
+  }
+
+  function handleMarkPublished() {
+    onUpdate(rid, { status: 'published', publishedAt: new Date().toISOString(), failReason: null }, 'Marked published')
+  }
+
+  function handleTakenCareOf() {
+    onUpdate(rid, { status: 'taken_care_of', publishedAt: new Date().toISOString(), failReason: null }, 'Marked done')
+  }
+
+  function handleUndo() {
+    onUpdate(rid, { status: initialStatus, failReason: null }, 'Reopened')
+  }
+
+  const charCount = localDraft.length
+  const charOver  = charCount > 4096
+  const link      = buildReviewLink(r)
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>
+          Response Workspace
+        </p>
+        <Badge variant={statusMeta.variant}>{statusMeta.label}</Badge>
+      </div>
+
+      {failReason && (
+        <div className="mb-3 px-3 py-2.5 rounded-lg text-xs leading-relaxed"
+             style={{ background: 'var(--color-danger-bg)', color: 'var(--color-danger)', border: '1px solid var(--color-danger-border)' }}>
+          <strong>Publish failed:</strong> {FAIL_REASONS[failReason] ?? failReason}
+        </div>
+      )}
+
+      {isDone ? (
+        <div className="p-3 rounded-xl text-xs flex items-center justify-between gap-3"
+             style={{ background: 'var(--color-surface-2)' }}>
+          <span style={{ color: 'var(--color-text-2)' }}>
+            Marked {status === 'published' ? 'published' : 'done'}
+            {wsEntry?.publishedAt && ` · ${fmtWhen(wsEntry.publishedAt)}`}
+          </span>
+          <button onClick={handleUndo} className="text-[10px] underline flex-shrink-0" style={{ color: 'var(--color-text-3)' }}>
+            Undo
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-[10px] font-bold uppercase tracking-[0.15em]" style={{ color: 'var(--color-text-3)' }}>
+                {draft ? '✦ AI Response Draft' : 'Your Response'}
+              </label>
+              <span className="text-[10px]" style={{ color: charOver ? 'var(--color-danger)' : 'var(--color-text-3)' }}>
+                {charCount} / 4096
+              </span>
+            </div>
+            <textarea
+              value={localDraft}
+              onChange={e => onTextChange(e.target.value)}
+              placeholder="Write a response to this review…"
+              rows={4}
+              className="w-full rounded-xl px-3 py-2.5 text-xs resize-y focus:outline-none transition-colors"
+              style={{
+                background: 'var(--ai-draft-bg)', color: 'var(--ai-draft-text)',
+                border: `1px solid ${charOver ? 'var(--color-danger)' : 'var(--ai-draft-border)'}`,
+                lineHeight: 1.6, fontFamily: 'inherit', minHeight: 84,
+              }}
+            />
+          </div>
+
+          <div>
+            <p className="text-[10px] font-bold uppercase tracking-[0.15em] mb-1.5" style={{ color: 'var(--color-text-3)' }}>
+              AI Rewrite Tone
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {TONES.map(t => {
+                const isActive = activeTone === t.id
+                return (
+                  <button key={t.id} disabled={rewriting} onClick={() => handleRewrite(t.id)}
+                          className="px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-all"
+                          style={isActive
+                            ? { background: 'var(--color-accent)', color: 'white', borderColor: 'var(--color-accent)', opacity: 0.85 }
+                            : { background: 'var(--color-surface-2)', color: 'var(--color-text-2)', borderColor: 'var(--color-border)', opacity: rewriting ? 0.5 : 1 }}>
+                    {isActive && rewriting ? '…' : t.label}
+                  </button>
+                )
+              })}
+            </div>
+            {rewriteErr && <p className="text-xs mt-2" style={{ color: 'var(--color-danger)' }}>{rewriteErr}</p>}
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap pt-1">
+            <Button variant="primary" onClick={handlePublish} disabled={!localDraft || publishing}>
+              {publishing ? 'Publishing…' : 'Publish to Google'}
+            </Button>
+            <Button variant={copied ? 'accent' : 'secondary'} onClick={handleCopy} disabled={!localDraft}>
+              {copied ? '✓ Copied!' : 'Copy Response'}
+            </Button>
+            <a href={link.href} target="_blank" rel="noopener noreferrer">
+              <Button variant="secondary">Open Google ↗</Button>
+            </a>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button variant="ghost" onClick={handleMarkPublished}>Mark Published</Button>
+            <Button variant="ghost" onClick={handleTakenCareOf}>Already Done</Button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function NotesAndAssignment({ r, wsEntry, onUpdate }) {
+  const rid = reviewId(r)
+  const [notes, setNotes] = useState(wsEntry?.notes ?? '')
+  const [assignedTo, setAssignedTo] = useState(wsEntry?.assignedTo ?? '')
+  const savedNotesRef = useRef(wsEntry?.notes ?? '')
+  const savedAssignedRef = useRef(wsEntry?.assignedTo ?? '')
+
+  function handleNotesBlur() {
+    onUpdate(rid, { notes }, notes !== savedNotesRef.current ? 'Internal note updated' : undefined)
+    savedNotesRef.current = notes
+  }
+
+  function handleAssignedBlur() {
+    onUpdate(rid, { assignedTo: assignedTo || null },
+      assignedTo !== savedAssignedRef.current ? (assignedTo ? `Assigned to ${assignedTo}` : 'Unassigned') : undefined)
+    savedAssignedRef.current = assignedTo
+  }
+
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+      <div>
+        <label className="text-[10px] font-bold uppercase tracking-wider mb-1.5 block" style={{ color: 'var(--color-text-3)' }}>
+          Internal Notes
+        </label>
+        <textarea
+          value={notes}
+          onChange={e => { setNotes(e.target.value); onUpdate(rid, { notes: e.target.value }) }}
+          onBlur={handleNotesBlur}
+          placeholder="Not visible to the customer…"
+          rows={2}
+          className="w-full rounded-lg px-2.5 py-2 text-xs resize-y focus:outline-none"
+          style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
+        />
+      </div>
+      <div>
+        <label className="text-[10px] font-bold uppercase tracking-wider mb-1.5 block" style={{ color: 'var(--color-text-3)' }}>
+          Assigned To
+        </label>
+        <input
+          type="text"
+          value={assignedTo}
+          onChange={e => setAssignedTo(e.target.value)}
+          onBlur={handleAssignedBlur}
+          placeholder="Manager or team member…"
+          className="w-full rounded-lg px-2.5 py-2 text-xs focus:outline-none"
+          style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
+        />
+      </div>
+    </div>
+  )
+}
+
+function ResponseHistory({ history }) {
+  if (!history?.length) return null
+  const sorted = [...history].reverse()
+  return (
+    <details>
+      <summary className="text-[10px] font-bold uppercase tracking-wider cursor-pointer" style={{ color: 'var(--color-text-3)' }}>
+        Response History ({history.length})
+      </summary>
+      <ul className="mt-2 space-y-1.5">
+        {sorted.map((h, i) => (
+          <li key={i} className="text-xs flex items-baseline gap-2">
+            <span style={{ color: 'var(--color-text-3)' }}>{fmtWhen(h.at)}</span>
+            <span style={{ color: 'var(--color-text-1)' }}>{h.action}</span>
+          </li>
+        ))}
+      </ul>
+    </details>
+  )
+}
+
 // ─── Side panel ────────────────────────────────────────────────────────────────
 
-function ReviewDetailPanel({ r, draft, allReviews, onClose }) {
+function ReviewDetailPanel({ r, draft, allReviews, onClose, wsEntry, onUpdate }) {
   const link = buildReviewLink(r)
   const sentiment = sentimentBucket(r)
   const sentMeta = SENTIMENT_META[sentiment]
@@ -279,7 +690,7 @@ function ReviewDetailPanel({ r, draft, allReviews, onClose }) {
         aria-hidden="true"
       />
       <motion.aside
-        className="fixed inset-y-0 right-0 z-50 flex flex-col w-full sm:w-[440px] overflow-y-auto"
+        className="fixed inset-y-0 right-0 z-50 flex flex-col w-full sm:w-[460px] overflow-y-auto"
         style={{ background: 'var(--color-surface)', borderLeft: '1px solid var(--color-border)', boxShadow: 'var(--shadow-xl)' }}
         initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }}
         transition={{ type: 'spring', damping: 30, stiffness: 320 }}
@@ -341,8 +752,8 @@ function ReviewDetailPanel({ r, draft, allReviews, onClose }) {
             {reviewLength(r.review_text) && ` · ${(r.review_text || '').trim().length} characters`}
           </p>
 
-          {/* Owner response */}
-          {r.owner_response && (
+          {/* Owner response (already replied on Google) */}
+          {r.owner_response ? (
             <div>
               <p className="text-[10px] font-bold uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-3)' }}>
                 Owner Response
@@ -352,24 +763,19 @@ function ReviewDetailPanel({ r, draft, allReviews, onClose }) {
                 {r.owner_response}
               </div>
             </div>
-          )}
-
-          {/* Suggested reply */}
-          {draft && !r.owner_response && (
-            <div>
-              <p className="text-[10px] font-bold uppercase tracking-wider mb-1.5 ai-label">✦ Suggested Reply</p>
-              <div className="p-3 rounded-xl text-xs leading-relaxed"
-                   style={{ background: 'var(--ai-draft-bg)', color: 'var(--ai-draft-text)', border: '1px solid var(--ai-draft-border)' }}>
-                {draft.draft}
-              </div>
-              <button
-                onClick={() => navigator.clipboard?.writeText(draft.draft)}
-                className="badge badge-neutral hover:opacity-80 transition-opacity cursor-pointer mt-2"
-              >
-                Copy suggested reply
-              </button>
+          ) : (
+            /* Not yet replied -- full response workspace (draft/edit/rewrite/publish) */
+            <div className="pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>
+              <ResponseWorkspace r={r} draft={draft} wsEntry={wsEntry} onUpdate={onUpdate} />
             </div>
           )}
+
+          {/* Internal notes + assignment -- available regardless of reply status */}
+          <div className="pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>
+            <NotesAndAssignment r={r} wsEntry={wsEntry} onUpdate={onUpdate} />
+          </div>
+
+          <ResponseHistory history={wsEntry?.history} />
 
           {/* Similar reviews */}
           {similar.length > 0 && (
@@ -391,10 +797,12 @@ function ReviewDetailPanel({ r, draft, allReviews, onClose }) {
             </div>
           )}
 
-          <a href={link.href} target="_blank" rel="noopener noreferrer"
-             className="badge badge-accent hover:opacity-80 transition-opacity inline-block">
-            {link.label}
-          </a>
+          {!r.owner_response && (
+            <a href={link.href} target="_blank" rel="noopener noreferrer"
+               className="badge badge-accent hover:opacity-80 transition-opacity inline-block">
+              {link.label}
+            </a>
+          )}
         </div>
       </motion.aside>
     </>
@@ -421,9 +829,11 @@ function Th({ label, sortKey, active, dir, onSort, className = '' }) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-export default function ReviewExplorer({ allReviews = [], filtered = [] }) {
+export default function ReviewExplorer({ allReviews = [], filtered = [], prevFiltered = [] }) {
   const showToast = useToast()
   const { data: drafts } = useResponseDrafts()
+  const { data: ws, setRecord } = useReviewWorkspace()
+  const [searchParams, setSearchParams] = useSearchParams()
 
   const [sortKey, setSortKey]     = useState('review_date')
   const [sortDir, setSortDir]     = useState('desc')
@@ -435,13 +845,24 @@ export default function ReviewExplorer({ allReviews = [], filtered = [] }) {
   const [locFilter, setLocFilter] = useState('')
   const [page,    setPage]        = useState(0)
   const [selectedKey, setSelectedKey] = useState(null)
+  const [needsResponseOnly, setNeedsResponseOnly] = useState(() => searchParams.get('filter') === 'needs-response')
 
   const resetPage = useCallback(() => setPage(0), [])
 
+  function toggleNeedsResponse() {
+    const next = !needsResponseOnly
+    setNeedsResponseOnly(next)
+    setSearchParams(next ? { filter: 'needs-response' } : {}, { replace: true })
+    resetPage()
+  }
+
   const locations = useMemo(() => [...new Set(filtered.map(r => r.location_name).filter(Boolean))].sort(), [filtered])
+
+  const trendAlerts = useMemo(() => computeTrendAlerts(filtered, prevFiltered), [filtered, prevFiltered])
 
   const processed = useMemo(() => {
     let rows = filtered
+    if (needsResponseOnly) rows = rows.filter(r => (Number(r.star_rating) || 5) <= 2 && !(r.owner_response || '').trim())
     if (noReply)   rows = rows.filter(r => !r.owner_response)
     if (stars)     rows = rows.filter(r => r.star_rating === Number(stars))
     if (locFilter) rows = rows.filter(r => r.location_name === locFilter)
@@ -455,6 +876,7 @@ export default function ReviewExplorer({ allReviews = [], filtered = [] }) {
         (r.location_name || '').toLowerCase().includes(kw)
       )
     }
+    if (needsResponseOnly) return [...rows].sort((a, b) => priority(b) - priority(a))
     return [...rows].sort((a, b) => {
       let av = a[sortKey] ?? '', bv = b[sortKey] ?? ''
       if (typeof av === 'string') { av = av.toLowerCase(); bv = bv.toLowerCase() }
@@ -462,13 +884,14 @@ export default function ReviewExplorer({ allReviews = [], filtered = [] }) {
       if (av > bv) return sortDir === 'asc' ?  1 : -1
       return 0
     })
-  }, [filtered, noReply, stars, locFilter, sentiment, length, keyword, sortKey, sortDir])
+  }, [filtered, needsResponseOnly, noReply, stars, locFilter, sentiment, length, keyword, sortKey, sortDir])
 
   const totalPages = Math.max(1, Math.ceil(processed.length / PAGE_SIZE))
   const safePage   = Math.min(page, totalPages - 1)
   const visible    = processed.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE)
 
   function toggleSort(key) {
+    if (needsResponseOnly) return // sorted by priority while this quick filter is active
     if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
     else { setSortKey(key); setSortDir('desc') }
     resetPage()
@@ -489,15 +912,46 @@ export default function ReviewExplorer({ allReviews = [], filtered = [] }) {
     [visible, selectedKey]
   )
   const selectedDraft = selected ? draftByReviewId[selected.review_id || selected.review_url || ''] : null
+  const selectedWsEntry = selected ? ws[reviewId(selected)] : null
+
+  function handleExportCSV() {
+    const headers = ['Date','Location','City','Stars','AI Sentiment','AI Priority','Reviewer','Review','Owner Response','Response Status','Review URL']
+    const rows = processed.map(r => [
+      r.review_date, r.location_name, r.city, r.star_rating,
+      sentimentBucket(r) ?? '', r.ai_priority ?? '',
+      r.reviewer_name, r.review_text, r.owner_response,
+      r.response_status || (r.owner_response ? 'responded' : 'unanswered'),
+      r.review_url,
+    ])
+    exportCSV(`lta-reviews-${new Date().toISOString().slice(0, 10)}`, headers, rows)
+    showToast(`Exported ${processed.length.toLocaleString()} reviews`)
+  }
 
   return (
     <div className="space-y-4 max-w-[1300px]">
       <div>
-        <h2 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Review Center</h2>
+        <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Customer Experience Center</h1>
         <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
-          Search, filter, and manage reviews across all locations
+          Search, filter, and respond to reviews across all locations — AI drafts, notes, assignments, and history in one place
         </p>
       </div>
+
+      {/* Needs Response quick filter */}
+      <button
+        onClick={toggleNeedsResponse}
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors"
+        style={needsResponseOnly
+          ? { background: 'var(--color-danger)', color: 'white', borderColor: 'var(--color-danger)' }
+          : { background: 'var(--color-surface)', color: 'var(--color-text-2)', borderColor: 'var(--color-border)' }}>
+        {needsResponseOnly ? '✓ Needs Response only' : 'Show only reviews needing a response'}
+      </button>
+
+      {needsResponseOnly && (
+        <>
+          <GBPBanner />
+          <WorkspaceStats reviews={processed} ws={ws} draftByReviewId={draftByReviewId} />
+        </>
+      )}
 
       <Card className="p-4">
         <FilterBar
@@ -513,14 +967,15 @@ export default function ReviewExplorer({ allReviews = [], filtered = [] }) {
 
       {/* Action bar */}
       <div className="flex items-center gap-2 flex-wrap">
-        <Button variant="secondary" onClick={() => { exportCSV(processed); showToast(`Exported ${processed.length.toLocaleString()} reviews`) }}>
+        <Button variant="secondary" onClick={handleExportCSV}>
           <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 20 20" stroke="currentColor" strokeWidth={1.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a1 1 0 001 1h10a1 1 0 001-1v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
           </svg>
           Export CSV
         </Button>
         <span className="text-xs" style={{ color: 'var(--color-text-3)' }}>
-          {processed.length.toLocaleString()} reviews · sorted by {sortKey.replace('_', ' ')} {sortDir === 'asc' ? '↑' : '↓'}
+          {processed.length.toLocaleString()} reviews
+          {needsResponseOnly ? ' · sorted by priority' : ` · sorted by ${sortKey.replace('_', ' ')} ${sortDir === 'asc' ? '↑' : '↓'}`}
         </span>
       </div>
 
@@ -556,6 +1011,7 @@ export default function ReviewExplorer({ allReviews = [], filtered = [] }) {
                 r={r}
                 selected={selectedKey === key}
                 onSelect={() => setSelectedKey(key)}
+                wsStatus={ws[reviewId(r)]?.status}
               />
             )
           })}
@@ -578,6 +1034,36 @@ export default function ReviewExplorer({ allReviews = [], filtered = [] }) {
         )}
       </div>
 
+      {/* Trend alerts -- scoped to the selected date range vs. an equal-length
+          prior period, shown alongside the Needs Response worklist. */}
+      {needsResponseOnly && trendAlerts.length > 0 && (
+        <div className="space-y-3 pt-2">
+          <h3 className="text-label" style={{ color: 'var(--color-text-2)' }}>
+            Rating Trend Alerts <span style={{ color: 'var(--color-text-3)', fontWeight: 400 }}>· selected period vs. prior</span>
+          </h3>
+          {trendAlerts.map((t, i) => (
+            <div key={i} className="flex items-start gap-3 p-4 rounded-xl border"
+                 style={{
+                   background:  t.delta > 0 ? 'var(--color-success-bg)' : 'var(--color-warning-bg)',
+                   borderColor: t.delta > 0 ? 'var(--color-success-border)' : 'var(--color-accent-md)',
+                 }}>
+              <span className="text-xl flex-shrink-0">{t.delta > 0 ? '↑' : '↓'}</span>
+              <div className="min-w-0">
+                <p className="text-sm font-semibold" style={{ color: 'var(--color-text-1)' }}>{t.name}</p>
+                <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-2)' }}>
+                  {t.delta > 0
+                    ? `Rating improved: ${t.avgPrev}★ → ${t.avgCur}★ (+${t.delta.toFixed(2)})`
+                    : `Rating declined: ${t.avgPrev}★ → ${t.avgCur}★ (${t.delta.toFixed(2)})`}
+                </p>
+              </div>
+              <Badge variant={t.delta > 0 ? 'success' : 'warning'} className="flex-shrink-0">
+                {t.delta > 0 ? '+' : ''}{t.delta.toFixed(2)}★
+              </Badge>
+            </div>
+          ))}
+        </div>
+      )}
+
       <AnimatePresence>
         {selected && (
           <ReviewDetailPanel
@@ -585,6 +1071,8 @@ export default function ReviewExplorer({ allReviews = [], filtered = [] }) {
             draft={selectedDraft}
             allReviews={filtered}
             onClose={() => setSelectedKey(null)}
+            wsEntry={selectedWsEntry}
+            onUpdate={setRecord}
           />
         )}
       </AnimatePresence>

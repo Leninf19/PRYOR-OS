@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
@@ -6,6 +6,7 @@ import {
   usePredictiveAlerts, useActionItems, useScraperStatusData,
   useCompetitorIntel,
 } from '../hooks/useIntelligence.js'
+import { useGoogleStatus } from '../hooks/useGoogleStatus.js'
 
 // ── Alert assembly ────────────────────────────────────────────────────────────
 
@@ -224,17 +225,6 @@ const TABS = [
 ]
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-
-function useGoogleStatus() {
-  const [status, setStatus] = useState({ loading: true })
-  useEffect(() => {
-    fetch('/api/google/status')
-      .then(r => r.json())
-      .then(d => setStatus({ loading: false, ...d }))
-      .catch(() => setStatus({ loading: false, connected: false, state: 'error' }))
-  }, [])
-  return status
-}
 
 export default function Alerts() {
   const { data: predictive, isLoading: loadP }  = usePredictiveAlerts()

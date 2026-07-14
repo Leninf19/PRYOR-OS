@@ -5,7 +5,7 @@ function daysBetween(a, b) {
   return Math.round((new Date(b) - new Date(a)) / 86400000)
 }
 
-function buildReport(allReviews) {
+export function buildReport(allReviews) {
   const locations = getUniqueLocations(allReviews)
   const maxDate = allReviews.reduce((m, r) => (r.review_date > m ? r.review_date : m), '')
 

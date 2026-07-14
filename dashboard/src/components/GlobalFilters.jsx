@@ -45,7 +45,7 @@ function Pills({ options, selected, onChange, colorActive = 'bg-amber-500 text-w
         onClick={() => onChange([])}
         className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
           all
-            ? 'bg-stone-800 text-white border-stone-800 dark:bg-[var(--color-accent)] dark:text-[#14100D] dark:border-[var(--color-accent)]'
+            ? 'bg-stone-800 text-white border-stone-800 dark:bg-[var(--color-accent)] dark:text-[var(--color-bg)] dark:border-[var(--color-accent)]'
             : 'bg-transparent text-stone-500 border-stone-200 hover:border-stone-400 hover:text-stone-700 dark:text-[var(--color-text-3)] dark:border-[var(--color-border)] dark:hover:border-[var(--color-border-2)] dark:hover:text-[var(--color-text-1)]'
         }`}
       >
@@ -79,7 +79,7 @@ function StarPills({ selected, onChange }) {
         onClick={() => onChange([])}
         className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
           all
-            ? 'bg-stone-800 text-white border-stone-800 dark:bg-[var(--color-accent)] dark:text-[#14100D] dark:border-[var(--color-accent)]'
+            ? 'bg-stone-800 text-white border-stone-800 dark:bg-[var(--color-accent)] dark:text-[var(--color-bg)] dark:border-[var(--color-accent)]'
             : 'bg-transparent text-stone-500 border-stone-200 hover:border-stone-400 dark:text-[var(--color-text-3)] dark:border-[var(--color-border)] dark:hover:border-[var(--color-border-2)]'
         }`}
       >All</button>
@@ -147,7 +147,7 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
               onClick={() => applyPreset(days)}
               className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                 current === label
-                  ? 'bg-stone-900 text-amber-400 shadow-sm dark:bg-[var(--color-accent)] dark:text-[#14100D]'
+                  ? 'bg-stone-900 text-amber-400 shadow-sm dark:bg-[var(--color-accent)] dark:text-[var(--color-bg)]'
                   : 'text-stone-500 hover:bg-stone-100 hover:text-stone-800 dark:text-[var(--color-text-3)] dark:hover:bg-[var(--color-surface-2)] dark:hover:text-[var(--color-text-1)]'
               }`}
             >

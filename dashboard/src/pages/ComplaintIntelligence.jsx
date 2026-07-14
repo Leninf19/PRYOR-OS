@@ -166,7 +166,7 @@ export default function ComplaintIntelligence() {
     <div className="space-y-6 max-w-[900px]">
 
       <div>
-        <h2 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Complaint Intelligence</h2>
+        <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Complaint Intelligence</h1>
         <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
           Operational issue classification across all 21 locations · last 30 days vs prior period
         </p>

@@ -6,7 +6,7 @@ import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
 import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
-import { computePeriodMetrics, getCategoryChanges, getLocationMomentum } from '../utils/dataUtils.js'
+import { computePeriodMetrics, getCategoryChanges, getLocationMomentum, mirroredPrevRange } from '../utils/dataUtils.js'
 import { COMPLAINT_CATEGORIES, PRAISE_CATEGORIES } from '../utils/textAnalysis.js'
 import { useExecutiveBrief } from '../hooks/useExecutiveBrief.js'
 
@@ -22,16 +22,6 @@ function buildLabelMap() {
 }
 const LABELS = buildLabelMap()
 function labelFor(id) { return LABELS[id] ?? humanize(id) }
-
-function mirroredPrevRange(filters) {
-  if (!filters?.start || !filters?.end) return null
-  const startMs = new Date(filters.start).getTime()
-  const endMs   = new Date(filters.end).getTime()
-  const lenMs   = endMs - startMs
-  const prevStart = new Date(startMs - lenMs - 1).toISOString().slice(0, 10)
-  const prevEnd   = new Date(startMs - 1).toISOString().slice(0, 10)
-  return `${prevStart} — ${prevEnd}`
-}
 
 function CategoryPill({ item, variant }) {
   return (

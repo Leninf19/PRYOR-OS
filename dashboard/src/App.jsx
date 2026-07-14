@@ -1,35 +1,48 @@
-import { useMemo, useEffect, useState } from 'react'
+import { useMemo, useEffect, useState, lazy, Suspense } from 'react'
 import { Routes, Route, Navigate, Outlet, useLocation, useOutletContext } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import Layout               from './components/Layout.jsx'
 import GlobalFilters        from './components/GlobalFilters.jsx'
-import Overview             from './pages/Overview.jsx'
-import LocationDetail       from './pages/LocationDetail.jsx'
-import ReviewExplorer       from './pages/ReviewExplorer.jsx'
-import TrendsAnalytics      from './pages/TrendsAnalytics.jsx'
-import ActionItems, { useUnansweredCount } from './pages/ActionItems.jsx'
-import ScraperStatus        from './pages/ScraperStatus.jsx'
-import Reports              from './pages/Reports.jsx'
-import ComplaintIntelligence   from './pages/ComplaintIntelligence.jsx'
-import DepartmentPerformance   from './pages/DepartmentPerformance.jsx'
-import ActionCenter            from './pages/ActionCenter.jsx'
-import OperationsImpact         from './pages/OperationsImpact.jsx'
-import WhatChanged              from './pages/WhatChanged.jsx'
-import ExecutiveDashboard       from './pages/ExecutiveDashboard.jsx'
-import CompetitorIntelligence  from './pages/CompetitorIntelligence.jsx'
-import Alerts               from './pages/Alerts.jsx'
-import AIAdvisor            from './pages/AIAdvisor.jsx'
-import MarketingIntelligence   from './pages/MarketingIntelligence.jsx'
-import EmployeeIntelligence    from './pages/EmployeeIntelligence.jsx'
-import ExecutiveReports     from './pages/ExecutiveReports.jsx'
-import Settings             from './pages/Settings.jsx'
+import Skeleton              from './components/ui/Skeleton.jsx'
 import { useReviewsData }    from './hooks/useReviewsData.js'
 import { useGlobalPrefetch } from './hooks/useIntelligence.js'
+import { useUnansweredCount } from './hooks/useReviewWorkspace.js'
 import { filterReviews, getDefaultDateRange } from './utils/dataUtils.js'
+
+// Route-level code-splitting -- each page ships in its own chunk, fetched
+// only when its route is visited, instead of one ~480KB bundle up front.
+const Overview               = lazy(() => import('./pages/Overview.jsx'))
+const LocationDetail         = lazy(() => import('./pages/LocationDetail.jsx'))
+const ReviewExplorer         = lazy(() => import('./pages/ReviewExplorer.jsx'))
+const TrendsAnalytics        = lazy(() => import('./pages/TrendsAnalytics.jsx'))
+const ScraperStatus          = lazy(() => import('./pages/ScraperStatus.jsx'))
+const ComplaintIntelligence  = lazy(() => import('./pages/ComplaintIntelligence.jsx'))
+const DepartmentPerformance  = lazy(() => import('./pages/DepartmentPerformance.jsx'))
+const ActionCenter           = lazy(() => import('./pages/ActionCenter.jsx'))
+const OperationsImpact       = lazy(() => import('./pages/OperationsImpact.jsx'))
+const WhatChanged            = lazy(() => import('./pages/WhatChanged.jsx'))
+const ActivityTimeline       = lazy(() => import('./pages/ActivityTimeline.jsx'))
+const ExecutiveDashboard     = lazy(() => import('./pages/ExecutiveDashboard.jsx'))
+const CompetitorIntelligence = lazy(() => import('./pages/CompetitorIntelligence.jsx'))
+const Alerts                 = lazy(() => import('./pages/Alerts.jsx'))
+const MarketingIntelligence  = lazy(() => import('./pages/MarketingIntelligence.jsx'))
+const EmployeeIntelligence   = lazy(() => import('./pages/EmployeeIntelligence.jsx'))
+const ExecutiveReports       = lazy(() => import('./pages/ExecutiveReports.jsx'))
+const Settings                = lazy(() => import('./pages/Settings.jsx'))
+
+function RouteFallback() {
+  return (
+    <div className="space-y-4">
+      <Skeleton className="h-8 w-64" />
+      <Skeleton className="h-40 w-full rounded-2xl" />
+      <Skeleton className="h-40 w-full rounded-2xl" />
+    </div>
+  )
+}
 
 // Pages that don't use the global review filter bar
 const NO_FILTER_PATHS = [
-  '/scraper-status', '/reports', '/intelligence', '/department-performance', '/action-center',
+  '/scraper-status', '/intelligence', '/department-performance', '/action-center',
   '/operations-impact', '/executive-dashboard', '/competitive', '/alerts', '/marketing-intel',
   '/employee-intel', '/executive-reports', '/settings',
 ]
@@ -154,7 +167,9 @@ function RootLayout() {
           exit={{ opacity: 0 }}
           transition={{ duration: 0.14 }}
         >
-          <Outlet context={{ allReviews, filtered, prevFiltered, filters }} />
+          <Suspense fallback={<RouteFallback />}>
+            <Outlet context={{ allReviews, filtered, prevFiltered, filters }} />
+          </Suspense>
         </motion.div>
       </AnimatePresence>
     </Layout>
@@ -169,36 +184,36 @@ export default function App() {
         <Route path="overview"          element={<ROverview />} />
         <Route path="locations"         element={<RLocations />} />
         <Route path="explorer"          element={<RExplorer />} />
-        <Route path="actions"           element={<RActions />} />
         <Route path="intelligence"      element={<ComplaintIntelligence />} />
         <Route path="department-performance" element={<DepartmentPerformance />} />
         <Route path="action-center"     element={<ActionCenter />} />
         <Route path="operations-impact" element={<OperationsImpact />} />
         <Route path="what-changed"      element={<WhatChanged />} />
+        <Route path="activity"          element={<ActivityTimeline />} />
         <Route path="executive-dashboard" element={<ExecutiveDashboard />} />
         <Route path="competitive"       element={<CompetitorIntelligence />} />
         <Route path="marketing-intel"   element={<MarketingIntelligence />} />
         <Route path="employee-intel"    element={<EmployeeIntelligence />} />
-        <Route path="advisor"           element={<AIAdvisor />} />
         <Route path="trends"            element={<RTrends />} />
         <Route path="alerts"            element={<Alerts />} />
         <Route path="executive-reports" element={<ExecutiveReports />} />
-        <Route path="reports"           element={<Reports />} />
         <Route path="scraper-status"    element={<RScraper />} />
         <Route path="settings"          element={<Settings />} />
         {/* Legacy redirects */}
         <Route path="rankings"   element={<Navigate to="/trends"      replace />} />
         <Route path="insights"   element={<Navigate to="/intelligence" replace />} />
         <Route path="validation" element={<Navigate to="/scraper-status" replace />} />
+        <Route path="advisor"    element={<Navigate to="/overview"    replace />} />
+        <Route path="actions"    element={<Navigate to="/explorer?filter=needs-response" replace />} />
+        <Route path="reports"    element={<Navigate to="/executive-reports" replace />} />
         <Route path="*"          element={<Navigate to="/overview"    replace />} />
       </Route>
     </Routes>
   )
 }
 
-function ROverview()   { const { allReviews, filtered, prevFiltered } = useOutletContext(); return <Overview allReviews={allReviews} filtered={filtered} prevFiltered={prevFiltered} /> }
+function ROverview()   { const { allReviews, filtered, prevFiltered, filters } = useOutletContext(); return <Overview allReviews={allReviews} filtered={filtered} prevFiltered={prevFiltered} filters={filters} /> }
 function RLocations()  { const c = useOutletContext(); return <LocationDetail allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} filters={c.filters} /> }
-function RExplorer()   { const { allReviews, filtered } = useOutletContext(); return <ReviewExplorer allReviews={allReviews} filtered={filtered} /> }
+function RExplorer()   { const { allReviews, filtered, prevFiltered } = useOutletContext(); return <ReviewExplorer allReviews={allReviews} filtered={filtered} prevFiltered={prevFiltered} /> }
 function RTrends()     { const c = useOutletContext(); return <TrendsAnalytics allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} /> }
-function RActions()    { const { filtered, prevFiltered } = useOutletContext(); return <ActionItems filtered={filtered} prevFiltered={prevFiltered} /> }
 function RScraper()    { const { allReviews } = useOutletContext(); return <ScraperStatus allReviews={allReviews} /> }

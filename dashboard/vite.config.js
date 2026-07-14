@@ -6,7 +6,11 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
-    chunkSizeWarningLimit: 6000,
+    // Was 6000 (silencing the warning instead of addressing it). Now that
+    // pages are route-split (see App.jsx's React.lazy), the vendor chunk
+    // (react+react-dom+recharts, ~525KB) is the largest real chunk -- set
+    // just above it so a genuinely oversized future chunk still warns.
+    chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: {
         manualChunks: {

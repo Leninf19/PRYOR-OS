@@ -1,5 +1,6 @@
 import Card from './Card.jsx'
 import Skeleton from './Skeleton.jsx'
+import ExplainableScore from './ExplainableScore.jsx'
 
 const DIM_ICON = {
   'Food Quality': '🍽', 'Service': '🙋', 'Atmosphere': '✨', 'Cleanliness': '🧹',
@@ -38,29 +39,35 @@ export default function CXIndexGrid({ dimensions, loading, title = 'Customer Exp
       <div className="flex items-center justify-between mb-4">
         <p className="text-label" style={{ color: 'var(--color-text-2)' }}>{title}</p>
         {overall && (
-          <span className="text-2xl font-black" style={{ color: scoreColor(overall.score), fontWeight: 800 }}>
-            {overall.score ?? '—'} <span className="text-xs font-normal" style={{ color: 'var(--color-text-3)' }}>overall</span>
-          </span>
+          <ExplainableScore label="Overall Experience" score={overall.score} prevScore={overall.prevScore}
+                             trend={overall.trend} delta={overall.delta} explanation={overall.explanation}
+                             reviewCount={overall.mentionCount}>
+            <span className="text-2xl font-black" style={{ color: scoreColor(overall.score), fontWeight: 800 }}>
+              {overall.score ?? '—'} <span className="text-xs font-normal" style={{ color: 'var(--color-text-3)' }}>overall</span>
+            </span>
+          </ExplainableScore>
         )}
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-3">
         {rest.map(d => (
-          <div key={d.dimension} className="rounded-xl p-3 text-center" style={{ background: 'var(--color-surface-2)' }}
-               title={d.explanation}>
-            <p className="text-lg" aria-hidden="true">{DIM_ICON[d.dimension] ?? '📋'}</p>
-            <p className="text-xl font-black mt-0.5" style={{ color: scoreColor(d.score), fontWeight: 800 }}>
-              {d.score ?? '—'}
-            </p>
-            <p className="text-[9px] font-semibold uppercase tracking-wide mt-0.5" style={{ color: 'var(--color-text-3)' }}>
-              {d.dimension}
-            </p>
-            {d.trend !== 'stable' && d.delta != null && (
-              <p className="text-[9px] font-semibold mt-0.5"
-                 style={{ color: d.trend === 'up' ? 'var(--color-success)' : 'var(--color-danger)' }}>
-                {d.trend === 'up' ? '↑' : '↓'} {Math.abs(d.delta)}
+          <ExplainableScore key={d.dimension} label={d.dimension} score={d.score} prevScore={d.prevScore}
+                             trend={d.trend} delta={d.delta} explanation={d.explanation} reviewCount={d.mentionCount}>
+            <div className="rounded-xl p-3 text-center" style={{ background: 'var(--color-surface-2)' }}>
+              <p className="text-lg" aria-hidden="true">{DIM_ICON[d.dimension] ?? '📋'}</p>
+              <p className="text-xl font-black mt-0.5" style={{ color: scoreColor(d.score), fontWeight: 800 }}>
+                {d.score ?? '—'}
               </p>
-            )}
-          </div>
+              <p className="text-[9px] font-semibold uppercase tracking-wide mt-0.5" style={{ color: 'var(--color-text-3)' }}>
+                {d.dimension}
+              </p>
+              {d.trend !== 'stable' && d.delta != null && (
+                <p className="text-[9px] font-semibold mt-0.5"
+                   style={{ color: d.trend === 'up' ? 'var(--color-success)' : 'var(--color-danger)' }}>
+                  {d.trend === 'up' ? '↑' : '↓'} {Math.abs(d.delta)}
+                </p>
+              )}
+            </div>
+          </ExplainableScore>
         ))}
       </div>
     </Card>

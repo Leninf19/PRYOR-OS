@@ -10,7 +10,9 @@ import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
 import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
 import CXIndexGrid from '../components/ui/CXIndexGrid.jsx'
+import ExplainableScore from '../components/ui/ExplainableScore.jsx'
 import { useLocationStats, useLocationDetail, usePrefetchLocationDetails } from '../hooks/useIntelligence.js'
+import { explainHealthScore } from '../utils/dataUtils.js'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -264,7 +266,9 @@ function LocationDashboard({ loc, detail, loading, locationReviews = [], locatio
       {/* KPI strip */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <Card className="p-4 flex flex-col items-center text-center">
-          <HealthRing score={health?.score} grade={health?.grade} size={72} />
+          <ExplainableScore label={`${loc?.name ?? 'Location'} Health Score`} score={health?.score} explanation={explainHealthScore(health)}>
+            <HealthRing score={health?.score} grade={health?.grade} size={72} />
+          </ExplainableScore>
           <p className="text-[10px] font-bold uppercase tracking-wider mt-2"
              style={{ color: 'var(--color-text-3)' }}>
             Health Score
@@ -376,7 +380,7 @@ export default function LocationDetail({ allReviews = [], filtered = [], prevFil
   return (
     <div className="space-y-6 max-w-[1100px]">
       <div>
-        <h2 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Location Intelligence</h2>
+        <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Location Intelligence</h1>
         <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
           Per-location health scores, predictions, staff recognition, and complaint analysis
         </p>

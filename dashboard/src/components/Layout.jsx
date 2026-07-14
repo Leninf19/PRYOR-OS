@@ -28,6 +28,7 @@ const I = {
   reports:     <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M6 2a2 2 0 00-2 2v12a2 2 0 002 2h8a2 2 0 002-2V7.414A2 2 0 0015.414 6L12 2.586A2 2 0 0010.586 2H6zm2 10a1 1 0 10-2 0v3a1 1 0 102 0v-3zm2-3a1 1 0 011 1v5a1 1 0 11-2 0v-5a1 1 0 011-1zm4-1a1 1 0 10-2 0v6a1 1 0 102 0V8z" clipRule="evenodd"/></svg>,
   scraper:     <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd"/></svg>,
   settings:    <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path d="M5 4a1 1 0 00-2 0v7.268a2 2 0 000 3.464V16a1 1 0 102 0v-1.268a2 2 0 000-3.464V4zM11 4a1 1 0 10-2 0v1.268a2 2 0 000 3.464V16a1 1 0 102 0V8.732a2 2 0 000-3.464V4zM16 3a1 1 0 011 1v7.268a2 2 0 010 3.464V16a1 1 0 11-2 0v-1.268a2 2 0 010-3.464V4a1 1 0 011-1z"/></svg>,
+  activity:    <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clipRule="evenodd"/></svg>,
 }
 
 // ── Navigation sections ───────────────────────────────────────────────────────
@@ -37,8 +38,8 @@ const NAV_SECTIONS = [
     label: 'Overview',
     items: [
       { id: 'overview',   path: '/overview',   label: 'Command Center', icon: I.overview   },
+      { id: 'activity',   path: '/activity',   label: 'Activity Timeline', icon: I.activity },
       { id: 'locations',  path: '/locations',  label: 'Locations',      icon: I.locations  },
-      { id: 'explorer',   path: '/explorer',   label: 'Reviews',        icon: I.reviews    },
     ],
   },
   {
@@ -49,13 +50,12 @@ const NAV_SECTIONS = [
       { id: 'competitive',     path: '/competitive',     label: 'Competitor Intel',  icon: I.competitive },
       { id: 'marketing-intel', path: '/marketing-intel', label: 'Marketing Intel',   icon: I.marketing   },
       { id: 'employee-intel',  path: '/employee-intel',  label: 'Employee Intel',    icon: I.employee    },
-      { id: 'advisor',         path: '/advisor',         label: 'AI Advisor',        icon: I.advisor     },
     ],
   },
   {
     label: 'Operations',
     items: [
-      { id: 'actions', path: '/actions', label: 'Response Center', icon: I.response, badge: 'unanswered' },
+      { id: 'explorer', path: '/explorer', label: 'Customer Experience Center', icon: I.response, badge: 'unanswered' },
       { id: 'action-center', path: '/action-center', label: 'Action Center', icon: I.actioncenter },
       { id: 'operations-impact', path: '/operations-impact', label: 'Operations Impact', icon: I.opsimpact },
       { id: 'what-changed', path: '/what-changed', label: 'What Changed?', icon: I.whatchanged },
@@ -68,13 +68,12 @@ const NAV_SECTIONS = [
     items: [
       { id: 'executive-dashboard', path: '/executive-dashboard', label: 'Executive Dashboard', icon: I.execdash },
       { id: 'executive-reports', path: '/executive-reports', label: 'Executive Reports', icon: I.execreports },
-      { id: 'reports',           path: '/reports',           label: 'Reports',           icon: I.reports     },
     ],
   },
   {
     label: 'System',
     items: [
-      { id: 'scraper',   path: '/scraper-status', label: 'Scraper Status', icon: I.scraper  },
+      { id: 'scraper',   path: '/scraper-status', label: 'Data Health', icon: I.scraper  },
       { id: 'settings',  path: '/settings',       label: 'Settings',       icon: I.settings },
     ],
   },

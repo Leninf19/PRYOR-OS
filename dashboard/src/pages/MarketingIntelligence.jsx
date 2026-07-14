@@ -2,6 +2,7 @@ import { useState } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import Tabs from '../components/ui/Tabs.jsx'
 import {
   useComplaintIntel, useCompetitorIntel, useMeta, useBestQuotes, useSeasonalTrends,
 } from '../hooks/useIntelligence.js'
@@ -225,17 +226,7 @@ export default function MarketingIntelligence() {
       )}
 
       {/* Tabs */}
-      <div className="flex gap-1 p-1 rounded-xl w-fit" style={{ background: 'var(--color-surface-2)' }}>
-        {TABS.map(t => (
-          <button key={t.id} onClick={() => setActiveTab(t.id)}
-                  className="px-4 py-2 text-sm font-medium rounded-lg transition-all"
-                  style={activeTab === t.id
-                    ? { background: 'var(--color-surface)', color: 'var(--color-text-1)', boxShadow: 'var(--shadow-sm)' }
-                    : { color: 'var(--color-text-2)' }}>
-            {t.label}
-          </button>
-        ))}
-      </div>
+      <Tabs tabs={TABS} value={activeTab} onChange={setActiveTab} wrap={false} />
 
       {/* Tab: What Customers Love */}
       {activeTab === 'insights' && (

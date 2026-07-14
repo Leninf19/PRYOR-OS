@@ -2,6 +2,7 @@ import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ExplainableScore from '../components/ui/ExplainableScore.jsx'
 import { useDepartmentPerformance } from '../hooks/useIntelligence.js'
 
 const DEPT_ICON = {
@@ -32,12 +33,18 @@ function DepartmentCard({ d }) {
         </Badge>
       </div>
 
-      <div className="flex items-baseline gap-2">
-        <span className="text-3xl font-black" style={{ color: scoreColor(d.score), fontWeight: 800 }}>
-          {d.score != null ? d.score : '—'}
-        </span>
-        <span className="text-xs" style={{ color: 'var(--color-text-3)' }}>/ 100</span>
-      </div>
+      <ExplainableScore
+        label={`${d.department} Score`} score={d.score} prevScore={d.prevScore} trend={d.trend} delta={d.delta}
+        reviewCount={d.positiveMentions + d.negativeMentions}
+        explanation={`Net-positive share of ${d.department.toLowerCase()}-related mentions: ${d.positiveMentions} positive vs. ${d.negativeMentions} negative in the last 30 days. ${d.recurringIssue ? `Recurring issue: "${d.recurringIssue}." ` : ''}${d.topStrength ? `Top strength: "${d.topStrength}."` : ''}`}
+      >
+        <div className="flex items-baseline gap-2">
+          <span className="text-3xl font-black" style={{ color: scoreColor(d.score), fontWeight: 800 }}>
+            {d.score != null ? d.score : '—'}
+          </span>
+          <span className="text-xs" style={{ color: 'var(--color-text-3)' }}>/ 100</span>
+        </div>
+      </ExplainableScore>
 
       <div className="flex items-center gap-3 text-xs" style={{ color: 'var(--color-text-2)' }}>
         <span style={{ color: 'var(--color-success)' }}>▲ {d.positiveMentions}</span>

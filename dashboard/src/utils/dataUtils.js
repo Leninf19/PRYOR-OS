@@ -20,12 +20,26 @@ export function isUnverified(locationName, city) {
   return !knownBrand || !city || city === 'Unknown' || city === ''
 }
 
+// Builds a plain-English explanation from compute_health_score()'s existing
+// `breakdown` field (refresh_analytics.py) -- the weights/points are already
+// computed server-side, this just narrates them for Score Explainability.
+export function explainHealthScore(health) {
+  const b = health?.breakdown
+  if (!b) return 'Not enough rated reviews in the last 30 days to compute a health score.'
+  return `Weighted composite: rating ${b.rating}/40 (40% weight), sentiment ${b.sentiment}/25 (25%), `
+    + `response rate ${b.responseRate}/20 (20%), trend ${b.trend}/15 (15%) — based on the trailing 30 days `
+    + `(avg ${health.avgRating30d}★, ${health.ratingDelta >= 0 ? '+' : ''}${health.ratingDelta}★ vs. the prior 30 days).`
+}
+
 // ── Confidence ────────────────────────────────────────────────────────────────
+// `color` is a CSS custom property for inline `style` usage (not a Tailwind
+// class) so it adapts automatically in dark mode, like every other color in
+// this app's design tokens.
 export function getConfidence(n) {
-  if (n === 0)  return { level: 0, label: 'Insufficient data', color: 'text-stone-400' }
-  if (n < 5)    return { level: 1, label: 'Low confidence',    color: 'text-orange-500' }
-  if (n < 10)   return { level: 2, label: 'Moderate',          color: 'text-yellow-600' }
-  return                { level: 3, label: 'Good',             color: 'text-emerald-600' }
+  if (n === 0)  return { level: 0, label: 'Insufficient data', color: 'var(--color-text-3)' }
+  if (n < 5)    return { level: 1, label: 'Low confidence',    color: 'var(--color-danger)' }
+  if (n < 10)   return { level: 2, label: 'Moderate',          color: 'var(--color-warning)' }
+  return                { level: 3, label: 'Good',             color: 'var(--color-success)' }
 }
 
 // ── Sentiment ─────────────────────────────────────────────────────────────────
@@ -101,6 +115,19 @@ export function getDefaultDateRange(reviews) {
   const start = new Date(now.getTime() - 7 * 86_400_000).toISOString().slice(0, 10)
   const { max } = getDateBounds(reviews)
   return { start, end, latestDate: max }
+}
+
+// Mirrors the currently-selected date range backwards to build the "prior
+// period" comparison range -- shared by every page that reuses the live
+// executive briefing (useExecutiveBrief) or otherwise labels a comparison period.
+export function mirroredPrevRange(filters) {
+  if (!filters?.start || !filters?.end) return null
+  const startMs = new Date(filters.start).getTime()
+  const endMs   = new Date(filters.end).getTime()
+  const lenMs   = endMs - startMs
+  const prevStart = new Date(startMs - lenMs - 1).toISOString().slice(0, 10)
+  const prevEnd   = new Date(startMs - 1).toISOString().slice(0, 10)
+  return `${prevStart} — ${prevEnd}`
 }
 
 // ── Filter reviews ────────────────────────────────────────────────────────────

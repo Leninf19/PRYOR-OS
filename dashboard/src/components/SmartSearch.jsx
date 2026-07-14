@@ -49,12 +49,13 @@ function buildResults(query, { meta, allReviews }) {
     }))
 
   const pages = [
-    { label: 'Command Center', path: '/overview' }, { label: 'Locations', path: '/locations' },
-    { label: 'Review Center', path: '/explorer' }, { label: 'Department Performance', path: '/department-performance' },
+    { label: 'Command Center', path: '/overview' }, { label: 'Activity Timeline', path: '/activity' },
+    { label: 'Locations', path: '/locations' },
+    { label: 'Customer Experience Center', path: '/explorer' }, { label: 'Department Performance', path: '/department-performance' },
     { label: 'AI Action Center', path: '/action-center' }, { label: 'Operations Impact Center', path: '/operations-impact' },
     { label: 'What Changed?', path: '/what-changed' }, { label: 'Complaint Intel', path: '/intelligence' },
     { label: 'Marketing Intelligence', path: '/marketing-intel' }, { label: 'Executive Reports', path: '/executive-reports' },
-    { label: 'Response Center', path: '/actions' }, { label: 'Settings', path: '/settings' },
+    { label: 'Settings', path: '/settings' },
   ]
     .filter(p => p.label.toLowerCase().includes(q))
     .slice(0, 5)

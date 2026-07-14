@@ -1,18 +1,21 @@
 import { useState, useMemo } from 'react'
 import { useOutletContext } from 'react-router-dom'
+import { ResponsiveContainer, LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts'
 import Badge from '../components/ui/Badge.jsx'
 import Card from '../components/ui/Card.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import Tabs from '../components/ui/Tabs.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
 import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
 import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
-import { filterReviews } from '../utils/dataUtils.js'
+import { filterReviews, getMonthlyTrend } from '../utils/dataUtils.js'
 import { exportCSV, printReport } from '../utils/exportUtils.js'
 import {
   useWeeklyReportData, useKPIs, useCompanySummary,
-  useComplaintIntel, useCompetitorIntel,
+  useComplaintIntel, useCompetitorIntel, useActionCenter,
 } from '../hooks/useIntelligence.js'
+import { useActionWorkspace } from '../hooks/useActionWorkspace.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -224,6 +227,19 @@ function ComplaintPanel({ complaint }) {
 
   return (
     <ReportShell title="Complaint Trend Report" onExport={handleExport}>
+      {top5.length > 0 && (
+        <ReportSection title="Top complaints by mention count">
+          <ResponsiveContainer width="100%" height={160}>
+            <BarChart data={top5} layout="vertical" margin={{ left: 8, right: 16 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" horizontal={false} />
+              <XAxis type="number" tick={{ fontSize: 10, fill: 'var(--color-text-3)' }} />
+              <YAxis type="category" dataKey="name" width={110} tick={{ fontSize: 10, fill: 'var(--color-text-2)' }} />
+              <Tooltip contentStyle={{ fontSize: 11, border: '1px solid var(--color-border)', borderRadius: 8 }} />
+              <Bar dataKey="count" fill="var(--color-danger)" radius={[0, 4, 4, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </ReportSection>
+      )}
       <ReportSection title="Top complaints (last 30 days)">
         <div style={{ borderRadius: 12, overflow: 'hidden', background: 'var(--color-surface-2)', padding: '0 12px' }}>
           {top5.map(c => (
@@ -303,6 +319,41 @@ function CompetitorPanel({ competitor }) {
   )
 }
 
+const PRIORITY_ORDER = { Critical: 0, High: 1, Medium: 2, Low: 3 }
+
+function ActionItemsPanel({ actions, ws }) {
+  const open = (actions ?? [])
+    .filter(a => !['Completed', 'Dismissed'].includes(ws[a.id]?.status))
+    .sort((a, b) => (PRIORITY_ORDER[a.priority] ?? 4) - (PRIORITY_ORDER[b.priority] ?? 4))
+    .slice(0, 5)
+
+  if (!actions) {
+    return <EmptyState icon="🛠" title="No recommendations yet"
+                       body="Run the analytics pipeline to generate Action Center recommendations." />
+  }
+
+  function handleExport() {
+    const rows = open.map(a => [a.priority, a.title, a.recommendedDepartment, ws[a.id]?.status ?? 'New', a.suggestedCompletionTime])
+    exportCSV('action-items-report', ['Priority', 'Recommendation', 'Department', 'Status', 'Target'], rows)
+  }
+
+  return (
+    <ReportShell title="Action Items" badge={{ variant: 'neutral', label: `${open.length} outstanding` }} onExport={handleExport}>
+      {open.length === 0 ? (
+        <p className="text-sm" style={{ color: 'var(--color-text-3)' }}>Nothing outstanding — all recommendations are completed or dismissed.</p>
+      ) : (
+        <div style={{ borderRadius: 12, overflow: 'hidden', background: 'var(--color-surface-2)', padding: '0 12px' }}>
+          {open.map(a => (
+            <MetricRow key={a.id} label={a.title}
+                       value={ws[a.id]?.status ?? 'New'}
+                       sub={`${a.priority} · ${a.recommendedDepartment}`} />
+          ))}
+        </div>
+      )}
+    </ReportShell>
+  )
+}
+
 function NetworkSummaryPanel({ summary }) {
   const text = summary?.summary ?? summary?.narrative ?? summary?.text ?? null
   if (!text) return (
@@ -342,6 +393,8 @@ function CustomPeriodPanel({ allReviews }) {
     }
   }, [allReviews, days])
 
+  const trend = useMemo(() => getMonthlyTrend(current), [current])
+
   function handleExport() {
     const rows = [5, 4, 3, 2, 1].map(star => {
       const count = current.filter(r => r.star_rating === star).length
@@ -356,22 +409,28 @@ function CustomPeriodPanel({ allReviews }) {
       badge={{ variant: 'neutral', label }}
       onExport={handleExport}
     >
-      <div className="no-print flex gap-1 p-1 rounded-xl w-fit" style={{ background: 'var(--color-surface-2)' }}>
-        {PERIOD_PRESETS.map(p => (
-          <button key={p.id} onClick={() => setPreset(p.id)}
-                  className="px-3 py-1.5 text-xs font-medium rounded-lg transition-all"
-                  style={preset === p.id
-                    ? { background: 'var(--color-surface)', color: 'var(--color-text-1)', boxShadow: 'var(--shadow-sm)' }
-                    : { color: 'var(--color-text-2)' }}>
-            {p.label}
-          </button>
-        ))}
+      <div className="no-print">
+        <Tabs tabs={PERIOD_PRESETS} value={preset} onChange={setPreset} wrap={false} size="xs" />
       </div>
 
       {current.length === 0 ? (
         <EmptyState icon="📅" title="No reviews in this period" body="Try a longer preset." />
       ) : (
         <div className="space-y-4">
+          {trend.length > 1 && (
+            <ReportSection title="Rating trend">
+              <ResponsiveContainer width="100%" height={140}>
+                <LineChart data={trend}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
+                  <XAxis dataKey="ym" tick={{ fontSize: 10, fill: 'var(--color-text-3)' }} tickFormatter={v => v.slice(5)} />
+                  <YAxis domain={[1, 5]} tick={{ fontSize: 10, fill: 'var(--color-text-3)' }} width={24} />
+                  <Tooltip contentStyle={{ fontSize: 11, border: '1px solid var(--color-border)', borderRadius: 8 }}
+                           formatter={v => [v ? `${v}★` : '—', 'Avg']} />
+                  <Line type="monotone" dataKey="avg" stroke="var(--color-accent)" strokeWidth={2.5} dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </ReportSection>
+          )}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <SentimentBreakdown reviews={current} />
             <RatingBreakdown reviews={current} prevReviews={prior} title={`${PERIOD_PRESETS.find(p => p.id === preset)?.label} rating breakdown`} />
@@ -390,6 +449,7 @@ const TABS = [
   { id: 'weekly',    label: 'Weekly'      },
   { id: 'complaint', label: 'Complaints'  },
   { id: 'competitor',label: 'Competitive' },
+  { id: 'actions',   label: 'Action Items' },
   { id: 'network',   label: 'Network AI'  },
 ]
 
@@ -400,9 +460,11 @@ export default function ExecutiveReports() {
   const { data: summary,    isLoading: lS } = useCompanySummary()
   const { data: complaint,  isLoading: lC } = useComplaintIntel()
   const { data: competitor, isLoading: lR } = useCompetitorIntel()
+  const { data: actions,    isLoading: lA } = useActionCenter()
+  const { data: actionWs } = useActionWorkspace()
   const [tab, setTab] = useState('custom')
 
-  const loading = { custom: false, weekly: lW, complaint: lC, competitor: lR, network: lS }
+  const loading = { custom: false, weekly: lW, complaint: lC, competitor: lR, actions: lA, network: lS }
 
   return (
     <div className="space-y-6 max-w-[900px]">
@@ -414,16 +476,8 @@ export default function ExecutiveReports() {
       </div>
 
       {/* Tabs */}
-      <div className="no-print flex gap-1 p-1 rounded-xl w-fit flex-wrap" style={{ background: 'var(--color-surface-2)' }}>
-        {TABS.map(t => (
-          <button key={t.id} onClick={() => setTab(t.id)}
-                  className="px-4 py-2 text-sm font-medium rounded-lg transition-all"
-                  style={tab === t.id
-                    ? { background: 'var(--color-surface)', color: 'var(--color-text-1)', boxShadow: 'var(--shadow-sm)' }
-                    : { color: 'var(--color-text-2)' }}>
-            {t.label}
-          </button>
-        ))}
+      <div className="no-print">
+        <Tabs tabs={TABS} value={tab} onChange={setTab} />
       </div>
 
       {/* Panels */}
@@ -438,6 +492,7 @@ export default function ExecutiveReports() {
           {tab === 'weekly'     && <WeeklyPanel     weekly={weekly}       kpis={kpis} />}
           {tab === 'complaint'  && <ComplaintPanel  complaint={complaint} />}
           {tab === 'competitor' && <CompetitorPanel competitor={competitor} />}
+          {tab === 'actions'    && <ActionItemsPanel actions={actions} ws={actionWs} />}
           {tab === 'network'    && <NetworkSummaryPanel summary={summary} />}
         </>
       )}

@@ -4,6 +4,7 @@ import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import Tabs from '../components/ui/Tabs.jsx'
 import { useMonthlyTrend, useRankings, useLocationStats, usePredictiveAlerts } from '../hooks/useIntelligence.js'
 
 // ─── Rankings tab ─────────────────────────────────────────────────────────────
@@ -47,44 +48,46 @@ function RankingsTab() {
 
         {/* Table */}
         <Card className="overflow-hidden">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Location</th>
-                <th>30d Rating</th>
-                <th>vs Prior</th>
-                <th>Reviews</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rated.map((r, i) => {
-                const delta = r.avgDelta
-                return (
-                  <tr key={r.name}>
-                    <td className="text-xs font-bold" style={{ color: 'var(--color-text-3)' }}>{i + 1}</td>
-                    <td>
-                      <p className="text-xs font-semibold" style={{ color: 'var(--color-text-1)' }}>{r.name}</p>
-                    </td>
-                    <td>
-                      <span className="text-sm font-bold"
-                            style={{ color: (r.curAvgRating ?? 0) >= 4 ? 'var(--color-success)' : 'var(--color-danger)' }}>
-                        {r.curAvgRating?.toFixed(2) ?? '—'}★
-                      </span>
-                    </td>
-                    <td>
-                      {delta != null ? (
-                        <span className={`text-xs font-semibold ${delta > 0 ? 'trend-up' : delta < 0 ? 'trend-down' : 'trend-flat'}`}>
-                          {delta > 0 ? '+' : ''}{delta.toFixed(2)}
+          <div className="overflow-x-auto">
+            <table className="data-table" style={{ minWidth: 480 }}>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Location</th>
+                  <th>30d Rating</th>
+                  <th>vs Prior</th>
+                  <th>Reviews</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rated.map((r, i) => {
+                  const delta = r.avgDelta
+                  return (
+                    <tr key={r.name}>
+                      <td className="text-xs font-bold" style={{ color: 'var(--color-text-3)' }}>{i + 1}</td>
+                      <td>
+                        <p className="text-xs font-semibold" style={{ color: 'var(--color-text-1)' }}>{r.name}</p>
+                      </td>
+                      <td>
+                        <span className="text-sm font-bold"
+                              style={{ color: (r.curAvgRating ?? 0) >= 4 ? 'var(--color-success)' : 'var(--color-danger)' }}>
+                          {r.curAvgRating?.toFixed(2) ?? '—'}★
                         </span>
-                      ) : <span style={{ color: 'var(--color-text-3)' }}>—</span>}
-                    </td>
-                    <td className="text-xs" style={{ color: 'var(--color-text-3)' }}>{r.curN}</td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
+                      </td>
+                      <td>
+                        {delta != null ? (
+                          <span className={`text-xs font-semibold ${delta > 0 ? 'trend-up' : delta < 0 ? 'trend-down' : 'trend-flat'}`}>
+                            {delta > 0 ? '+' : ''}{delta.toFixed(2)}
+                          </span>
+                        ) : <span style={{ color: 'var(--color-text-3)' }}>—</span>}
+                      </td>
+                      <td className="text-xs" style={{ color: 'var(--color-text-3)' }}>{r.curN}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
         </Card>
       </div>
     </div>
@@ -174,53 +177,55 @@ function PredictionsTab() {
       {withPred.length > 0 ? (
         <>
         <Card className="overflow-hidden">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Location</th>
-                <th>Current Rating</th>
-                <th>Projected (30d)</th>
-                <th>Direction</th>
-                <th>Confidence</th>
-              </tr>
-            </thead>
-            <tbody>
-              {withPred.map(loc => {
-                const cur  = loc.periodSentiment?.avgRating
-                const pred = loc.predictedRating
-                const conf = loc.predictedRatingConfidence
-                const dir  = cur && pred ? pred - cur : 0
-                return (
-                  <tr key={loc.name}>
-                    <td>
-                      <p className="text-xs font-semibold" style={{ color: 'var(--color-text-1)' }}>{loc.name}</p>
-                      <p className="text-[10px]" style={{ color: 'var(--color-text-3)' }}>{loc.city}</p>
-                    </td>
-                    <td>
-                      <span className="text-sm font-bold"
-                            style={{ color: (cur ?? 0) >= 4 ? 'var(--color-success)' : 'var(--color-danger)' }}>
-                        {cur?.toFixed(2) ?? '—'}★
-                      </span>
-                    </td>
-                    <td>
-                      <span className="text-sm font-bold"
-                            style={{ color: (pred ?? 0) >= 4 ? 'var(--color-success)' : 'var(--color-danger)' }}>
-                        {pred?.toFixed(2) ?? '—'}★
-                      </span>
-                    </td>
-                    <td>
-                      <span className={`text-xs font-semibold ${dir > 0.05 ? 'trend-up' : dir < -0.05 ? 'trend-down' : 'trend-flat'}`}>
-                        {dir > 0.05 ? `↑ +${dir.toFixed(2)}` : dir < -0.05 ? `↓ ${dir.toFixed(2)}` : '→ Stable'}
-                      </span>
-                    </td>
-                    <td>
-                      {conf && <Badge variant={conf.level === 'high' ? 'success' : conf.level === 'moderate' ? 'warning' : 'neutral'}>{conf.label}</Badge>}
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
+          <div className="overflow-x-auto">
+            <table className="data-table" style={{ minWidth: 560 }}>
+              <thead>
+                <tr>
+                  <th>Location</th>
+                  <th>Current Rating</th>
+                  <th>Projected (30d)</th>
+                  <th>Direction</th>
+                  <th>Confidence</th>
+                </tr>
+              </thead>
+              <tbody>
+                {withPred.map(loc => {
+                  const cur  = loc.periodSentiment?.avgRating
+                  const pred = loc.predictedRating
+                  const conf = loc.predictedRatingConfidence
+                  const dir  = cur && pred ? pred - cur : 0
+                  return (
+                    <tr key={loc.name}>
+                      <td>
+                        <p className="text-xs font-semibold" style={{ color: 'var(--color-text-1)' }}>{loc.name}</p>
+                        <p className="text-[10px]" style={{ color: 'var(--color-text-3)' }}>{loc.city}</p>
+                      </td>
+                      <td>
+                        <span className="text-sm font-bold"
+                              style={{ color: (cur ?? 0) >= 4 ? 'var(--color-success)' : 'var(--color-danger)' }}>
+                          {cur?.toFixed(2) ?? '—'}★
+                        </span>
+                      </td>
+                      <td>
+                        <span className="text-sm font-bold"
+                              style={{ color: (pred ?? 0) >= 4 ? 'var(--color-success)' : 'var(--color-danger)' }}>
+                          {pred?.toFixed(2) ?? '—'}★
+                        </span>
+                      </td>
+                      <td>
+                        <span className={`text-xs font-semibold ${dir > 0.05 ? 'trend-up' : dir < -0.05 ? 'trend-down' : 'trend-flat'}`}>
+                          {dir > 0.05 ? `↑ +${dir.toFixed(2)}` : dir < -0.05 ? `↓ ${dir.toFixed(2)}` : '→ Stable'}
+                        </span>
+                      </td>
+                      <td>
+                        {conf && <Badge variant={conf.level === 'high' ? 'success' : conf.level === 'moderate' ? 'warning' : 'neutral'}>{conf.label}</Badge>}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
         </Card>
         <p className="text-[10px]" style={{ color: 'var(--color-text-3)' }}>
           AI-generated forecasts based on historical trend, not a guarantee of future performance.
@@ -248,27 +253,14 @@ export default function TrendsAnalytics({ allReviews, filtered, prevFiltered }) 
   return (
     <div className="space-y-6 max-w-[1100px]">
       <div>
-        <h2 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Trends & Predictions</h2>
+        <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Trends & Predictions</h1>
         <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
           Rating trends, location rankings, and 30-day forecasts
         </p>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 p-1 rounded-xl w-fit" style={{ background: 'var(--color-surface-2)' }}>
-        {TABS.map(t => (
-          <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
-            className="px-4 py-2 text-sm font-medium rounded-lg transition-all"
-            style={tab === t.id
-              ? { background: 'var(--color-surface)', color: 'var(--color-text-1)', boxShadow: 'var(--shadow-sm)' }
-              : { color: 'var(--color-text-2)' }}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      <Tabs tabs={TABS} value={tab} onChange={setTab} wrap={false} />
 
       {tab === 'trend'       && <TrendTab />}
       {tab === 'rankings'   && <RankingsTab />}
