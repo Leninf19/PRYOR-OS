@@ -233,6 +233,32 @@ def export_intelligence(conn) -> None:
     if "complaint_intelligence" in by_key:
         write_json("intelligence/complaint-intelligence.json", by_key["complaint_intelligence"])
 
+    # Department performance
+    if "department_performance" in by_key:
+        write_json("intelligence/department-performance.json", by_key["department_performance"])
+
+    # Customer Experience Index (company-wide; per-location is embedded in location_detail_*)
+    if "cx_index" in by_key:
+        write_json("intelligence/cx-index.json", by_key["cx_index"])
+
+    # Marketing Intelligence extras
+    if "best_quotes" in by_key:
+        write_json("intelligence/best-quotes.json", by_key["best_quotes"])
+    if "seasonal_trends" in by_key:
+        write_json("intelligence/seasonal-trends.json", by_key["seasonal_trends"])
+
+    # Executive Dashboard scores
+    if "executive_scores" in by_key:
+        write_json("intelligence/executive-scores.json", by_key["executive_scores"])
+
+    # AI Action Center
+    if "action_center" in by_key:
+        write_json("intelligence/action-center.json", by_key["action_center"])
+
+    # Operations Impact Center
+    if "operations_impact" in by_key:
+        write_json("intelligence/operations-impact.json", by_key["operations_impact"])
+
     # Predictive alerts
     if "predictive_alerts" in by_key:
         write_json("intelligence/predictive-alerts.json", by_key["predictive_alerts"])

@@ -22,6 +22,13 @@ export function useScraperStatusData()  { return useQuery({ queryKey: ['scraper-
 export function useCompetitorIntel()    { return useQuery({ queryKey: ['competitor-intel'],      queryFn: () => fetchJSON('/data/intelligence/competitive-intelligence.json'), ...OPTS }) }
 export function useWeeklyReportData()   { return useQuery({ queryKey: ['weekly-report'],       queryFn: () => fetchJSON('/data/reports/weekly-summary.json'),              ...OPTS }) }
 export function useActionItems()        { return useQuery({ queryKey: ['action-items'],        queryFn: () => fetchJSON('/data/action-items.json'),                        ...OPTS }) }
+export function useDepartmentPerformance() { return useQuery({ queryKey: ['department-performance'], queryFn: () => fetchJSON('/data/intelligence/department-performance.json'), ...OPTS }) }
+export function useActionCenter()       { return useQuery({ queryKey: ['action-center'],        queryFn: () => fetchJSON('/data/intelligence/action-center.json'),          ...OPTS }) }
+export function useOperationsImpact()   { return useQuery({ queryKey: ['operations-impact'],    queryFn: () => fetchJSON('/data/intelligence/operations-impact.json'),      ...OPTS }) }
+export function useCXIndex()            { return useQuery({ queryKey: ['cx-index'],             queryFn: () => fetchJSON('/data/intelligence/cx-index.json'),               ...OPTS }) }
+export function useBestQuotes()         { return useQuery({ queryKey: ['best-quotes'],          queryFn: () => fetchJSON('/data/intelligence/best-quotes.json'),            ...OPTS }) }
+export function useSeasonalTrends()     { return useQuery({ queryKey: ['seasonal-trends'],       queryFn: () => fetchJSON('/data/intelligence/seasonal-trends.json'),        ...OPTS }) }
+export function useExecutiveScores()    { return useQuery({ queryKey: ['executive-scores'],      queryFn: () => fetchJSON('/data/intelligence/executive-scores.json'),       ...OPTS }) }
 
 export function useLocationDetail(slug) {
   return useQuery({
@@ -42,6 +49,7 @@ export function useGlobalPrefetch() {
       ['location-stats',    '/data/analytics/location-stats.json'],
       ['rankings',          '/data/analytics/rankings-30d.json'],
       ['complaint-intel',   '/data/intelligence/complaint-intelligence.json'],
+      ['department-performance', '/data/intelligence/department-performance.json'],
       ['company-summary',   '/data/intelligence/company-summary.json'],
       ['predictive-alerts', '/data/intelligence/predictive-alerts.json'],
       ['response-drafts',   '/data/intelligence/response-drafts.json'],

@@ -3,7 +3,7 @@ import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
 import {
-  useComplaintIntel, useCompetitorIntel, useMeta,
+  useComplaintIntel, useCompetitorIntel, useMeta, useBestQuotes, useSeasonalTrends,
 } from '../hooks/useIntelligence.js'
 
 // ── Caption templates ─────────────────────────────────────────────────────────
@@ -156,6 +156,8 @@ export default function MarketingIntelligence() {
   const { data: complaint,  isLoading: lC } = useComplaintIntel()
   const { data: competitor, isLoading: lR } = useCompetitorIntel()
   const { data: meta,       isLoading: lM } = useMeta()
+  const { data: quotes }   = useBestQuotes()
+  const { data: seasonal } = useSeasonalTrends()
   const [activeTab, setActiveTab] = useState('insights')
 
   const isLoading = lC || lR || lM
@@ -190,6 +192,7 @@ export default function MarketingIntelligence() {
     { id: 'insights',  label: 'What Customers Love' },
     { id: 'campaign',  label: 'Campaign Ideas'       },
     { id: 'captions',  label: 'Caption Templates'    },
+    { id: 'trends',    label: 'Quotes & Seasonal Trends' },
   ]
 
   return (
@@ -356,6 +359,58 @@ export default function MarketingIntelligence() {
               <p className="text-lg font-black" style={{ color: 'var(--color-text-1)' }}>{captions.campaign}</p>
               <p className="text-sm italic" style={{ color: 'var(--color-text-2)' }}>"{captions.tagline}"</p>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tab: Best Quotes & Seasonal Trends */}
+      {activeTab === 'trends' && (
+        <div className="space-y-6">
+          <div>
+            <h2 className="text-title mb-3" style={{ color: 'var(--color-text-1)' }}>Best Customer Quotes</h2>
+            {quotes?.length > 0 ? (
+              <div className="grid sm:grid-cols-2 gap-3">
+                {quotes.map((q, i) => (
+                  <div key={i} className="card p-4 space-y-2">
+                    <Badge variant="success">{q.category}</Badge>
+                    <p className="text-sm leading-relaxed italic" style={{ color: 'var(--color-text-1)', lineHeight: 1.7 }}>
+                      "{q.quote}"
+                    </p>
+                    <p className="text-[10px]" style={{ color: 'var(--color-text-3)' }}>
+                      {q.reviewerName || 'Guest'} · {q.locationName} · {'★'.repeat(q.starRating ?? 5)}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm" style={{ color: 'var(--color-text-3)' }}>No standout quotes identified yet.</p>
+            )}
+          </div>
+
+          <div>
+            <h2 className="text-title mb-1" style={{ color: 'var(--color-text-1)' }}>Seasonal Trends</h2>
+            <p className="text-xs mb-3" style={{ color: 'var(--color-text-3)' }}>
+              Categories whose mention rate is notably higher in a specific month, across your full review history.
+              Based on limited samples for some categories — treat as a signal to investigate, not a certainty.
+            </p>
+            {seasonal?.length > 0 ? (
+              <div className="space-y-1.5">
+                {seasonal.map((s, i) => (
+                  <div key={i} className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg"
+                       style={{ background: 'var(--color-surface-2)' }}>
+                    <div className="flex items-center gap-2">
+                      <Badge variant={s.type === 'complaint' ? 'danger' : 'success'}>{s.type}</Badge>
+                      <span className="text-xs font-semibold" style={{ color: 'var(--color-text-1)' }}>{s.name}</span>
+                    </div>
+                    <span className="text-xs" style={{ color: 'var(--color-text-2)' }}>
+                      Peaks in <strong>{s.peakMonth}</strong> ({s.skew}× typical rate, {s.peakCount}/{s.totalMentions} mentions)
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm" style={{ color: 'var(--color-text-3)' }}>No seasonal patterns detected yet.</p>
+            )}
           </div>
         </div>
       )}

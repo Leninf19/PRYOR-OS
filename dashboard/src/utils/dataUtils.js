@@ -282,3 +282,58 @@ export function computePeriodMetrics(reviews, prevReviews = []) {
     netSentiment:  metric(+(sent.positive - sent.bad).toFixed(1), +(prevSent.positive - prevSent.bad).toFixed(1)),
   }
 }
+
+// ── Category changes (for the "What Changed?" page) ────────────────────────────
+// Reads each review's already-classified complaint_tags/praise_tags (set by the
+// pipeline's classify_review()) to find categories that crossed the minCount
+// threshold between periods -- "new" this period, "resolved" since last period,
+// or still present but meaningfully up/down.
+function _tallyTags(reviews, field) {
+  const counts = {}
+  reviews.forEach(r => (r[field] || []).forEach(t => { counts[t] = (counts[t] || 0) + 1 }))
+  return counts
+}
+
+function _diffTags(cur, prev, minCount = 2) {
+  const allIds = new Set([...Object.keys(cur), ...Object.keys(prev)])
+  const fresh = [], resolved = [], changed = []
+  allIds.forEach(id => {
+    const c = cur[id] || 0, p = prev[id] || 0
+    if (c >= minCount && p < minCount) fresh.push({ id, count: c, prevCount: p })
+    else if (p >= minCount && c < minCount) resolved.push({ id, count: c, prevCount: p })
+    else if (c >= minCount || p >= minCount) changed.push({ id, count: c, prevCount: p, delta: c - p })
+  })
+  return {
+    new: fresh.sort((a, b) => b.count - a.count),
+    resolved: resolved.sort((a, b) => b.prevCount - a.prevCount),
+    changed: changed.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta)),
+  }
+}
+
+export function getCategoryChanges(filtered, prevFiltered, minCount = 2) {
+  return {
+    complaints: _diffTags(_tallyTags(filtered, 'complaint_tags'), _tallyTags(prevFiltered, 'complaint_tags'), minCount),
+    praises:    _diffTags(_tallyTags(filtered, 'praise_tags'),    _tallyTags(prevFiltered, 'praise_tags'),    minCount),
+  }
+}
+
+// ── Location momentum (for the "What Changed?" page) ────────────────────────────
+// All locations with enough sample size in both periods, sorted by rating
+// delta -- top of the list is gaining momentum, bottom is losing it.
+export function getLocationMomentum(filtered, prevFiltered, minSample = 5) {
+  const byLoc = {}, prevByLoc = {}
+  filtered.forEach(r => { if (r.star_rating != null) (byLoc[r.location_name] ??= []).push(r.star_rating) })
+  prevFiltered.forEach(r => { if (r.star_rating != null) (prevByLoc[r.location_name] ??= []).push(r.star_rating) })
+
+  const avg = arr => arr.reduce((s, n) => s + n, 0) / arr.length
+  const out = []
+  Object.keys(byLoc).forEach(name => {
+    const cur = byLoc[name], prev = prevByLoc[name]
+    if (!prev || cur.length < minSample || prev.length < minSample) return
+    out.push({
+      name, curAvg: +avg(cur).toFixed(2), prevAvg: +avg(prev).toFixed(2),
+      delta: +(avg(cur) - avg(prev)).toFixed(2), curN: cur.length, prevN: prev.length,
+    })
+  })
+  return out.sort((a, b) => b.delta - a.delta)
+}

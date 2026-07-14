@@ -1,8 +1,20 @@
+import { useOutletContext } from 'react-router-dom'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import {
   useCompanySummary, useComplaintIntel, useCompetitorIntel,
   useActionItems, usePredictiveAlerts,
 } from '../hooks/useIntelligence.js'
+import { useExecutiveBrief } from '../hooks/useExecutiveBrief.js'
+
+function mirroredPrevRange(filters) {
+  if (!filters?.start || !filters?.end) return null
+  const startMs = new Date(filters.start).getTime()
+  const endMs   = new Date(filters.end).getTime()
+  const lenMs   = endMs - startMs
+  const prevStart = new Date(startMs - lenMs - 1).toISOString().slice(0, 10)
+  const prevEnd   = new Date(startMs - 1).toISOString().slice(0, 10)
+  return `${prevStart} — ${prevEnd}`
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -115,11 +127,16 @@ function LoadingSkeleton() {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function AIAdvisor() {
+  const { filtered = [], prevFiltered = [], filters = {} } = useOutletContext() ?? {}
   const { data: summary,    isLoading: lS } = useCompanySummary()
   const { data: complaint,  isLoading: lC } = useComplaintIntel()
   const { data: competitor, isLoading: lR } = useCompetitorIntel()
   const { data: actions,    isLoading: lA } = useActionItems()
   const { data: predictive, isLoading: lP } = usePredictiveAlerts()
+
+  const periodLabel = filters?.start && filters?.end ? `${filters.start} — ${filters.end}` : null
+  const prevPeriodLabel = mirroredPrevRange(filters)
+  const brief = useExecutiveBrief(filtered, prevFiltered, periodLabel, prevPeriodLabel)
 
   const isLoading = lS || lC || lR || lA || lP
 
@@ -255,6 +272,41 @@ export default function AIAdvisor() {
         )}
       </div>
 
+      {/* ── Executive Briefing — live, regenerates when filters change ─────────── */}
+      {(brief.text || brief.loading || aiSummaryText) && (
+        <Section title="Executive Briefing" accent="var(--color-accent)">
+          {brief.loading ? (
+            <div className="space-y-2 opacity-50">
+              <Skeleton className="h-4 w-full" />
+              <Skeleton className="h-4 w-5/6" />
+              <Skeleton className="h-4 w-4/6" />
+            </div>
+          ) : brief.text ? (
+            <>
+              <p className="text-sm leading-relaxed" style={{ color: 'var(--color-text-1)', lineHeight: 1.8 }}>
+                {brief.text}
+              </p>
+              {periodLabel && (
+                <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-3)' }}>
+                  Generated live for {periodLabel}
+                </p>
+              )}
+            </>
+          ) : aiSummaryText ? (
+            <>
+              <p className="text-sm leading-relaxed" style={{ color: 'var(--color-text-1)', lineHeight: 1.8 }}>
+                {aiSummaryText}
+              </p>
+              <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-3)' }}>
+                {brief.error
+                  ? 'Live briefing unavailable — showing the last pipeline-generated summary instead.'
+                  : 'From the last analytics pipeline run (trailing 30 days).'}
+              </p>
+            </>
+          ) : null}
+        </Section>
+      )}
+
       {/* ── Today's priorities ────────────────────────────────────────────────── */}
       {priorities.length > 0 && (
         <Section title="Today's Priorities" accent="var(--color-accent)">
@@ -307,15 +359,6 @@ export default function AIAdvisor() {
               {briefing.marketingOpportunity}
             </p>
           )}
-        </Section>
-      )}
-
-      {/* ── AI company summary ────────────────────────────────────────────────── */}
-      {aiSummaryText && (
-        <Section title="Network Summary" accent="var(--color-text-3)">
-          <p className="text-sm leading-relaxed" style={{ color: 'var(--color-text-1)', lineHeight: 1.8 }}>
-            {aiSummaryText}
-          </p>
         </Section>
       )}
 

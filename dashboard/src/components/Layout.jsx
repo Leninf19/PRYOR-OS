@@ -3,6 +3,7 @@ import { NavLink, useLocation } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useMeta, usePredictiveAlerts, useActionItems } from '../hooks/useIntelligence.js'
 import ThemeToggle from './ui/ThemeToggle.jsx'
+import SmartSearch from './SmartSearch.jsx'
 
 // ── Icons (inline SVG, 15×15, Heroicons solid) ────────────────────────────────
 
@@ -11,6 +12,11 @@ const I = {
   locations:   <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M9.293 2.293a1 1 0 011.414 0l7 7A1 1 0 0117 11h-1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-3a1 1 0 00-1-1H9a1 1 0 00-1 1v3a1 1 0 01-1 1H5a1 1 0 01-1-1v-6H3a1 1 0 01-.707-1.707l7-7z" clipRule="evenodd"/></svg>,
   reviews:     <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M2 5a2 2 0 012-2h8a2 2 0 012 2v10a2 2 0 002 2H4a2 2 0 01-2-2V5zm3 1h6v4H5V6zm6 6H5v2h6v-2z" clipRule="evenodd"/><path d="M15 7h1a2 2 0 012 2v5.5a1.5 1.5 0 01-3 0V7z"/></svg>,
   complaint:   <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M3 3a1 1 0 000 2v8a2 2 0 002 2h2.586l-1.293 1.293a1 1 0 101.414 1.414L10 15.414l2.293 2.293a1 1 0 001.414-1.414L12.414 15H15a2 2 0 002-2V5a1 1 0 100-2H3zm11 4a1 1 0 10-2 0v4a1 1 0 102 0V7zm-3 1a1 1 0 10-2 0v3a1 1 0 102 0V8zM8 9a1 1 0 00-2 0v2a1 1 0 102 0V9z" clipRule="evenodd"/></svg>,
+  department:  <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M4 4a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H8v2h5a1 1 0 011 1v3h1a1 1 0 110 2h-6a1 1 0 110-2h1v-2H8v2h1a1 1 0 110 2H3a1 1 0 110-2h1v-3a1 1 0 011-1h5V9H8a1 1 0 01-1-1V4H5v3a1 1 0 11-2 0V4z" clipRule="evenodd"/></svg>,
+  actioncenter: <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M6 3a1 1 0 00-1 1v1H4a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2V7a2 2 0 00-2-2h-1V4a1 1 0 10-2 0v1H7V4a1 1 0 00-1-1zm8.707 5.293a1 1 0 00-1.414-1.414L9 11.172l-1.293-1.293a1 1 0 10-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd"/></svg>,
+  opsimpact:   <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path d="M3 3a1 1 0 00-1 1v12a1 1 0 001 1h14a1 1 0 100-2H4V4a1 1 0 00-1-1z"/><path d="M6 15a1 1 0 01-1-1v-3a1 1 0 112 0v3a1 1 0 01-1 1zm4 0a1 1 0 01-1-1V8a1 1 0 112 0v6a1 1 0 01-1 1zm4 0a1 1 0 01-1-1v-5a1 1 0 112 0v5a1 1 0 01-1 1zm4 0a1 1 0 01-1-1V5a1 1 0 112 0v9a1 1 0 01-1 1z"/></svg>,
+  whatchanged: <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M4 3a1 1 0 00-1 1v3a1 1 0 001 1h3a1 1 0 100-2H6.414A6.985 6.985 0 0110 5c2.4 0 4.462 1.469 5.325 3.556a1 1 0 101.848-.764A9 9 0 004 4.83V4a1 1 0 00-1-1zm12 8a1 1 0 00-1 1v.17A6.985 6.985 0 0110 15a6.985 6.985 0 01-5.325-2.444 1 1 0 10-1.593 1.208A9 9 0 0016 15.17V16a1 1 0 102 0v-3a1 1 0 00-1-1h-1z" clipRule="evenodd"/></svg>,
+  execdash:    <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path d="M10 2a1 1 0 011 1v6h6a1 1 0 011 1 8 8 0 11-8-8z"/><path d="M12.5 1.5a1 1 0 011-1A7.5 7.5 0 0121 8a1 1 0 01-1 1h-6.5a1 1 0 01-1-1V1.5z"/></svg>,
   competitive: <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z"/></svg>,
   marketing:   <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path d="M18 3a1 1 0 00-1.447-.894L8.763 6H5a3 3 0 000 6h.28l1.771 5.316A1 1 0 008 18h1a1 1 0 001-1v-4.382l6.553 3.276A1 1 0 0018 15V3z"/></svg>,
   employee:    <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path d="M13 6a3 3 0 11-6 0 3 3 0 016 0zM18 8a2 2 0 11-4 0 2 2 0 014 0zM14 15a4 4 0 00-8 0v3h8v-3zM6 8a2 2 0 11-4 0 2 2 0 014 0zM16 18v-3a5.972 5.972 0 00-.75-2.906A3.005 3.005 0 0119 15v3h-3zM4.75 12.094A5.973 5.973 0 004 15v3H1v-3a3 3 0 013.75-2.906z"/></svg>,
@@ -39,6 +45,7 @@ const NAV_SECTIONS = [
     label: 'AI Intelligence',
     items: [
       { id: 'intelligence',    path: '/intelligence',    label: 'Complaint Intel',   icon: I.complaint   },
+      { id: 'department-performance', path: '/department-performance', label: 'Department Performance', icon: I.department },
       { id: 'competitive',     path: '/competitive',     label: 'Competitor Intel',  icon: I.competitive },
       { id: 'marketing-intel', path: '/marketing-intel', label: 'Marketing Intel',   icon: I.marketing   },
       { id: 'employee-intel',  path: '/employee-intel',  label: 'Employee Intel',    icon: I.employee    },
@@ -49,6 +56,9 @@ const NAV_SECTIONS = [
     label: 'Operations',
     items: [
       { id: 'actions', path: '/actions', label: 'Response Center', icon: I.response, badge: 'unanswered' },
+      { id: 'action-center', path: '/action-center', label: 'Action Center', icon: I.actioncenter },
+      { id: 'operations-impact', path: '/operations-impact', label: 'Operations Impact', icon: I.opsimpact },
+      { id: 'what-changed', path: '/what-changed', label: 'What Changed?', icon: I.whatchanged },
       { id: 'trends',  path: '/trends',  label: 'Trends',          icon: I.trends   },
       { id: 'alerts',  path: '/alerts',  label: 'Alerts',          icon: I.alerts   },
     ],
@@ -56,6 +66,7 @@ const NAV_SECTIONS = [
   {
     label: 'Reporting',
     items: [
+      { id: 'executive-dashboard', path: '/executive-dashboard', label: 'Executive Dashboard', icon: I.execdash },
       { id: 'executive-reports', path: '/executive-reports', label: 'Executive Reports', icon: I.execreports },
       { id: 'reports',           path: '/reports',           label: 'Reports',           icon: I.reports     },
     ],
@@ -139,6 +150,11 @@ function SidebarContent({ unansweredCount, onLinkClick }) {
         <h1 className="text-sm font-bold leading-tight" style={{ color: 'var(--color-text-1)' }}>
           Future Insights
         </h1>
+      </div>
+
+      {/* Smart Search */}
+      <div className="px-3 pt-3 flex-shrink-0">
+        <SmartSearch />
       </div>
 
       {/* Nav sections */}

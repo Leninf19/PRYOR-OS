@@ -11,6 +11,11 @@ import ActionItems, { useUnansweredCount } from './pages/ActionItems.jsx'
 import ScraperStatus        from './pages/ScraperStatus.jsx'
 import Reports              from './pages/Reports.jsx'
 import ComplaintIntelligence   from './pages/ComplaintIntelligence.jsx'
+import DepartmentPerformance   from './pages/DepartmentPerformance.jsx'
+import ActionCenter            from './pages/ActionCenter.jsx'
+import OperationsImpact         from './pages/OperationsImpact.jsx'
+import WhatChanged              from './pages/WhatChanged.jsx'
+import ExecutiveDashboard       from './pages/ExecutiveDashboard.jsx'
 import CompetitorIntelligence  from './pages/CompetitorIntelligence.jsx'
 import Alerts               from './pages/Alerts.jsx'
 import AIAdvisor            from './pages/AIAdvisor.jsx'
@@ -24,8 +29,9 @@ import { filterReviews, getDefaultDateRange } from './utils/dataUtils.js'
 
 // Pages that don't use the global review filter bar
 const NO_FILTER_PATHS = [
-  '/scraper-status', '/reports', '/intelligence', '/competitive',
-  '/alerts', '/advisor', '/marketing-intel', '/employee-intel', '/executive-reports', '/settings',
+  '/scraper-status', '/reports', '/intelligence', '/department-performance', '/action-center',
+  '/operations-impact', '/executive-dashboard', '/competitive', '/alerts', '/marketing-intel',
+  '/employee-intel', '/executive-reports', '/settings',
 ]
 
 function buildDefaultFilters(reviews) {
@@ -165,6 +171,11 @@ export default function App() {
         <Route path="explorer"          element={<RExplorer />} />
         <Route path="actions"           element={<RActions />} />
         <Route path="intelligence"      element={<ComplaintIntelligence />} />
+        <Route path="department-performance" element={<DepartmentPerformance />} />
+        <Route path="action-center"     element={<ActionCenter />} />
+        <Route path="operations-impact" element={<OperationsImpact />} />
+        <Route path="what-changed"      element={<WhatChanged />} />
+        <Route path="executive-dashboard" element={<ExecutiveDashboard />} />
         <Route path="competitive"       element={<CompetitorIntelligence />} />
         <Route path="marketing-intel"   element={<MarketingIntelligence />} />
         <Route path="employee-intel"    element={<EmployeeIntelligence />} />

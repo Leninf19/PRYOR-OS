@@ -248,6 +248,57 @@ export const COMPLAINT_CATEGORIES = [
       'couldn\'t get the server\'s attention',
     ],
   },
+  {
+    id: 'host_seating',
+    label: 'Host & Greeting',
+    icon: '🚪',
+    baseSeverity: 'medium',
+    phrases: [
+      'rude host','host was rude','hostess was rude','unfriendly host',
+      'unfriendly hostess','host was unwelcoming','host ignored us',
+      'host didn\'t greet','front desk was rude','hostess ignored',
+      'host stand was disorganized','unorganized host stand',
+      'host was not helpful','host was unhelpful',
+    ],
+  },
+  {
+    id: 'carryout',
+    label: 'Carryout / Takeout',
+    icon: '📦',
+    baseSeverity: 'medium',
+    phrases: [
+      'carryout order was wrong','takeout order was wrong','takeout order was missing',
+      'pickup order was wrong','order wasn\'t ready when','waited for my takeout',
+      'carryout was cold','togo order incorrect','to go order was wrong',
+      'forgot items in my takeout','pickup order missing','my carryout order was',
+      'takeout was incorrect','curbside order was wrong',
+    ],
+  },
+  {
+    id: 'delivery',
+    label: 'Delivery',
+    icon: '🛵',
+    baseSeverity: 'medium',
+    phrases: [
+      'delivery was late','delivery never arrived','uber eats order','doordash order',
+      'grubhub order','delivery driver','arrived cold from delivery',
+      'delivery order was wrong','delivery took forever','never delivered',
+      'third party delivery','delivery was missing',
+    ],
+  },
+  {
+    id: 'maintenance',
+    label: 'Facility & Maintenance',
+    icon: '🔧',
+    baseSeverity: 'medium',
+    phrases: [
+      'broken chair','broken table','ac wasn\'t working','air conditioning broken',
+      'heater wasn\'t working','broken booth','torn seats','leaking roof',
+      'broken door','flickering lights','broken sign','run down',
+      'needs renovation','outdated decor','falling apart','sink was broken',
+      'toilet was broken',
+    ],
+  },
 ]
 
 export const PRAISE_CATEGORIES = [
@@ -414,6 +465,38 @@ export const PRAISE_CATEGORIES = [
       'delivery was on time','delivery arrived quickly','great delivery',
     ],
   },
+  {
+    id: 'great_management',
+    label: 'Excellent Management',
+    icon: '👔',
+    phrases: [
+      'manager was great','manager was wonderful','manager was amazing',
+      'manager was very helpful','manager took care of us','manager went above and beyond',
+      'great management','excellent management','manager was fantastic',
+      'owner was great','owner was very kind','management was excellent',
+    ],
+  },
+  {
+    id: 'great_host',
+    label: 'Warm Welcome',
+    icon: '🚪',
+    phrases: [
+      'host was great','host was wonderful','hostess was great','hostess was wonderful',
+      'great host','friendly host','friendly hostess','warm welcome',
+      'greeted us warmly','host was very friendly','hostess was very friendly',
+      'seated us right away','host sat us immediately',
+    ],
+  },
+  {
+    id: 'well_maintained',
+    label: 'Well-Maintained Facility',
+    icon: '🔧',
+    phrases: [
+      'well maintained','well kept','well-maintained','kept up nicely',
+      'nicely renovated','recently renovated','modern and clean',
+      'facility was great','building was well kept','nice and updated',
+    ],
+  },
 ]
 
 // ── Core matching ─────────────────────────────────────────────────────────────
@@ -577,7 +660,7 @@ export function extractInsights(reviews) {
 
 // ── Staff name detection ──────────────────────────────────────────────────────
 
-const MENU_ITEMS = [
+export const MENU_ITEMS = [
   'tacos','taco','enchiladas','enchilada','fajitas','fajita','burrito','burritos',
   'margarita','margaritas','chips','salsa','guacamole','nachos','quesadilla',
   'quesadillas','tamales','tamale','carnitas','carne asada','al pastor','pollo',

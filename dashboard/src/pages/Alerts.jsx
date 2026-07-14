@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
@@ -9,8 +9,23 @@ import {
 
 // ── Alert assembly ────────────────────────────────────────────────────────────
 
-function buildAlerts(predictive, actionItems, scraperRuns, competitorIntel) {
+function buildAlerts(predictive, actionItems, scraperRuns, competitorIntel, googleStatus) {
   const list = []
+
+  // 0. Google Business Profile disconnected -- operational, not data-derived,
+  // but still something corporate needs to know without digging into Settings.
+  if (googleStatus && !googleStatus.loading && !googleStatus.connected) {
+    list.push({
+      id: 'gbp-disconnected',
+      severity: 'info',
+      priority: 'System',
+      title: 'Google Business Profile is not connected',
+      location: 'All locations',
+      body: 'One-click publishing and automatic reply sync are unavailable until a Google account is connected.',
+      action: 'Connect it in Settings → Google Integration.',
+      time: null,
+    })
+  }
 
   // 1. Unanswered negative reviews (1–2★) — danger priority
   const unanswered = actionItems?.unanswered ?? []
@@ -210,18 +225,30 @@ const TABS = [
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+function useGoogleStatus() {
+  const [status, setStatus] = useState({ loading: true })
+  useEffect(() => {
+    fetch('/api/google/status')
+      .then(r => r.json())
+      .then(d => setStatus({ loading: false, ...d }))
+      .catch(() => setStatus({ loading: false, connected: false, state: 'error' }))
+  }, [])
+  return status
+}
+
 export default function Alerts() {
   const { data: predictive, isLoading: loadP }  = usePredictiveAlerts()
   const { data: actionItems, isLoading: loadA }  = useActionItems()
   const { data: scraperRuns, isLoading: loadS }  = useScraperStatusData()
   const { data: competitorIntel, isLoading: loadC } = useCompetitorIntel()
+  const googleStatus = useGoogleStatus()
   const [tab, setTab] = useState('all')
 
   const isLoading = loadP || loadA || loadS || loadC
 
   const alerts = isLoading
     ? []
-    : buildAlerts(predictive, actionItems, scraperRuns, competitorIntel)
+    : buildAlerts(predictive, actionItems, scraperRuns, competitorIntel, googleStatus)
 
   const filtered = tab === 'all'
     ? alerts

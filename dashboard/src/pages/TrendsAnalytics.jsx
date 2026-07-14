@@ -172,6 +172,7 @@ function PredictionsTab() {
       )}
 
       {withPred.length > 0 ? (
+        <>
         <Card className="overflow-hidden">
           <table className="data-table">
             <thead>
@@ -180,12 +181,14 @@ function PredictionsTab() {
                 <th>Current Rating</th>
                 <th>Projected (30d)</th>
                 <th>Direction</th>
+                <th>Confidence</th>
               </tr>
             </thead>
             <tbody>
               {withPred.map(loc => {
                 const cur  = loc.periodSentiment?.avgRating
                 const pred = loc.predictedRating
+                const conf = loc.predictedRatingConfidence
                 const dir  = cur && pred ? pred - cur : 0
                 return (
                   <tr key={loc.name}>
@@ -210,12 +213,19 @@ function PredictionsTab() {
                         {dir > 0.05 ? `↑ +${dir.toFixed(2)}` : dir < -0.05 ? `↓ ${dir.toFixed(2)}` : '→ Stable'}
                       </span>
                     </td>
+                    <td>
+                      {conf && <Badge variant={conf.level === 'high' ? 'success' : conf.level === 'moderate' ? 'warning' : 'neutral'}>{conf.label}</Badge>}
+                    </td>
                   </tr>
                 )
               })}
             </tbody>
           </table>
         </Card>
+        <p className="text-[10px]" style={{ color: 'var(--color-text-3)' }}>
+          AI-generated forecasts based on historical trend, not a guarantee of future performance.
+        </p>
+        </>
       ) : (
         <EmptyState icon="📈" title="Predictions not yet available"
                     body="Predictions require at least 3 months of review history per location. Run the pipeline to generate." />

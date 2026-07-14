@@ -9,6 +9,7 @@ import EmptyState from '../components/ui/EmptyState.jsx'
 import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
 import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
+import CXIndexGrid from '../components/ui/CXIndexGrid.jsx'
 import { useLocationStats, useLocationDetail, usePrefetchLocationDetails } from '../hooks/useIntelligence.js'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -79,16 +80,22 @@ function AISummaryCard({ detail }) {
   )
 }
 
+const FORECAST_CONFIDENCE_VARIANT = { high: 'success', moderate: 'warning', low: 'neutral' }
+
 function PredictionCard({ detail }) {
-  const pred  = detail?.predictedRating
-  const vol   = detail?.predictedVolume
-  const alert = detail?.trendAlert
+  const pred       = detail?.predictedRating
+  const predConf   = detail?.predictedRatingConfidence
+  const vol        = detail?.predictedVolume
+  const alert      = detail?.trendAlert
 
   if (!pred && !vol) return null
 
   return (
     <Card className="p-4">
-      <p className="text-label mb-3" style={{ color: 'var(--color-text-2)' }}>30-Day Forecast</p>
+      <div className="flex items-center justify-between mb-3">
+        <p className="text-label" style={{ color: 'var(--color-text-2)' }}>30-Day Forecast</p>
+        {predConf && <Badge variant={FORECAST_CONFIDENCE_VARIANT[predConf.level] ?? 'neutral'}>{predConf.label}</Badge>}
+      </div>
       <div className="grid grid-cols-2 gap-3">
         {pred && (
           <div>
@@ -108,6 +115,9 @@ function PredictionCard({ detail }) {
           </div>
         )}
       </div>
+      <p className="text-[9px] mt-2" style={{ color: 'var(--color-text-3)' }}>
+        AI-generated forecast, not a guarantee{predConf ? ` · based on ${predConf.monthsOfData} month${predConf.monthsOfData === 1 ? '' : 's'} of history` : ''}.
+      </p>
       {alert && (
         <div className="mt-3 flex items-start gap-2 p-3 rounded-lg"
              style={{ background: 'var(--color-danger-bg)', borderLeft: '3px solid var(--color-danger)' }}>
@@ -313,6 +323,8 @@ function LocationDashboard({ loc, detail, loading, locationReviews = [], locatio
       </div>
 
       <PeriodComparison reviews={locationReviews} prevReviews={locationPrevReviews} />
+
+      <CXIndexGrid dimensions={detail?.cxIndex} title="Customer Experience Index (30d)" />
 
       {/* Intelligence row */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

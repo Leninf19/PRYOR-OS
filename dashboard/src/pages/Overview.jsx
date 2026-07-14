@@ -8,9 +8,10 @@ import Badge from '../components/ui/Badge.jsx'
 import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
 import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
+import CXIndexGrid from '../components/ui/CXIndexGrid.jsx'
 import {
   useKPIs, useCompanySummary, useMonthlyTrend, useLocationStats,
-  usePredictiveAlerts, useComplaintIntel, useActionItems,
+  usePredictiveAlerts, useComplaintIntel, useActionItems, useCXIndex,
 } from '../hooks/useIntelligence.js'
 
 // ─── AI Summary ──────────────────────────────────────────────────────────────
@@ -339,6 +340,7 @@ export default function Overview({ filtered = [], prevFiltered = [] }) {
   const { data: alerts                          } = usePredictiveAlerts()
   const { data: intel,   isLoading: lIntel    } = useComplaintIntel()
   const { data: actions, isLoading: lActions  } = useActionItems()
+  const { data: cxIndex, isLoading: lCX       } = useCXIndex()
 
   return (
     <div className="space-y-6 max-w-[1400px]">
@@ -355,6 +357,8 @@ export default function Overview({ filtered = [], prevFiltered = [] }) {
       <AlertBanner alerts={alerts} />
 
       <KPIGrid kpis={kpis} loading={lKpis} />
+
+      <CXIndexGrid dimensions={cxIndex} loading={lCX} />
 
       {/* Review classification + rating breakdown — driven live by the global
           filter bar (date/brand/location/stars), unlike the KPI row above
