@@ -3,6 +3,7 @@ import { useOutletContext } from 'react-router-dom'
 import Card from '../components/ui/Card.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import { useExecutiveScores } from '../hooks/useIntelligence.js'
 import { useCompanyGoals } from '../hooks/useCompanyGoals.js'
 import { useReviewWorkspace } from '../hooks/useReviewWorkspace.js'
@@ -200,7 +201,7 @@ function CompanyGoals() {
 }
 
 export default function ExecutiveDashboard() {
-  const { data: scores, isLoading } = useExecutiveScores()
+  const { data: scores, isLoading, isError, refetch } = useExecutiveScores()
 
   return (
     <div className="space-y-8 max-w-[1200px]">
@@ -213,7 +214,9 @@ export default function ExecutiveDashboard() {
 
       <CompanyGoals />
 
-      {isLoading ? (
+      {isError ? (
+        <ErrorState body="Couldn't load executive scores." onRetry={refetch} />
+      ) : isLoading ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           {[1,2,3,4,5,6,7,8].map(i => <Skeleton key={i} className="h-40 rounded-2xl" />)}
         </div>

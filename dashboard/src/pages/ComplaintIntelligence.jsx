@@ -3,6 +3,7 @@ import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import { useComplaintIntel } from '../hooks/useIntelligence.js'
 
 const SEV_LABEL = { 3: 'Critical', 2: 'Moderate', 1: 'Low' }
@@ -156,7 +157,7 @@ function SectionHeader({ title, count, sub }) {
 }
 
 export default function ComplaintIntelligence() {
-  const { data: intel, isLoading } = useComplaintIntel()
+  const { data: intel, isLoading, isError, refetch } = useComplaintIntel()
   const [tab, setTab] = useState('complaints')
 
   const complaints = intel?.complaints ?? []
@@ -214,7 +215,9 @@ export default function ComplaintIntelligence() {
       )}
 
       {/* Category cards */}
-      {isLoading ? (
+      {isError ? (
+        <ErrorState body="Couldn't load complaint intelligence data." onRetry={refetch} />
+      ) : isLoading ? (
         <div className="space-y-3">
           {[1,2,3,4,5].map(i => <Skeleton key={i} className="h-20 w-full" />)}
         </div>

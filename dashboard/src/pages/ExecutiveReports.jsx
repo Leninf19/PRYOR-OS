@@ -5,6 +5,7 @@ import Badge from '../components/ui/Badge.jsx'
 import Card from '../components/ui/Card.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import Tabs from '../components/ui/Tabs.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
 import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
@@ -455,16 +456,18 @@ const TABS = [
 
 export default function ExecutiveReports() {
   const { allReviews = [] } = useOutletContext() ?? {}
-  const { data: weekly,     isLoading: lW } = useWeeklyReportData()
+  const { data: weekly,     isLoading: lW, isError: eW, refetch: rW } = useWeeklyReportData()
   const { data: kpis,       isLoading: lK } = useKPIs()
-  const { data: summary,    isLoading: lS } = useCompanySummary()
-  const { data: complaint,  isLoading: lC } = useComplaintIntel()
-  const { data: competitor, isLoading: lR } = useCompetitorIntel()
-  const { data: actions,    isLoading: lA } = useActionCenter()
+  const { data: summary,    isLoading: lS, isError: eS, refetch: rS } = useCompanySummary()
+  const { data: complaint,  isLoading: lC, isError: eC, refetch: rC } = useComplaintIntel()
+  const { data: competitor, isLoading: lR, isError: eR, refetch: rR } = useCompetitorIntel()
+  const { data: actions,    isLoading: lA, isError: eA, refetch: rA } = useActionCenter()
   const { data: actionWs } = useActionWorkspace()
   const [tab, setTab] = useState('custom')
 
   const loading = { custom: false, weekly: lW, complaint: lC, competitor: lR, actions: lA, network: lS }
+  const error   = { custom: false, weekly: eW, complaint: eC, competitor: eR, actions: eA, network: eS }
+  const retry   = { custom: () => {}, weekly: rW, complaint: rC, competitor: rR, actions: rA, network: rS }
 
   return (
     <div className="space-y-6 max-w-[900px]">
@@ -481,7 +484,9 @@ export default function ExecutiveReports() {
       </div>
 
       {/* Panels */}
-      {loading[tab] ? (
+      {error[tab] ? (
+        <ErrorState body="Couldn't load this report." onRetry={retry[tab]} />
+      ) : loading[tab] ? (
         <div className="space-y-4">
           <Skeleton className="h-12 rounded-2xl" />
           {[...Array(3)].map((_, i) => <Skeleton key={i} className="h-16" />)}

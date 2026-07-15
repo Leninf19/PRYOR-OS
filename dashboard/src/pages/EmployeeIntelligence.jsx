@@ -2,6 +2,7 @@ import { useState } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import { useLocationStats, useAllLocationDetails } from '../hooks/useIntelligence.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -126,8 +127,12 @@ function EmployeeCard({ emp, rank }) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 export default function EmployeeIntelligence() {
-  const { data: locationStats, isLoading: lStats }   = useLocationStats()
+  const { data: locationStats, isLoading: lStats, isError: eStats, refetch: refetchStats } = useLocationStats()
   const { data: locationDetails, isLoading: lDetails } = useAllLocationDetails(locationStats)
+
+  if (eStats) {
+    return <ErrorState body="Couldn't load employee intelligence data." onRetry={refetchStats} />
+  }
 
   if (lStats || lDetails) {
     return (

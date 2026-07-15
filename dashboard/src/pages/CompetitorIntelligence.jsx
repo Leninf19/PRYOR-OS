@@ -3,6 +3,7 @@ import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import { useCompetitorIntel } from '../hooks/useIntelligence.js'
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -620,10 +621,11 @@ function LoadingSkeleton() {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function CompetitorIntelligence() {
-  const { data: intel, isLoading } = useCompetitorIntel()
+  const { data: intel, isLoading, isError, refetch } = useCompetitorIntel()
   const [showAll, setShowAll] = useState(false)
   const [selectedLocName, setSelectedLocName] = useState(null)
 
+  if (isError) return <ErrorState body="Couldn't load competitor intelligence data." onRetry={refetch} />
   if (isLoading) return <LoadingSkeleton />
 
   if (!intel) {

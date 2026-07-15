@@ -4,6 +4,7 @@ import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import Tabs from '../components/ui/Tabs.jsx'
 import { useActionCenter, useComplaintIntel } from '../hooks/useIntelligence.js'
 import { useActionWorkspace } from '../hooks/useActionWorkspace.js'
@@ -234,7 +235,7 @@ function ActionCard({ a, entry, onUpdate, locations, complaintIntel }) {
 }
 
 export default function ActionCenter() {
-  const { data: actions, isLoading } = useActionCenter()
+  const { data: actions, isLoading, isError, refetch } = useActionCenter()
   const { data: complaintIntel } = useComplaintIntel()
   const { data: ws, setRecord } = useActionWorkspace()
   const { allReviews = [] } = useOutletContext() ?? {}
@@ -262,7 +263,9 @@ export default function ActionCenter() {
         <Tabs tabs={['All', ...STATUSES]} value={statusFilter} onChange={setStatusFilter} size="sm" />
       </div>
 
-      {isLoading ? (
+      {isError ? (
+        <ErrorState body="Couldn't load the action center recommendations." onRetry={refetch} />
+      ) : isLoading ? (
         <div className="space-y-3">{[1,2,3,4].map(i => <Skeleton key={i} className="h-48 rounded-2xl" />)}</div>
       ) : !visible?.length ? (
         <EmptyState icon="✓" title="No recommendations in this filter"

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import {
   usePredictiveAlerts, useActionItems, useScraperStatusData,
   useCompetitorIntel,
@@ -227,14 +228,16 @@ const TABS = [
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 export default function Alerts() {
-  const { data: predictive, isLoading: loadP }  = usePredictiveAlerts()
-  const { data: actionItems, isLoading: loadA }  = useActionItems()
-  const { data: scraperRuns, isLoading: loadS }  = useScraperStatusData()
-  const { data: competitorIntel, isLoading: loadC } = useCompetitorIntel()
+  const { data: predictive, isLoading: loadP, isError: errP, refetch: refetchP }  = usePredictiveAlerts()
+  const { data: actionItems, isLoading: loadA, isError: errA, refetch: refetchA }  = useActionItems()
+  const { data: scraperRuns, isLoading: loadS, isError: errS, refetch: refetchS }  = useScraperStatusData()
+  const { data: competitorIntel, isLoading: loadC, isError: errC, refetch: refetchC } = useCompetitorIntel()
   const googleStatus = useGoogleStatus()
   const [tab, setTab] = useState('all')
 
   const isLoading = loadP || loadA || loadS || loadC
+  const isError = errP || errA || errS || errC
+  const refetchAll = () => { refetchP(); refetchA(); refetchS(); refetchC() }
 
   const alerts = isLoading
     ? []
@@ -288,7 +291,9 @@ export default function Alerts() {
       </div>
 
       {/* Content */}
-      {isLoading ? (
+      {isError ? (
+        <ErrorState body="Couldn't load alerts data." onRetry={refetchAll} />
+      ) : isLoading ? (
         <LoadingSkeleton />
       ) : filtered.length === 0 ? (
         <EmptyState

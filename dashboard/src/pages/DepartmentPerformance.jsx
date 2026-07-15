@@ -2,6 +2,7 @@ import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import ExplainableScore from '../components/ui/ExplainableScore.jsx'
 import { useDepartmentPerformance } from '../hooks/useIntelligence.js'
 
@@ -89,7 +90,7 @@ function DepartmentCard({ d }) {
 }
 
 export default function DepartmentPerformance() {
-  const { data: departments, isLoading } = useDepartmentPerformance()
+  const { data: departments, isLoading, isError, refetch } = useDepartmentPerformance()
 
   return (
     <div className="space-y-6 max-w-[1100px]">
@@ -100,7 +101,9 @@ export default function DepartmentPerformance() {
         </p>
       </div>
 
-      {isLoading ? (
+      {isError ? (
+        <ErrorState body="Couldn't load department performance data." onRetry={refetch} />
+      ) : isLoading ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {[1,2,3,4,5,6].map(i => <Skeleton key={i} className="h-56 rounded-2xl" />)}
         </div>

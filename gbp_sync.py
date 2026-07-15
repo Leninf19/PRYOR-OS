@@ -88,6 +88,19 @@ def _discover_and_link_locations(conn, accounts: list, our_locations: list, now:
     return linked
 
 
+def _record_early_failure(conn, now: str, reason: str) -> None:
+    """A failure at account discovery (before any location is even known)
+    previously left no scraper_runs row at all, so Data Health / Location
+    Sync showed nothing rather than a visible failure. This gives every
+    sync attempt a row, matching the per-location failure path below."""
+    conn.execute(
+        """INSERT INTO scraper_runs (started_at, finished_at, mode, status, error_summary)
+           VALUES (?, ?, 'api_sync', 'failed', ?)""",
+        (now, datetime.now(timezone.utc).isoformat(), reason[:2000]),
+    )
+    conn.commit()
+
+
 def sync_all(fast: bool = False) -> dict:
     """Runs one full sync pass. Returns run stats (new/edited/deleted counts)
     in the same shape auto_update.py's run stats use, so the scheduled
@@ -103,9 +116,12 @@ def sync_all(fast: bool = False) -> dict:
     try:
         accounts = ga.list_accounts()
     except ga.GBPError as e:
+        _record_early_failure(conn, now, str(e))
         return {"status": "failed", "reason": str(e)}
     if not accounts:
-        return {"status": "failed", "reason": "No Google Business Profile accounts found for this token"}
+        reason = "No Google Business Profile accounts found for this token"
+        _record_early_failure(conn, now, reason)
+        return {"status": "failed", "reason": reason}
 
     our_locations = [dict(r) for r in conn.execute("SELECT * FROM locations WHERE is_active = 1").fetchall()]
     linked = _discover_and_link_locations(conn, accounts, our_locations, now)

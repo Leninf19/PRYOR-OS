@@ -2,6 +2,7 @@ import { useState } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import Tabs from '../components/ui/Tabs.jsx'
 import {
   useComplaintIntel, useCompetitorIntel, useMeta, useBestQuotes, useSeasonalTrends,
@@ -154,15 +155,17 @@ function LoadingSkeleton() {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 export default function MarketingIntelligence() {
-  const { data: complaint,  isLoading: lC } = useComplaintIntel()
-  const { data: competitor, isLoading: lR } = useCompetitorIntel()
-  const { data: meta,       isLoading: lM } = useMeta()
+  const { data: complaint,  isLoading: lC, isError: eC, refetch: rC } = useComplaintIntel()
+  const { data: competitor, isLoading: lR, isError: eR, refetch: rR } = useCompetitorIntel()
+  const { data: meta,       isLoading: lM, isError: eM, refetch: rM } = useMeta()
   const { data: quotes }   = useBestQuotes()
   const { data: seasonal } = useSeasonalTrends()
   const [activeTab, setActiveTab] = useState('insights')
 
   const isLoading = lC || lR || lM
+  const isError = eC || eR || eM
 
+  if (isError) return <ErrorState body="Couldn't load marketing intelligence data." onRetry={() => { rC(); rR(); rM() }} />
   if (isLoading) return <LoadingSkeleton />
 
   const praises  = complaint?.praises ?? []

@@ -171,6 +171,15 @@ def init_schema(conn: sqlite3.Connection):
     conn.commit()
 
 
+# Bumped whenever a migration is added to the list below -- purely an
+# observability marker (`PRAGMA user_version`), not a gate: every migration
+# is still individually idempotent via the try/except pattern, so this
+# doesn't control which migrations run. It just lets you tell at a glance,
+# from the DB file alone, whether it's seen the latest migration batch --
+# `sqlite3 reviews.db "PRAGMA user_version"` -- without reading this file.
+SCHEMA_VERSION = 13
+
+
 def _migrate_schema(conn: sqlite3.Connection):
     """Apply additive schema migrations that can't go in CREATE TABLE IF NOT EXISTS."""
     migrations = [
@@ -205,6 +214,8 @@ def _migrate_schema(conn: sqlite3.Connection):
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_gbp_review_name "
         "ON reviews(gbp_review_name) WHERE gbp_review_name IS NOT NULL"
     )
+
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def review_content_hash(review_text: str, star_rating) -> str:

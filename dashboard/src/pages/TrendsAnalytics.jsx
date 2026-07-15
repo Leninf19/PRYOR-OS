@@ -4,14 +4,16 @@ import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import Tabs from '../components/ui/Tabs.jsx'
 import { useMonthlyTrend, useRankings, useLocationStats, usePredictiveAlerts } from '../hooks/useIntelligence.js'
 
 // ─── Rankings tab ─────────────────────────────────────────────────────────────
 
 function RankingsTab() {
-  const { data: rankings, isLoading } = useRankings()
+  const { data: rankings, isLoading, isError, refetch } = useRankings()
 
+  if (isError) return <ErrorState body="Couldn't load rankings data." onRetry={refetch} />
   if (isLoading) return <div className="space-y-2">{[1,2,3,4,5].map(i => <Skeleton key={i} className="h-14 w-full" />)}</div>
   if (!rankings?.length) return <EmptyState icon="📊" title="No ranking data yet" />
 
@@ -97,9 +99,10 @@ function RankingsTab() {
 // ─── Trend tab ────────────────────────────────────────────────────────────────
 
 function TrendTab() {
-  const { data: trend, isLoading } = useMonthlyTrend()
+  const { data: trend, isLoading, isError, refetch } = useMonthlyTrend()
   const last24 = (trend ?? []).slice(-24)
 
+  if (isError) return <ErrorState body="Couldn't load monthly trend data." onRetry={refetch} />
   if (isLoading) return <Skeleton className="h-64 w-full" />
 
   return (
@@ -146,9 +149,10 @@ function TrendTab() {
 // ─── Predictions tab ──────────────────────────────────────────────────────────
 
 function PredictionsTab() {
-  const { data: stats,  isLoading: lStats  } = useLocationStats()
-  const { data: alerts, isLoading: lAlerts } = usePredictiveAlerts()
+  const { data: stats,  isLoading: lStats,  isError: eStats,  refetch: rStats  } = useLocationStats()
+  const { data: alerts, isLoading: lAlerts, isError: eAlerts, refetch: rAlerts } = usePredictiveAlerts()
 
+  if (eStats || eAlerts) return <ErrorState body="Couldn't load predictions data." onRetry={() => { rStats(); rAlerts() }} />
   if (lStats || lAlerts) return <div className="space-y-3">{[1,2,3].map(i => <Skeleton key={i} className="h-20 w-full" />)}</div>
 
   const withPred = (stats ?? []).filter(s => s.predictedRating != null).sort((a, b) => (a.predictedRating ?? 0) - (b.predictedRating ?? 0))

@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 import ThemeToggle from '../components/ui/ThemeToggle.jsx'
+import Skeleton from '../components/ui/Skeleton.jsx'
+import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import { useCompanyGoals } from '../hooks/useCompanyGoals.js'
 import { useGoogleStatus } from '../hooks/useGoogleStatus.js'
 
@@ -117,18 +120,28 @@ function TestConnectionPanel() {
 }
 
 function useGbpSyncData() {
-  const [state, setState] = useState({ loading: true, data: null })
-  useEffect(() => {
+  const [state, setState] = useState({ loading: true, data: null, error: false })
+
+  const load = () => {
+    setState(s => ({ ...s, loading: true }))
     fetch('/data/gbp-sync.json')
-      .then(r => { if (!r.ok) throw new Error('not found'); return r.json() })
-      .then(data => setState({ loading: false, data }))
-      .catch(() => setState({ loading: false, data: null }))
-  }, [])
-  return state
+      .then(r => {
+        // 404 means no sync has ever run yet -- a legitimate empty state,
+        // not a failure. Anything else (network/parse error) is a real error.
+        if (r.status === 404) return null
+        if (!r.ok) throw new Error(`gbp-sync.json returned ${r.status}`)
+        return r.json()
+      })
+      .then(data => setState({ loading: false, data, error: false }))
+      .catch(() => setState({ loading: false, data: null, error: true }))
+  }
+
+  useEffect(load, [])
+  return { ...state, refetch: load }
 }
 
 function LocationSyncPanel() {
-  const { loading, data } = useGbpSyncData()
+  const { loading, data, error, refetch } = useGbpSyncData()
   const [triggering, setTriggering] = useState(false)
   const [triggerMsg, setTriggerMsg] = useState(null)
 
@@ -158,11 +171,9 @@ function LocationSyncPanel() {
         <div>
           <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Location Sync</p>
           <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
-            {loading
-              ? 'Loading…'
-              : data
-                ? `${linkedCount} of ${locations.length} locations linked to Google`
-                : 'No sync data yet — run a sync to populate this view.'}
+            {!loading && (data
+              ? `${linkedCount} of ${locations.length} locations linked to Google`
+              : !error && 'No sync data yet — run a sync to populate this view.')}
             {data?.lastRun && ` · last sync ${data.lastRun.status} at ${data.lastRun.finished_at || data.lastRun.started_at}`}
           </p>
         </div>
@@ -179,9 +190,19 @@ function LocationSyncPanel() {
           {triggerMsg.text}
         </div>
       )}
+      {loading && (
+        <div className="px-6 pb-5 space-y-2">
+          {[1,2,3].map(i => <Skeleton key={i} className="h-8 w-full" />)}
+        </div>
+      )}
+      {error && (
+        <div className="border-t" style={{ borderColor: 'var(--color-border)' }}>
+          <ErrorState body="Couldn't load location sync status." onRetry={refetch} />
+        </div>
+      )}
       {locations.length > 0 && (
-        <div className="border-t max-h-72 overflow-y-auto" style={{ borderColor: 'var(--color-border)' }}>
-          <table className="w-full text-xs">
+        <div className="border-t max-h-72 overflow-y-auto overflow-x-auto" style={{ borderColor: 'var(--color-border)' }}>
+          <table className="w-full text-xs" style={{ minWidth: 480 }}>
             <thead>
               <tr className="text-left" style={{ color: 'var(--color-text-3)' }}>
                 <th className="px-6 py-2 font-medium">Location</th>
@@ -205,6 +226,98 @@ function LocationSyncPanel() {
           </table>
         </div>
       )}
+      {data && locations.length === 0 && (
+        <div className="border-t" style={{ borderColor: 'var(--color-border)' }}>
+          <EmptyState icon="📍" title="No locations found"
+                      body="Sync data exists but no locations are recorded yet — try Sync Now." />
+        </div>
+      )}
+    </div>
+  )
+}
+
+// One-time reconciliation between existing scraped reviews and the Google
+// API (gbp_import.py) -- preview first, then a confirmed apply, never a
+// single blind click straight to writing 16,000+ reviews.
+function HistoricalImportPanel() {
+  const [triggering, setTriggering] = useState(null) // null | 'preview' | 'apply'
+  const [msg, setMsg] = useState(null)
+  const [confirmText, setConfirmText] = useState('')
+
+  const trigger = async (apply) => {
+    setTriggering(apply ? 'apply' : 'preview')
+    setMsg(null)
+    try {
+      const r = await fetch('/api/google/trigger-import', {
+        method:  'POST',
+        headers: { 'content-type': 'application/json' },
+        body:    JSON.stringify({ apply }),
+      })
+      const d = await r.json()
+      setMsg(d.success
+        ? {
+            ok: true,
+            text: apply
+              ? 'Import started — check the "Historical Import" workflow run in GitHub Actions for the full report and commit.'
+              : 'Preview started — check the "Historical Import" workflow run in GitHub Actions (job summary) for the match-rate report. Nothing is written in preview mode.',
+          }
+        : { ok: false, text: d.message || 'Could not trigger the import.' })
+      if (apply) setConfirmText('')
+    } catch (err) {
+      setMsg({ ok: false, text: err.message })
+    } finally {
+      setTriggering(null)
+    }
+  }
+
+  return (
+    <div className="rounded-2xl border overflow-hidden"
+         style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <div className="px-6 py-5">
+        <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Historical Import</p>
+        <p className="text-xs mt-0.5 leading-relaxed" style={{ color: 'var(--color-text-3)' }}>
+          One-time reconciliation of every existing scraped review against Google's own records. Always preview
+          first — it changes nothing and shows the match rate — before running the real import.
+        </p>
+      </div>
+      <div className="px-6 pb-5 pt-1 border-t space-y-3" style={{ borderColor: 'var(--color-border)' }}>
+        <div className="flex items-center gap-3 flex-wrap pt-3">
+          <button
+            onClick={() => trigger(false)}
+            disabled={triggering !== null}
+            className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
+            style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)', opacity: triggering ? 0.6 : 1 }}>
+            {triggering === 'preview' ? 'Starting…' : 'Preview Import'}
+          </button>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={confirmText}
+              onChange={e => setConfirmText(e.target.value)}
+              placeholder='Type "IMPORT" to enable'
+              className="text-xs px-2.5 py-2 rounded-lg border w-40 focus:outline-none"
+              style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
+            />
+            <button
+              onClick={() => trigger(true)}
+              disabled={triggering !== null || confirmText !== 'IMPORT'}
+              className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
+              style={{
+                background: confirmText === 'IMPORT' ? 'var(--color-accent)' : 'var(--color-surface-2)',
+                borderColor: confirmText === 'IMPORT' ? 'var(--color-accent)' : 'var(--color-border)',
+                color: confirmText === 'IMPORT' ? 'white' : 'var(--color-text-3)',
+                opacity: triggering ? 0.6 : 1,
+              }}>
+              {triggering === 'apply' ? 'Starting…' : 'Run Import'}
+            </button>
+          </div>
+        </div>
+        {msg && (
+          <p className="text-xs" style={{ color: msg.ok ? 'var(--color-text-2)' : 'var(--color-danger, #dc2626)' }}>
+            {msg.text}
+          </p>
+        )}
+      </div>
     </div>
   )
 }
@@ -257,7 +370,7 @@ function GBPSection() {
         <div className="px-6 py-4 border-t" style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-2)' }}>
           {status.connected ? (
             <>
-              <div className="grid grid-cols-2 gap-3 mb-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
                 {[
                   { label: 'Account', value: status.accountId || '—' },
                   { label: 'Accounts found', value: status.accountCount ?? '—' },
@@ -316,6 +429,7 @@ function GBPSection() {
         <>
           <TestConnectionPanel />
           <LocationSyncPanel />
+          <HistoricalImportPanel />
         </>
       )}
 

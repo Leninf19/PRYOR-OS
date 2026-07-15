@@ -6,6 +6,7 @@ import Badge from '../components/ui/Badge.jsx'
 import HealthRing from '../components/ui/HealthRing.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
 import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
@@ -243,9 +244,8 @@ function LocationDashboard({ loc, detail, loading, locationReviews = [], locatio
     return (
       <div className="space-y-4">
         <Skeleton className="h-32 w-full" />
-        <div className="grid grid-cols-2 gap-4">
-          <Skeleton className="h-24 w-full" />
-          <Skeleton className="h-24 w-full" />
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          {[1,2,3,4].map(i => <Skeleton key={i} className="h-24 w-full" />)}
         </div>
         <Skeleton className="h-40 w-full" />
       </div>
@@ -348,7 +348,7 @@ function LocationDashboard({ loc, detail, loading, locationReviews = [], locatio
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export default function LocationDetail({ allReviews = [], filtered = [], prevFiltered = [], filters = {} }) {
-  const { data: stats, isLoading: lStats } = useLocationStats()
+  const { data: stats, isLoading: lStats, isError: eStats, refetch: refetchStats } = useLocationStats()
   usePrefetchLocationDetails(stats)
   const [selected, setSelected] = useState(null)
 
@@ -386,7 +386,9 @@ export default function LocationDetail({ allReviews = [], filtered = [], prevFil
         </p>
       </div>
 
-      {lStats ? (
+      {eStats ? (
+        <ErrorState body="Couldn't load location data." onRetry={refetchStats} />
+      ) : lStats ? (
         <div className="skeleton h-10 w-full max-w-2xl" />
       ) : (
         <LocationPicker stats={stats} selected={selected ?? stats?.[0]?.name} onSelect={setSelected} />

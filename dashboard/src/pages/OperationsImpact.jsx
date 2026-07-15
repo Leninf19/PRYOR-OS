@@ -1,6 +1,7 @@
 import Card from '../components/ui/Card.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
+import ErrorState from '../components/ui/ErrorState.jsx'
 import { useOperationsImpact } from '../hooks/useIntelligence.js'
 
 const CARDS = [
@@ -52,7 +53,7 @@ function ImpactCard({ def, entry }) {
 }
 
 export default function OperationsImpact() {
-  const { data: impact, isLoading } = useOperationsImpact()
+  const { data: impact, isLoading, isError, refetch } = useOperationsImpact()
 
   return (
     <div className="space-y-6 max-w-[1100px]">
@@ -63,7 +64,9 @@ export default function OperationsImpact() {
         </p>
       </div>
 
-      {isLoading ? (
+      {isError ? (
+        <ErrorState body="Couldn't load operations impact data." onRetry={refetch} />
+      ) : isLoading ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {[1,2,3,4,5,6].map(i => <Skeleton key={i} className="h-36 rounded-2xl" />)}
         </div>

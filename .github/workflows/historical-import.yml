@@ -1,0 +1,69 @@
+name: Historical Import
+
+# One-time reconciliation between the existing scraped review history and
+# the Google Business Profile API (gbp_import.py). Deliberately
+# workflow_dispatch-only -- never scheduled -- since this is a manual,
+# reviewed action, not part of the recurring sync (that's update-reviews.yml
+# running gbp_sync.py). Defaults to a dry run; the reconciliation report is
+# always written to the job summary so it's readable without a DB copy.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Actually write changes (unchecked = dry-run report only)'
+        type: boolean
+        default: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install anthropic
+
+      - name: Run historical import
+        id: import
+        run: |
+          if [ "${{ inputs.apply }}" = "true" ]; then
+            python gbp_import.py --apply | tee import_output.txt
+          else
+            python gbp_import.py | tee import_output.txt
+          fi
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+
+      - name: Write report to job summary
+        if: always()
+        run: |
+          echo "## Historical Import — mode: ${{ inputs.apply == 'true' && 'APPLY (changes written)' || 'DRY RUN (no changes written)' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat import_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f gbp_import_report.json ]; then
+            echo "### Full reconciliation report (gbp_import_report.json)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat gbp_import_report.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Commit updated data
+        if: always() && inputs.apply == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dashboard/reviews.db
+          git diff --staged --quiet || git commit -m "chore: historical import applied [skip ci]"
+          git push

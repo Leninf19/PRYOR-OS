@@ -13,13 +13,16 @@ asserts google_api.py's list_accounts()/list_locations() hit the current
 correct hosts, while list_reviews()/reply_to_review() still correctly use
 the legacy v4 host (unaffected by the 2022 split).
 
-No pytest dependency in this repo -- run directly: py test_google_api_endpoints.py
+No pytest dependency in this repo -- run directly: py tests/test_google_api_endpoints.py
 Exits 0 on success, 1 with a clear message on failure.
 """
 import io
 import json
+import sys
+from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import google_api as ga
 
 OLD_ACCOUNTS_URL_PREFIX = "https://mybusiness.googleapis.com/v4/accounts"
