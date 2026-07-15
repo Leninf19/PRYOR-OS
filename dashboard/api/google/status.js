@@ -1,8 +1,10 @@
 // Reports Google Business Profile connection status
 // GET /api/google/status
-// Returns { connected, state, accountName? }
+// Returns { connected, state, accountName?, accountId?, scopes?, tokenExpiresIn? }
 
-async function getAccessToken() {
+import { fetchWithRetry } from './_lib/http.js'
+
+async function exchangeRefreshToken() {
   const r = await fetch('https://oauth2.googleapis.com/token', {
     method:  'POST',
     headers: { 'content-type': 'application/json' },
@@ -14,7 +16,7 @@ async function getAccessToken() {
     }),
   })
   const d = await r.json()
-  return d.access_token || null
+  return d
 }
 
 export default async function handler(req, res) {
@@ -32,26 +34,37 @@ export default async function handler(req, res) {
   }
 
   try {
-    const accessToken = await getAccessToken()
-    if (!accessToken) {
-      return res.status(200).json({ connected: false, state: 'invalid_credentials' })
+    const tokenData = await exchangeRefreshToken()
+    if (!tokenData.access_token) {
+      return res.status(200).json({
+        connected: false, state: 'invalid_credentials',
+        error: tokenData.error_description || tokenData.error || 'Refresh token rejected',
+      })
     }
 
-    const r = await fetch('https://mybusiness.googleapis.com/v4/accounts', {
-      headers: { Authorization: `Bearer ${accessToken}` },
+    const r = await fetchWithRetry('https://mybusiness.googleapis.com/v4/accounts', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
     })
 
     if (!r.ok) {
-      return res.status(200).json({ connected: false, state: 'api_error', error: `GBP API ${r.status}` })
+      const body = await r.json().catch(() => ({}))
+      return res.status(200).json({
+        connected: false, state: 'api_error',
+        error: body.error?.message || `GBP API ${r.status}`,
+      })
     }
 
     const data    = await r.json()
     const account = (data.accounts || [])[0]
 
     return res.status(200).json({
-      connected:   true,
-      state:       'connected',
-      accountName: account?.accountName || 'Google Business Profile',
+      connected:      true,
+      state:          'connected',
+      accountName:    account?.accountName || 'Google Business Profile',
+      accountId:      account?.name || null,
+      accountCount:   (data.accounts || []).length,
+      scopes:         (tokenData.scope || 'https://www.googleapis.com/auth/business.manage').split(' '),
+      tokenExpiresIn: tokenData.expires_in || null,
     })
   } catch (err) {
     return res.status(200).json({ connected: false, state: 'error', error: err.message })

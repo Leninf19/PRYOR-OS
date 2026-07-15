@@ -1,0 +1,49 @@
+name: Critical Review Alert Check
+
+# Deliberately independent of update-reviews.yml's ~6h cron -- this is a
+# lightweight, frequent tripwire (sync just the newest review page per
+# location + classify + check for unescalated critical reviews) so a
+# critical review (food safety, injury, discrimination, legal concern)
+# doesn't sit unnoticed until the next full pipeline run or the 10pm digest.
+# See critical_alert_check.py and digest_filters.py.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install anthropic
+
+      - name: Check for critical reviews
+        run: python critical_alert_check.py
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+
+      - name: Commit updated data
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dashboard/reviews.db
+          git diff --staged --quiet || git commit -m "chore: critical-alert check housekeeping [skip ci]"
+          git push

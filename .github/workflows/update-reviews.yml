@@ -21,25 +21,15 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install playwright anthropic
+        run: pip install anthropic
 
-      - name: Install Playwright browsers
-        run: playwright install chromium --with-deps
-
-      - name: Run scraper
+      - name: Sync reviews via Google Business Profile API
         id: scrape
-        run: python auto_update.py
+        run: python gbp_sync.py
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-
-      - name: Upload debug snapshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scraper-debug-logs
-          path: logs/
-          if-no-files-found: ignore
-          retention-days: 7
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
 
       - name: Validate data
         if: always()

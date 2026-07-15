@@ -10,6 +10,7 @@ __pycache__/
 *.pyo
 scraped_reviews.csv
 scraped_missing.csv
+gbp_import_report.json
 
 # Node
 node_modules/

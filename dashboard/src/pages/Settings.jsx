@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import Badge from '../components/ui/Badge.jsx'
 import ThemeToggle from '../components/ui/ThemeToggle.jsx'
 import { useCompanyGoals } from '../hooks/useCompanyGoals.js'
@@ -34,19 +34,180 @@ const GBP_STEPS = [
   },
   {
     n: 5,
-    title: 'Add credentials to Vercel environment variables',
-    body: 'In your Vercel project → Settings → Environment Variables, add GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN. Once set, Future Insights authenticates with Google automatically without re-authorization each time.',
+    title: 'Add credentials to Vercel, then connect',
+    body: 'In your Vercel project → Settings → Environment Variables, add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET. Click "Connect Google Account" below — the refresh token is now saved automatically once VERCEL_API_TOKEN / VERCEL_PROJECT_ID / VERCEL_DEPLOY_HOOK_URL are also configured (see README). No manual token copy-paste needed.',
     tag: 'Final step',
   },
 ]
 
 const PLANNED_GBP = [
   'One-click "Publish to Google" from every review card',
-  'Real-time sync — reviews appear in Future Insights within minutes',
+  'Automatic sync every 6 hours, plus critical-review alerts within ~15–30 minutes',
   'Auto-detect reviews already responded to on Google',
   'Full status tracking: Approved → Published → Confirmed on Google',
   'Failure alerts with exact reason (permission missing, review removed, etc.)',
 ]
+
+// Renders one Test Connection check row.
+function CheckRow({ c }) {
+  const icon = c.status === 'pass' ? '✓' : c.status === 'fail' ? '✕' : '…'
+  const color = c.status === 'pass' ? 'var(--color-success, #16a34a)'
+    : c.status === 'fail' ? 'var(--color-danger, #dc2626)' : 'var(--color-text-3)'
+  return (
+    <div className="flex items-start gap-3 py-2">
+      <span className="w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 text-[11px] font-bold"
+            style={{ background: `${color}1a`, color }}>
+        {icon}
+      </span>
+      <div className="min-w-0">
+        <p className="text-xs font-semibold" style={{ color: 'var(--color-text-1)' }}>{c.label}</p>
+        <p className="text-[11px] mt-0.5 leading-relaxed" style={{ color: 'var(--color-text-3)' }}>{c.detail}</p>
+      </div>
+    </div>
+  )
+}
+
+function TestConnectionPanel() {
+  const [running, setRunning] = useState(false)
+  const [result, setResult] = useState(null)
+
+  const run = async () => {
+    setRunning(true)
+    setResult(null)
+    try {
+      const r = await fetch('/api/google/test-connection')
+      setResult(await r.json())
+    } catch (err) {
+      setResult({ overallStatus: 'fail', checks: [{ id: 'network', label: 'Reach test endpoint', status: 'fail', detail: err.message }] })
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  return (
+    <div className="rounded-2xl border overflow-hidden"
+         style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <div className="px-6 py-5 flex items-center justify-between gap-4">
+        <div>
+          <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Test Connection</p>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
+            Walks OAuth → account → locations → reviews → reply permission, with the exact failure reason if any step breaks
+          </p>
+        </div>
+        <button
+          onClick={run}
+          disabled={running}
+          className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors flex-shrink-0"
+          style={{ background: 'var(--color-accent)', borderColor: 'var(--color-accent)', color: 'white', opacity: running ? 0.6 : 1 }}>
+          {running ? 'Testing…' : 'Run Test'}
+        </button>
+      </div>
+      {result && (
+        <div className="px-6 pb-5 pt-1 border-t divide-y" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="pt-3">
+            <Badge variant={result.overallStatus === 'pass' ? 'success' : 'danger'}>
+              {result.overallStatus === 'pass' ? 'All checks passed' : 'Connection issue found'}
+            </Badge>
+          </div>
+          {result.checks.map(c => <CheckRow key={c.id} c={c} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function useGbpSyncData() {
+  const [state, setState] = useState({ loading: true, data: null })
+  useEffect(() => {
+    fetch('/data/gbp-sync.json')
+      .then(r => { if (!r.ok) throw new Error('not found'); return r.json() })
+      .then(data => setState({ loading: false, data }))
+      .catch(() => setState({ loading: false, data: null }))
+  }, [])
+  return state
+}
+
+function LocationSyncPanel() {
+  const { loading, data } = useGbpSyncData()
+  const [triggering, setTriggering] = useState(false)
+  const [triggerMsg, setTriggerMsg] = useState(null)
+
+  const syncNow = async () => {
+    setTriggering(true)
+    setTriggerMsg(null)
+    try {
+      const r = await fetch('/api/google/trigger-sync', { method: 'POST' })
+      const d = await r.json()
+      setTriggerMsg(d.success
+        ? { ok: true, text: 'Sync started — this page reflects new data after the workflow finishes (a few minutes).' }
+        : { ok: false, text: d.message || 'Could not trigger sync.' })
+    } catch (err) {
+      setTriggerMsg({ ok: false, text: err.message })
+    } finally {
+      setTriggering(false)
+    }
+  }
+
+  const locations = data?.locations || []
+  const linkedCount = locations.filter(l => l.linked).length
+
+  return (
+    <div className="rounded-2xl border overflow-hidden"
+         style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <div className="px-6 py-5 flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Location Sync</p>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
+            {loading
+              ? 'Loading…'
+              : data
+                ? `${linkedCount} of ${locations.length} locations linked to Google`
+                : 'No sync data yet — run a sync to populate this view.'}
+            {data?.lastRun && ` · last sync ${data.lastRun.status} at ${data.lastRun.finished_at || data.lastRun.started_at}`}
+          </p>
+        </div>
+        <button
+          onClick={syncNow}
+          disabled={triggering}
+          className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
+          style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)', opacity: triggering ? 0.6 : 1 }}>
+          {triggering ? 'Starting…' : 'Sync Now'}
+        </button>
+      </div>
+      {triggerMsg && (
+        <div className="px-6 pb-3 text-xs" style={{ color: triggerMsg.ok ? 'var(--color-text-2)' : 'var(--color-danger, #dc2626)' }}>
+          {triggerMsg.text}
+        </div>
+      )}
+      {locations.length > 0 && (
+        <div className="border-t max-h-72 overflow-y-auto" style={{ borderColor: 'var(--color-border)' }}>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left" style={{ color: 'var(--color-text-3)' }}>
+                <th className="px-6 py-2 font-medium">Location</th>
+                <th className="px-3 py-2 font-medium">Reviews</th>
+                <th className="px-3 py-2 font-medium">Linked</th>
+                <th className="px-6 py-2 font-medium">Last Synced</th>
+              </tr>
+            </thead>
+            <tbody>
+              {locations.map(l => (
+                <tr key={l.slug} className="border-t" style={{ borderColor: 'var(--color-border)' }}>
+                  <td className="px-6 py-2" style={{ color: 'var(--color-text-1)' }}>{l.name}</td>
+                  <td className="px-3 py-2" style={{ color: 'var(--color-text-2)' }}>{l.review_count}</td>
+                  <td className="px-3 py-2">
+                    <Badge variant={l.linked ? 'success' : 'neutral'}>{l.linked ? 'Yes' : 'Not yet'}</Badge>
+                  </td>
+                  <td className="px-6 py-2" style={{ color: 'var(--color-text-3)' }}>{l.gbp_last_synced_at || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
 
 function GBPSection() {
   const [stepsOpen, setStepsOpen] = useState(false)
@@ -95,14 +256,29 @@ function GBPSection() {
 
         <div className="px-6 py-4 border-t" style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-2)' }}>
           {status.connected ? (
-            <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)', lineHeight: 1.75 }}>
-              One-click publishing is active for all 21 locations. To disconnect, remove
-              <code className="mx-1 text-[10px] px-1.5 py-0.5 rounded"
-                    style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
-                GOOGLE_REFRESH_TOKEN
-              </code>
-              from Vercel environment variables.
-            </p>
+            <>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                {[
+                  { label: 'Account', value: status.accountId || '—' },
+                  { label: 'Accounts found', value: status.accountCount ?? '—' },
+                  { label: 'Token expires in', value: status.tokenExpiresIn ? `${status.tokenExpiresIn}s` : '—' },
+                  { label: 'Scopes', value: (status.scopes || []).map(s => s.split('/').pop()).join(', ') || '—' },
+                ].map(row => (
+                  <div key={row.label}>
+                    <p className="text-[10px] font-medium" style={{ color: 'var(--color-text-3)' }}>{row.label}</p>
+                    <p className="text-xs font-mono mt-0.5 break-all" style={{ color: 'var(--color-text-1)' }}>{row.value}</p>
+                  </div>
+                ))}
+              </div>
+              <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)', lineHeight: 1.75 }}>
+                One-click publishing is active for all 21 locations. To disconnect, remove
+                <code className="mx-1 text-[10px] px-1.5 py-0.5 rounded"
+                      style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
+                  GOOGLE_REFRESH_TOKEN
+                </code>
+                from Vercel environment variables.
+              </p>
+            </>
           ) : (
             <>
               <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)', lineHeight: 1.75 }}>
@@ -134,6 +310,14 @@ function GBPSection() {
           )}
         </div>
       </div>
+
+      {/* Diagnostics -- only meaningful once credentials exist */}
+      {(status.connected || status.state === 'invalid_credentials') && (
+        <>
+          <TestConnectionPanel />
+          <LocationSyncPanel />
+        </>
+      )}
 
       {/* Setup steps */}
       {stepsOpen && (

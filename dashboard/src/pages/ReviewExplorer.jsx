@@ -461,11 +461,11 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate }) {
       const res = await fetch('/api/google/publish', {
         method:  'POST',
         headers: { 'content-type': 'application/json' },
-        body:    JSON.stringify({
-          locationName: r.location_name,
-          reviewerName: r.reviewer_name,
-          replyText:    localDraft,
-        }),
+        body:    JSON.stringify(
+          r.gbp_review_name
+            ? { reviewName: r.gbp_review_name, replyText: localDraft }
+            : { locationName: r.location_name, reviewerName: r.reviewer_name, replyText: localDraft }
+        ),
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok) {

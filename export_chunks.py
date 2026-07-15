@@ -14,6 +14,7 @@ ReviewExplorer/LocationDetail) and a few derived views (action items,
 scraper status, validation summary) the frontend still needs in row form
 rather than pre-aggregated form.
 """
+import csv
 import json
 import re
 from collections import Counter
@@ -56,7 +57,30 @@ def review_to_dict(r, loc) -> dict:
         "ai_sentiment": r["ai_sentiment"] if "ai_sentiment" in r.keys() else None,
         "ai_sentiment_reason": r["ai_sentiment_reason"] if "ai_sentiment_reason" in r.keys() else None,
         "ai_priority": r["ai_priority"] if "ai_priority" in r.keys() else None,
+        "gbp_review_name": r["gbp_review_name"] if "gbp_review_name" in r.keys() else None,
     }
+
+
+def export_reviews_csv(conn, out_path=None) -> None:
+    """Regenerates dashboard/reviews.csv from the database. weekly_report.py
+    reads this file directly (no DB access) -- it used to be written by
+    auto_update.py's scraper as a side effect of scraping; now that
+    gbp_sync.py is the active sync path and writes only to the SQLite DB,
+    this keeps that CSV (and weekly_report.py) working unchanged."""
+    path = out_path or (db.BASE_DIR / "dashboard" / "reviews.csv")
+    rows = conn.execute(
+        """SELECT r.reviewer_name, r.review_date, r.star_rating, r.review_text,
+                  r.owner_response, r.review_url, l.name AS location_name, l.city AS city
+           FROM reviews r JOIN locations l ON l.id = r.location_id
+           WHERE r.is_deleted = 0 ORDER BY r.review_date"""
+    ).fetchall()
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+        writer.writerow(["location_name", "city", "reviewer_name", "review_date",
+                          "star_rating", "review_text", "owner_response", "review_url"])
+        for r in rows:
+            writer.writerow([r["location_name"], r["city"], r["reviewer_name"], r["review_date"],
+                              r["star_rating"], r["review_text"], r["owner_response"], r["review_url"]])
 
 
 def export_meta(conn, locations: dict) -> None:
@@ -207,6 +231,33 @@ def export_weekly_report(conn, locations: dict) -> None:
     })
 
 
+def export_gbp_sync_status(conn, locations: dict) -> None:
+    """Per-location Google Business Profile linkage + sync state, plus the
+    most recent api_sync run, for the Settings -> Connection Center's
+    Location Sync view. Read-only summary of columns gbp_sync.py maintains."""
+    loc_list = [
+        {
+            "name": l["name"], "city": l["city"], "brand": l["brand"],
+            "slug": slugify(l["name"]),
+            "linked": bool(l.get("gbp_location_name")),
+            "gbp_verification_status": l.get("gbp_verification_status"),
+            "gbp_last_synced_at": l.get("gbp_last_synced_at"),
+            "review_count": conn.execute(
+                "SELECT COUNT(*) AS c FROM reviews WHERE location_id = ? AND is_deleted = 0",
+                (l["id"],),
+            ).fetchone()["c"],
+        }
+        for l in locations.values()
+    ]
+    last_run = conn.execute(
+        "SELECT * FROM scraper_runs WHERE mode = 'api_sync' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    write_json("gbp-sync.json", {
+        "locations": sorted(loc_list, key=lambda l: l["name"]),
+        "lastRun": dict(last_run) if last_run else None,
+    })
+
+
 def export_scraper_status(conn) -> None:
     runs = conn.execute("SELECT * FROM scraper_runs ORDER BY id DESC LIMIT 30").fetchall()
     run_list = []
@@ -317,6 +368,7 @@ def export_location_detail_reviews(conn, locations: dict) -> None:
                 "ai_sentiment": rd.get("ai_sentiment"),
                 "ai_sentiment_reason": rd.get("ai_sentiment_reason"),
                 "ai_priority": rd.get("ai_priority"),
+                "gbp_review_name": rd.get("gbp_review_name"),
             })
         write_json(f"reviews/by-location/{slugify(loc['name'])}.json", reviews_out)
 
@@ -326,12 +378,14 @@ def main():
     db.init_schema(conn)
     locations = {row["id"]: dict(row) for row in conn.execute("SELECT * FROM locations").fetchall()}
 
+    export_reviews_csv(conn)
     export_meta(conn, locations)
     export_analytics_cache(conn)
     export_location_detail_reviews(conn, locations)  # replaces export_reviews_by_location
     export_action_items(conn, locations)
     export_validation(conn)
     export_scraper_status(conn)
+    export_gbp_sync_status(conn, locations)
     export_weekly_report(conn, locations)
     export_intelligence(conn)
 

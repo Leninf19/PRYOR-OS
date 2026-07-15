@@ -1,0 +1,45 @@
+name: Nightly Review Digest
+
+# Targets 10pm America/New_York, which GitHub's UTC-only cron can't express
+# directly across DST. Two cron entries bracket it (02:00 UTC = 10pm EDT,
+# 03:00 UTC = 10pm EST); nightly_digest.py itself checks the real local hour
+# and exits quietly unless it's actually 10pm ET, so exactly one of these
+# two firings does anything on any given day. See nightly_digest.py.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'
+    - cron: '0 3 * * *'
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install tzdata
+
+      - name: Run nightly digest
+        run: python nightly_digest.py
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+
+      - name: Commit updated data
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dashboard/reviews.db
+          git diff --staged --quiet || git commit -m "chore: nightly digest housekeeping [skip ci]"
+          git push

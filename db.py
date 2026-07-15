@@ -143,6 +143,13 @@ def canonical_review_id(url: str):
 
 
 def dedup_key(location_name: str, row: dict) -> str:
+    # gbp_review_name (the Google Business Profile API's own resource path) is
+    # the strongest possible identity when present -- preferred over the
+    # Maps-scrape-derived canonical_review_id, which doesn't exist for rows
+    # sourced from the API sync rather than the scraper.
+    gbp_name = row.get("gbp_review_name")
+    if gbp_name:
+        return gbp_name
     rid = canonical_review_id(row.get("review_url", ""))
     if rid:
         return rid
@@ -172,12 +179,32 @@ def _migrate_schema(conn: sqlite3.Connection):
         "ALTER TABLE reviews ADD COLUMN ai_sentiment_reason TEXT",
         "ALTER TABLE reviews ADD COLUMN ai_priority TEXT",
         "ALTER TABLE reviews ADD COLUMN ai_hash TEXT",
+        # Google Business Profile API integration -- populated by gbp_sync.py/
+        # gbp_import.py, left NULL for scraper-sourced rows. gbp_review_name is
+        # the API's own resource path (accounts/*/locations/*/reviews/*), the
+        # strongest possible identity -- see dedup_key(). gbp_update_time /
+        # gbp_reply_update_time are Google's own timestamps (the scraper never
+        # captured a reply date at all).
+        "ALTER TABLE locations ADD COLUMN gbp_account_name TEXT",
+        "ALTER TABLE locations ADD COLUMN gbp_location_name TEXT",
+        "ALTER TABLE locations ADD COLUMN gbp_verification_status TEXT",
+        "ALTER TABLE locations ADD COLUMN gbp_last_synced_at TEXT",
+        "ALTER TABLE reviews ADD COLUMN gbp_review_name TEXT",
+        "ALTER TABLE reviews ADD COLUMN gbp_update_time TEXT",
+        "ALTER TABLE reviews ADD COLUMN gbp_reply_update_time TEXT",
+        "ALTER TABLE reviews ADD COLUMN gbp_language_code TEXT",
     ]
     for sql in migrations:
         try:
             conn.execute(sql)
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+    # Must run after the ALTER TABLEs above -- the column has to exist first.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_gbp_review_name "
+        "ON reviews(gbp_review_name) WHERE gbp_review_name IS NOT NULL"
+    )
 
 
 def review_content_hash(review_text: str, star_rating) -> str:
@@ -229,21 +256,71 @@ def get_or_create_location(conn, name: str, city: str = "", brand: str = "", sea
     return cur.lastrowid
 
 
+def link_review_to_gbp(conn, review_id: int, gbp_review_name: str, gbp_update_time: str = None,
+                        gbp_reply_update_time: str = None, gbp_language_code: str = None) -> None:
+    """Attaches Google API identity to an ALREADY-KNOWN existing review row by
+    its own id -- used by gbp_import.py's reconciliation pass once it has
+    matched a scraped row to an API review, since routing that through
+    upsert_review()/dedup_key() would look the row up by gbp_review_name
+    (which doesn't exist on it yet) and insert a duplicate instead of
+    updating the row that was actually matched."""
+    conn.execute(
+        """UPDATE reviews SET gbp_review_name = ?, gbp_update_time = ?,
+           gbp_reply_update_time = ?, gbp_language_code = ? WHERE id = ?""",
+        (gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code, review_id),
+    )
+
+
+def set_location_gbp_info(conn, location_id: int, gbp_account_name: str,
+                           gbp_location_name: str, gbp_verification_status: str, now: str) -> None:
+    """Records the Google Business Profile API resource identity for a location,
+    plus a sync timestamp -- called once per location per gbp_sync.py run."""
+    conn.execute(
+        """UPDATE locations SET gbp_account_name = ?, gbp_location_name = ?,
+           gbp_verification_status = ?, gbp_last_synced_at = ? WHERE id = ?""",
+        (gbp_account_name, gbp_location_name, gbp_verification_status, now, location_id),
+    )
+
+
+def get_location_by_gbp_name(conn, gbp_location_name: str):
+    """Looks up a location previously linked via set_location_gbp_info() by its
+    Google API resource name -- lets gbp_sync.py map an API location straight
+    back to our internal location_id without re-doing name matching."""
+    return conn.execute(
+        "SELECT * FROM locations WHERE gbp_location_name = ?", (gbp_location_name,)
+    ).fetchone()
+
+
 def upsert_review(conn, location_id: int, location_name: str, row: dict, now: str) -> str:
-    """Insert a new review or update an existing one. Returns 'new', 'edited', or 'unchanged'."""
+    """Insert a new review or update an existing one. Returns 'new', 'edited', or 'unchanged'.
+
+    `row` may optionally carry gbp_review_name / gbp_update_time / gbp_reply_update_time /
+    gbp_language_code -- populated by the Google Business Profile API sync (gbp_sync.py /
+    gbp_import.py), always absent (None) for scraper-sourced rows from auto_update.py.
+    When present, gbp_review_name becomes the identity key (see dedup_key()) and
+    gbp_update_time becomes an authoritative edit signal straight from Google, on top
+    of the existing text/rating/response comparison below.
+    """
     key = dedup_key(location_name, row)
     existing = conn.execute("SELECT * FROM reviews WHERE dedup_key = ?", (key,)).fetchone()
+
+    gbp_review_name = row.get("gbp_review_name")
+    gbp_update_time = row.get("gbp_update_time")
+    gbp_reply_update_time = row.get("gbp_reply_update_time")
+    gbp_language_code = row.get("gbp_language_code")
 
     if existing is None:
         conn.execute(
             """INSERT INTO reviews
                (location_id, canonical_review_id, dedup_key, reviewer_name, review_date,
-                star_rating, review_text, owner_response, review_url, first_seen_at, last_seen_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                star_rating, review_text, owner_response, review_url, first_seen_at, last_seen_at,
+                gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (location_id, canonical_review_id(row.get("review_url", "")), key,
              row.get("reviewer_name", ""), row.get("review_date", ""),
              row.get("star_rating") or None, row.get("review_text", ""),
-             row.get("owner_response", ""), row.get("review_url", ""), now, now),
+             row.get("owner_response", ""), row.get("review_url", ""), now, now,
+             gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code),
         )
         return "new"
 
@@ -256,6 +333,14 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
         if old_cmp != new_cmp and new_cmp is not None:
             changed_fields.append((field, old_val, new_val))
 
+    # Google's own edit timestamp, when available, catches edits the text-diff
+    # above could miss and is the accurate signal for API-sourced rows.
+    gbp_edit_detected = (
+        gbp_update_time is not None
+        and existing["gbp_update_time"] is not None
+        and gbp_update_time != existing["gbp_update_time"]
+    )
+
     for field, old_val, new_val in changed_fields:
         conn.execute(
             """INSERT INTO review_revisions (review_id, field_changed, old_value, new_value)
@@ -264,9 +349,9 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
              str(new_val) if new_val is not None else None),
         )
 
-    # Preserve existing non-empty values when the scraper returns empty — this
-    # prevents a missed CSS selector on re-scrape from clearing a response that
-    # was already captured and stored.
+    # Preserve existing non-empty values when the source returns empty — this
+    # prevents a missed CSS selector on re-scrape (or a partial API response)
+    # from clearing a response that was already captured and stored.
     new_response = (row.get("owner_response") or "").strip()
     final_response = new_response if new_response else (existing["owner_response"] or "")
     new_text = (row.get("review_text") or "").strip()
@@ -274,13 +359,18 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
 
     conn.execute(
         """UPDATE reviews SET review_text = ?, owner_response = ?, star_rating = ?,
-           last_seen_at = ?, missing_since = NULL, is_deleted = 0, deleted_detected_at = NULL
+           last_seen_at = ?, missing_since = NULL, is_deleted = 0, deleted_detected_at = NULL,
+           gbp_review_name = COALESCE(?, gbp_review_name),
+           gbp_update_time = COALESCE(?, gbp_update_time),
+           gbp_reply_update_time = COALESCE(?, gbp_reply_update_time),
+           gbp_language_code = COALESCE(?, gbp_language_code)
            WHERE id = ?""",
         (final_text, final_response,
          row.get("star_rating") or existing["star_rating"],
-         now, existing["id"]),
+         now, gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
+         existing["id"]),
     )
-    return "edited" if changed_fields else "unchanged"
+    return "edited" if (changed_fields or gbp_edit_detected) else "unchanged"
 
 
 def detect_deletions(conn, location_id: int, scraped_keys: set, window_min_date: str, now: str) -> int:
