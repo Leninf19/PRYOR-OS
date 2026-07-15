@@ -1,8 +1,15 @@
 """
-Google Business Profile API client (v4) -- read accounts/locations/reviews,
-reply to a review. Used by gbp_sync.py (scheduled incremental sync),
-gbp_import.py (one-time historical backfill), and the frequent critical-alert
-check.
+Google Business Profile API client -- read accounts/locations/reviews, reply
+to a review. Used by gbp_sync.py (scheduled incremental sync), gbp_import.py
+(one-time historical backfill), and the frequent critical-alert check.
+
+Google split the old monolithic v4 "My Business API" into several
+purpose-built APIs in 2022. Only review read/reply stayed on the legacy v4
+host; account and location listing moved to their own APIs and 404 on the
+old v4 paths. This client calls each on its correct current host, but
+normalizes the account/location dicts it returns back into the old v4 shape
+(accountName, locationName, address, locationState.isVerified) so gbp_sync.py
+and gbp_import.py don't need to know any of this happened.
 
 Auth: exchanges GOOGLE_REFRESH_TOKEN for a short-lived access token via the
 standard OAuth2 refresh-token grant -- the same mechanics as
@@ -23,7 +30,10 @@ import urllib.error
 import urllib.parse
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
-API_BASE = "https://mybusiness.googleapis.com/v4"
+API_BASE = "https://mybusiness.googleapis.com/v4"                          # reviews + reply only
+ACCOUNTS_BASE = "https://mybusinessaccountmanagement.googleapis.com/v1"    # accounts.list
+LOCATIONS_BASE = "https://mybusinessbusinessinformation.googleapis.com/v1"  # locations.list
+LOCATIONS_READ_MASK = "name,title,storefrontAddress,metadata"
 
 _MAX_RETRIES = 5
 _BASE_BACKOFF_SECONDS = 1.0
@@ -162,21 +172,46 @@ def _request(method: str, url: str, body: dict | None = None, params: dict | Non
 
 
 def list_accounts() -> list:
-    data = _request("GET", f"{API_BASE}/accounts")
+    data = _request("GET", f"{ACCOUNTS_BASE}/accounts")
     return data.get("accounts", [])
+
+
+def _v4_location_path(account_name: str, location_api_name: str) -> str:
+    """The Business Information API's location.name may or may not include
+    the parent account segment (its canonical form is just
+    'locations/{id}'). The legacy v4 reviews/reply endpoints require the
+    full 'accounts/{acct}/locations/{id}' path, so this rebuilds it from
+    whatever segment Google actually returned, regardless of which form."""
+    tail = location_api_name.split("locations/")[-1]
+    return f"{account_name}/locations/{tail}"
 
 
 def list_locations(account_name: str) -> list:
     """Paginates through ALL locations for an account (publish.js today stops
-    at page 1/100 -- this follows nextPageToken to completion)."""
+    at page 1/100 -- this follows nextPageToken to completion). Normalizes
+    each location dict back into the old v4 shape (name as the full
+    accounts/*/locations/* path, locationName, address, locationState) so
+    callers don't need to know the underlying API moved."""
     locations = []
     page_token = None
     while True:
-        params = {"pageSize": 100}
+        params = {"pageSize": 100, "readMask": LOCATIONS_READ_MASK}
         if page_token:
             params["pageToken"] = page_token
-        data = _request("GET", f"{API_BASE}/{account_name}/locations", params=params)
-        locations.extend(data.get("locations", []))
+        data = _request("GET", f"{LOCATIONS_BASE}/{account_name}/locations", params=params)
+        for loc in data.get("locations", []):
+            address = loc.get("storefrontAddress") or {}
+            locations.append({
+                **loc,
+                "name": _v4_location_path(account_name, loc.get("name", "")),
+                "locationName": loc.get("title"),
+                "address": address,
+                # Verification state isn't exposed by the Business Information
+                # API's readMask fields used here (it lives in the separate,
+                # not-integrated Verifications API) -- left absent rather than
+                # guessed, so downstream code's "UNVERIFIED" fallback reads as
+                # "unknown," not a false claim of an actually-checked status.
+            })
         page_token = data.get("nextPageToken")
         if not page_token:
             break

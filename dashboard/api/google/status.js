@@ -42,7 +42,10 @@ export default async function handler(req, res) {
       })
     }
 
-    const r = await fetchWithRetry('https://mybusiness.googleapis.com/v4/accounts', {
+    // Account listing moved off the legacy v4 host in Google's 2022 API
+    // split -- mybusiness.googleapis.com/v4/accounts now 404s. Reviews/reply
+    // (publish.js) are unaffected; they're the one thing that stayed on v4.
+    const r = await fetchWithRetry('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     })
 

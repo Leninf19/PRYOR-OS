@@ -11,6 +11,25 @@
 
 import { fetchWithRetry } from './_lib/http.js'
 
+// Google split the old monolithic v4 "My Business API" into several
+// purpose-built APIs in 2022. Only review read/reply stayed on the legacy
+// v4 host -- account and location listing moved and 404 on the old v4
+// paths, which is why these are three different hosts.
+const GBP_BASE = 'https://mybusiness.googleapis.com/v4'
+const ACCOUNTS_BASE = 'https://mybusinessaccountmanagement.googleapis.com/v1'
+const LOCATIONS_BASE = 'https://mybusinessbusinessinformation.googleapis.com/v1'
+const LOCATIONS_READ_MASK = 'name,title,storefrontAddress,metadata'
+
+// The Business Information API's location.name may or may not include the
+// parent account segment (its canonical form is just "locations/{id}").
+// The legacy v4 reviews/reply endpoints require the full
+// "accounts/{acct}/locations/{id}" path, so this rebuilds it from whatever
+// segment Google actually returned, regardless of which form.
+function v4LocationPath(accountName, locationApiName) {
+  const tail = (locationApiName || '').split('locations/').pop()
+  return `${accountName}/locations/${tail}`
+}
+
 async function getAccessToken() {
   const r = await fetch('https://oauth2.googleapis.com/token', {
     method:  'POST',
@@ -27,8 +46,8 @@ async function getAccessToken() {
   return d.access_token
 }
 
-async function gbpGet(path, token) {
-  const r = await fetchWithRetry(`https://mybusiness.googleapis.com/v4/${path}`, {
+async function gbpGet(url, token) {
+  const r = await fetchWithRetry(url, {
     headers: { Authorization: `Bearer ${token}` },
   })
   if (!r.ok) {
@@ -40,13 +59,15 @@ async function gbpGet(path, token) {
 
 // Follows nextPageToken to completion -- the old version silently stopped
 // at the first page (100 locations / 50 reviews), missing anything beyond it.
-async function gbpGetAllPages(basePath, token, listKey, pageParam = 'pageSize', pageSize = 100) {
+// baseUrl is a full URL (callers pass the correct host per endpoint, since
+// accounts/locations/reviews no longer all live on the same one).
+async function gbpGetAllPages(baseUrl, token, listKey, pageParam = 'pageSize', pageSize = 100) {
   let items = []
   let pageToken = null
   do {
-    const sep = basePath.includes('?') ? '&' : '?'
-    const path = `${basePath}${sep}${pageParam}=${pageSize}${pageToken ? `&pageToken=${pageToken}` : ''}`
-    const data = await gbpGet(path, token)
+    const sep = baseUrl.includes('?') ? '&' : '?'
+    const url = `${baseUrl}${sep}${pageParam}=${pageSize}${pageToken ? `&pageToken=${pageToken}` : ''}`
+    const data = await gbpGet(url, token)
     items = items.concat(data[listKey] || [])
     pageToken = data.nextPageToken || null
   } while (pageToken)
@@ -64,7 +85,7 @@ function locationMatches(gbpName, ourName) {
 }
 
 async function replyViaReviewName(reviewName, replyText, token) {
-  const replyRes = await fetchWithRetry(`https://mybusiness.googleapis.com/v4/${reviewName}/reply`, {
+  const replyRes = await fetchWithRetry(`${GBP_BASE}/${reviewName}/reply`, {
     method:  'PUT',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body:    JSON.stringify({ comment: replyText }),
@@ -105,14 +126,22 @@ export default async function handler(req, res) {
     }
 
     // Fallback: fuzzy-match by location name, then by reviewer display name.
-    const accounts = await gbpGetAllPages('accounts', token, 'accounts')
+    const accounts = await gbpGetAllPages(`${ACCOUNTS_BASE}/accounts`, token, 'accounts')
     if (!accounts.length) {
       return res.status(404).json({ error: 'location_mismatch', message: 'No GBP accounts found on this Google account.' })
     }
 
     let targetLocation = null
     for (const account of accounts) {
-      const locations = await gbpGetAllPages(`${account.name}/locations`, token, 'locations').catch(() => [])
+      const rawLocations = await gbpGetAllPages(
+        `${LOCATIONS_BASE}/${account.name}/locations?readMask=${encodeURIComponent(LOCATIONS_READ_MASK)}`,
+        token, 'locations'
+      ).catch(() => [])
+      const locations = rawLocations.map(loc => ({
+        ...loc,
+        name: v4LocationPath(account.name, loc.name),
+        locationName: loc.title,
+      }))
       targetLocation = locations.find(loc => locationMatches(loc.locationName, locationName))
       if (targetLocation) break
     }
@@ -124,7 +153,7 @@ export default async function handler(req, res) {
       })
     }
 
-    const reviews = await gbpGetAllPages(`${targetLocation.name}/reviews`, token, 'reviews', 'pageSize', 50)
+    const reviews = await gbpGetAllPages(`${GBP_BASE}/${targetLocation.name}/reviews`, token, 'reviews', 'pageSize', 50)
     if (!reviews.length) {
       return res.status(404).json({ error: 'review_gone', message: 'No reviews found for this location on Google.' })
     }

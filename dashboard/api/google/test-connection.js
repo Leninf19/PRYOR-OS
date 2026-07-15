@@ -7,10 +7,27 @@
 
 import { fetchWithRetry } from './_lib/http.js'
 
+// Google split the old monolithic v4 "My Business API" into several
+// purpose-built APIs in 2022. Only review read/reply stayed on the legacy
+// v4 host -- account and location listing moved and now 404 on the old
+// v4 paths, which is why these are three different hosts.
 const GBP_BASE = 'https://mybusiness.googleapis.com/v4'
+const ACCOUNTS_BASE = 'https://mybusinessaccountmanagement.googleapis.com/v1'
+const LOCATIONS_BASE = 'https://mybusinessbusinessinformation.googleapis.com/v1'
+const LOCATIONS_READ_MASK = 'name,title,storefrontAddress,metadata'
 
 function check(id, label, status, detail) {
   return { id, label, status, detail }
+}
+
+// The Business Information API's location.name may or may not include the
+// parent account segment (its canonical form is just "locations/{id}").
+// The legacy v4 reviews endpoint requires the full
+// "accounts/{acct}/locations/{id}" path, so this rebuilds it from whatever
+// segment Google actually returned, regardless of which form.
+function v4LocationPath(accountName, locationApiName) {
+  const tail = locationApiName.split('locations/').pop()
+  return `${accountName}/locations/${tail}`
 }
 
 export default async function handler(req, res) {
@@ -69,7 +86,7 @@ export default async function handler(req, res) {
   // 3. Account access
   let accounts
   try {
-    const r = await fetchWithRetry(`${GBP_BASE}/accounts`, { headers: auth })
+    const r = await fetchWithRetry(`${ACCOUNTS_BASE}/accounts`, { headers: auth })
     if (!r.ok) {
       const e = await r.json().catch(() => ({}))
       checks.push(check('accounts', 'List Google Business Profile accounts', 'fail',
@@ -95,10 +112,17 @@ export default async function handler(req, res) {
   let locations = []
   try {
     for (const account of accounts) {
-      const r = await fetchWithRetry(`${GBP_BASE}/${account.name}/locations?pageSize=100`, { headers: auth })
+      const r = await fetchWithRetry(
+        `${LOCATIONS_BASE}/${account.name}/locations?pageSize=100&readMask=${encodeURIComponent(LOCATIONS_READ_MASK)}`,
+        { headers: auth }
+      )
       if (r.ok) {
         const data = await r.json()
-        locations = locations.concat(data.locations || [])
+        locations = locations.concat((data.locations || []).map(loc => ({
+          ...loc,
+          name: v4LocationPath(account.name, loc.name || ''),
+          locationName: loc.title,
+        })))
       }
     }
   } catch (err) {
