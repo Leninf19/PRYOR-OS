@@ -21,15 +21,33 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install anthropic
+        run: pip install playwright anthropic
 
-      - name: Sync reviews via Google Business Profile API
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
+
+      # TEMPORARY: gbp_sync.py (Google Business Profile API) is blocked by a
+      # Google Cloud quota of 0 requests/minute on mybusinessaccountmanagement
+      # .googleapis.com -- Basic API Access was approved but the quota itself
+      # needs a separate increase request Google hasn't granted yet. Falling
+      # back to the Playwright scraper so reviews keep flowing in the
+      # meantime. No Google-linked rows exist yet (gbp_review_name is NULL on
+      # every row), so this is a clean, collision-free switch. Swap the two
+      # lines below back once the quota is granted -- see gbp_sync.py.
+      - name: Run scraper (temporary fallback -- see comment above)
         id: scrape
-        run: python gbp_sync.py
+        run: python auto_update.py
         env:
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Upload debug snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-debug-logs
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Validate data
         if: always()
