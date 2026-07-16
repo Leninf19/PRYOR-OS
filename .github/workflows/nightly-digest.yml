@@ -40,6 +40,21 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          MSG="chore: nightly digest housekeeping [skip ci]"
           git add dashboard/reviews.db
-          git diff --staged --quiet || git commit -m "chore: nightly digest housekeeping [skip ci]"
-          git push
+          git diff --staged --quiet && exit 0
+          git commit -m "$MSG"
+          # Retry against the latest remote tip rather than silently dropping
+          # the push if another workflow committed first (found in
+          # production 2026-07-16).
+          for attempt in 1 2 3; do
+            git push && exit 0
+            echo "Push rejected (attempt $attempt/3) -- rebasing onto the latest remote state and retrying..."
+            git fetch origin main
+            git reset --mixed origin/main
+            git add dashboard/reviews.db
+            git commit -m "$MSG"
+            sleep $((attempt * 3))
+          done
+          echo "::error::Failed to push after 3 attempts"
+          exit 1

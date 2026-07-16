@@ -75,9 +75,25 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          MSG="chore: pipeline run (+${{ steps.scrape.outputs.new_count || '0' }} reviews) [skip ci]"
           git add dashboard/reviews.csv dashboard/reviews.db
-          git diff --staged --quiet || git commit -m "chore: pipeline run (+${{ steps.scrape.outputs.new_count || '0' }} reviews) [skip ci]"
-          git push
+          git diff --staged --quiet && exit 0
+          git commit -m "$MSG"
+          # The scraper run takes ~14min, long enough to collide with the
+          # 15-min critical-alert-check cron's own commit -- retry against
+          # the latest remote tip rather than silently losing this run's
+          # scraped reviews to a rejected push (found in production 2026-07-16).
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            echo "Push rejected (attempt $attempt/5) -- rebasing our data onto the latest remote state and retrying..."
+            git fetch origin main
+            git reset --mixed origin/main
+            git add dashboard/reviews.csv dashboard/reviews.db
+            git commit -m "$MSG"
+            sleep $((attempt * 5))
+          done
+          echo "::error::Failed to push after 5 attempts"
+          exit 1
 
       - name: Set up Node
         if: always()
