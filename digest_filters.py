@@ -32,6 +32,66 @@ _GENERIC_PHRASES = {
 
 _MIN_MEANINGFUL_LENGTH = 15  # characters, after stripping punctuation/emoji
 
+# Google's Business Profile API returns star ratings as an enum string
+# ("ONE".."FIVE"); some code paths/fixtures may also see "ONE_STAR"-style
+# variants, or a plain numeric string/float from other sources. This maps
+# every known shape to a plain int so filtering is never fooled by the
+# review's original representation.
+_STAR_ENUM_MAP = {
+    "ONE": 1, "ONE_STAR": 1,
+    "TWO": 2, "TWO_STAR": 2, "TWO_STARS": 2,
+    "THREE": 3, "THREE_STAR": 3, "THREE_STARS": 3,
+    "FOUR": 4, "FOUR_STAR": 4, "FOUR_STARS": 4,
+    "FIVE": 5, "FIVE_STAR": 5, "FIVE_STARS": 5,
+}
+
+
+def normalize_rating(review) -> int | None:
+    """Coerces a review's star rating into a plain int 1-5, regardless of
+    whether the source stored it as an int, a float, a numeric string
+    ("1", "1.0"), or a Google API enum string ("ONE", "ONE_STAR"). Returns
+    None if the rating can't be determined -- callers must treat None as
+    "not negative," never silently coerce it to a guessed value."""
+    raw = review.get("star_rating") if hasattr(review, "get") else review["star_rating"]
+    if raw is None:
+        return None
+    if isinstance(raw, bool):  # bool is a subclass of int -- exclude explicitly
+        return None
+    if isinstance(raw, (int, float)):
+        n = int(raw)
+        return n if 1 <= n <= 5 else None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        try:
+            n = int(float(s))
+            return n if 1 <= n <= 5 else None
+        except ValueError:
+            pass
+        return _STAR_ENUM_MAP.get(s.upper())
+    return None
+
+
+def is_negative_review_for_notification(review) -> bool:
+    """True if a review's normalized rating is 1 or 2 -- the sole
+    eligibility rule for the immediate new-review negative-alert email.
+    Deliberately has NO content/meaningfulness filter: a bare 1-2 star
+    rating with no written text still qualifies, since this alert's job is
+    awareness of a dissatisfied customer, not content curation (that's what
+    the nightly digest's is_meaningful_review() is for, on its own,
+    separate email)."""
+    rating = normalize_rating(review)
+    return rating is not None and rating <= 2
+
+
+def get_new_negative_reviews(new_reviews: list) -> list:
+    """Filters an already-deduped 'new reviews this run' list down to only
+    the ones eligible for the immediate negative-review notification email.
+    Never touches storage -- callers must keep storing every rating
+    regardless of what this returns."""
+    return [r for r in new_reviews if is_negative_review_for_notification(r)]
+
 
 def _strip_punctuation_and_emoji(text: str) -> str:
     """Keeps letters/numbers/spaces only -- reduces "..." / a string of

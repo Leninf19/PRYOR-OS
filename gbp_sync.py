@@ -19,8 +19,14 @@ import sys
 from datetime import datetime, timezone
 
 import db
+import digest_filters
 import google_api as ga
 
+# Kept in sync with digest_filters._STAR_ENUM_MAP -- this is the DB-write
+# path (upsert_review needs a plain int star_rating stored), while
+# digest_filters.normalize_rating() is the read-side/notification path
+# that also tolerates "ONE_STAR"-style variants and numeric strings for
+# defense-in-depth. Both must recognize every value Google actually sends.
 STAR_MAP = {"ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5}
 
 
@@ -92,10 +98,13 @@ def _record_early_failure(conn, now: str, reason: str) -> None:
     """A failure at account discovery (before any location is even known)
     previously left no scraper_runs row at all, so Data Health / Location
     Sync showed nothing rather than a visible failure. This gives every
-    sync attempt a row, matching the per-location failure path below."""
+    sync attempt a row, matching the per-location failure path below.
+    failure_stage='account_discovery' is the explicit marker notify.py uses
+    to pick the global-failure template instead of the per-location one --
+    it is NEVER inferred from zeroed location counters, only set here."""
     conn.execute(
-        """INSERT INTO scraper_runs (started_at, finished_at, mode, status, error_summary)
-           VALUES (?, ?, 'api_sync', 'failed', ?)""",
+        """INSERT INTO scraper_runs (started_at, finished_at, mode, status, error_summary, failure_stage)
+           VALUES (?, ?, 'api_sync', 'failed', ?, 'account_discovery')""",
         (now, datetime.now(timezone.utc).isoformat(), reason[:2000]),
     )
     conn.commit()
@@ -215,30 +224,34 @@ def sync_all(fast: bool = False) -> dict:
     }
 
 
-def _build_email_html(new_reviews: list) -> str:
-    """Simple summary HTML for the existing 'N new reviews' notification step
-    in update-reviews.yml (dawidd6/action-send-mail) -- deliberately kept
-    plain rather than replicating auto_update.py's full review-card design,
-    since that email is out of scope for this integration (left as-is,
-    just needs to keep receiving a new_count/email_html pair)."""
-    if not new_reviews:
+def _build_email_html(negative_reviews: list) -> str:
+    """Simple summary HTML for the negative-review notification step in
+    update-reviews.yml (dawidd6/action-send-mail). Callers are expected to
+    pass an already-filtered (1-2 star only) list -- via
+    digest_filters.get_new_negative_reviews() -- but this still re-checks
+    every row itself before rendering, so a mistakenly-unfiltered array can
+    never leak a 3-5 star review into the email (Requirement #3)."""
+    negative_reviews = [r for r in negative_reviews if digest_filters.is_negative_review_for_notification(r)]
+    if not negative_reviews:
         return ""
     rows = "".join(
-        f"<li><strong>{r['location']}</strong> — {r['star_rating'] or '?'}★ from "
-        f"{r['reviewer_name']}: {(r['review_text'] or '')[:150]}</li>"
-        for r in new_reviews[:20]
+        f"<li><strong>{r['location']}</strong> — {digest_filters.normalize_rating(r)}★ from "
+        f"{r['reviewer_name']}: "
+        f"{(r['review_text'] or '').strip()[:150] or 'Rating only — no written review.'}</li>"
+        for r in negative_reviews[:20]
     )
-    more = f"<p>+ {len(new_reviews) - 20} more</p>" if len(new_reviews) > 20 else ""
+    more = f"<p>+ {len(negative_reviews) - 20} more</p>" if len(negative_reviews) > 20 else ""
     return f"<ul>{rows}</ul>{more}"
 
 
-def _write_github_output(new_count: int, email_html: str) -> None:
+def _write_github_output(new_count: int, negative_count: int, email_html: str) -> None:
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
-        print(f"\nResult: {new_count} new reviews found")
+        print(f"\nResult: {new_count} new reviews found ({negative_count} new 1-2 star)")
         return
     with open(output_path, "a", encoding="utf-8") as f:
         f.write(f"new_count={new_count}\n")
+        f.write(f"negative_count={negative_count}\n")
         delimiter = "EOF_EMAIL"
         f.write(f"email_html<<{delimiter}\n{email_html}\n{delimiter}\n")
 
@@ -251,11 +264,22 @@ if __name__ == "__main__":
     result = sync_all(fast=args.fast)
     print(result)
 
+    print(f"gbp_sync.py: locations succeeded={result.get('locations_succeeded', 0)}, "
+          f"failed={result.get('locations_failed', 0)}")
+    if result.get("status") == "failed":
+        stage = "before location discovery" if not result.get("locations_succeeded") and not result.get("locations_failed") else "during location scraping"
+        print(f"gbp_sync.py: failure occurred {stage}")
+
     if not args.fast:
         # The fast/critical-check path doesn't touch this GH Actions output --
         # it's only meaningful for the main scheduled sync step.
         new_reviews = result.get("new_reviews", [])
-        _write_github_output(len(new_reviews), _build_email_html(new_reviews))
+        new_negative = digest_filters.get_new_negative_reviews(new_reviews)
+        excluded = len(new_reviews) - len(new_negative)
+        print(f"gbp_sync.py: {len(new_reviews)} genuinely new review(s), "
+              f"{len(new_negative)} new 1-2 star, {excluded} excluded (3-5 star)")
+        print(f"gbp_sync.py: negative-review email {'will be sent' if new_negative else 'skipped (no new 1-2 star reviews)'}")
+        _write_github_output(len(new_reviews), len(new_negative), _build_email_html(new_negative))
 
     if result.get("status") == "failed":
         sys.exit(1)

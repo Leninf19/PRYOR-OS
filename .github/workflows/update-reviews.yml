@@ -113,7 +113,11 @@ jobs:
           VERCEL_PROJECT_ID: prj_8Lj4p2UgPOVVwEZoRuuEpKy9L5gp
 
       - name: Send email notification
-        if: steps.scrape.outputs.new_count != '0' && steps.scrape.outputs.new_count != ''
+        # Gated on negative_count (new 1-2 star reviews only), NOT new_count
+        # (which includes every rating and still drives the commit message
+        # above, unchanged) -- this is the fix for the "positive reviews in
+        # the new-reviews email" bug.
+        if: steps.scrape.outputs.negative_count != '0' && steps.scrape.outputs.negative_count != ''
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -121,7 +125,7 @@ jobs:
           secure: true
           username: ${{ secrets.GMAIL_USER }}
           password: ${{ secrets.GMAIL_APP_PASSWORD }}
-          subject: "${{ steps.scrape.outputs.new_count }} new reviews – LTA Dashboard"
+          subject: "${{ steps.scrape.outputs.negative_count }} new negative reviews – LTA Dashboard"
           to: advertising@l3amigos.com
           from: "LTA Review Dashboard <${{ secrets.GMAIL_USER }}>"
           html_body: ${{ steps.scrape.outputs.email_html }}

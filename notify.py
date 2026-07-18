@@ -18,7 +18,9 @@ both via digest_filters.py.
 Reuses weekly_report.py's exact Gmail SMTP pattern (same env vars, same
 "from" display name) rather than inventing a second mailer.
 """
+import html as _html
 import os
+import re
 import smtplib
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
@@ -61,6 +63,86 @@ def log_notification(conn, notification_type, subject, *, related_review_id=None
     )
 
 
+def _safe(s) -> str:
+    return _html.escape(str(s or ""), quote=False)
+
+
+def _sanitize_error_message(msg: str) -> str:
+    """Defense-in-depth before an error message ever reaches an email body.
+    google_api.py's own error text never embeds a credential (verified),
+    but this strips anything that LOOKS like a token/secret/client-id
+    regardless, in case a future error path or a raw Google response ever
+    does."""
+    msg = re.sub(r"ya29\.[\w\-.]+", "[REDACTED]", msg)
+    msg = re.sub(r"GOCSPX-[\w-]+", "[REDACTED]", msg)
+    msg = re.sub(r"[\w-]{10,}\.apps\.googleusercontent\.com", "[REDACTED-CLIENT-ID]", msg)
+    msg = re.sub(r"1//[\w\-]+", "[REDACTED]", msg)  # refresh-token-shaped strings
+    return msg
+
+
+def _parse_global_error(raw: str) -> dict:
+    """Best-effort structured extraction from google_api.py's own
+    "Google API {status}: {message}" format (and the "service
+    'x.googleapis.com'" substring Google's quota errors include). Degrades
+    gracefully to "unknown"/a generic service name rather than guessing --
+    this only ever reads text our own code already produced deterministically
+    for the common cases; anything else falls back safely."""
+    status_match = re.search(r"Google API (\d{3}):", raw)
+    service_match = re.search(r"service '([\w.\-]+)'", raw)
+    return {
+        "status": status_match.group(1) if status_match else "unknown",
+        "service": service_match.group(1) if service_match else "Google Business Profile API",
+    }
+
+
+def _build_global_failure_alert(run) -> str:
+    """Template for a failure at account/location discovery -- before any
+    restaurant location was even known, so there is no per-location detail
+    to show and no "affected locations" list to build. Distinct from the
+    per-location scrape-failure template below; only used when
+    failure_stage is the explicit 'account_discovery' marker (never
+    inferred from zeroed counters -- see check_scraper_failure())."""
+    raw = (run["error_summary"] or "").strip()
+    parsed = _parse_global_error(raw)
+    safe_message = _safe(_sanitize_error_message(raw)[:500])
+    workflow = os.environ.get("GITHUB_WORKFLOW", "review sync pipeline")
+    when = run["finished_at"] or run["started_at"] or "unknown time"
+
+    next_step = (
+        "This is expected while Google Business Profile API quota approval is pending. "
+        "Check Google Cloud Console → APIs & Services → the service above → Quotas, and confirm "
+        "whether a quota increase request has been submitted and granted -- API access approval "
+        "and quota approval are often separate steps."
+        if parsed["status"] == "429" else
+        "Check the GitHub Actions logs for this run for the full error detail."
+    )
+
+    return (
+        '<div style="background:#fff7ed;border-left:4px solid #f97316;'
+        'padding:20px 24px;margin-bottom:24px;border-radius:0 10px 10px 0">'
+        '<p style="margin:0 0 4px;font-size:11px;font-weight:700;color:#c2410c;'
+        'text-transform:uppercase;letter-spacing:0.08em">Global API Connection Failure</p>'
+        '<h2 style="margin:0 0 12px;font-size:16px;font-weight:700;color:#7c2d12">'
+        '⚠️ Location discovery could not begin</h2>'
+        f'<p style="margin:0 0 12px;font-size:13px;color:#1e293b;line-height:1.6">'
+        f'Location discovery could not begin because the Google Business Profile '
+        f'{_safe(parsed["service"])} returned HTTP {_safe(parsed["status"])}.</p>'
+        '<table style="width:100%;font-size:13px;color:#374151;margin-bottom:12px" cellpadding="4">'
+        f'<tr><td style="font-weight:600;width:170px">Workflow</td><td>{_safe(workflow)}</td></tr>'
+        f'<tr><td style="font-weight:600">Time of failure</td><td>{_safe(when)}</td></tr>'
+        f'<tr><td style="font-weight:600">Service</td><td>{_safe(parsed["service"])}</td></tr>'
+        f'<tr><td style="font-weight:600">HTTP status</td><td>{_safe(parsed["status"])}</td></tr>'
+        f'<tr><td style="font-weight:600">Error message</td><td>{safe_message}</td></tr>'
+        f'<tr><td style="font-weight:600">Previous review data</td>'
+        f'<td>Retained — nothing was overwritten or erased. This failure happened before any '
+        f'location or review data was touched.</td></tr>'
+        '</table>'
+        f'<p style="margin:0;font-size:13px;color:#475569;line-height:1.6">'
+        f'<strong>Recommended next step:</strong> {next_step}</p>'
+        '</div>'
+    )
+
+
 def check_scraper_failure(conn) -> str:
     run = conn.execute(
         "SELECT * FROM scraper_runs WHERE status IN ('failed', 'partial') "
@@ -71,6 +153,14 @@ def check_scraper_failure(conn) -> str:
     if already_notified(conn, "scraper_failure", since=run["started_at"]):
         return ""
     log_notification(conn, "scraper_failure", f"run #{run['id']}")
+
+    # Explicit marker ONLY -- never inferred from zeroed location counters.
+    # A row with failure_stage IS NULL (every pre-existing run, and any
+    # genuine per-location failure) always falls through to the original
+    # per-location template below, even if it happens to show 0 of 0.
+    failure_stage = run["failure_stage"] if "failure_stage" in run.keys() else None
+    if failure_stage == "account_discovery":
+        return _build_global_failure_alert(run)
 
     ok = run["locations_succeeded"] or 0
     failed = run["locations_failed"] or 0

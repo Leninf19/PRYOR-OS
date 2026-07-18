@@ -177,7 +177,7 @@ def init_schema(conn: sqlite3.Connection):
 # doesn't control which migrations run. It just lets you tell at a glance,
 # from the DB file alone, whether it's seen the latest migration batch --
 # `sqlite3 reviews.db "PRAGMA user_version"` -- without reading this file.
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def _migrate_schema(conn: sqlite3.Connection):
@@ -202,6 +202,13 @@ def _migrate_schema(conn: sqlite3.Connection):
         "ALTER TABLE reviews ADD COLUMN gbp_update_time TEXT",
         "ALTER TABLE reviews ADD COLUMN gbp_reply_update_time TEXT",
         "ALTER TABLE reviews ADD COLUMN gbp_language_code TEXT",
+        # Distinguishes a global failure (couldn't even discover locations --
+        # e.g. a Google API quota/auth error) from a per-location scrape
+        # failure, so notify.py can pick the right failure-alert template
+        # instead of inferring it from zeroed location counters. NULL for
+        # every pre-existing row and for normal per-location failures --
+        # both keep using the original (unrelated, unchanged) alert wording.
+        "ALTER TABLE scraper_runs ADD COLUMN failure_stage TEXT",
     ]
     for sql in migrations:
         try:

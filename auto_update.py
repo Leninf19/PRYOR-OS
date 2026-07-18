@@ -14,6 +14,7 @@ from pathlib import Path
 from collections import defaultdict
 
 import db
+import digest_filters
 
 BASE_DIR      = Path(__file__).parent
 REVIEWS_CSV   = BASE_DIR / "dashboard" / "reviews.csv"
@@ -866,9 +867,18 @@ def append_to_csv(new_rows: list):
 # ---------------------------------------------------------------------------
 
 def build_email_html(new_rows: list, failed_locs: list[dict] | None = None) -> str:
-    """Build premium HTML email for the new-reviews notification.
-    Reviews are NEVER truncated. failed_locs: list of {name, error} dicts."""
+    """Build premium HTML email for the negative-review notification.
+    Callers are expected to pass an already-filtered (1-2 star only) list --
+    via digest_filters.get_new_negative_reviews() -- but this still re-checks
+    every row itself before rendering, so a mistakenly-unfiltered array can
+    never leak a 3-5 star review into the email (defense-in-depth, not the
+    only guard). Reviews are NEVER truncated. failed_locs: list of
+    {name, error} dicts."""
     import html as _html
+
+    new_rows = [r for r in new_rows if digest_filters.is_negative_review_for_notification(r)]
+    if not new_rows:
+        return ""
 
     # ── Topic + action detection ─────────────────────────────────────────────
     _TOPIC_MAP = [
@@ -1122,7 +1132,7 @@ def build_email_html(new_rows: list, failed_locs: list[dict] | None = None) -> s
         '<!DOCTYPE html><html lang="en"><head>'
         '<meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
-        f'<title>{total} New Review{"s" if total != 1 else ""} — LTA Dashboard</title>'
+        f'<title>{total} New Negative Review{"s" if total != 1 else ""} — LTA Dashboard</title>'
         '</head>'
         '<body style="margin:0;padding:0;background:#f1f5f9;'
         'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Arial,sans-serif;'
@@ -1133,7 +1143,7 @@ def build_email_html(new_rows: list, failed_locs: list[dict] | None = None) -> s
         '<p style="margin:0 0 6px;font-size:10px;font-weight:800;letter-spacing:3px;'
         'color:#f59e0b;text-transform:uppercase">LTA Review Dashboard</p>'
         f'<h1 style="margin:0 0 6px;font-size:22px;font-weight:800;color:white;letter-spacing:-0.3px">'
-        f'{total} New Review{"s" if total != 1 else ""}</h1>'
+        f'{total} New Negative Review{"s" if total != 1 else ""}</h1>'
         f'<p style="margin:0;font-size:12px;color:#64748b">{date_str}</p>'
         '</div>'
 
@@ -1155,12 +1165,13 @@ def build_email_html(new_rows: list, failed_locs: list[dict] | None = None) -> s
     )
 
 
-def write_github_output(new_count: int, email_html: str):
+def write_github_output(new_count: int, negative_count: int, email_html: str):
     if not GITHUB_OUTPUT:
-        print(f"\nResult: {new_count} new reviews found")
+        print(f"\nResult: {new_count} new reviews found ({negative_count} new 1-2 star)")
         return
     with open(GITHUB_OUTPUT, "a") as f:
         f.write(f"new_count={new_count}\n")
+        f.write(f"negative_count={negative_count}\n")
         delimiter = "EOF_EMAIL"
         f.write(f"email_html<<{delimiter}\n{email_html}\n{delimiter}\n")
 
@@ -1309,13 +1320,21 @@ async def main():
 
     print(f"New reviews found: {len(new_rows)}")
 
+    # Storage/CSV keep every rating, unfiltered -- notification filtering
+    # is a completely separate concern applied only below, never here.
+    new_negative_rows = digest_filters.get_new_negative_reviews(new_rows)
+    excluded_count = len(new_rows) - len(new_negative_rows)
+    print(f"New 1-2 star reviews: {len(new_negative_rows)} "
+          f"({excluded_count} excluded, 3-5 star)")
+    print(f"Negative-review email: {'will be sent' if new_negative_rows else 'skipped (no new 1-2 star reviews)'}")
+
     if new_rows:
         append_to_csv(new_rows)
         print(f"Updated {REVIEWS_CSV}")
-        email_html = build_email_html(new_rows, failed_locs if failed_locs else None)
-        write_github_output(len(new_rows), email_html)
+        email_html = build_email_html(new_negative_rows, failed_locs if failed_locs else None)
+        write_github_output(len(new_rows), len(new_negative_rows), email_html)
     else:
-        write_github_output(0, "")
+        write_github_output(0, 0, "")
 
     if LOCAL_MODE:
         import subprocess
