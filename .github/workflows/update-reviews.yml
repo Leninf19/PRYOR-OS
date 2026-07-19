@@ -18,6 +18,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: write
 
@@ -46,9 +47,11 @@ jobs:
       # lines below back once the quota is granted -- see gbp_sync.py.
       - name: Run scraper (temporary fallback -- see comment above)
         id: scrape
+        timeout-minutes: 30
         run: python auto_update.py
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PYTHONUNBUFFERED: "1"
 
       - name: Upload debug snapshots
         if: always()
