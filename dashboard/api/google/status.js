@@ -3,6 +3,8 @@
 // Returns { connected, state, accountName?, accountId?, scopes?, tokenExpiresIn? }
 
 import { fetchWithRetry } from './_lib/http.js'
+import { requireAuth } from '../_lib/auth.js'
+import { enforceRateLimit } from '../_lib/rateLimit.js'
 
 async function exchangeRefreshToken() {
   const r = await fetch('https://oauth2.googleapis.com/token', {
@@ -21,6 +23,12 @@ async function exchangeRefreshToken() {
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `status:${account.userId}`, { requestsPerWindow: 15, windowSeconds: 60 })
+  if (!allowed) return
 
   const hasId      = !!process.env.GOOGLE_CLIENT_ID
   const hasSecret  = !!process.env.GOOGLE_CLIENT_SECRET

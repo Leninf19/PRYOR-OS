@@ -5,12 +5,28 @@
 // POST /api/google/trigger-import  { apply?: boolean }
 // Returns { success: true } or { error, message }
 
+import { requireAuth } from '../_lib/auth.js'
+import { enforceRateLimit } from '../_lib/rateLimit.js'
+
 const REPO_OWNER = 'LosTresAmigos1'
 const REPO_NAME  = 'lta-review-dashboard'
 const WORKFLOW   = 'historical-import.yml'
 
+// Applying a historical import mutates every review row -- this must
+// require more than just an Owner-role session (which the frontend's old
+// "type IMPORT" gate only enforced client-side). The server now demands
+// the same literal confirmation phrase, checked here, so bypassing the UI
+// (a raw request to this endpoint) can't skip it.
+const CONFIRM_PHRASE = 'IMPORT'
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `trigger-import:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
+  if (!allowed) return
 
   const pat = process.env.GITHUB_SYNC_PAT
   if (!pat) {
@@ -21,6 +37,13 @@ export default async function handler(req, res) {
   }
 
   const apply = req.body?.apply === true
+
+  if (apply && req.body?.confirm !== CONFIRM_PHRASE) {
+    return res.status(400).json({
+      error:   'confirmation_required',
+      message: `Applying a historical import requires confirm: "${CONFIRM_PHRASE}" in the request body.`,
+    })
+  }
 
   try {
     const r = await fetch(

@@ -1,39 +1,34 @@
 import { useQuery, useQueries, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
-
-async function fetchJSON(path) {
-  const res = await fetch(path)
-  if (!res.ok) throw new Error(`${res.status} ${path}`)
-  return res.json()
-}
+import { fetchJSON } from '../lib/dataClient.js'
 
 const OPTS = { staleTime: 1000 * 60 * 10 } // 10 min cache
 
-export function useMeta()               { return useQuery({ queryKey: ['meta'],               queryFn: () => fetchJSON('/data/meta.json'),                                ...OPTS }) }
-export function useKPIs()               { return useQuery({ queryKey: ['kpis'],               queryFn: () => fetchJSON('/data/analytics/kpis.json'),                      ...OPTS }) }
-export function useMonthlyTrend()       { return useQuery({ queryKey: ['monthly-trend'],       queryFn: () => fetchJSON('/data/analytics/monthly-trend.json'),             ...OPTS }) }
-export function useLocationStats()      { return useQuery({ queryKey: ['location-stats'],      queryFn: () => fetchJSON('/data/analytics/location-stats.json'),            ...OPTS }) }
-export function useRankings()           { return useQuery({ queryKey: ['rankings'],            queryFn: () => fetchJSON('/data/analytics/rankings-30d.json'),              ...OPTS }) }
-export function useComplaintIntel()     { return useQuery({ queryKey: ['complaint-intel'],     queryFn: () => fetchJSON('/data/intelligence/complaint-intelligence.json'), ...OPTS }) }
-export function useCompanySummary()     { return useQuery({ queryKey: ['company-summary'],     queryFn: () => fetchJSON('/data/intelligence/company-summary.json'),        ...OPTS }) }
-export function usePredictiveAlerts()   { return useQuery({ queryKey: ['predictive-alerts'],   queryFn: () => fetchJSON('/data/intelligence/predictive-alerts.json'),      ...OPTS }) }
-export function useResponseDrafts()     { return useQuery({ queryKey: ['response-drafts'],     queryFn: () => fetchJSON('/data/intelligence/response-drafts.json'),        ...OPTS }) }
-export function useScraperStatusData()  { return useQuery({ queryKey: ['scraper-status'],      queryFn: () => fetchJSON('/data/scraper-status.json'),                      ...OPTS }) }
-export function useCompetitorIntel()    { return useQuery({ queryKey: ['competitor-intel'],      queryFn: () => fetchJSON('/data/intelligence/competitive-intelligence.json'), ...OPTS }) }
-export function useWeeklyReportData()   { return useQuery({ queryKey: ['weekly-report'],       queryFn: () => fetchJSON('/data/reports/weekly-summary.json'),              ...OPTS }) }
-export function useActionItems()        { return useQuery({ queryKey: ['action-items'],        queryFn: () => fetchJSON('/data/action-items.json'),                        ...OPTS }) }
-export function useDepartmentPerformance() { return useQuery({ queryKey: ['department-performance'], queryFn: () => fetchJSON('/data/intelligence/department-performance.json'), ...OPTS }) }
-export function useActionCenter()       { return useQuery({ queryKey: ['action-center'],        queryFn: () => fetchJSON('/data/intelligence/action-center.json'),          ...OPTS }) }
-export function useOperationsImpact()   { return useQuery({ queryKey: ['operations-impact'],    queryFn: () => fetchJSON('/data/intelligence/operations-impact.json'),      ...OPTS }) }
-export function useCXIndex()            { return useQuery({ queryKey: ['cx-index'],             queryFn: () => fetchJSON('/data/intelligence/cx-index.json'),               ...OPTS }) }
-export function useBestQuotes()         { return useQuery({ queryKey: ['best-quotes'],          queryFn: () => fetchJSON('/data/intelligence/best-quotes.json'),            ...OPTS }) }
-export function useSeasonalTrends()     { return useQuery({ queryKey: ['seasonal-trends'],       queryFn: () => fetchJSON('/data/intelligence/seasonal-trends.json'),        ...OPTS }) }
-export function useExecutiveScores()    { return useQuery({ queryKey: ['executive-scores'],      queryFn: () => fetchJSON('/data/intelligence/executive-scores.json'),       ...OPTS }) }
+export function useMeta()               { return useQuery({ queryKey: ['meta'],               queryFn: () => fetchJSON('meta.json'),                                ...OPTS }) }
+export function useKPIs()               { return useQuery({ queryKey: ['kpis'],               queryFn: () => fetchJSON('analytics/kpis.json'),                      ...OPTS }) }
+export function useMonthlyTrend()       { return useQuery({ queryKey: ['monthly-trend'],       queryFn: () => fetchJSON('analytics/monthly-trend.json'),             ...OPTS }) }
+export function useLocationStats()      { return useQuery({ queryKey: ['location-stats'],      queryFn: () => fetchJSON('analytics/location-stats.json'),            ...OPTS }) }
+export function useRankings()           { return useQuery({ queryKey: ['rankings'],            queryFn: () => fetchJSON('analytics/rankings-30d.json'),              ...OPTS }) }
+export function useComplaintIntel()     { return useQuery({ queryKey: ['complaint-intel'],     queryFn: () => fetchJSON('intelligence/complaint-intelligence.json'), ...OPTS }) }
+export function useCompanySummary()     { return useQuery({ queryKey: ['company-summary'],     queryFn: () => fetchJSON('intelligence/company-summary.json'),        ...OPTS }) }
+export function usePredictiveAlerts()   { return useQuery({ queryKey: ['predictive-alerts'],   queryFn: () => fetchJSON('intelligence/predictive-alerts.json'),      ...OPTS }) }
+export function useResponseDrafts()     { return useQuery({ queryKey: ['response-drafts'],     queryFn: () => fetchJSON('intelligence/response-drafts.json'),        ...OPTS }) }
+export function useScraperStatusData()  { return useQuery({ queryKey: ['scraper-status'],      queryFn: () => fetchJSON('scraper-status.json'),                      ...OPTS }) }
+export function useCompetitorIntel()    { return useQuery({ queryKey: ['competitor-intel'],      queryFn: () => fetchJSON('intelligence/competitive-intelligence.json'), ...OPTS }) }
+export function useWeeklyReportData()   { return useQuery({ queryKey: ['weekly-report'],       queryFn: () => fetchJSON('reports/weekly-summary.json'),              ...OPTS }) }
+export function useActionItems()        { return useQuery({ queryKey: ['action-items'],        queryFn: () => fetchJSON('action-items.json'),                        ...OPTS }) }
+export function useDepartmentPerformance() { return useQuery({ queryKey: ['department-performance'], queryFn: () => fetchJSON('intelligence/department-performance.json'), ...OPTS }) }
+export function useActionCenter()       { return useQuery({ queryKey: ['action-center'],        queryFn: () => fetchJSON('intelligence/action-center.json'),          ...OPTS }) }
+export function useOperationsImpact()   { return useQuery({ queryKey: ['operations-impact'],    queryFn: () => fetchJSON('intelligence/operations-impact.json'),      ...OPTS }) }
+export function useCXIndex()            { return useQuery({ queryKey: ['cx-index'],             queryFn: () => fetchJSON('intelligence/cx-index.json'),               ...OPTS }) }
+export function useBestQuotes()         { return useQuery({ queryKey: ['best-quotes'],          queryFn: () => fetchJSON('intelligence/best-quotes.json'),            ...OPTS }) }
+export function useSeasonalTrends()     { return useQuery({ queryKey: ['seasonal-trends'],       queryFn: () => fetchJSON('intelligence/seasonal-trends.json'),        ...OPTS }) }
+export function useExecutiveScores()    { return useQuery({ queryKey: ['executive-scores'],      queryFn: () => fetchJSON('intelligence/executive-scores.json'),       ...OPTS }) }
 
 export function useLocationDetail(slug) {
   return useQuery({
     queryKey: ['location-detail', slug],
-    queryFn: () => fetchJSON(`/data/intelligence/locations/${slug}.json`),
+    queryFn: () => fetchJSON(`intelligence/locations/${slug}.json`),
     enabled: !!slug,
     ...OPTS,
   })
@@ -44,18 +39,18 @@ export function useGlobalPrefetch() {
   const qc = useQueryClient()
   useEffect(() => {
     const files = [
-      ['kpis',              '/data/analytics/kpis.json'],
-      ['monthly-trend',     '/data/analytics/monthly-trend.json'],
-      ['location-stats',    '/data/analytics/location-stats.json'],
-      ['rankings',          '/data/analytics/rankings-30d.json'],
-      ['complaint-intel',   '/data/intelligence/complaint-intelligence.json'],
-      ['department-performance', '/data/intelligence/department-performance.json'],
-      ['company-summary',   '/data/intelligence/company-summary.json'],
-      ['predictive-alerts', '/data/intelligence/predictive-alerts.json'],
-      ['response-drafts',   '/data/intelligence/response-drafts.json'],
-      ['competitor-intel',  '/data/intelligence/competitive-intelligence.json'],
-      ['action-items',      '/data/action-items.json'],
-      ['meta',              '/data/meta.json'],
+      ['kpis',              'analytics/kpis.json'],
+      ['monthly-trend',     'analytics/monthly-trend.json'],
+      ['location-stats',    'analytics/location-stats.json'],
+      ['rankings',          'analytics/rankings-30d.json'],
+      ['complaint-intel',   'intelligence/complaint-intelligence.json'],
+      ['department-performance', 'intelligence/department-performance.json'],
+      ['company-summary',   'intelligence/company-summary.json'],
+      ['predictive-alerts', 'intelligence/predictive-alerts.json'],
+      ['response-drafts',   'intelligence/response-drafts.json'],
+      ['competitor-intel',  'intelligence/competitive-intelligence.json'],
+      ['action-items',      'action-items.json'],
+      ['meta',              'meta.json'],
     ]
     files.forEach(([key, path]) => {
       qc.prefetchQuery({
@@ -75,7 +70,7 @@ export function usePrefetchLocationDetails(stats) {
       const slug = loc.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
       qc.prefetchQuery({
         queryKey: ['location-detail', slug],
-        queryFn: () => fetchJSON(`/data/intelligence/locations/${slug}.json`),
+        queryFn: () => fetchJSON(`intelligence/locations/${slug}.json`),
         staleTime: 1000 * 60 * 10,
       })
     })
@@ -92,7 +87,7 @@ export function useAllLocationDetails(stats) {
   const results = useQueries({
     queries: slugs.map(slug => ({
       queryKey: ['location-detail', slug],
-      queryFn: () => fetchJSON(`/data/intelligence/locations/${slug}.json`),
+      queryFn: () => fetchJSON(`intelligence/locations/${slug}.json`),
       enabled: !!slug,
       ...OPTS,
     })),
@@ -106,7 +101,7 @@ export function useAllLocationDetails(stats) {
 export function useLocationReviews(slug) {
   return useQuery({
     queryKey: ['location-reviews', slug],
-    queryFn: () => fetchJSON(`/data/reviews/by-location/${slug}.json`),
+    queryFn: () => fetchJSON(`reviews/by-location/${slug}.json`),
     enabled: !!slug,
     ...OPTS,
   })

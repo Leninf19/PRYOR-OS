@@ -2,5 +2,10 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "framework": "vite",
+  "functions": {
+    "api/data/**": {
+      "includeFiles": "private-data/**"
+    }
+  },
   "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }]
 }

@@ -3,10 +3,30 @@
 
 import { randomBytes } from 'crypto'
 import { setCookie } from './_lib/cookies.js'
+import { evaluateSession } from '../_lib/auth.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
-export default function handler(req, res) {
+// Starting the OAuth flow can overwrite the org's only stored Google
+// refresh token -- previously reachable by anyone who hit this URL
+// directly (a "confused deputy" risk: the browser's own session cookie
+// survives the whole /api/google/auth -> Google -> /api/google/callback
+// round trip since it's same-origin navigation the whole way, so gating
+// here and re-checking in callback.js is both possible and necessary).
+export default async function handler(req, res) {
+  if (req.method !== 'GET') return res.status(405).send('Method not allowed')
+
+  const { account } = await evaluateSession(req, ['owner'])
+  if (!account) {
+    return res.status(401).send(`
+      <html><body style="font-family:system-ui;max-width:520px;margin:60px auto;padding:0 20px">
+        <h2>Sign in required</h2>
+        <p>Connecting Google Business Profile requires an Owner account. Please sign in first.</p>
+        <a href="/login">← Sign in</a>
+      </body></html>
+    `)
+  }
+
   const clientId = process.env.GOOGLE_CLIENT_ID
   if (!clientId) {
     return res.status(503).send(`

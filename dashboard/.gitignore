@@ -1,1 +1,10 @@
 .vercel
+
+# `vercel env pull` writes real production secrets (ACCOUNT_DIRECTORY_JSON,
+# SESSION_SIGNING_SECRET, UPSTASH_*, GOOGLE_*, etc) into one of these files
+# in plaintext for local dev -- the root .gitignore's `*.env` does NOT match
+# Vercel's actual filenames (.env.local, .env.development.local, etc, none
+# of which end in the literal ".env"), so this covers that gap explicitly.
+.env
+.env.local
+.env.*.local

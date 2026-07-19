@@ -124,7 +124,7 @@ function useGbpSyncData() {
 
   const load = () => {
     setState(s => ({ ...s, loading: true }))
-    fetch('/data/gbp-sync.json')
+    fetch('/api/data/gbp-sync.json')
       .then(r => {
         // 404 means no sync has ever run yet -- a legitimate empty state,
         // not a failure. Anything else (network/parse error) is a real error.

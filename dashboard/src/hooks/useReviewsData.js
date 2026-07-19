@@ -1,10 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-
-async function fetchJSON(path) {
-  const res = await fetch(path)
-  if (!res.ok) throw new Error(`Failed to fetch ${path}: ${res.status}`)
-  return res.json()
-}
+import { fetchJSON } from '../lib/dataClient.js'
 
 // Fetches the small per-location chunks (written by export_chunks.py) in
 // parallel and concatenates them into the same flat review-array shape the
@@ -15,9 +10,9 @@ export function useReviewsData() {
   return useQuery({
     queryKey: ['all-reviews'],
     queryFn: async () => {
-      const meta = await fetchJSON('/data/meta.json')
+      const meta = await fetchJSON('meta.json')
       const chunks = await Promise.all(
-        meta.locations.map(loc => fetchJSON(`/data/reviews/by-location/${loc.slug}.json`))
+        meta.locations.map(loc => fetchJSON(`reviews/by-location/${loc.slug}.json`))
       )
       return chunks.flat().sort((a, b) => a.review_date.localeCompare(b.review_date))
     },

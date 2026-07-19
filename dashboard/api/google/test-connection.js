@@ -6,6 +6,8 @@
 // Returns { overallStatus: 'pass'|'fail', checks: [{ id, label, status, detail }] }
 
 import { fetchWithRetry } from './_lib/http.js'
+import { requireAuth } from '../_lib/auth.js'
+import { enforceRateLimit } from '../_lib/rateLimit.js'
 
 // Google split the old monolithic v4 "My Business API" into several
 // purpose-built APIs in 2022. Only review read/reply stayed on the legacy
@@ -32,6 +34,12 @@ function v4LocationPath(accountName, locationApiName) {
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `test-connection:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
 
   const checks = []
   const clientId     = process.env.GOOGLE_CLIENT_ID

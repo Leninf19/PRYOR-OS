@@ -80,8 +80,78 @@ Two different patterns, used for different reasons:
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REFRESH_TOKEN` | `dashboard/api/google/*.js` (OAuth, status, publish, test-connection) **and** `google_api.py` (`gbp_sync.py`, `gbp_import.py`, `critical_alert_check.py`) | **Both** Vercel project env vars (for the live serverless functions) **and** GitHub Actions secrets (for the scheduled Python sync/alert workflows) — same three values, set in two places. See "Refresh token generation" below; once automation is configured, `GOOGLE_REFRESH_TOKEN` is written to Vercel for you, but still needs manually copying into GitHub Actions secrets since GitHub has no equivalent write API used here. |
 | `VERCEL_API_TOKEN` / `VERCEL_PROJECT_ID` / `VERCEL_ORG_ID` / `VERCEL_DEPLOY_HOOK_URL` | `dashboard/api/google/callback.js` (writes `GOOGLE_REFRESH_TOKEN` to Vercel automatically after OAuth, then triggers a redeploy) | Vercel project env vars. `VERCEL_API_TOKEN` is a personal/team API token scoped to env-var write access — distinct from the GitHub Actions secret of a similar name (`VERCEL_TOKEN`), do not confuse the two. |
 | `GITHUB_SYNC_PAT` | `dashboard/api/google/trigger-sync.js` (the Settings → Connection Center "Sync Now" button) | Vercel project env var — a GitHub personal access token with `workflow` scope, used only to dispatch `update-reviews.yml` on demand. |
+| `SESSION_SIGNING_SECRET` | `dashboard/api/_lib/session.js` (session cookie signing/verification, Edge + Node) | Vercel project env var. A dedicated, high-entropy secret (32+ characters) — generate with `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"`. Never reuse another secret for this. |
+| `ACCOUNT_DIRECTORY_JSON` | `dashboard/api/_lib/accounts.js` (account directory — see "Authentication & authorization" below) | Vercel project env var. A JSON string; see schema below. |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | `dashboard/api/_lib/rateLimit.js` | Vercel project env var, auto-populated if you add the Upstash Redis integration via the Vercel Marketplace. Optional but strongly recommended — see "Rate limiting" below for what happens if unset. |
 
 `VERCEL_ORG_ID` / `VERCEL_PROJECT_ID` used by the GitHub Actions deploy step are not secret and are hardcoded directly in the workflow YAML files — this is unrelated to the same-named Vercel env vars above (those are read at runtime by `callback.js`, not by CI).
+
+## Authentication & authorization (Phase 1)
+
+Every write-capable and sensitive-data endpoint requires a signed session cookie (`lta_session`) tied to an account in `ACCOUNT_DIRECTORY_JSON`. This replaces the previous state where every `dashboard/api/google/*.js` endpoint and the entire review dataset were reachable by anyone who knew or guessed the URL.
+
+### Account directory (temporary, Phase 1 only)
+
+`ACCOUNT_DIRECTORY_JSON` is a single Vercel env var holding a JSON object:
+
+```json
+{
+  "accounts": [
+    {
+      "userId": "usr_lenin",
+      "email": "you@example.com",
+      "passwordHash": "$2b$12$...",
+      "role": "owner",
+      "locationIds": "*",
+      "sessionVersion": 1,
+      "disabled": false,
+      "displayName": "Lenin"
+    }
+  ]
+}
+```
+
+- `role` is one of `owner`, `marketing`, `location_manager`, `read_only`. Only `owner` accounts should exist in Phase 1 (Lenin, Martin, Ruffy) — `location_manager`/`read_only` are supported by the schema but not yet safe to use (see "Location authorization strategy" below).
+- `passwordHash` is a bcrypt hash (cost factor 12), generated with:
+  ```
+  node -e "require('bcryptjs').hash(process.argv[1], 12).then(console.log)" 'the-password'
+  ```
+  (run from `dashboard/`, where `bcryptjs` is installed). Never store a plaintext password here.
+- `locationIds` is `"*"` for full access, or (once location-scoped roles are introduced) an array of stable numeric `locations.id` values — never location names.
+- `sessionVersion` invalidates every outstanding session for that account the moment you increment it (e.g. after a password change or to force a re-login). Bump it, redeploy the env var, done — no other action needed.
+- `disabled: true` blocks an account without deleting its record.
+- If this env var is missing or fails validation in any way, the entire auth system fails **closed** — every request is treated as unauthenticated. This is deliberate.
+
+**This is an explicit, temporary stopgap** — not a permanent user-management system. The migration path to a hosted database (Phase 4) is a straight lift: `userId`/`email`/`passwordHash`/`role`/`locationIds`/`sessionVersion`/`disabled` map directly onto a `users` table's columns.
+
+### Session design
+
+A signed (JWS/HS256 via `jose`), `HttpOnly`, `Secure`, `SameSite=Lax` cookie, 12-hour fixed expiry. Claims: `userId`, `email`, `role`, `locationIds`, `issuedAt`, `expiresAt`, `sessionVersion` — nothing else (no password hashes, no OAuth tokens, no API keys). On every request, the account's *current* role/locationIds/sessionVersion/disabled state is re-read from `ACCOUNT_DIRECTORY_JSON` — the cookie's claims are only used to identify which account it is, never trusted as the actual permission source.
+
+`dashboard/middleware.js` performs the same check at the Edge as a fast pre-filter (and to permanently retire the legacy `/data/*` path — see below), but `dashboard/api/_lib/auth.js`'s `requireAuth()` is the authoritative layer and every API handler calls it independently.
+
+### Rate limiting
+
+Login, the highest-stakes write endpoints (`publish`, `trigger-sync`, `trigger-import`, `test-connection`), and the Anthropic-backed endpoints (`rewrite`, `executive-brief`, since abuse there is a direct cost) are rate-limited via Upstash Redis (`@upstash/ratelimit`), which is durable across serverless instances — unlike an in-memory counter, which resets per cold start and provides close to no real protection in a multi-instance deployment.
+
+**Behavior deliberately differs by environment (`dashboard/api/_lib/rateLimit.js`):**
+
+- **Production** (`VERCEL_ENV === 'production'`, which Vercel sets automatically on deployed functions): if `UPSTASH_REDIS_REST_URL`/`UPSTASH_REDIS_REST_TOKEN` are missing, or Upstash itself is unreachable/erroring, the endpoint **fails closed** — it returns a generic `503 { error: 'service_unavailable' }` rather than silently letting the request through. The response never names Upstash or any env var, and authentication still runs first, so an unauthenticated caller learns nothing beyond the normal 401 — only an already-authenticated caller ever sees the 503, and even then with no configuration detail. A sanitized error is logged server-side for the administrator.
+- **Everywhere else** (local scripts, the Node test suite, `vercel dev` without `VERCEL_ENV=production`, preview deployments): missing Upstash config **fails open**, so local development and CI never need a real Upstash account. Every fail-open path logs an unmistakable `DEV/TEST FALLBACK` warning — it is never silently mistaken for real protection.
+
+Add the Upstash Redis integration from the Vercel Marketplace to get real protection in production. `dashboard/scripts/check-prod-env.mjs` is an optional, not-wired-in-by-default script you can add to `buildCommand` if you'd rather a misconfigured deploy fail the build outright instead of only degrading at request time (see that file's header for the tradeoff).
+
+### Location authorization strategy
+
+`locations.id` (a stable integer, already the foreign key for every review in `dashboard/reviews.db`) is the correct long-term authorization identifier — not `location_name`. It does not yet propagate to the exported review JSON or to `publish.js`'s/`rewrite.js`'s request payloads. Until it does, `location_manager` accounts must not be created: there is no way to verify a request actually belongs to that manager's location. Before introducing scoped accounts: add `location_id` to `export_chunks.py`'s `review_to_dict()`, and have `publish.js` resolve a review's true `location_id` server-side (via `gbp_review_name`/`dedup_key`) rather than trusting anything the client sends.
+
+### Local development secrets
+
+If you use `vercel env pull` to test any of this locally, it writes every project env var — including `ACCOUNT_DIRECTORY_JSON`, `SESSION_SIGNING_SECRET`, and the Upstash/Google/GitHub/Anthropic credentials — into a plaintext `.env*.local` file inside `dashboard/`. `dashboard/.gitignore` covers these filenames explicitly (the root `.gitignore`'s `*.env` pattern does not match Vercel's actual `.env.local`/`.env.development.local` naming). Never commit one of these files, and never paste its contents anywhere outside your own machine.
+
+### Standing rule: no sensitive data in `dashboard/public/`
+
+`dashboard/public/` is served by Vercel as static assets to anyone, unauthenticated, forever. **No sensitive operational data may ever be written there** — this includes raw reviews, manager investigations, complaint cases, internal notes, assignments, manager responses, audit history, unpublished reply drafts, AI-generated internal recommendations, account/user information, or any integration status containing private identifiers. `export_chunks.py` writes to `dashboard/private-data/` instead, reachable only through the authenticated `dashboard/api/data/[...path].js` endpoint. When the future Manager Complaint Investigation feature is built, its data must follow the same rule from day one.
 
 ## Deployment
 

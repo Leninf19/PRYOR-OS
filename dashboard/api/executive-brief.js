@@ -10,10 +10,19 @@
 //   worstLocation, worstLocationDelta }
 // Returns { briefing: string }
 
+import { requireAuth } from './_lib/auth.js'
+import { enforceRateLimit } from './_lib/rateLimit.js'
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' })
   }
+
+  const account = await requireAuth(req, res, ['owner', 'marketing'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `executive-brief:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
 
   const apiKey = process.env.ANTHROPIC_API_KEY
   if (!apiKey) {

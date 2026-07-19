@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { useMeta, usePredictiveAlerts, useActionItems } from '../hooks/useIntelligence.js'
 import ThemeToggle from './ui/ThemeToggle.jsx'
 import SmartSearch from './SmartSearch.jsx'
+import LogoutButton from './LogoutButton.jsx'
 
 // ── Icons (inline SVG, 15×15, Heroicons solid) ────────────────────────────────
 
@@ -191,10 +192,13 @@ function SidebarContent({ unansweredCount, onLinkClick }) {
       {/* Footer */}
       <div className="px-5 py-3 flex-shrink-0 flex items-center justify-between gap-2"
            style={{ borderTop: '1px solid var(--color-border)' }}>
-        <p className="text-[10px]" style={{ color: 'var(--color-text-3)' }}>
+        <p className="text-[10px] truncate" style={{ color: 'var(--color-text-3)' }}>
           Los Tres Amigos · 21 Locations
         </p>
-        <ThemeToggle compact />
+        <div className="flex items-center gap-1 flex-shrink-0">
+          <LogoutButton />
+          <ThemeToggle compact />
+        </div>
       </div>
     </>
   )

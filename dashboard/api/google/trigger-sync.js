@@ -4,12 +4,21 @@
 // POST /api/google/trigger-sync
 // Returns { success: true } or { error, message }
 
+import { requireAuth } from '../_lib/auth.js'
+import { enforceRateLimit } from '../_lib/rateLimit.js'
+
 const REPO_OWNER = 'LosTresAmigos1'
 const REPO_NAME  = 'lta-review-dashboard'
 const WORKFLOW   = 'update-reviews.yml'
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `trigger-sync:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
+  if (!allowed) return
 
   const pat = process.env.GITHUB_SYNC_PAT
   if (!pat) {

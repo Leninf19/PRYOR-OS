@@ -7,10 +7,26 @@
 
 import { parseCookies, clearCookie } from './_lib/cookies.js'
 import { upsertEnvVar, triggerRedeploy } from './_lib/vercel.js'
+import { evaluateSession } from '../_lib/auth.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
 export default async function handler(req, res) {
+  if (req.method !== 'GET') return res.status(405).send('Method not allowed')
+
+  // Defense in depth: auth.js already required an Owner session before
+  // redirecting here, but this endpoint is independently authoritative and
+  // never assumes that check already ran (the CSRF state check below is a
+  // separate concern -- it proves this callback belongs to a flow *this
+  // browser* started, not that the caller is still an authorized Owner).
+  const { account } = await evaluateSession(req, ['owner'])
+  if (!account) {
+    return res.status(401).send(page('Sign in required', `
+      <p>Connecting Google Business Profile requires an Owner account.</p>
+      <p><a href="/login">← Sign in</a></p>
+    `))
+  }
+
   const { code, error, state } = req.query
 
   const cookies = parseCookies(req)
@@ -118,29 +134,29 @@ export default async function handler(req, res) {
     }
   }
 
-  // Automation not configured -- fall back to the original manual flow
-  // rather than blocking the connection entirely.
-  return res.send(page('✓ Google connected — manual step required', `
-    <p style="color:#16a34a;font-weight:600">Authorization successful.</p>
-    <div style="background:#fef3c7;border:1px solid #fbbf24;border-radius:8px;padding:12px 16px;margin:20px 0">
-      Automatic setup isn't configured yet (missing <code>VERCEL_API_TOKEN</code> / <code>VERCEL_PROJECT_ID</code> /
-      <code>VERCEL_DEPLOY_HOOK_URL</code>), so this token needs to be added manually this one time.
+  // Automation not configured -- the refresh token is NEVER displayed,
+  // logged, or put in a URL. `tokens` (and the refresh token within it)
+  // goes out of scope when this function returns and is not persisted
+  // anywhere; the Owner must configure the Vercel automation env vars and
+  // restart the OAuth flow (which will issue a fresh token, since
+  // `prompt=consent` on the initial request always re-issues one).
+  return res.status(503).send(page('Connected, but automatic setup is incomplete', `
+    <p style="color:#16a34a;font-weight:600">Authorization with Google succeeded.</p>
+    <div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:12px 16px;margin:20px 0">
+      This dashboard cannot save the refresh token automatically because required server
+      configuration is missing:
+      <ul style="margin:8px 0 0 20px">
+        ${!process.env.VERCEL_API_TOKEN ? '<li><code>VERCEL_API_TOKEN</code></li>' : ''}
+        ${!process.env.VERCEL_PROJECT_ID ? '<li><code>VERCEL_PROJECT_ID</code></li>' : ''}
+        ${!process.env.VERCEL_DEPLOY_HOOK_URL ? '<li><code>VERCEL_DEPLOY_HOOK_URL</code></li>' : ''}
+      </ul>
     </div>
-    <h3>Your Refresh Token</h3>
-    <div style="background:#f5f5f4;border:1px solid #d6d3d1;border-radius:8px;padding:16px;word-break:break-all;font-family:monospace;font-size:13px;margin-bottom:24px">
-      ${tokens.refresh_token}
-    </div>
-    <h3>Add it to Vercel (final step)</h3>
+    <p>For security, the token is not shown here, logged, or stored anywhere by this request.</p>
+    <h3>Next steps</h3>
     <ol style="line-height:2.2">
-      <li>Go to <strong>vercel.com → your project → Settings → Environment Variables</strong></li>
-      <li>Add variable: Key = <code>GOOGLE_REFRESH_TOKEN</code> &nbsp;·&nbsp; Value = the token above</li>
-      <li>Set scope to <strong>Production</strong> (and Preview if testing), then <strong>Save</strong></li>
-      <li>Trigger a redeploy — go to Deployments → click the three dots → Redeploy</li>
+      <li>Add the missing variable(s) above in <strong>vercel.com → your project → Settings → Environment Variables</strong></li>
+      <li>Return to <a href="/settings">Settings</a> and click Connect again to restart the flow</li>
     </ol>
-    <p style="margin-top:16px;font-size:13px;color:#78716c">
-      Tip: set up <code>VERCEL_API_TOKEN</code> / <code>VERCEL_DEPLOY_HOOK_URL</code> (see README) so this step
-      automates itself next time.
-    </p>
     <p style="margin-top:32px"><a href="/settings">← Back to Settings</a></p>
   `))
 }

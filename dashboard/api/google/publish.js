@@ -10,6 +10,16 @@
 // (unavoidable without a persisted id for that review).
 
 import { fetchWithRetry } from './_lib/http.js'
+import { requireAuth } from '../_lib/auth.js'
+import { enforceRateLimit } from '../_lib/rateLimit.js'
+
+// Location Manager is part of the permission model but is NOT included
+// below yet: this endpoint's fallback path only has a client-supplied
+// locationName string to go on, with no server-side way to resolve it to
+// the review's actual location_id (see README "Location authorization
+// strategy" gap). Enabling Location Manager here requires that resolution
+// to exist first -- do not add 'location_manager' to this list until then.
+const ALLOWED_ROLES = ['owner', 'marketing']
 
 // Google split the old monolithic v4 "My Business API" into several
 // purpose-built APIs in 2022. Only review read/reply stayed on the legacy
@@ -102,6 +112,12 @@ async function replyViaReviewName(reviewName, replyText, token) {
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ALLOWED_ROLES)
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `publish:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
 
   if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_REFRESH_TOKEN) {
     return res.status(503).json({
