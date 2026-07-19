@@ -5,6 +5,16 @@ on:
   schedule:
     - cron: '0 */6 * * *'    # ~every 6h; GitHub may delay scheduled runs under load
 
+# Every workflow that commits to dashboard/reviews.db shares this same
+# group, serializing them so two writers can never race to commit/push at
+# once (the root cause of the git-race data-loss incident on 2026-07-16).
+# cancel-in-progress: false -- a run already mutating the DB must finish
+# (or fail cleanly) rather than being killed mid-write by a newer run
+# starting; queued runs simply wait their turn instead.
+concurrency:
+  group: reviews-db-writer
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -70,6 +80,10 @@ jobs:
         if: always()
         run: python export_chunks.py
 
+      - name: Verify database integrity before commit
+        if: always()
+        run: python check_db_integrity.py
+
       - name: Commit updated data
         if: always()
         run: |
@@ -79,21 +93,17 @@ jobs:
           git add dashboard/reviews.csv dashboard/reviews.db
           git diff --staged --quiet && exit 0
           git commit -m "$MSG"
-          # The scraper run takes ~14min, long enough to collide with the
-          # 15-min critical-alert-check cron's own commit -- retry against
-          # the latest remote tip rather than silently losing this run's
-          # scraped reviews to a rejected push (found in production 2026-07-16).
-          for attempt in 1 2 3 4 5; do
-            git push && exit 0
-            echo "Push rejected (attempt $attempt/5) -- rebasing our data onto the latest remote state and retrying..."
-            git fetch origin main
-            git reset --mixed origin/main
-            git add dashboard/reviews.csv dashboard/reviews.db
-            git commit -m "$MSG"
-            sleep $((attempt * 5))
-          done
-          echo "::error::Failed to push after 5 attempts"
-          exit 1
+          # concurrency: above already prevents another reviews.db-writing
+          # workflow from running at the same time. A rejected push here
+          # means main moved for some other reason (e.g. an unrelated
+          # manual commit) -- fail loudly rather than silently resolving it
+          # by resetting onto remote and recommitting, which previously
+          # risked overwriting newer review data with this run's older copy
+          # (the root cause of the 2026-07-16 incident this replaces).
+          if ! git push; then
+            echo "::error::git push rejected -- main has moved since this job started. This run's changes were NOT saved. Re-run this workflow once main is stable; no automatic reset/recommit is attempted."
+            exit 1
+          fi
 
       - name: Set up Node
         if: always()

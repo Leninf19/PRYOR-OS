@@ -14,6 +14,15 @@ on:
         type: boolean
         default: false
 
+# Shared with every other workflow that commits to dashboard/reviews.db --
+# see update-reviews.yml for the full rationale. This must not run
+# concurrently with any of them: it rewrites review rows wholesale, which
+# is exactly the kind of change a concurrent scraper/sync commit could
+# otherwise silently clobber or be clobbered by.
+concurrency:
+  group: reviews-db-writer
+  cancel-in-progress: false
+
 jobs:
   import:
     runs-on: ubuntu-latest
@@ -59,11 +68,23 @@ jobs:
             echo '```' >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Verify database integrity before commit
+        if: always() && inputs.apply == 'true'
+        run: python check_db_integrity.py
+
       - name: Commit updated data
         if: always() && inputs.apply == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add dashboard/reviews.db
-          git diff --staged --quiet || git commit -m "chore: historical import applied [skip ci]"
-          git push
+          git diff --staged --quiet && exit 0
+          git commit -m "chore: historical import applied [skip ci]"
+          # concurrency: above serializes this against every other
+          # reviews.db writer. A rejected push means main moved for some
+          # other reason -- fail loudly rather than reset+recommit (see
+          # update-reviews.yml for why that pattern was removed everywhere).
+          if ! git push; then
+            echo "::error::git push rejected -- main has moved since this job started. This run's applied import was NOT saved. Re-run this workflow (with apply) once main is stable; no automatic reset/recommit is attempted."
+            exit 1
+          fi

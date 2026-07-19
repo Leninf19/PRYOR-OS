@@ -11,6 +11,12 @@ on:
   schedule:
     - cron: '*/15 * * * *'
 
+# Shared with every other workflow that commits to dashboard/reviews.db --
+# see update-reviews.yml for the full rationale.
+concurrency:
+  group: reviews-db-writer
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -39,6 +45,10 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
 
+      - name: Verify database integrity before commit
+        if: always()
+        run: python check_db_integrity.py
+
       - name: Commit updated data
         if: always()
         run: |
@@ -48,17 +58,11 @@ jobs:
           git add dashboard/reviews.db
           git diff --staged --quiet && exit 0
           git commit -m "$MSG"
-          # This runs every 15min and can collide with the ~14min scraper's
-          # own commit -- retry against the latest remote tip rather than
-          # silently dropping the push (found in production 2026-07-16).
-          for attempt in 1 2 3; do
-            git push && exit 0
-            echo "Push rejected (attempt $attempt/3) -- rebasing onto the latest remote state and retrying..."
-            git fetch origin main
-            git reset --mixed origin/main
-            git add dashboard/reviews.db
-            git commit -m "$MSG"
-            sleep $((attempt * 3))
-          done
-          echo "::error::Failed to push after 3 attempts"
-          exit 1
+          # concurrency: above serializes this against every other
+          # reviews.db writer. A rejected push means main moved for some
+          # other reason -- fail loudly rather than reset+recommit (that
+          # previously risked overwriting newer data, see update-reviews.yml).
+          if ! git push; then
+            echo "::error::git push rejected -- main has moved since this job started. This run's changes were NOT saved. Re-run this workflow once main is stable; no automatic reset/recommit is attempted."
+            exit 1
+          fi
