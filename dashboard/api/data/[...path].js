@@ -125,6 +125,8 @@ export default async function handler(req, res) {
   if (!account) return
 
   console.log('[data-diag] raw req.query.path=', JSON.stringify(req.query.path))
+  console.log('[data-diag] full req.query=', JSON.stringify(req.query))
+  console.log('[data-diag] req.url=', req.url)
 
   const relPath = buildRequestedRelPath(req.query.path)
   const resolvedForDiag = relPath ? path.resolve(PRIVATE_ROOT, relPath) : null
