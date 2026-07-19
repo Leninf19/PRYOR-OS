@@ -15,6 +15,8 @@ from collections import defaultdict
 
 import db
 import digest_filters
+import local_safety
+import check_db_integrity
 
 BASE_DIR      = Path(__file__).parent
 REVIEWS_CSV   = BASE_DIR / "dashboard" / "reviews.csv"
@@ -1180,16 +1182,13 @@ def write_github_output(new_count: int, negative_count: int, email_html: str):
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def main():
+async def _scrape_and_write(existing: set) -> tuple[list, list]:
+    """The actual scrape + dashboard/reviews.db mutation + CSV/GitHub-output
+    side effects -- identical in local and cloud mode. Returns
+    (new_rows, failed_locs). Split out of main() purely so main() can wrap
+    it in the local-mode lock/integrity-check/git sequence below without a
+    130-line indentation change to this body."""
     from playwright.async_api import async_playwright
-
-    print(f"Starting scrape: {datetime.now()} | LOCAL={LOCAL_MODE} | DEBUG={DEBUG_MODE}")
-    if DEBUG_MODE:
-        LOGS_DIR.mkdir(exist_ok=True)
-        print(f"Debug snapshots → {LOGS_DIR}")
-
-    existing = load_existing()
-    print(f"Existing reviews in CSV: {len(existing)}")
 
     conn = db.get_connection()
     db.init_schema(conn)
@@ -1336,27 +1335,107 @@ async def main():
     else:
         write_github_output(0, 0, "")
 
-    if LOCAL_MODE:
-        import subprocess
-        print("\nPushing to GitHub...")
-        subprocess.run("git add dashboard/reviews.csv dashboard/reviews.db", shell=True, cwd=BASE_DIR)
-        msg = f"update: {len(new_rows)} new reviews" if new_rows else "update: no new reviews"
-        subprocess.run(f'git commit -m "{msg}"', shell=True, cwd=BASE_DIR)
-        subprocess.run("git push", shell=True, cwd=BASE_DIR)
-        print("\nDeploying to Vercel...")
-        subprocess.run("vercel --prod --yes", shell=True, cwd=BASE_DIR / "dashboard")
+    return new_rows, failed_locs
 
-        print("\n")
-        print("=" * 50)
-        if new_rows:
-            from collections import Counter
-            print(f"  RESULT: {len(new_rows)} NEW REVIEWS FOUND")
-            print("-" * 50)
-            for loc_name, cnt in Counter(r["location_name"] for r in new_rows).most_common():
-                print(f"  {cnt:4d}  {loc_name}")
-        else:
-            print("  RESULT: No new reviews since last run.")
-        print("=" * 50)
+
+def _print_result_summary(new_rows: list) -> None:
+    print("\n")
+    print("=" * 50)
+    if new_rows:
+        from collections import Counter
+        print(f"  RESULT: {len(new_rows)} NEW REVIEWS FOUND")
+        print("-" * 50)
+        for loc_name, cnt in Counter(r["location_name"] for r in new_rows).most_common():
+            print(f"  {cnt:4d}  {loc_name}")
+    else:
+        print("  RESULT: No new reviews since last run.")
+    print("=" * 50)
+
+
+def _git_commit_push_deploy(new_rows: list) -> None:
+    """--local only. Never falls back to reset-and-recommit on a rejected
+    push (see .github/workflows/*.yml for why that pattern was removed
+    everywhere it used to exist) -- a rejected push here means the local
+    checkout is behind origin/main, and the correct fix is for the human to
+    pull/rebase and re-run, not for this script to guess. Critically: a
+    rejected push must also cancel the Vercel deploy below it, since
+    deploying local build output that was never actually pushed would
+    create exactly the local/remote drift this whole safety pass exists to
+    prevent."""
+    import subprocess
+
+    print("\nPushing to GitHub...")
+    subprocess.run("git add dashboard/reviews.csv dashboard/reviews.db", shell=True, cwd=BASE_DIR, check=True)
+    msg = f"update: {len(new_rows)} new reviews" if new_rows else "update: no new reviews"
+    commit = subprocess.run(f'git commit -m "{msg}"', shell=True, cwd=BASE_DIR)
+    # A "nothing to commit" exit is expected and not an error (e.g. a rerun
+    # with no new reviews) -- only a push failure below is fatal.
+    push = subprocess.run("git push", shell=True, cwd=BASE_DIR)
+    if push.returncode != 0:
+        print(
+            "\n::error:: git push failed or was rejected -- your local branch is likely "
+            "behind origin/main. NOT deploying to Vercel (that would publish local build "
+            "output that was never actually pushed). Run `git pull --rebase` (or resolve "
+            "the conflict manually), confirm `git push` succeeds on its own, then re-run "
+            "auto_update.py --local. No automatic reset/recommit was attempted."
+        )
+        raise RuntimeError("git push failed in --local mode; deploy skipped")
+
+    print("\nDeploying to Vercel...")
+    subprocess.run("vercel --prod --yes", shell=True, cwd=BASE_DIR / "dashboard", check=True)
+
+
+async def main():
+    print(f"Starting scrape: {datetime.now()} | LOCAL={LOCAL_MODE} | DEBUG={DEBUG_MODE}")
+    if DEBUG_MODE:
+        LOGS_DIR.mkdir(exist_ok=True)
+        print(f"Debug snapshots → {LOGS_DIR}")
+
+    existing = load_existing()
+    print(f"Existing reviews in CSV: {len(existing)}")
+
+    if not LOCAL_MODE:
+        # Cloud/CI path is completely unchanged: no lock (GitHub Actions'
+        # own `concurrency: group: reviews-db-writer` already serializes
+        # this), no local pre/post integrity check (the surrounding
+        # workflow runs check_db_integrity.py as its own step), no git ops
+        # (the workflow's own "Commit updated data" step owns that).
+        new_rows, _ = await _scrape_and_write(existing)
+        return
+
+    # --- --local only, from here down ---
+    local_safety.ensure_safe_for_local_mode()
+    local_safety.ensure_expected_db_path(db.DB_PATH, BASE_DIR)
+
+    lock_path = BASE_DIR / local_safety.LOCAL_LOCK_FILENAME
+    local_safety.acquire(lock_path)
+    print(f"Local mutation lock acquired: {lock_path}")
+
+    try:
+        pre_ok, pre_message, baseline_counts = check_db_integrity.check_integrity(db.DB_PATH)
+        print(f"Pre-scrape integrity check: {pre_message}")
+        if not pre_ok:
+            raise RuntimeError(f"Refusing to start --local scrape: {pre_message}")
+
+        new_rows, failed_locs = await _scrape_and_write(existing)
+
+        post_ok, post_message, final_counts = check_db_integrity.check_integrity(db.DB_PATH)
+        print(f"Post-scrape integrity check: {post_message}")
+        if final_counts and baseline_counts:
+            for key in ("locations", "reviews"):
+                delta = final_counts[key] - baseline_counts[key]
+                print(f"  {key}: {baseline_counts[key]} -> {final_counts[key]} (delta {delta:+d})")
+        if not post_ok:
+            raise RuntimeError(
+                f"Post-scrape integrity check failed: {post_message}. "
+                "Skipping git commit/push/deploy -- the on-disk database will NOT be published in this state."
+            )
+
+        _git_commit_push_deploy(new_rows)
+        _print_result_summary(new_rows)
+    finally:
+        local_safety.release(lock_path)
+        print(f"Local mutation lock released: {lock_path}")
 
 
 if __name__ == "__main__":

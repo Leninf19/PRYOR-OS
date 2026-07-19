@@ -25,3 +25,7 @@ dashboard/.vercel/cache/
 credentials.json
 token.json
 *.env
+
+# auto_update.py --local's mutation lock (see local_safety.py) -- must
+# never be committed; it's meaningful only on the machine that created it.
+.local_db_mutation.lock
