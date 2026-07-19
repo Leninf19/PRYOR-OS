@@ -7,11 +7,27 @@
 //
 // Run directly: node tests/test_publish_reply.js
 
+import bcrypt from 'bcryptjs'
 import handler from '../dashboard/api/google/publish.js'
+import { signSession } from '../dashboard/api/_lib/session.js'
 
 process.env.GOOGLE_CLIENT_ID = 'fake-client-id'
 process.env.GOOGLE_CLIENT_SECRET = 'fake-client-secret'
 process.env.GOOGLE_REFRESH_TOKEN = 'fake-refresh-token'
+process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xyz'
+
+// publish.js now requires an authenticated Owner/Marketing session (Phase 1
+// endpoint-authorization work) -- every test below authenticates as Owner
+// first so the underlying publish logic these tests actually target is
+// still exercised the same way it always was.
+process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
+  accounts: [{
+    userId: 'usr_owner', email: 'owner@example.com',
+    passwordHash: await bcrypt.hash('x', 12),
+    role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false,
+  }],
+})
+const AUTH_COOKIE = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
 
 function fakeRes() {
   const res = { statusCode: null, body: null }
@@ -23,7 +39,7 @@ function fakeRes() {
 async function invoke(body, fetchImpl) {
   globalThis.fetch = fetchImpl
   const res = fakeRes()
-  await handler({ method: 'POST', body }, res)
+  await handler({ method: 'POST', body, headers: { cookie: `lta_session=${AUTH_COOKIE}` } }, res)
   return res
 }
 

@@ -1,0 +1,9 @@
+{
+  "name": "lta-review-dashboard-tests",
+  "private": true,
+  "type": "module",
+  "description": "Root-level devDependencies for tests/ -- the actual app dependencies live in dashboard/package.json. This exists only so Node test files under tests/ (which sits outside dashboard/'s node_modules resolution path) can import bcryptjs directly to build fixture account hashes.",
+  "devDependencies": {
+    "bcryptjs": "^3.0.3"
+  }
+}
