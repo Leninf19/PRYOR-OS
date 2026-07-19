@@ -1,57 +1,54 @@
 // Authenticated read access to dashboard/private-data/ -- the JSON chunks
 // export_chunks.py writes (reviews, analytics, AI intelligence, etc), moved
 // out of dashboard/public/ specifically so they are no longer reachable by
-// direct URL. GET /api/data/<same relative path the file used to have under
-// public/data/>, e.g. /api/data/meta.json, /api/data/reviews/by-location/x.json.
+// direct URL. GET /api/data?file=<same relative path the file used to have
+// under public/data/>, e.g. /api/data?file=meta.json,
+// /api/data?file=reviews/by-location/x.json.
+//
+// This was originally a dynamic catch-all route (api/data/[...path].js,
+// matching /api/data/<path>). That was replaced after a production
+// investigation confirmed a platform-level bug: when dashboard/middleware.js
+// (Edge Middleware) calls next() to continue a request to a dynamic
+// catch-all API route, Vercel only successfully re-routes to the function
+// when exactly ONE path segment remains after /api/data/ -- two or more
+// segments got a platform NOT_FOUND before the function was ever invoked,
+// and even in the one-segment case that DID reach the function,
+// req.query.path was consistently undefined (confirmed via temporary
+// request-tracing instrumentation, since removed). Both symptoms trace to
+// the same root cause: Edge Middleware + a dynamic catch-all route do not
+// compose reliably through next() on this platform. A single static
+// endpoint reading the target file from an ordinary query string parameter
+// sidesteps dynamic-route matching entirely -- req.query.file is populated
+// by plain query-string parsing, a completely different, unaffected code
+// path.
 //
 // SAFETY MODEL (read this before changing the allowlist below):
-//   A catch-all file-serving route is one bad path check away from being a
-//   general file-download endpoint. This handler does NOT trust path.join()
-//   plus a startsWith() check as its only defense -- the primary defense is
-//   a positive allowlist of exact filenames and directory+slug patterns
-//   matching exactly what export_chunks.py actually produces. A request for
-//   anything not on this list is rejected before the filesystem is ever
-//   touched, regardless of how it's encoded. The resolve()+prefix check
-//   below is a second, independent layer, not the only one.
+//   A file-serving endpoint that accepts a caller-supplied relative path is
+//   one bad check away from being a general file-download endpoint. This
+//   handler does NOT trust path.join() plus a startsWith() check as its
+//   only defense -- the primary defense is a positive allowlist of exact
+//   filenames and directory+slug patterns matching exactly what
+//   export_chunks.py actually produces. A request for anything not on this
+//   list is rejected before the filesystem is ever touched, regardless of
+//   how it's encoded. The resolve()+prefix check below is a second,
+//   independent layer, not the only one.
 //
 // Vercel bundling note: this function does `fs.readFile` against a path
 // built at request time, which Vercel's static dependency tracer cannot
 // discover by analyzing the source -- dashboard/vercel.json's
-// `functions["api/data/**"].includeFiles` glob is what actually gets
+// `functions["api/data.js"].includeFiles` glob is what actually gets
 // dashboard/private-data/** included in this function's deployment bundle.
 // Do not assume runtime fs access "just works" without that entry.
 
 import { readFile } from 'fs/promises'
-import { existsSync, readdirSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { requireAuth } from '../_lib/auth.js'
+import { requireAuth } from './_lib/auth.js'
 
 const ALLOWED_ROLES = ['owner', 'marketing']
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PRIVATE_ROOT = path.resolve(__dirname, '..', '..', 'private-data')
-
-// TEMPORARY DIAGNOSTIC (Phase 1 /api/data/* routing investigation --
-// remove once root cause is confirmed). No file contents, no secrets --
-// filenames and paths only.
-function logDiagnostics(relPath, resolvedTarget) {
-  console.log('[data-diag] __dirname=', __dirname)
-  console.log('[data-diag] process.cwd()=', process.cwd())
-  console.log('[data-diag] process.env.VERCEL=', process.env.VERCEL)
-  console.log('[data-diag] PRIVATE_ROOT=', PRIVATE_ROOT)
-  console.log('[data-diag] PRIVATE_ROOT exists=', existsSync(PRIVATE_ROOT))
-  if (existsSync(PRIVATE_ROOT)) {
-    try {
-      console.log('[data-diag] PRIVATE_ROOT readdir=', readdirSync(PRIVATE_ROOT))
-    } catch (err) {
-      console.log('[data-diag] PRIVATE_ROOT readdir failed:', err.message)
-    }
-  }
-  console.log('[data-diag] requested relPath=', relPath)
-  console.log('[data-diag] resolvedTarget=', resolvedTarget)
-  console.log('[data-diag] resolvedTarget exists=', resolvedTarget ? existsSync(resolvedTarget) : 'n/a')
-}
+const PRIVATE_ROOT = path.resolve(__dirname, '..', 'private-data')
 
 // Every static file export_chunks.py writes (see its main()/export_* calls).
 const EXACT_ALLOWLIST = new Set([
@@ -95,18 +92,19 @@ function isAllowed(relPath) {
   return DYNAMIC_ALLOWLIST.some(re => re.test(relPath))
 }
 
-// req.query.path is an array of already-decoded segments (Vercel's own
-// catch-all routing splits and decodes before handler code ever runs).
-// Still validated defensively here rather than trusted: reject anything
-// that isn't a plain [a-z0-9._-]+ segment, which alone rules out '..',
-// '.', empty segments, encoded slashes, backslashes, and null bytes -- an
-// allowlisted rejoined string can only ever describe one of the known-good
-// shapes above, regardless of how the request tried to spell it.
-function buildRequestedRelPath(segments) {
-  if (!Array.isArray(segments) || segments.length === 0) return null
+// req.query.file is a single, already-decoded string (ordinary query-string
+// parsing, not dynamic-route segment extraction). Still validated
+// defensively here rather than trusted: split on '/' and reject anything
+// where any segment isn't a plain [a-zA-Z0-9._-]+, which alone rules out
+// '..', '.', empty segments, encoded slashes, backslashes, and null bytes --
+// an allowlisted rejoined string can only ever describe one of the
+// known-good shapes above, regardless of how the request tried to spell it.
+function buildRequestedRelPath(fileParam) {
+  if (typeof fileParam !== 'string' || fileParam.length === 0) return null
+  const segments = fileParam.split('/')
   for (const seg of segments) {
-    if (typeof seg !== 'string' || seg.length === 0) return null
-    if (seg.includes('\0') || seg.includes('\\') || seg.includes('/')) return null
+    if (seg.length === 0) return null
+    if (seg.includes('\0') || seg.includes('\\')) return null
     if (!/^[a-zA-Z0-9._-]+$/.test(seg)) return null
     if (seg === '.' || seg === '..') return null
   }
@@ -124,14 +122,7 @@ export default async function handler(req, res) {
   const account = await requireAuth(req, res, ALLOWED_ROLES)
   if (!account) return
 
-  console.log('[data-diag] raw req.query.path=', JSON.stringify(req.query.path))
-  console.log('[data-diag] full req.query=', JSON.stringify(req.query))
-  console.log('[data-diag] req.url=', req.url)
-
-  const relPath = buildRequestedRelPath(req.query.path)
-  const resolvedForDiag = relPath ? path.resolve(PRIVATE_ROOT, relPath) : null
-  logDiagnostics(relPath, resolvedForDiag)
-
+  const relPath = buildRequestedRelPath(req.query.file)
   if (!relPath || !isAllowed(relPath)) {
     return res.status(404).json({ error: 'not_found' })
   }

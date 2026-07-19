@@ -3,8 +3,8 @@
 // ever be served from there again -- this is what stops Vercel's SPA
 // rewrite from serving index.html with a 200 for a file that no longer
 // exists), and (b) performs the same session/role pre-check as the Node
-// endpoint for /api/data/*, without being the only thing standing guard
-// (dashboard/api/data/[...path].js re-verifies everything independently).
+// endpoint for /api/data, without being the only thing standing guard
+// (dashboard/api/data.js re-verifies everything independently).
 //
 // Run directly: node tests/test_middleware.js
 
@@ -59,15 +59,15 @@ async function testLegacyDataPath404EvenWithValidSession() {
 }
 
 async function testApiDataUnauthenticatedRejected() {
-  const res = await middleware(fakeRequest('/api/data/meta.json', null))
-  assert(res instanceof Response, 'middleware must short-circuit an unauthenticated /api/data/* request')
+  const res = await middleware(fakeRequest('/api/data?file=meta.json', null))
+  assert(res instanceof Response, 'middleware must short-circuit an unauthenticated /api/data request')
   assert(res.status === 401, `expected 401, got ${res.status}`)
 }
 
 async function testApiDataAuthenticatedContinues() {
   await setDirectory()
   const token = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
-  const res = await middleware(fakeRequest('/api/data/meta.json', token))
+  const res = await middleware(fakeRequest('/api/data?file=meta.json', token))
   // next() from @vercel/functions returns a Response whose presence signals
   // "continue" to the platform -- what matters here is it did NOT
   // short-circuit with a 401/403/404 of its own.
@@ -77,8 +77,8 @@ async function testApiDataAuthenticatedContinues() {
 async function main() {
   await run('legacy /data/* always 404s (no session)', testLegacyDataPathAlways404)
   await run('legacy /data/* 404s even with a valid session (nothing should ever be served there)', testLegacyDataPath404EvenWithValidSession)
-  await run('/api/data/* unauthenticated -> 401 at the edge', testApiDataUnauthenticatedRejected)
-  await run('/api/data/* authenticated -> continues to the Node handler', testApiDataAuthenticatedContinues)
+  await run('/api/data unauthenticated -> 401 at the edge', testApiDataUnauthenticatedRejected)
+  await run('/api/data authenticated -> continues to the Node handler', testApiDataAuthenticatedContinues)
 
   console.log()
   if (results.every(Boolean)) {

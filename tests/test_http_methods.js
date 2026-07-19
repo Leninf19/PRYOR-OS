@@ -14,7 +14,7 @@
 process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xyz'
 delete process.env.ACCOUNT_DIRECTORY_JSON
 
-import dataHandler from '../dashboard/api/data/[...path].js'
+import dataHandler from '../dashboard/api/data.js'
 import executiveBriefHandler from '../dashboard/api/executive-brief.js'
 import authHandler from '../dashboard/api/google/auth.js'
 import callbackHandler from '../dashboard/api/google/callback.js'
@@ -53,7 +53,7 @@ function fakeRes() {
 
 // [handler, allowedMethod, extraReqFields]
 const ROUTES = [
-  ['/api/data/*', dataHandler, 'GET', { query: { path: ['meta.json'] } }],
+  ['/api/data', dataHandler, 'GET', { query: { file: 'meta.json' } }],
   ['/api/executive-brief', executiveBriefHandler, 'POST', {}],
   ['/api/google/auth', authHandler, 'GET', { query: {} }],
   ['/api/google/callback', callbackHandler, 'GET', { query: { code: 'x', state: 'y' } }],

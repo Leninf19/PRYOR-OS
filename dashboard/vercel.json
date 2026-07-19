@@ -3,7 +3,7 @@
   "outputDirectory": "dist",
   "framework": "vite",
   "functions": {
-    "api/data/**": {
+    "api/data.js": {
       "includeFiles": "private-data/**"
     }
   },

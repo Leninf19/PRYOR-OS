@@ -6,24 +6,31 @@
 // not a 404. This runs first and short-circuits that.
 //
 // This is DEFENSE IN DEPTH / a legacy-path guard, not the primary security
-// boundary -- dashboard/api/data/[...path].js (Node) is authoritative and
+// boundary -- dashboard/api/data.js (Node) is authoritative and
 // independently re-verifies everything below itself; it never assumes
 // middleware already ran (a matcher typo or a future route outside it must
 // not silently lose protection).
 //
 // What this file verifies vs. what the Node endpoint verifies:
-//   - Middleware (/api/data/*): signature + expiry (via _lib/session.js)
+//   - Middleware (/api/data): signature + expiry (via _lib/session.js)
 //     and current sessionVersion/disabled/role (via _lib/accounts.js) --
 //     everything that's Edge-runtime safe (no bcrypt, no fs, no Redis).
-//   - Node endpoint (dashboard/api/data/[...path].js): the SAME checks
-//     again, independently, PLUS the file-path allowlist and the actual
-//     file read. It does not trust that middleware already approved the
+//   - Node endpoint (dashboard/api/data.js): the SAME checks again,
+//     independently, PLUS the file-path allowlist and the actual file
+//     read. It does not trust that middleware already approved the
 //     request.
 //   - Neither layer does rate limiting here -- Upstash is Node-only.
 //
 // /data/* (legacy): no files exist there after this phase's migration, so
 // there's nothing to gate -- this simply always 404s, matching requirement
 // "direct requests to the old /data/* paths return 404".
+//
+// Matcher note: this used to also match /api/data/:path* (a dynamic
+// catch-all route). That combination hit a confirmed Vercel platform bug --
+// next() failed to route multi-segment catch-all requests to the
+// underlying function at all -- so the data endpoint is now a single
+// static path (/api/data, with the file identified by a ?file= query
+// param) and the matcher below only needs an exact match for it.
 
 import { next } from '@vercel/functions'
 import { verifySession, SESSION_COOKIE } from './api/_lib/session.js'
@@ -52,16 +59,11 @@ function json(status, body) {
 export default async function middleware(request) {
   const { pathname } = new URL(request.url)
 
-  // TEMPORARY DIAGNOSTIC (see Phase 1 /api/data/* routing investigation --
-  // remove once root cause is confirmed). Logs no secrets/cookie values,
-  // only whether a cookie header is present at all.
-  console.log(`[middleware-diag] pathname=${pathname} method=${request.method} hasCookie=${Boolean(request.headers.get('cookie'))} segments=${pathname.split('/').filter(Boolean).length}`)
-
   if (pathname.startsWith('/data/')) {
     return json(404, { error: 'not_found' })
   }
 
-  // pathname.startsWith('/api/data/') from here on (per the matcher below).
+  // pathname === '/api/data' from here on (per the matcher below).
   const cookies = parseCookieHeader(request.headers.get('cookie'))
   const claims = await verifySession(cookies[SESSION_COOKIE])
   if (!claims) return json(401, { error: 'unauthenticated', message: 'Sign in required.' })
@@ -78,14 +80,11 @@ export default async function middleware(request) {
     return json(403, { error: 'forbidden', message: 'You do not have permission to view this.' })
   }
 
-  // TEMPORARY DIAGNOSTIC (see above -- remove with the rest of this pass).
-  console.log(`[middleware-diag] passed edge pre-check, calling next() for pathname=${pathname}`)
-
   // Passed the edge pre-check -- continue to the Node function, which
   // authoritatively re-verifies all of the above.
   return next()
 }
 
 export const config = {
-  matcher: ['/data/:path*', '/api/data/:path*'],
+  matcher: ['/data/:path*', '/api/data'],
 }
