@@ -52,6 +52,11 @@ function json(status, body) {
 export default async function middleware(request) {
   const { pathname } = new URL(request.url)
 
+  // TEMPORARY DIAGNOSTIC (see Phase 1 /api/data/* routing investigation --
+  // remove once root cause is confirmed). Logs no secrets/cookie values,
+  // only whether a cookie header is present at all.
+  console.log(`[middleware-diag] pathname=${pathname} method=${request.method} hasCookie=${Boolean(request.headers.get('cookie'))} segments=${pathname.split('/').filter(Boolean).length}`)
+
   if (pathname.startsWith('/data/')) {
     return json(404, { error: 'not_found' })
   }
@@ -72,6 +77,9 @@ export default async function middleware(request) {
   if (!ALLOWED_ROLES.includes(account.role)) {
     return json(403, { error: 'forbidden', message: 'You do not have permission to view this.' })
   }
+
+  // TEMPORARY DIAGNOSTIC (see above -- remove with the rest of this pass).
+  console.log(`[middleware-diag] passed edge pre-check, calling next() for pathname=${pathname}`)
 
   // Passed the edge pre-check -- continue to the Node function, which
   // authoritatively re-verifies all of the above.

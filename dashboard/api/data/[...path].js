@@ -22,6 +22,7 @@
 // Do not assume runtime fs access "just works" without that entry.
 
 import { readFile } from 'fs/promises'
+import { existsSync, readdirSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { requireAuth } from '../_lib/auth.js'
@@ -30,6 +31,27 @@ const ALLOWED_ROLES = ['owner', 'marketing']
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PRIVATE_ROOT = path.resolve(__dirname, '..', '..', 'private-data')
+
+// TEMPORARY DIAGNOSTIC (Phase 1 /api/data/* routing investigation --
+// remove once root cause is confirmed). No file contents, no secrets --
+// filenames and paths only.
+function logDiagnostics(relPath, resolvedTarget) {
+  console.log('[data-diag] __dirname=', __dirname)
+  console.log('[data-diag] process.cwd()=', process.cwd())
+  console.log('[data-diag] process.env.VERCEL=', process.env.VERCEL)
+  console.log('[data-diag] PRIVATE_ROOT=', PRIVATE_ROOT)
+  console.log('[data-diag] PRIVATE_ROOT exists=', existsSync(PRIVATE_ROOT))
+  if (existsSync(PRIVATE_ROOT)) {
+    try {
+      console.log('[data-diag] PRIVATE_ROOT readdir=', readdirSync(PRIVATE_ROOT))
+    } catch (err) {
+      console.log('[data-diag] PRIVATE_ROOT readdir failed:', err.message)
+    }
+  }
+  console.log('[data-diag] requested relPath=', relPath)
+  console.log('[data-diag] resolvedTarget=', resolvedTarget)
+  console.log('[data-diag] resolvedTarget exists=', resolvedTarget ? existsSync(resolvedTarget) : 'n/a')
+}
 
 // Every static file export_chunks.py writes (see its main()/export_* calls).
 const EXACT_ALLOWLIST = new Set([
@@ -102,7 +124,12 @@ export default async function handler(req, res) {
   const account = await requireAuth(req, res, ALLOWED_ROLES)
   if (!account) return
 
+  console.log('[data-diag] raw req.query.path=', JSON.stringify(req.query.path))
+
   const relPath = buildRequestedRelPath(req.query.path)
+  const resolvedForDiag = relPath ? path.resolve(PRIVATE_ROOT, relPath) : null
+  logDiagnostics(relPath, resolvedForDiag)
+
   if (!relPath || !isAllowed(relPath)) {
     return res.status(404).json({ error: 'not_found' })
   }
