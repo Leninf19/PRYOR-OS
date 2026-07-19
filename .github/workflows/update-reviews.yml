@@ -85,10 +85,11 @@ jobs:
 
       - name: Verify database integrity before commit
         if: always()
+        id: integrity
         run: python check_db_integrity.py
 
       - name: Commit updated data
-        if: always()
+        if: always() && steps.integrity.outcome == 'success'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -115,7 +116,7 @@ jobs:
           node-version: '24'
 
       - name: Deploy to Vercel
-        if: always()
+        if: always() && steps.integrity.outcome == 'success'
         run: |
           cd dashboard
           npm ci
