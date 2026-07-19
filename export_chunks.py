@@ -2,10 +2,17 @@
 export_chunks.py - Export Agent (Milestone 3).
 
 Reads dashboard/reviews.db and writes a set of small, purpose-built JSON
-files into dashboard/public/data/, replacing the single 7.2MB
-dashboard/src/data/reviews.json import that every page loads in full today.
-Vite serves public/ as static assets, so the frontend can fetch() only the
-chunk(s) a given page actually needs.
+files into dashboard/private-data/ -- a directory OUTSIDE dashboard/public/,
+so Vercel never serves these files as static assets. The frontend reaches
+them only through the authenticated dashboard/api/data/[...path].js
+endpoint (session-gated, path-allowlisted), not by direct fetch().
+
+This directory was dashboard/public/data/ until raw review content, AI
+sentiment/priority fields, and other operational data were found to be
+reachable by anyone who guessed the URL -- see README "Standing rule:
+sensitive data must never be written into a publicly served directory".
+Do not add a new export target under dashboard/public/ for anything beyond
+truly public, anonymous-safe assets (icons, manifest, etc).
 
 Most of the heavy aggregation (KPIs, trends, location stats, rankings,
 insights) is already computed by refresh_analytics.py into analytics_cache
@@ -32,7 +39,7 @@ STOP_WORDS = {
     'service','staff','always','never','still','now','even','back','out',
 }
 
-PUBLIC_DATA_DIR = db.BASE_DIR / "dashboard" / "public" / "data"
+PRIVATE_DATA_DIR = db.BASE_DIR / "dashboard" / "private-data"
 
 
 def slugify(name: str) -> str:
@@ -40,7 +47,7 @@ def slugify(name: str) -> str:
 
 
 def write_json(rel_path: str, payload) -> None:
-    path = PUBLIC_DATA_DIR / rel_path
+    path = PRIVATE_DATA_DIR / rel_path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 
@@ -390,9 +397,9 @@ def main():
     export_intelligence(conn)
 
     conn.close()
-    files = list(PUBLIC_DATA_DIR.rglob("*.json"))
+    files = list(PRIVATE_DATA_DIR.rglob("*.json"))
     total_bytes = sum(f.stat().st_size for f in files)
-    print(f"Exported {len(files)} chunk files, {total_bytes / 1024:.0f} KB total, to {PUBLIC_DATA_DIR}")
+    print(f"Exported {len(files)} chunk files, {total_bytes / 1024:.0f} KB total, to {PRIVATE_DATA_DIR}")
 
 
 if __name__ == "__main__":
