@@ -1,15 +1,18 @@
-// POST /api/session/login  { email, password }
-// Returns { account: { userId, email, role, locationIds, displayName } } and
-// sets the lta_session cookie, or a generic 401 on any failure.
-//
-// No account enumeration: an unknown email and a wrong password produce the
-// exact same response (status, body, and error code) -- verifyPassword()
-// still runs against a dummy hash when the account isn't found so the two
-// cases take comparable time as well.
+// Single serverless function handling all three session endpoints --
+// consolidated from separate login.js/logout.js/whoami.js files to stay
+// under the Vercel Hobby plan's 12-serverless-function-per-deployment
+// limit (Phase 1's new auth endpoints pushed the project to 13). A
+// dynamic route file ([action].js) is exactly one function regardless of
+// how many `action` values it dispatches on, and Vercel/Node populates
+// req.query.action from the URL segment, so the external routes are
+// unchanged: POST /api/session/login, POST /api/session/logout,
+// GET /api/session/whoami all still work exactly as before -- only the
+// file layout changed, not the API.
 
-import { setCookie } from '../google/_lib/cookies.js'
+import { setCookie, clearCookie } from '../google/_lib/cookies.js'
 import { loadAccountDirectory, findAccountByEmail } from '../_lib/accounts.js'
 import { verifyPassword } from '../_lib/password.js'
+import { requireAuth } from '../_lib/auth.js'
 import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 
@@ -27,7 +30,15 @@ function clientIp(req) {
   return req.socket?.remoteAddress || 'unknown'
 }
 
-export default async function handler(req, res) {
+// POST /api/session/login  { email, password }
+// Returns { account: { userId, email, role, locationIds, displayName } } and
+// sets the lta_session cookie, or a generic 401 on any failure.
+//
+// No account enumeration: an unknown email and a wrong password produce the
+// exact same response (status, body, and error code) -- verifyPassword()
+// still runs against a dummy hash when the account isn't found so the two
+// cases take comparable time as well.
+async function login(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
 
   const allowed = await enforceRateLimit(req, res, `login:${clientIp(req)}`, { requestsPerWindow: 10, windowSeconds: 60 })
@@ -86,4 +97,33 @@ export default async function handler(req, res) {
       displayName: account.displayName ?? account.email,
     },
   })
+}
+
+// POST /api/session/logout -- clears the session cookie.
+// No server-side revocation list in Phase 1 (sessionVersion already covers
+// forced invalidation; the 12h expiry bounds a stolen-cookie window).
+function logout(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+  clearCookie(res, SESSION_COOKIE)
+  return res.status(200).json({ success: true })
+}
+
+// GET /api/session/whoami -- used by the frontend AuthGate on load to
+// decide login-screen vs. dashboard. Runs the exact same requireAuth() path
+// as every other protected endpoint (no separate, weaker check).
+// Returns 200 { account } if a valid session exists, 401 otherwise.
+async function whoami(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+  const account = await requireAuth(req, res, null) // null = any authenticated role
+  if (!account) return
+  return res.status(200).json({ account })
+}
+
+export default async function handler(req, res) {
+  switch (req.query?.action) {
+    case 'login':  return login(req, res)
+    case 'logout': return logout(req, res)
+    case 'whoami': return whoami(req, res)
+    default:       return res.status(404).json({ error: 'not_found' })
+  }
 }

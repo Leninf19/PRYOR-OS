@@ -1,6 +1,8 @@
-// Confirms every one of the 13 routable dashboard/api/** handlers rejects
-// unsupported HTTP methods (including HEAD/OPTIONS -- neither should ever
-// fall through to auth/data logic) with 405, before touching auth or data.
+// Confirms every one of the 13 routable dashboard/api/** routes (11
+// serverless functions -- the 3 /api/session/* routes share one
+// [action].js file) rejects unsupported HTTP methods (including
+// HEAD/OPTIONS -- neither should ever fall through to auth/data logic)
+// with 405, before touching auth or data.
 // Handlers that require auth are exercised unauthenticated here on purpose:
 // the method check must be the very first thing that runs, so a wrong
 // method on a protected route still gets 405, not 401 (order matters for
@@ -22,9 +24,7 @@ import testConnectionHandler from '../dashboard/api/google/test-connection.js'
 import triggerImportHandler from '../dashboard/api/google/trigger-import.js'
 import triggerSyncHandler from '../dashboard/api/google/trigger-sync.js'
 import rewriteHandler from '../dashboard/api/rewrite.js'
-import loginHandler from '../dashboard/api/session/login.js'
-import logoutHandler from '../dashboard/api/session/logout.js'
-import whoamiHandler from '../dashboard/api/session/whoami.js'
+import sessionHandler from '../dashboard/api/session/[action].js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -63,9 +63,9 @@ const ROUTES = [
   ['/api/google/trigger-import', triggerImportHandler, 'POST', {}],
   ['/api/google/trigger-sync', triggerSyncHandler, 'POST', {}],
   ['/api/rewrite', rewriteHandler, 'POST', {}],
-  ['/api/session/login', loginHandler, 'POST', {}],
-  ['/api/session/logout', logoutHandler, 'POST', {}],
-  ['/api/session/whoami', whoamiHandler, 'GET', {}],
+  ['/api/session/login', sessionHandler, 'POST', { query: { action: 'login' } }],
+  ['/api/session/logout', sessionHandler, 'POST', { query: { action: 'logout' } }],
+  ['/api/session/whoami', sessionHandler, 'GET', { query: { action: 'whoami' } }],
 ]
 
 const ALL_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']

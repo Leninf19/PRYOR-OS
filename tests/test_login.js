@@ -1,5 +1,6 @@
-// Regression tests for dashboard/api/session/login.js -- no real network,
-// no real Upstash (UPSTASH_REDIS_REST_URL/TOKEN deliberately left unset so
+// Regression tests for the login action of
+// dashboard/api/session/[action].js -- no real network, no real Upstash
+// (UPSTASH_REDIS_REST_URL/TOKEN deliberately left unset so
 // enforceRateLimit() takes its documented fail-open path).
 //
 // Run directly: node tests/test_login.js
@@ -7,7 +8,7 @@
 process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xyz'
 
 import bcrypt from 'bcryptjs'
-import handler from '../dashboard/api/session/login.js'
+import handler from '../dashboard/api/session/[action].js'
 import { verifySession, SESSION_COOKIE } from '../dashboard/api/_lib/session.js'
 
 function assert(cond, msg) {
@@ -45,7 +46,7 @@ async function setDirectory() {
 }
 
 async function invoke(body) {
-  const req = { method: 'POST', body, headers: {}, socket: { remoteAddress: '127.0.0.1' } }
+  const req = { method: 'POST', body, headers: {}, query: { action: 'login' }, socket: { remoteAddress: '127.0.0.1' } }
   const res = fakeRes()
   await handler(req, res)
   return res
