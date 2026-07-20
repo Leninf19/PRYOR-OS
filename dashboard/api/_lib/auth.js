@@ -20,6 +20,7 @@
 import { parseCookies } from '../google/_lib/cookies.js'
 import { verifySession, SESSION_COOKIE } from './session.js'
 import { getAccountById } from './accountStore.js'
+import { roleHasPermission } from './permissions.js'
 
 // Never include passwordHash (or anything else not needed by the caller) in
 // data that might reach the frontend or a log line. The only caller is
@@ -75,4 +76,56 @@ export async function requireAuth(req, res, allowedRoles) {
     res.status(401).json({ error: 'unauthenticated', message: 'Sign in required.' })
   }
   return null
+}
+
+// --- Phase 2 Milestone 2: composable, location-aware authorization -------
+// Everything below is additive and, as of this milestone, unused by any
+// endpoint. requireAuth() above is unchanged. These build on top of it
+// rather than replacing it -- most endpoints will eventually call
+// requireScopedAuth() instead of requireAuth() directly, but none do yet.
+
+// Pure, synchronous, trivially unit-testable: does this account's location
+// grant reach a given location? '*' means company-wide (Owner/Marketing
+// today); otherwise the id must appear in the account's explicit list.
+export function requireLocationAccess(account, locationId) {
+  return account.locationIds === '*' || account.locationIds.includes(locationId)
+}
+
+// Write-side specialization of requireLocationAccess -- the check is
+// identical, but a distinct name keeps call sites self-documenting (reading
+// a publish/reply path, "requireOwnership" states intent more clearly than
+// a second call to "requireLocationAccess" would).
+export function requireOwnership(account, resourceLocationId) {
+  return requireLocationAccess(account, resourceLocationId)
+}
+
+// The composite most endpoints will eventually call: authenticate, check
+// the role carries the required permission, then (if the request concerns
+// a specific location) check the account's location grant covers it.
+//
+// `resolveLocationId(req, account)` returns the location id the request
+// concerns, or null/undefined if the request isn't location-scoped (e.g. a
+// company-wide view). It receives `account` so it can special-case a
+// wildcard grant if resolving the id would otherwise require extra work.
+//
+// A location outside the account's grant returns 404, not 403 -- see the
+// Phase 2 architecture's API error contract (§6): 403 would confirm the
+// resource exists but is off-limits, disclosing its existence to an
+// account that shouldn't even know to ask.
+export async function requireScopedAuth(req, res, { permission, resolveLocationId }) {
+  const account = await requireAuth(req, res, null)
+  if (!account) return null
+
+  if (!roleHasPermission(account.role, permission)) {
+    res.status(403).json({ error: 'forbidden', message: 'You do not have permission to perform this action.' })
+    return null
+  }
+
+  const locationId = await resolveLocationId(req, account)
+  if (locationId != null && !requireLocationAccess(account, locationId)) {
+    res.status(404).json({ error: 'not_found' })
+    return null
+  }
+
+  return { account, locationId }
 }
