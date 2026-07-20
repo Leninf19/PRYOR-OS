@@ -54,6 +54,12 @@ def write_json(rel_path: str, payload) -> None:
 
 def review_to_dict(r, loc) -> dict:
     return {
+        # Canonical, stable numeric location identifier -- the same
+        # locations.id (dashboard/reviews.db) that account locationIds will
+        # reference once location-scoped accounts exist (Phase 2 Milestone
+        # 6+). Never derived from name/slug/array position, so it survives
+        # a location rename untouched.
+        "locationId": loc["id"],
         "location_name": loc["name"], "city": loc["city"],
         "reviewer_name": r["reviewer_name"], "review_date": r["review_date"],
         "star_rating": r["star_rating"], "review_text": r["review_text"],
@@ -93,6 +99,7 @@ def export_reviews_csv(conn, out_path=None) -> None:
 def export_meta(conn, locations: dict) -> None:
     loc_list = [
         {
+            "locationId": l["id"],
             "name": l["name"], "city": l["city"], "brand": l["brand"],
             "slug": slugify(l["name"]), "maps_url": l.get("maps_url") or "",
         }
@@ -163,6 +170,7 @@ def export_action_items(conn, locations: dict) -> None:
             avg_cur, avg_prev = sum(cur) / len(cur), sum(prev) / len(prev)
             if abs(avg_cur - avg_prev) >= 0.2:
                 trend.append({
+                    "locationId": loc_id,
                     "name": loc["name"], "avgCur": round(avg_cur, 2), "avgPrev": round(avg_prev, 2),
                     "delta": round(avg_cur - avg_prev, 2), "curN": len(cur), "prevN": len(prev),
                 })
@@ -175,7 +183,12 @@ def export_validation(conn) -> None:
         """SELECT flag_type, location_id, detail, detected_at FROM validation_flags
            WHERE resolved_at IS NULL ORDER BY detected_at DESC"""
     ).fetchall()
-    write_json("validation.json", [dict(r) for r in rows])
+    # location_id (snake_case) already comes straight off the table; locationId
+    # is added alongside as the canonical field name used everywhere else in
+    # this file -- location_id is left in place, not renamed, since it's an
+    # additive change. A flag with no specific location (a company-wide
+    # validation issue) keeps location_id/locationId as None, same as today.
+    write_json("validation.json", [{**dict(r), "locationId": r["location_id"]} for r in rows])
 
 
 def top_complaint_words(rows, n=8):
@@ -244,6 +257,7 @@ def export_gbp_sync_status(conn, locations: dict) -> None:
     Location Sync view. Read-only summary of columns gbp_sync.py maintains."""
     loc_list = [
         {
+            "locationId": l["id"],
             "name": l["name"], "city": l["city"], "brand": l["brand"],
             "slug": slugify(l["name"]),
             "linked": bool(l.get("gbp_location_name")),
@@ -274,14 +288,17 @@ def export_scraper_status(conn) -> None:
                JOIN locations l ON l.id = srl.location_id WHERE srl.run_id = ?""",
             (run["id"],),
         ).fetchall()
-        run_list.append({**dict(run), "locations": [dict(r) for r in loc_rows]})
+        # srl.* already includes the raw location_id column; locationId is
+        # added alongside it for the same reason as validation.json above.
+        run_list.append({**dict(run), "locations": [{**dict(r), "locationId": r["location_id"]} for r in loc_rows]})
     write_json("scraper-status.json", run_list)
 
 
-def export_intelligence(conn) -> None:
+def export_intelligence(conn, locations: dict) -> None:
     """Export AI-generated intelligence: summaries, complaint intel, predictions, drafts."""
     cache_rows = conn.execute("SELECT cache_key, payload FROM analytics_cache").fetchall()
     by_key = {r["cache_key"]: json.loads(r["payload"]) for r in cache_rows}
+    slug_to_id = {slugify(l["name"]): l["id"] for l in locations.values()}
 
     # Company AI summary
     if "ai_company_summary" in by_key:
@@ -325,6 +342,17 @@ def export_intelligence(conn) -> None:
     for key, payload in by_key.items():
         if key.startswith("location_detail_"):
             slug = key[len("location_detail_"):]
+            # refresh_analytics.py computes this payload and doesn't know
+            # about locationId -- inject it here rather than in that (much
+            # larger, out-of-scope-for-this-milestone) module. A slug with
+            # no matching current location (a stale cache entry left over
+            # from a since-renamed/removed location) is written through
+            # unchanged rather than guessing -- it will be regenerated
+            # correctly next time refresh_analytics.py runs.
+            if isinstance(payload, dict) and "locationId" not in payload:
+                location_id = slug_to_id.get(slug)
+                if location_id is not None:
+                    payload = {"locationId": location_id, **payload}
             write_json(f"intelligence/locations/{slug}.json", payload)
 
     # Competitive intelligence
@@ -362,6 +390,7 @@ def export_location_detail_reviews(conn, locations: dict) -> None:
             rd = dict(r)
             tags = classify_review(rd.get("review_text") or "", rd.get("star_rating"))
             reviews_out.append({
+                "locationId": loc["id"],
                 "location_name": loc["name"], "city": loc["city"],
                 "reviewer_name": rd.get("reviewer_name"), "review_date": rd.get("review_date"),
                 "star_rating": rd.get("star_rating"), "review_text": rd.get("review_text"),
@@ -394,7 +423,7 @@ def main():
     export_scraper_status(conn)
     export_gbp_sync_status(conn, locations)
     export_weekly_report(conn, locations)
-    export_intelligence(conn)
+    export_intelligence(conn, locations)
 
     conn.close()
     files = list(PRIVATE_DATA_DIR.rglob("*.json"))
