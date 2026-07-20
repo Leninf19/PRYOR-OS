@@ -87,8 +87,22 @@ export async function requireAuth(req, res, allowedRoles) {
 // Pure, synchronous, trivially unit-testable: does this account's location
 // grant reach a given location? '*' means company-wide (Owner/Marketing
 // today); otherwise the id must appear in the account's explicit list.
+//
+// Fails closed on any malformed shape rather than throwing -- a missing
+// account, a missing/null/non-array locationIds, or any other unexpected
+// shape simply denies access instead of raising a TypeError. In practice
+// accountStore.js only ever hands back accounts that already passed
+// accounts.js's strict validator (locationIds is always '*' or a valid
+// array of positive integers), so this defends against a hypothetical
+// malformed caller, not a reachable production state. No normalization is
+// performed -- a string locationId is still denied against a numeric grant
+// unless that is explicitly designed later.
 export function requireLocationAccess(account, locationId) {
-  return account.locationIds === '*' || account.locationIds.includes(locationId)
+  if (!account) return false
+  const { locationIds } = account
+  if (locationIds === '*') return true
+  if (!Array.isArray(locationIds)) return false
+  return locationIds.includes(locationId)
 }
 
 // Write-side specialization of requireLocationAccess -- the check is

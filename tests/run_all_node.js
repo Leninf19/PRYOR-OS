@@ -13,6 +13,7 @@ const TESTS = [
   'test_publish_reply.js',
   'test_auth.js',
   'test_permissions.js',
+  'test_authorization_matrix.js',
   'test_rate_limit.js',
   'test_login.js',
   'test_data_endpoint.js',
