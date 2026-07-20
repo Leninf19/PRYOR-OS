@@ -1977,6 +1977,16 @@ def main():
     )
     company_health = compute_health_score(reviews, period)
 
+    # Company-wide lifetime star distribution -- added for Phase 2 Milestone 5
+    # so the per-location analytics artifacts (below) have a single company
+    # total to reconcile against (sum of every location's own lifetime star
+    # distribution must equal this). Purely additive to the existing kpis
+    # cache entry -- every field already here is unchanged.
+    company_star_breakdown = [
+        {"star": s, "count": sum(1 for r in rated if r["star_rating"] == s)}
+        for s in range(1, 6)
+    ]
+
     kpis = {
         "totalReviews":      len(reviews),
         "totalLocations":    len(locations),
@@ -1986,6 +1996,7 @@ def main():
         "ratingDelta30d":    rating_delta,
         "unansweredCount":   unanswered,
         "healthScore":       company_health,
+        "starBreakdown":     company_star_breakdown,
         "computedAt":        now.isoformat(),
     }
     set_cache(conn, "kpis", kpis)
@@ -2100,6 +2111,71 @@ def main():
             "menuHighlights": loc_menu,
             "aiSummary": ai_summary,
             "cxIndex": build_cx_index(loc_intel),
+        })
+
+        # --- Phase 2 Milestone 5 (Option C): canonical per-location analytics ---
+        # Everything below reuses values already computed above in this same
+        # loop iteration (loc_health, loc_trend, loc_intel, loc_staff,
+        # loc_menu, ai_summary, loc_pred*, loc_alert) plus one new call to
+        # the existing build_department_summary() -- the same shared
+        # function company-wide "department_performance" already uses,
+        # given this location's own loc_intel instead of the company-wide
+        # intel. No calculation is duplicated; this is strictly a new,
+        # canonical-locationId-keyed packaging of data this loop already
+        # produces, plus two new lightweight aggregates (lifetime review
+        # count and lifetime star distribution) computed directly from the
+        # already-filtered all_r list.
+        #
+        # Deliberately EXCLUDED (per the architecture's location/company
+        # separation): rankings(), build_action_center(), and
+        # build_operations_impact() all compare or rank across locations --
+        # those remain company-wide only and must never appear here.
+        rated_all_r = [r for r in all_r if r.get("star_rating") is not None]
+        lifetime_rating = round(sum(r["star_rating"] for r in rated_all_r) / len(rated_all_r), 2) if rated_all_r else None
+        star_breakdown_lifetime = [
+            {"star": s, "count": sum(1 for r in rated_all_r if r["star_rating"] == s)}
+            for s in range(1, 6)
+        ]
+
+        set_cache(conn, f"analytics_location_{loc_id}", {
+            "locationId": loc_id,
+            "name": loc["name"], "city": loc["city"], "brand": loc["brand"],
+            "reviewCounts": {
+                "lifetime": len(all_r),
+                "last30d": len(period_r),
+            },
+            "averageRating": {
+                "lifetime": lifetime_rating,
+                "last30d": loc_avg_30,
+                "delta30d": loc_delta,
+            },
+            "starDistribution": {
+                "lifetime": star_breakdown_lifetime,
+            },
+            "responseMetrics": {
+                "unansweredNegative": unanswered_neg,
+                "healthScore": loc_health,
+            },
+            "trends": {
+                "monthly": loc_trend,
+                "trendAlert": loc_alert,
+            },
+            "prediction": {
+                "predictedRating": loc_pred,
+                "predictedRatingConfidence": loc_pred_confidence,
+                "predictedVolume": loc_vol,
+            },
+            "departmentMetrics": build_department_summary(loc_intel),
+            "keywords": {
+                "menuHighlights": loc_menu,
+            },
+            "aiSummary": ai_summary,
+            "complaints": loc_intel["complaints"],
+            "praises": loc_intel["praises"],
+            "staffMentions": loc_staff,
+            "cxIndex": build_cx_index(loc_intel),
+            "sentiment30d": sentiment(period_r),
+            "computedAt": now.isoformat(),
         })
 
     # --- AI Action Center (company-wide) ---

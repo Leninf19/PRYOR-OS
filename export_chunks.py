@@ -129,6 +129,139 @@ def export_analytics_cache(conn) -> None:
             write_json(f"insights/{key[len('insights_90d_'):]}.json", payload)
 
 
+def export_location_analytics(conn, locations: dict) -> None:
+    """
+    Phase 2 Milestone 5 (Option C): one canonical analytics artifact per
+    location, under analytics/locations/<locationId>.json -- keyed by the
+    same numeric locations.id Milestone 4 established, never a slug. This
+    is ADDITIVE alongside the existing company-wide analytics/*.json files
+    (export_analytics_cache above), which are untouched.
+
+    refresh_analytics.py computes the payload (analytics_location_<id> in
+    analytics_cache) using the same shared aggregation functions the
+    company-wide analytics use, just fed this location's own filtered
+    review list -- this function only reads that already-computed payload
+    and writes it through, exactly like export_analytics_cache does for the
+    company-wide files.
+    """
+    rows = conn.execute(
+        "SELECT cache_key, payload FROM analytics_cache WHERE cache_key LIKE 'analytics_location_%'"
+    ).fetchall()
+    by_key = {r["cache_key"]: json.loads(r["payload"]) for r in rows}
+
+    for loc_id in locations:
+        key = f"analytics_location_{loc_id}"
+        if key in by_key:
+            write_json(f"analytics/locations/{loc_id}.json", by_key[key])
+
+
+def validate_location_analytics(conn, locations: dict) -> tuple:
+    """
+    Post-export integrity check for the per-location analytics artifacts
+    written by export_location_analytics() above. Reads what was actually
+    written to PRIVATE_DATA_DIR (not analytics_cache), so it catches an
+    export bug as well as a computation bug, and independently re-queries
+    the database for each location's true review count rather than trusting
+    the artifact's own claim -- the strongest available check against
+    cross-location contamination or a miscounted export.
+
+    Returns (ok, issues, details): ok is False if ANY check fails; issues is
+    a list of human-readable problem descriptions; details carries the raw
+    reconciliation numbers for reporting.
+    """
+    issues = []
+    details = {}
+
+    loc_dir = PRIVATE_DATA_DIR / "analytics" / "locations"
+    files = sorted(loc_dir.glob("*.json")) if loc_dir.exists() else []
+
+    by_loc_id = {}
+    for f in files:
+        stem = f.stem
+        try:
+            loc_id = int(stem)
+        except ValueError:
+            issues.append(f"analytics/locations/{f.name}: filename is not a canonical integer locationId")
+            continue
+        if loc_id in by_loc_id:
+            issues.append(f"duplicate analytics artifact for location id {loc_id} (filename {f.name})")
+            continue
+        try:
+            by_loc_id[loc_id] = json.loads(f.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            issues.append(f"analytics/locations/{f.name}: not valid JSON")
+
+    missing = sorted(set(locations.keys()) - set(by_loc_id.keys()))
+    if missing:
+        issues.append(f"location(s) missing an analytics artifact: {missing}")
+
+    orphans = sorted(set(by_loc_id.keys()) - set(locations.keys()))
+    if orphans:
+        issues.append(f"orphan location analytics for unknown location id(s): {orphans}")
+
+    for loc_id, payload in by_loc_id.items():
+        declared = payload.get("locationId")
+        if declared is None:
+            issues.append(f"location {loc_id}: analytics artifact is missing its locationId field")
+        elif declared != loc_id:
+            issues.append(f"location {loc_id}: filename/content locationId mismatch (filename={loc_id}, content={declared})")
+
+        if loc_id in locations:
+            independent_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM reviews WHERE location_id = ? AND is_deleted = 0", (loc_id,)
+            ).fetchone()["c"]
+            claimed_count = payload.get("reviewCounts", {}).get("lifetime")
+            if claimed_count != independent_count:
+                issues.append(
+                    f"location {loc_id}: artifact claims {claimed_count} lifetime reviews, but an "
+                    f"independent database count finds {independent_count} -- possible cross-location "
+                    f"contamination or a stale/miscounted export"
+                )
+
+    kpis_path = PRIVATE_DATA_DIR / "analytics" / "kpis.json"
+    if kpis_path.exists():
+        kpis = json.loads(kpis_path.read_text(encoding="utf-8"))
+        company_total = kpis.get("totalReviews")
+        company_avg = kpis.get("lifetimeAvgRating")
+        company_star = {e["star"]: e["count"] for e in (kpis.get("starBreakdown") or [])}
+
+        sum_reviews = sum((p.get("reviewCounts", {}).get("lifetime") or 0) for p in by_loc_id.values())
+        details["companyReviewTotal"] = company_total
+        details["sumLocationReviewTotals"] = sum_reviews
+        if company_total is not None and sum_reviews != company_total:
+            issues.append(f"sum of location review counts ({sum_reviews}) != company review total ({company_total})")
+
+        weighted_sum, weighted_n = 0.0, 0
+        for p in by_loc_id.values():
+            n = p.get("reviewCounts", {}).get("lifetime") or 0
+            avg = p.get("averageRating", {}).get("lifetime")
+            if avg is not None and n:
+                weighted_sum += avg * n
+                weighted_n += n
+        reconstructed_avg = round(weighted_sum / weighted_n, 2) if weighted_n else None
+        details["companyAverageRating"] = company_avg
+        details["reconstructedAverageRating"] = reconstructed_avg
+        if company_avg is not None and reconstructed_avg is not None and abs(company_avg - reconstructed_avg) > 0.02:
+            issues.append(
+                f"reconstructed average rating ({reconstructed_avg}) does not reconcile with company average ({company_avg})"
+            )
+
+        summed_star = {}
+        for p in by_loc_id.values():
+            for entry in p.get("starDistribution", {}).get("lifetime", []):
+                summed_star[entry["star"]] = summed_star.get(entry["star"], 0) + entry["count"]
+        details["companyStarDistribution"] = company_star
+        details["reconstructedStarDistribution"] = summed_star
+        if company_star and summed_star != company_star:
+            issues.append("reconstructed star distribution does not match company star distribution")
+
+    details["locationAnalyticsGenerated"] = len(by_loc_id)
+    details["locationsMissingAnalytics"] = missing
+    details["orphanAnalytics"] = orphans
+
+    return len(issues) == 0, issues, details
+
+
 def export_reviews_by_location(conn, locations: dict) -> None:
     for loc_id, loc in locations.items():
         rows = conn.execute(
@@ -417,6 +550,7 @@ def main():
     export_reviews_csv(conn)
     export_meta(conn, locations)
     export_analytics_cache(conn)
+    export_location_analytics(conn, locations)  # Phase 2 Milestone 5 (Option C)
     export_location_detail_reviews(conn, locations)  # replaces export_reviews_by_location
     export_action_items(conn, locations)
     export_validation(conn)
@@ -425,7 +559,18 @@ def main():
     export_weekly_report(conn, locations)
     export_intelligence(conn, locations)
 
+    # Gate the pipeline on per-location analytics integrity before closing
+    # the connection (the independent review-count cross-check needs it).
+    ok, issues, details = validate_location_analytics(conn, locations)
     conn.close()
+
+    if not ok:
+        print("Location analytics validation FAILED:")
+        for issue in issues:
+            print(f"  - {issue}")
+        raise SystemExit(1)
+    print(f"Location analytics validation passed ({details['locationAnalyticsGenerated']} locations).")
+
     files = list(PRIVATE_DATA_DIR.rglob("*.json"))
     total_bytes = sum(f.stat().st_size for f in files)
     print(f"Exported {len(files)} chunk files, {total_bytes / 1024:.0f} KB total, to {PRIVATE_DATA_DIR}")
