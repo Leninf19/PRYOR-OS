@@ -7,9 +7,15 @@
 process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xyz'
 
 import bcrypt from 'bcryptjs'
+import { readFileSync } from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import { signSession, verifySession, SESSION_COOKIE } from '../dashboard/api/_lib/session.js'
 import { loadAccountDirectory, findAccountById, findAccountByEmail } from '../dashboard/api/_lib/accounts.js'
 import { requireAuth } from '../dashboard/api/_lib/auth.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const DASHBOARD_DIR = path.resolve(__dirname, '..', 'dashboard')
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -239,6 +245,35 @@ async function testRemovedAccountRejected() {
   assert(res.statusCode === 401, `expected 401, got ${res.statusCode}`)
 }
 
+// Phase 2 Milestone 1 (account-store abstraction): static source checks,
+// not behavioral ones -- the whole point of this milestone is that no
+// caller-observable behavior changed, so what's actually new to verify is
+// the *shape* of the import graph: auth.js/middleware.js/login no longer
+// reach into accounts.js directly, and accountStore.js is the one place
+// that does, exposing exactly the two documented lookups.
+async function testAuthNoLongerImportsAccountsDirectly() {
+  const authSrc = readFileSync(path.join(DASHBOARD_DIR, 'api', '_lib', 'auth.js'), 'utf-8')
+  assert(!/from\s+['"][^'"]*\baccounts\.js['"]/.test(authSrc),
+    'auth.js must not import accounts.js directly -- it should go through accountStore.js')
+  assert(/from\s+['"][^'"]*\baccountStore\.js['"]/.test(authSrc),
+    'auth.js must import account lookups from accountStore.js')
+}
+
+async function testAccountStoreIsSingleSourceOfAccountLookups() {
+  const accountStoreSrc = readFileSync(path.join(DASHBOARD_DIR, 'api', '_lib', 'accountStore.js'), 'utf-8')
+  assert(/from\s+['"][^'"]*\baccounts\.js['"]/.test(accountStoreSrc),
+    'accountStore.js should be the module delegating to accounts.js')
+  assert(/export function getAccountById/.test(accountStoreSrc), 'accountStore.js must export getAccountById')
+  assert(/export function getAccountByEmail/.test(accountStoreSrc), 'accountStore.js must export getAccountByEmail')
+
+  const middlewareSrc = readFileSync(path.join(DASHBOARD_DIR, 'middleware.js'), 'utf-8')
+  const loginSrc = readFileSync(path.join(DASHBOARD_DIR, 'api', 'session', '[action].js'), 'utf-8')
+  for (const [name, src] of [['middleware.js', middlewareSrc], ['session/[action].js', loginSrc]]) {
+    assert(!/from\s+['"][^'"]*\baccounts\.js['"]/.test(src), `${name} must not import accounts.js directly`)
+    assert(/from\s+['"][^'"]*\baccountStore\.js['"]/.test(src), `${name} must import from accountStore.js`)
+  }
+}
+
 async function main() {
   await run('sign/verify round trip preserves claims', testSignAndVerifyRoundTrip)
   await run('expired token is rejected', testExpiredTokenRejected)
@@ -260,6 +295,8 @@ async function main() {
   await run('an unrecognized extra account field (e.g. stray plaintext password) -> rejected', testUnknownAccountFieldRejected)
   await run('an unrecognized top-level directory key -> rejected', testUnknownTopLevelKeyRejected)
   await run('each individually-missing required field -> rejected', testMissingRequiredFieldsRejected)
+  await run('auth.js no longer imports accounts.js directly', testAuthNoLongerImportsAccountsDirectly)
+  await run('accountStore.js is the single source used for account lookups', testAccountStoreIsSingleSourceOfAccountLookups)
 
   console.log()
   if (results.every(Boolean)) {

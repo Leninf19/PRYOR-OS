@@ -13,7 +13,7 @@
 //
 // What this file verifies vs. what the Node endpoint verifies:
 //   - Middleware (/api/data): signature + expiry (via _lib/session.js)
-//     and current sessionVersion/disabled/role (via _lib/accounts.js) --
+//     and current sessionVersion/disabled/role (via _lib/accountStore.js) --
 //     everything that's Edge-runtime safe (no bcrypt, no fs, no Redis).
 //   - Node endpoint (dashboard/api/data.js): the SAME checks again,
 //     independently, PLUS the file-path allowlist and the actual file
@@ -34,7 +34,7 @@
 
 import { next } from '@vercel/functions'
 import { verifySession, SESSION_COOKIE } from './api/_lib/session.js'
-import { loadAccountDirectory, findAccountById } from './api/_lib/accounts.js'
+import { getAccountById } from './api/_lib/accountStore.js'
 
 const ALLOWED_ROLES = ['owner', 'marketing']
 
@@ -68,10 +68,7 @@ export default async function middleware(request) {
   const claims = await verifySession(cookies[SESSION_COOKIE])
   if (!claims) return json(401, { error: 'unauthenticated', message: 'Sign in required.' })
 
-  const accounts = loadAccountDirectory()
-  if (!accounts) return json(401, { error: 'unauthenticated', message: 'Sign in required.' })
-
-  const account = findAccountById(accounts, claims.userId)
+  const account = getAccountById(claims.userId)
   if (!account || account.disabled) return json(401, { error: 'unauthenticated', message: 'Sign in required.' })
   if (account.sessionVersion !== claims.sessionVersion) {
     return json(401, { error: 'session_expired', message: 'Your session is no longer valid. Please sign in again.' })

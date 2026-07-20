@@ -10,7 +10,7 @@
 // file layout changed, not the API.
 
 import { setCookie, clearCookie } from '../google/_lib/cookies.js'
-import { loadAccountDirectory, findAccountByEmail } from '../_lib/accounts.js'
+import { getAccountByEmail } from '../_lib/accountStore.js'
 import { verifyPassword } from '../_lib/password.js'
 import { requireAuth } from '../_lib/auth.js'
 import { signSession, SESSION_COOKIE } from '../_lib/session.js'
@@ -55,13 +55,7 @@ async function login(req, res) {
 
   const genericFailure = () => res.status(401).json({ error: 'invalid_credentials', message: 'Invalid email or password.' })
 
-  const accounts = loadAccountDirectory()
-  if (!accounts) {
-    console.error('[login] ACCOUNT_DIRECTORY_JSON is missing or invalid.')
-    return genericFailure()
-  }
-
-  const account = findAccountByEmail(accounts, email)
+  const account = getAccountByEmail(email)
   const hashToCheck = account?.passwordHash || DUMMY_HASH
   const passwordOk = await verifyPassword(password, hashToCheck)
 

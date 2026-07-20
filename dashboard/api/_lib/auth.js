@@ -19,7 +19,22 @@
 
 import { parseCookies } from '../google/_lib/cookies.js'
 import { verifySession, SESSION_COOKIE } from './session.js'
-import { loadAccountDirectory, findAccountById, toSafeAccount } from './accounts.js'
+import { getAccountById } from './accountStore.js'
+
+// Never include passwordHash (or anything else not needed by the caller) in
+// data that might reach the frontend or a log line. The only caller is
+// evaluateSession() below, so this lives here rather than in accountStore.js
+// -- account lookup and account shaping are separate concerns.
+function toSafeAccount(account) {
+  if (!account) return null
+  return {
+    userId: account.userId,
+    email: account.email,
+    role: account.role,
+    locationIds: account.locationIds,
+    displayName: account.displayName ?? account.email,
+  }
+}
 
 // Returns { account, reason } where account is null on failure and reason
 // is one of 'unauthenticated' | 'session_expired' | 'forbidden' when it is.
@@ -31,13 +46,7 @@ export async function evaluateSession(req, allowedRoles) {
   const claims = await verifySession(cookies[SESSION_COOKIE])
   if (!claims) return { account: null, reason: 'unauthenticated' }
 
-  const accounts = loadAccountDirectory()
-  if (!accounts) {
-    console.error('[auth] ACCOUNT_DIRECTORY_JSON is missing or invalid -- rejecting all requests.')
-    return { account: null, reason: 'unauthenticated' }
-  }
-
-  const account = findAccountById(accounts, claims.userId)
+  const account = getAccountById(claims.userId)
   if (!account || account.disabled) return { account: null, reason: 'unauthenticated' }
 
   if (account.sessionVersion !== claims.sessionVersion) {
