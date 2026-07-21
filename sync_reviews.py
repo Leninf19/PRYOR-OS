@@ -12,6 +12,23 @@ Wiring an actual production workflow to call this instead is Phase 3
 Milestone 4b's job, deliberately deferred -- see provider_sync.py's
 docstring.
 
+Exit code on a total sync failure (Phase 3 Milestone 4.1, a deliberate
+architectural decision, not an oversight): main() returns 1 when
+result["status"] == "failed", unlike auto_update.py's historical cloud/CI
+behavior, which never exits non-zero for a "normal" failure (every
+per-location try/except there swallows and continues; only --local-only
+safety checks ever raise). This is intentionally NOT preserved. Reasoning:
+update-reviews.yml never gates its commit/deploy steps on the sync step's
+own outcome -- both are gated on `steps.integrity.outcome` (check_db_
+integrity.py's own exit code) instead, and every step from "Upload debug
+snapshots" onward runs `if: always()`. So a non-zero exit here changes
+nothing about whether data gets committed or deployed; it only makes the
+workflow run's own overall conclusion accurately reflect "the sync
+attempted and completely failed" instead of silently reporting "success"
+for a run that scraped/synced nothing. Verified against update-reviews.yml
+(Milestone 4b's design review): no downstream step reads
+`steps.scrape.outcome` anywhere.
+
 Usage:
     py sync_reviews.py                       # provider from $REVIEW_PROVIDER, default 'scraper'
     py sync_reviews.py --provider gbp
@@ -115,6 +132,10 @@ def main() -> int:
               f"{'will be sent' if new_negative else 'skipped (no new 1-2 star reviews)'}")
         _write_github_output(len(new_reviews), len(new_negative), _build_email_html(new_negative))
 
+    # Deliberately NOT matching auto_update.py's historical always-exits-0
+    # behavior for a total failure -- see this module's docstring
+    # (Phase 3 Milestone 4.1) for why this is an intentional improvement,
+    # not a compatibility gap.
     if result.get("status") == "failed":
         return 1
     return 0

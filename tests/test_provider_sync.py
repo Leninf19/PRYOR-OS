@@ -18,6 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import provider_sync
 from provider_base import Provider, ProviderLocation, ProviderReview, ProviderRateLimitError
+from provider_gbp import GBPProvider
+from provider_mock import MockProvider
+from provider_scraper import ScraperProvider
 
 results = []
 
@@ -270,6 +273,71 @@ async def test_gbp_info_only_written_when_external_id_present():
     assert rows["Linked Spot"]["gbp_last_synced_at"] is not None
 
 
+# --- Provider-dependent mode (Phase 3 Milestone 4.1) --------------------------
+
+def test_mode_for_matches_each_real_provider_class():
+    """Tied directly to the real provider classes' own .name values (not
+    fabricated strings) -- GBPProvider.name/ScraperProvider.name/
+    MockProvider.name are class attributes, so no instantiation (and no
+    credentials/Playwright/snapshot file) is needed to check this mapping."""
+    assert provider_sync._mode_for(GBPProvider) == "api_sync"
+    assert provider_sync._mode_for(ScraperProvider) == "cloud"
+    assert provider_sync._mode_for(MockProvider) == "mock"
+
+
+def test_mode_for_unknown_provider_defaults_to_api_sync():
+    import types
+    assert provider_sync._mode_for(types.SimpleNamespace(name="some_future_provider")) == "api_sync"
+
+
+async def test_scraper_run_records_cloud_mode_never_api_sync():
+    _fresh_db()
+    provider = FakeProvider(locations=[])
+    provider.name = "scraper"
+    await provider_sync.sync_all(provider)
+    conn = db.get_connection()
+    row = conn.execute("SELECT mode FROM scraper_runs ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    assert row["mode"] == "cloud"
+    assert row["mode"] != "api_sync", "a scraper run must never record mode='api_sync'"
+
+
+async def test_gbp_run_always_records_api_sync_mode():
+    _fresh_db()
+    provider = FakeProvider(locations=[])
+    provider.name = "gbp"
+    await provider_sync.sync_all(provider)
+    conn = db.get_connection()
+    row = conn.execute("SELECT mode FROM scraper_runs ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    assert row["mode"] == "api_sync"
+
+
+async def test_mock_run_records_mock_mode():
+    _fresh_db()
+    provider = FakeProvider(locations=[])
+    provider.name = "mock"
+    await provider_sync.sync_all(provider)
+    conn = db.get_connection()
+    row = conn.execute("SELECT mode FROM scraper_runs ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    assert row["mode"] == "mock"
+
+
+async def test_early_discovery_failure_also_records_provider_dependent_mode():
+    """The mode fix must apply to the _record_early_failure() path too, not
+    only the success path."""
+    _fresh_db()
+    provider = FakeProvider(discover_error=ProviderRateLimitError("simulated", status=429))
+    provider.name = "scraper"
+    await provider_sync.sync_all(provider)
+    conn = db.get_connection()
+    row = conn.execute("SELECT mode, status FROM scraper_runs ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    assert row["status"] == "failed"
+    assert row["mode"] == "cloud", "an early-failure row must also use the provider-dependent mode, not 'api_sync'"
+
+
 def main():
     tests = [
         ("sync_all() with a synchronous provider (matches GBPProvider/MockProvider)", test_sync_all_with_sync_provider),
@@ -282,6 +350,12 @@ def main():
         ("new/edited/deleted statistics sum correctly across multiple locations", test_statistics_sum_correctly_across_multiple_locations),
         ("multiple external_id=None locations are linked independently, never collide", test_multiple_no_external_id_locations_do_not_collide),
         ("gbp_last_synced_at is only written for a location with a real external_id", test_gbp_info_only_written_when_external_id_present),
+        ("_mode_for() maps each real provider class to its correct mode value", test_mode_for_matches_each_real_provider_class),
+        ("_mode_for() defaults an unknown provider to 'api_sync'", test_mode_for_unknown_provider_defaults_to_api_sync),
+        ("a scraper run records mode='cloud', never 'api_sync'", test_scraper_run_records_cloud_mode_never_api_sync),
+        ("a gbp run always records mode='api_sync'", test_gbp_run_always_records_api_sync_mode),
+        ("a mock run records mode='mock'", test_mock_run_records_mock_mode),
+        ("an early discovery failure also records the provider-dependent mode", test_early_discovery_failure_also_records_provider_dependent_mode),
     ]
     for name, fn in tests:
         run(name, fn)

@@ -96,6 +96,17 @@ def test_main_returns_zero_on_skipped_status():
 
 
 def test_main_returns_one_on_failed_status():
+    """Phase 3 Milestone 4.1 (a deliberate architectural decision, not an
+    oversight -- see sync_reviews.py's own module docstring): a total sync
+    failure returns exit code 1, deliberately NOT matching auto_update.py's
+    historical cloud/CI behavior of always exiting 0 regardless of scrape
+    outcome. This is safe because update-reviews.yml never gates its commit
+    or deploy steps on this step's own outcome -- both are gated on
+    check_db_integrity.py's exit code instead (verified directly against
+    update-reviews.yml during the Milestone 4b design review) -- so this
+    only makes the workflow run's own reported conclusion accurately
+    reflect a total failure, without changing whether anything gets
+    committed or deployed."""
     with _argv("--provider", "mock", "--fast"), \
          mock.patch("sync_reviews.provider_sync.sync_all", new=mock.AsyncMock(
              return_value={"status": "failed", "reason": "simulated failure",

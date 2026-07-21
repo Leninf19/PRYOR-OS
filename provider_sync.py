@@ -27,6 +27,36 @@ def _norm_name(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
+# Phase 3 Milestone 4.1: `mode` historically described *how* a run was
+# invoked ('local'/'cloud' for auto_update.py's interactive/CI paths,
+# 'api_sync' for gbp_sync.py's programmatic API sync) -- kept deliberately
+# separate from `provider` (which data source). Now that every provider goes
+# through this one orchestrator, `mode` is looked up per provider rather than
+# hardcoded, so each one keeps writing exactly the value it always did:
+#   - GBPProvider  -> 'api_sync' (unchanged from gbp_sync.py's original value;
+#     export_chunks.py's export_gbp_sync_status() specifically filters
+#     `WHERE mode = 'api_sync'` to find genuine GBP runs -- any other
+#     provider writing 'api_sync' too would make that query pick up a
+#     non-GBP run and mislabel it).
+#   - ScraperProvider -> 'cloud' (matching auto_update.py's own CI value).
+#   - MockProvider -> 'mock', a new, distinct value -- deliberately NOT
+#     'local', which specifically implies auto_update.py --local's
+#     interactive git-commit/push/deploy flow that MockProvider never goes
+#     through.
+# A provider with no explicit entry defaults to 'api_sync' (the safest
+# choice for a hypothetical future provider synced programmatically, same
+# as gbp_sync.py's original, only-ever-GBP behavior).
+_MODE_BY_PROVIDER = {
+    "gbp": "api_sync",
+    "scraper": "cloud",
+    "mock": "mock",
+}
+
+
+def _mode_for(provider: Provider) -> str:
+    return _MODE_BY_PROVIDER.get(provider.name, "api_sync")
+
+
 async def _maybe_await(value):
     """Providers are not uniformly sync or async -- GBPProvider/MockProvider
     are plain sync (matching the Provider ABC's own literal method
@@ -102,7 +132,7 @@ def _link_locations(conn, provider_locations: list, our_locations: list, now: st
     return linked
 
 
-def _record_early_failure(conn, now: str, reason: str, provider_name: str) -> None:
+def _record_early_failure(conn, now: str, reason: str, provider_name: str, mode: str) -> None:
     """A failure at location discovery (before any location is even known)
     previously left no scraper_runs row at all, so Data Health / Location
     Sync showed nothing rather than a visible failure. This gives every
@@ -111,16 +141,12 @@ def _record_early_failure(conn, now: str, reason: str, provider_name: str) -> No
     to pick the global-failure template instead of the per-location one --
     it is NEVER inferred from zeroed location counters, only set here.
 
-    mode is hardcoded 'api_sync' regardless of which provider ran --
-    Milestone 1 deliberately kept `mode` describing *how* a run was invoked
-    ('local'/'cloud' for auto_update.py's interactive/CI paths, 'api_sync'
-    for a script that syncs programmatically) separate from `provider`
-    (which script/data-source), so this generic orchestrator (invoked
-    programmatically, never interactively) continues that same convention."""
+    mode is provider-dependent (see _mode_for()/_MODE_BY_PROVIDER above),
+    not hardcoded -- Phase 3 Milestone 4.1."""
     conn.execute(
         """INSERT INTO scraper_runs (started_at, finished_at, mode, status, error_summary, failure_stage, provider)
-           VALUES (?, ?, 'api_sync', 'failed', ?, 'account_discovery', ?)""",
-        (now, datetime.now(timezone.utc).isoformat(), reason[:2000], provider_name),
+           VALUES (?, ?, ?, 'failed', ?, 'account_discovery', ?)""",
+        (now, datetime.now(timezone.utc).isoformat(), mode, reason[:2000], provider_name),
     )
     conn.commit()
 
@@ -135,18 +161,24 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
     Moved and generalized from gbp_sync.py's original sync_all() (Phase 3
     Milestone 1). The only behavioral differences from that original: the
     provider name written to scraper_runs.provider is provider.name (not
-    hardcoded 'gbp'), and the "not configured" reason string names the
-    provider generically (provider.display_name) rather than hardcoding
-    "Google credentials" -- for GBPProvider this reads "Google Business
-    Profile not configured" instead of the original "Google credentials not
-    configured"; no test asserts the exact original string, and the
-    generalized text remains accurate and unambiguous. Every other
-    behavior -- location linking, dedup/upsert, deletion detection,
-    per-location and run-level status computation, the returned dict shape
-    -- is identical for GBPProvider."""
+    hardcoded 'gbp'), the "not configured" reason string names the provider
+    generically (provider.display_name) rather than hardcoding "Google
+    credentials" -- for GBPProvider this reads "Google Business Profile not
+    configured" instead of the original "Google credentials not configured";
+    no test asserts the exact original string, and the generalized text
+    remains accurate and unambiguous -- and scraper_runs.mode is looked up
+    per provider (see _mode_for()) rather than hardcoded 'api_sync' (Phase 3
+    Milestone 4.1: hardcoding it for every provider would have made
+    export_chunks.py's export_gbp_sync_status() mistake a ScraperProvider/
+    MockProvider run for a genuine GBP one). For GBPProvider this still
+    resolves to 'api_sync', identical to before. Every other behavior --
+    location linking, dedup/upsert, deletion detection, per-location and
+    run-level status computation, the returned dict shape -- is identical
+    for GBPProvider."""
     conn = db.get_connection()
     db.init_schema(conn)
     now = datetime.now(timezone.utc).isoformat()
+    mode = _mode_for(provider)
 
     if not provider.is_configured():
         return {"status": "skipped", "reason": f"{provider.display_name} not configured"}
@@ -154,7 +186,7 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
     try:
         provider_locations = await _maybe_await(provider.discover_locations())
     except ProviderError as e:
-        _record_early_failure(conn, now, str(e), provider.name)
+        _record_early_failure(conn, now, str(e), provider.name, mode)
         return {"status": "failed", "reason": str(e)}
 
     our_locations = [dict(r) for r in conn.execute("SELECT * FROM locations WHERE is_active = 1").fetchall()]
@@ -163,8 +195,8 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
 
     run_id = conn.execute(
         """INSERT INTO scraper_runs (started_at, mode, status, locations_attempted, provider)
-           VALUES (?, 'api_sync', 'running', ?, ?)""",
-        (now, len(linked), provider.name),
+           VALUES (?, ?, 'running', ?, ?)""",
+        (now, mode, len(linked), provider.name),
     ).lastrowid
     conn.commit()
 

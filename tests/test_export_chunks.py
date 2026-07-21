@@ -166,6 +166,35 @@ def test_export_gbp_sync_status_includes_locationId():
         assert payload["locations"][0]["locationId"] == loc_id
 
 
+def test_export_gbp_sync_status_still_identifies_only_genuine_gbp_runs():
+    """Phase 3 Milestone 4.1: export_gbp_sync_status()'s `WHERE mode =
+    'api_sync'` filter must still find only genuine GBP runs even after a
+    *more recent* ScraperProvider run (mode='cloud', via provider_sync.py)
+    has landed -- the mode fix is exactly what keeps a scraper run from
+    being mistaken for the "most recent GBP sync"."""
+    with ScratchExport() as ex:
+        _add_location(ex.conn, "GBP Location")
+        locations = _locations_dict(ex.conn)
+
+        # Older, genuine GBP run.
+        ex.conn.execute(
+            "INSERT INTO scraper_runs (started_at, mode, provider, status) VALUES (?, 'api_sync', 'gbp', 'ok')",
+            ("2026-07-20T00:00:00+00:00",),
+        )
+        # Newer scraper run, via the generic orchestrator -- must be 'cloud', not 'api_sync'.
+        ex.conn.execute(
+            "INSERT INTO scraper_runs (started_at, mode, provider, status) VALUES (?, 'cloud', 'scraper', 'ok')",
+            ("2026-07-21T00:00:00+00:00",),
+        )
+        ex.conn.commit()
+
+        export_chunks.export_gbp_sync_status(ex.conn, locations)
+        payload = ex.read_json("gbp-sync.json")
+        assert payload["lastRun"]["mode"] == "api_sync"
+        assert payload["lastRun"]["provider"] == "gbp", \
+            "the newer scraper run must not be mistaken for the most recent GBP sync"
+
+
 # --- export_action_items (unanswered list + trend alerts) --------------------
 
 def test_export_action_items_unanswered_reviews_include_locationId():
@@ -435,6 +464,7 @@ def main():
     run("export_meta(): locationId is unaffected by a location name change", test_export_meta_locationId_unaffected_by_name_change)
     run("export_meta(): locationId is stable across repeated exports", test_export_meta_locationId_stable_across_repeated_exports)
     run("export_gbp_sync_status(): includes locationId", test_export_gbp_sync_status_includes_locationId)
+    run("export_gbp_sync_status(): still identifies only genuine GBP runs after a newer scraper run", test_export_gbp_sync_status_still_identifies_only_genuine_gbp_runs)
     run("export_action_items(): unanswered reviews include locationId", test_export_action_items_unanswered_reviews_include_locationId)
     run("export_action_items(): trend alerts include locationId", test_export_action_items_trend_alerts_include_locationId)
     run("export_validation(): includes locationId, preserves null for company-wide flags", test_export_validation_includes_locationId_and_preserves_null)
