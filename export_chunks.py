@@ -427,6 +427,48 @@ def export_scraper_status(conn) -> None:
     write_json("scraper-status.json", run_list)
 
 
+def export_provider_health(conn) -> None:
+    """Phase 3 Milestone 2: a provider-neutral health snapshot (healthy/
+    warning/degraded/failed/offline per provider), computed by
+    provider_health.compute_health() from the same scraper_runs rows
+    export_scraper_status() already reads.
+
+    Written to its own file rather than a new key on scraper-status.json:
+    that file's top level is a bare JSON array today (ScraperStatus.jsx and
+    Alerts.jsx both consume it as an array directly), so adding a sibling
+    key there would change its top-level type to an object -- a real
+    breaking change existing consumers could not simply ignore. A separate
+    file keeps scraper-status.json byte-for-byte untouched while still
+    giving the future Provider Health Center milestone real data to build
+    against from day one."""
+    from provider_gbp import GBPProvider
+    from provider_scraper import ScraperProvider
+    import provider_health
+
+    runs = [dict(r) for r in conn.execute(
+        "SELECT * FROM scraper_runs ORDER BY id DESC LIMIT 30"
+    ).fetchall()]
+
+    by_provider: dict = {}
+    for run in runs:
+        # `provider` is NULL for every row written before Milestone 1's
+        # migration -- by BOTH writers, not just the scraper -- so `mode`
+        # (always populated, for either writer, since long before this
+        # column existed) is the correct disambiguator for historical rows,
+        # not an assumption that every provider-less row is the scraper's.
+        provider_name = run.get("provider") or ("gbp" if run.get("mode") == "api_sync" else "scraper")
+        by_provider.setdefault(provider_name, []).append(run)
+
+    providers = {"gbp": GBPProvider(), "scraper": ScraperProvider()}
+    health = {
+        name: provider_health.compute_health(
+            name, provider.is_configured(), by_provider.get(name, []), provider.expected_cadence_minutes,
+        )
+        for name, provider in providers.items()
+    }
+    write_json("provider-health.json", health)
+
+
 def export_intelligence(conn, locations: dict) -> None:
     """Export AI-generated intelligence: summaries, complaint intel, predictions, drafts."""
     cache_rows = conn.execute("SELECT cache_key, payload FROM analytics_cache").fetchall()
@@ -555,6 +597,7 @@ def main():
     export_action_items(conn, locations)
     export_validation(conn)
     export_scraper_status(conn)
+    export_provider_health(conn)
     export_gbp_sync_status(conn, locations)
     export_weekly_report(conn, locations)
     export_intelligence(conn, locations)

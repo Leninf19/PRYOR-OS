@@ -18,6 +18,7 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
@@ -258,6 +259,109 @@ def test_export_scraper_status_includes_locationId():
         assert payload[0]["locations"][0]["location_id"] == loc_id, "existing snake_case field must remain (additive change)"
 
 
+# --- export_provider_health (Phase 3 Milestone 2) ------------------------------
+
+def _add_run(conn, mode, provider=None, status="ok", started_at=None,
+             attempted=1, succeeded=1, failed=0):
+    if started_at is None:
+        from datetime import datetime, timezone
+        started_at = datetime.now(timezone.utc).isoformat()  # "now" so freshness checks pass regardless of when the suite runs
+    cur = conn.execute(
+        """INSERT INTO scraper_runs (started_at, mode, provider, status,
+                                      locations_attempted, locations_succeeded, locations_failed)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (started_at, mode, provider, status, attempted, succeeded, failed),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_export_provider_health_does_not_change_scraper_status_json_shape():
+    """scraper-status.json's top level must remain a bare array -- adding
+    provider-health.json as a separate file must not touch it at all."""
+    with ScratchExport() as ex:
+        _add_run(ex.conn, "cloud")
+        export_chunks.export_scraper_status(ex.conn)
+        export_chunks.export_provider_health(ex.conn)
+        payload = ex.read_json("scraper-status.json")
+        assert isinstance(payload, list), "scraper-status.json must remain a bare array, not be wrapped into an object"
+
+
+def test_export_provider_health_groups_by_explicit_provider_column():
+    with ScratchExport() as ex:
+        _add_run(ex.conn, "api_sync", provider="gbp", status="ok")
+        _add_run(ex.conn, "cloud", provider="scraper", status="ok")
+        with mock.patch("provider_gbp.GBPProvider.is_configured", return_value=True), \
+             mock.patch("provider_scraper.ScraperProvider.is_configured", return_value=True):
+            export_chunks.export_provider_health(ex.conn)
+        payload = ex.read_json("provider-health.json")
+        assert set(payload.keys()) == {"gbp", "scraper"}
+        assert payload["gbp"]["state"] == "healthy"
+        assert payload["scraper"]["state"] == "healthy"
+
+
+def test_export_provider_health_infers_scraper_for_legacy_null_provider_rows():
+    """A run written before Milestone 1's `provider` column existed, by the
+    scraper (mode='cloud'/'local'), must be grouped under 'scraper' even
+    though `provider` is NULL -- not silently dropped or misgrouped."""
+    with ScratchExport() as ex:
+        _add_run(ex.conn, "cloud", provider=None, status="failed", succeeded=0, failed=1)
+        with mock.patch("provider_gbp.GBPProvider.is_configured", return_value=True), \
+             mock.patch("provider_scraper.ScraperProvider.is_configured", return_value=True):
+            export_chunks.export_provider_health(ex.conn)
+        payload = ex.read_json("provider-health.json")
+        assert payload["scraper"]["state"] == "failed"
+        assert payload["gbp"]["state"] == "offline", "no gbp run exists -- must not be contaminated by the scraper's legacy row"
+
+
+def test_export_provider_health_infers_gbp_for_legacy_null_provider_api_sync_rows():
+    """A run written before Milestone 1's `provider` column existed, by
+    gbp_sync.py (mode='api_sync'), must be grouped under 'gbp' -- `provider`
+    being NULL must not cause every provider-less historical row to be
+    assumed to belong to the scraper."""
+    with ScratchExport() as ex:
+        _add_run(ex.conn, "api_sync", provider=None, status="ok")
+        with mock.patch("provider_gbp.GBPProvider.is_configured", return_value=True), \
+             mock.patch("provider_scraper.ScraperProvider.is_configured", return_value=True):
+            export_chunks.export_provider_health(ex.conn)
+        payload = ex.read_json("provider-health.json")
+        assert payload["gbp"]["state"] == "healthy"
+        assert payload["scraper"]["state"] == "offline", "no scraper run exists -- must not be contaminated by the gbp legacy row"
+
+
+def test_export_provider_health_offline_when_not_configured():
+    with ScratchExport() as ex:
+        _add_run(ex.conn, "cloud", provider="scraper", status="ok")
+        with mock.patch("provider_gbp.GBPProvider.is_configured", return_value=False), \
+             mock.patch("provider_scraper.ScraperProvider.is_configured", return_value=False):
+            export_chunks.export_provider_health(ex.conn)
+        payload = ex.read_json("provider-health.json")
+        assert payload["gbp"]["state"] == "offline"
+        assert payload["scraper"]["state"] == "offline"
+
+
+def test_export_provider_health_result_matches_compute_health_directly():
+    """Cross-check: the exported health for a provider must be exactly what
+    provider_health.compute_health() would independently compute from the
+    same rows, not some export-local reimplementation."""
+    import provider_health
+    from provider_scraper import ScraperProvider
+
+    with ScratchExport() as ex:
+        _add_run(ex.conn, "cloud", provider="scraper", status="partial", attempted=10, succeeded=6, failed=4)
+        with mock.patch("provider_gbp.GBPProvider.is_configured", return_value=True), \
+             mock.patch("provider_scraper.ScraperProvider.is_configured", return_value=True):
+            export_chunks.export_provider_health(ex.conn)
+        payload = ex.read_json("provider-health.json")
+
+        runs = [dict(r) for r in ex.conn.execute("SELECT * FROM scraper_runs ORDER BY id DESC").fetchall()]
+        expected = provider_health.compute_health(
+            "scraper", True, runs, ScraperProvider.expected_cadence_minutes,
+            now=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        )
+        assert payload["scraper"]["state"] == expected["state"]
+
+
 # --- export_intelligence (per-location AI intelligence files) ------------------
 
 def test_export_intelligence_injects_locationId_into_location_detail():
@@ -335,6 +439,12 @@ def main():
     run("export_action_items(): trend alerts include locationId", test_export_action_items_trend_alerts_include_locationId)
     run("export_validation(): includes locationId, preserves null for company-wide flags", test_export_validation_includes_locationId_and_preserves_null)
     run("export_scraper_status(): includes locationId", test_export_scraper_status_includes_locationId)
+    run("export_provider_health(): scraper-status.json remains a bare array, unaffected", test_export_provider_health_does_not_change_scraper_status_json_shape)
+    run("export_provider_health(): groups runs by the explicit provider column", test_export_provider_health_groups_by_explicit_provider_column)
+    run("export_provider_health(): infers 'scraper' for legacy NULL-provider scraper rows", test_export_provider_health_infers_scraper_for_legacy_null_provider_rows)
+    run("export_provider_health(): infers 'gbp' for legacy NULL-provider api_sync rows", test_export_provider_health_infers_gbp_for_legacy_null_provider_api_sync_rows)
+    run("export_provider_health(): offline for both providers when neither is configured", test_export_provider_health_offline_when_not_configured)
+    run("export_provider_health(): result matches provider_health.compute_health() directly", test_export_provider_health_result_matches_compute_health_directly)
     run("export_intelligence(): injects locationId into location_detail_* payloads", test_export_intelligence_injects_locationId_into_location_detail)
     run("export_intelligence(): does not clobber an already-present locationId", test_export_intelligence_does_not_clobber_existing_locationId)
     run("export_intelligence(): a stale slug with no matching location does not crash or get a guessed id", test_export_intelligence_handles_stale_slug_without_crashing)

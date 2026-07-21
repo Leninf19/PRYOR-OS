@@ -13,6 +13,7 @@ TESTS = [
     "test_retry.py",
     "test_provider_base.py",
     "test_provider_scraper.py",
+    "test_provider_health.py",
     "test_export_chunks.py",
     "test_location_analytics.py",
     "test_google_api_endpoints.py",
