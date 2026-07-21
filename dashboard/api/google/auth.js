@@ -3,7 +3,7 @@
 
 import { randomBytes } from 'crypto'
 import { setCookie } from './_lib/cookies.js'
-import { evaluateSession } from '../_lib/auth.js'
+import { evaluateSession, statusForAuthFailure } from '../_lib/auth.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -16,8 +16,23 @@ const STATE_COOKIE = 'gbp_oauth_state'
 export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).send('Method not allowed')
 
-  const { account } = await evaluateSession(req, ['owner'])
+  // ERROR_CONTRACT_EXCEPTION_1 (Phase 2 Milestone 6A): distinguish "no valid
+  // identity" (401) from "authenticated, but not Owner" (403) per the
+  // frozen API error contract -- this used to collapse both into 401 by
+  // only checking `!account`. Owner remains the only allowed role; nothing
+  // about the OAuth flow, redirect, or successful-Owner path below changes.
+  const { account, reason } = await evaluateSession(req, ['owner'])
   if (!account) {
+    const status = statusForAuthFailure(reason)
+    if (status === 403) {
+      return res.status(403).send(`
+        <html><body style="font-family:system-ui;max-width:520px;margin:60px auto;padding:0 20px">
+          <h2>Access denied</h2>
+          <p>Connecting Google Business Profile requires an Owner account. Your account does not have that role.</p>
+          <a href="/settings">← Back to Settings</a>
+        </body></html>
+      `)
+    }
     return res.status(401).send(`
       <html><body style="font-family:system-ui;max-width:520px;margin:60px auto;padding:0 20px">
         <h2>Sign in required</h2>

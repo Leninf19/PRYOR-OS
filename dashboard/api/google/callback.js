@@ -7,7 +7,7 @@
 
 import { parseCookies, clearCookie } from './_lib/cookies.js'
 import { upsertEnvVar, triggerRedeploy } from './_lib/vercel.js'
-import { evaluateSession } from '../_lib/auth.js'
+import { evaluateSession, statusForAuthFailure } from '../_lib/auth.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -19,8 +19,19 @@ export default async function handler(req, res) {
   // never assumes that check already ran (the CSRF state check below is a
   // separate concern -- it proves this callback belongs to a flow *this
   // browser* started, not that the caller is still an authorized Owner).
-  const { account } = await evaluateSession(req, ['owner'])
+  // ERROR_CONTRACT_EXCEPTION_1 (Phase 2 Milestone 6A): same 401-vs-403
+  // distinction as auth.js -- see the comment there. The independent CSRF
+  // state check below is unaffected and still runs exactly as before for
+  // any request that gets past this gate.
+  const { account, reason } = await evaluateSession(req, ['owner'])
   if (!account) {
+    const status = statusForAuthFailure(reason)
+    if (status === 403) {
+      return res.status(403).send(page('Access denied', `
+        <p>Connecting Google Business Profile requires an Owner account. Your account does not have that role.</p>
+        <p><a href="/settings">← Back to Settings</a></p>
+      `))
+    }
     return res.status(401).send(page('Sign in required', `
       <p>Connecting Google Business Profile requires an Owner account.</p>
       <p><a href="/login">← Sign in</a></p>

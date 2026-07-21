@@ -231,40 +231,47 @@ const ENDPOINT_REGISTRY = [
     route: 'GET /api/google/auth', file: 'api/google/auth.js', method: 'GET',
     authRequired: true, currentAllowedRoles: ['owner'],
     scope: 'account-wide administrative (OAuth initiation)',
-    unauthorizedShape: 'html', wrongRoleStatus: 401,
+    unauthorizedShape: 'html', wrongRoleStatus: 403,
     locationMilestone: null,
     knownDefect: 'ERROR_CONTRACT_EXCEPTION_1',
-    notes: 'TRACKED ARCHITECTURE EXCEPTION (ERROR_CONTRACT_EXCEPTION_1, owned by Milestone 6A): this handler calls evaluateSession() directly and only checks `if (!account)`, never reading `reason` -- so an authenticated-but-wrong-role caller (e.g. Marketing) gets 401 today, not the 403 the frozen error contract (§6) requires and every requireAuth()-based endpoint already produces for the same situation. Current behavior: 401. Target behavior: 403. Not fixed in Milestone 3 (would change production behavior). See ERROR_CONTRACT_EXCEPTIONS below and the pending Milestone 6A test.',
+    notes: 'RESOLVED by Milestone 6A (was: ERROR_CONTRACT_EXCEPTION_1). This handler now destructures `reason` from evaluateSession() and uses the shared statusForAuthFailure(reason) helper (dashboard/api/_lib/auth.js) to return 403 for an authenticated-but-wrong-role caller (e.g. Marketing), matching every requireAuth()-based endpoint and the frozen §6 error contract. 401 is still returned for a true identity failure (no session, invalid session, disabled account, stale sessionVersion). See ERROR_CONTRACT_EXCEPTIONS below for the full resolution record.',
   },
   {
     route: 'GET /api/google/callback', file: 'api/google/callback.js', method: 'GET',
     authRequired: true, currentAllowedRoles: ['owner'],
     scope: 'account-wide administrative (OAuth callback)',
-    unauthorizedShape: 'html', wrongRoleStatus: 401,
+    unauthorizedShape: 'html', wrongRoleStatus: 403,
     locationMilestone: null,
     knownDefect: 'ERROR_CONTRACT_EXCEPTION_1',
-    notes: 'Same evaluateSession() pattern and the same tracked ERROR_CONTRACT_EXCEPTION_1 as auth.js above (current: 401, target: 403, owned by Milestone 6A), plus an independent CSRF state check. Owner-only.',
+    notes: 'Same fix and the same resolved ERROR_CONTRACT_EXCEPTION_1 as auth.js above, plus an independent CSRF state check (unchanged). Owner-only.',
   },
 ]
 
 // ---------------------------------------------------------------------------
 // TRACKED ARCHITECTURE EXCEPTIONS -- known, deliberate deviations from the
-// frozen Phase 2 Revision 3 architecture that are NOT fixed in the milestone
-// that discovered them, each with an explicit owner (a named milestone or
-// sub-milestone) so it cannot go unfixed by omission. Referenced by
-// `knownDefect` above and cross-checked by a meta-test below.
+// frozen Phase 2 Revision 3 architecture, each with an explicit owner (a
+// named milestone or sub-milestone) so it cannot go unfixed by omission.
+// Referenced by `knownDefect` above and cross-checked by a meta-test below.
+// An exception with status: 'resolved' is retained for historical context
+// (which milestone found it, which milestone fixed it, what changed) --
+// never deleted outright -- but must no longer be treated as open: see
+// recordErrorContractPendingTests() (skips resolved exceptions) and
+// testResolvedExceptionsDoNotLeaveStaleRegistryEntries() (fails if any
+// registry entry referencing a resolved exception still shows the old,
+// pre-fix status).
 // ---------------------------------------------------------------------------
 
 const ERROR_CONTRACT_EXCEPTIONS = [
   {
     id: 'ERROR_CONTRACT_EXCEPTION_1',
+    status: 'resolved',
     affects: ['api/google/auth.js', 'api/google/callback.js'],
-    currentBehavior: '401 for an authenticated account with the wrong role (indistinguishable from no session at all)',
+    formerBehavior: '401 for an authenticated account with the wrong role (indistinguishable from no session at all)',
     targetBehavior: '403 for an authenticated account with the wrong role, per the frozen §6 error contract -- matching every requireAuth()-based endpoint',
-    ownerMilestone: '6A',
-    ownerMilestoneName: 'Milestone 6A -- API error-contract normalization',
-    ownerMilestonePlacement: 'a small, dedicated milestone inserted before Milestone 6 (location-filtered /api/data), and in any case must land before Milestone 10 (production scoped-account rollout) -- a scoped-role account is exactly the caller most likely to hit this code path (Owner-only admin endpoints), so the defect must be closed before real scoped accounts exist.',
-    reasonNotFixedYet: 'fixing it means changing auth.js/callback.js to read `reason` from evaluateSession() and branch 401 vs 403 -- an observable production behavior change, out of scope for a test-infrastructure-only milestone (Milestone 3) and not requested for Milestone 3\'s narrowly-scoped follow-up either.',
+    discoveredByMilestone: 3,
+    resolvedByMilestone: '6A',
+    resolvedByMilestoneName: 'Milestone 6A -- API error-contract normalization',
+    resolutionSummary: 'Both handlers now destructure `reason` (not just `account`) from evaluateSession() and branch on the new shared dashboard/api/_lib/auth.js helper statusForAuthFailure(reason) -- 403 for reason === "forbidden" (authenticated, wrong role), 401 otherwise (no valid identity at all). requireAuth(), evaluateSession() itself, and the successful-Owner path are all byte-for-byte unchanged; Owner remains the only allowed role.',
   },
 ]
 
@@ -625,17 +632,53 @@ function recordScopedRolePendingTests() {
 }
 
 // --- Error-contract normalization: pending target behavior ----------------
-// Decision 1's resolution for the discovered OAuth 401-vs-403 discrepancy:
-// tracked as ERROR_CONTRACT_EXCEPTION_1, owned by Milestone 6A. This is the
-// explicit commitment that the TARGET (403) behavior becomes an active test
-// once that milestone lands -- not left as an unowned observation.
+// Only UNRESOLVED exceptions are recorded as pending -- a resolved one
+// (like ERROR_CONTRACT_EXCEPTION_1, fixed by Milestone 6A) must not still
+// show up here, or the matrix would be lying about the current state of
+// the codebase. Its activated test lives in SECTION 2/main() as an
+// ordinary run(...) call now, not a pending(...) call.
 function recordErrorContractPendingTests() {
   for (const exception of ERROR_CONTRACT_EXCEPTIONS) {
-    pending(`${exception.affects.join(' & ')}: authenticated-wrong-role caller returns 403, not ${exception.currentBehavior.split(' ')[0]}`, {
+    if (exception.status === 'resolved') continue
+    pending(`${exception.affects.join(' & ')}: authenticated-wrong-role caller returns 403, not ${exception.formerBehavior.split(' ')[0]}`, {
       expectedBehavior: exception.targetBehavior,
       milestone: exception.ownerMilestone,
-      reason: `Current behavior is "${exception.currentBehavior}". ${exception.reasonNotFixedYet} Placement: ${exception.ownerMilestoneName} -- ${exception.ownerMilestonePlacement}`,
+      reason: `Current behavior is "${exception.formerBehavior}". ${exception.reasonNotFixedYet} Placement: ${exception.ownerMilestoneName} -- ${exception.ownerMilestonePlacement}`,
     })
+  }
+}
+
+// --- Error-contract normalization: activated target-behavior test --------
+// The activated replacement for the pending test that used to live here --
+// ERROR_CONTRACT_EXCEPTION_1 is now resolved. Combines two checks in one
+// test: (1) the registry itself is not stale (a resolved exception's
+// referencing entries must show the corrected wrongRoleStatus, or the
+// registry would be lying about current behavior), and (2) a live
+// confirmation that the target 403 behavior actually landed at both
+// affected endpoints. Full endpoint-level coverage (all four roles, both
+// endpoints, response-shape/HTML checks, fail-closed checks on the new
+// shared statusForAuthFailure() helper, and the unaffected successful-Owner
+// path) lives in the dedicated tests/test_google_oauth_error_contract.js.
+async function testResolvedOAuthExceptionEndpointsReturn403ForWrongRole() {
+  const fixtures = await setDirectory()
+  const resolvedExceptions = ERROR_CONTRACT_EXCEPTIONS.filter(e => e.status === 'resolved')
+  assert(resolvedExceptions.length > 0, 'expected at least one resolved error-contract exception to verify')
+
+  for (const exception of resolvedExceptions) {
+    const referencingEntries = ENDPOINT_REGISTRY.filter(e => e.knownDefect === exception.id)
+    assert(referencingEntries.length === exception.affects.length,
+      `resolved exception ${exception.id} should still be referenced by exactly ${exception.affects.length} registry entries for historical context, found ${referencingEntries.length}`)
+
+    for (const entry of referencingEntries) {
+      assert(entry.wrongRoleStatus === 403, `${entry.route} references resolved exception ${exception.id} but its registry wrongRoleStatus is still ${entry.wrongRoleStatus} -- the registry is stale and must be updated to reflect the fix`)
+
+      const handler = HANDLERS[entry.file]
+      const token = await tokenFor(fixtures.marketing)
+      const req = minimalReqFor(entry, token)
+      const res = fakeRes()
+      await handler(req, res)
+      assert(res.statusCode === 403, `${entry.file}: authenticated Marketing must now return 403 (${exception.id} resolved by Milestone ${exception.resolvedByMilestone}), got ${res.statusCode}`)
+    }
   }
 }
 
@@ -953,8 +996,12 @@ async function testEveryKnownDefectIsTrackedWithAnOwner() {
     assert(exceptionIds.has(entry.knownDefect), `${entry.route} references unknown defect id "${entry.knownDefect}" -- no matching ERROR_CONTRACT_EXCEPTIONS entry`)
   }
   for (const exception of ERROR_CONTRACT_EXCEPTIONS) {
-    assert(exception.ownerMilestone, `exception ${exception.id} has no ownerMilestone -- every tracked exception must be assigned, never left unowned`)
-    assert(exception.currentBehavior && exception.targetBehavior, `exception ${exception.id} must document both current and target behavior`)
+    assert(exception.status === 'resolved' || exception.ownerMilestone,
+      `exception ${exception.id} has no ownerMilestone -- every open tracked exception must be assigned, never left unowned`)
+    assert(exception.status !== 'resolved' || exception.resolvedByMilestone,
+      `resolved exception ${exception.id} must record which milestone resolved it`)
+    const behaviorBefore = exception.status === 'resolved' ? exception.formerBehavior : exception.currentBehavior
+    assert(behaviorBefore && exception.targetBehavior, `exception ${exception.id} must document both its former/current and target behavior`)
     const referencingEntries = ENDPOINT_REGISTRY.filter(e => e.knownDefect === exception.id)
     assert(referencingEntries.length === exception.affects.length, `exception ${exception.id} claims to affect ${exception.affects.length} file(s) but ${referencingEntries.length} registry entries reference it`)
   }
@@ -1152,6 +1199,7 @@ async function main() {
 
   console.log('\n--- SECTION 2: Role matrix ---')
   await run('every endpoint denies every role not in its current allow-list (403)', testRoleMatrixDeniesEveryNonAllowedRole)
+  await run('[RESOLVED, Milestone 6A] OAuth endpoints (auth.js/callback.js) return 403 for authenticated wrong-role, not 401 -- registry is not stale', testResolvedOAuthExceptionEndpointsReturn403ForWrongRole)
   recordScopedRolePendingTests()
   recordErrorContractPendingTests()
 

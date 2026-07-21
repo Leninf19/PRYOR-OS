@@ -61,6 +61,20 @@ export async function evaluateSession(req, allowedRoles) {
   return { account: toSafeAccount(account), reason: null }
 }
 
+// Maps an evaluateSession() failure `reason` to the correct HTTP status per
+// the frozen API error contract: 401 for "no valid identity at all"
+// (unauthenticated / session_expired), 403 for "valid identity, wrong
+// capability" (forbidden -- includes an unrecognized/unknown role, which
+// evaluateSession() already fails closed into 'forbidden' rather than
+// granting access). Shared by any endpoint that calls evaluateSession()
+// directly instead of requireAuth() -- today that's the HTML-responding
+// Google OAuth endpoints (auth.js/callback.js), which need a different
+// failure presentation than requireAuth()'s JSON body but must still use
+// the same status-code decision.
+export function statusForAuthFailure(reason) {
+  return reason === 'forbidden' ? 403 : 401
+}
+
 // JSON-API form: writes the 401/403 response itself and returns null, or
 // returns the current account record (safe subset) on success. Caller's
 // only job is `if (!account) return`.

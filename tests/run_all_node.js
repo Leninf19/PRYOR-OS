@@ -20,6 +20,7 @@ const TESTS = [
   'test_middleware.js',
   'test_endpoint_auth.js',
   'test_oauth_safety.js',
+  'test_google_oauth_error_contract.js',
   'test_http_methods.js',
   'test_workflow_concurrency.js',
   'test_no_direct_data_fetches.js',
