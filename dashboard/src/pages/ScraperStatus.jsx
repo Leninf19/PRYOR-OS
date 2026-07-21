@@ -12,14 +12,30 @@ const SUBTABS = [
   { id: 'validation', label: 'Data Validation' },
 ]
 
+// The pipeline has two writers with two different status vocabularies for
+// the same columns: auto_update.py (the currently-active scraper) writes
+// run status 'ok'/'partial'/'failed' and location status 'ok'/'error';
+// gbp_sync.py writes location status 'success'/'failed'. Recognize both
+// rather than hardcoding just one, or a run/location from whichever writer
+// isn't matched renders as a false failure.
+const OK_STATUSES = new Set(['ok', 'success'])
+const FAILED_STATUSES = new Set(['error', 'failed'])
+
 const STATUS_STYLE = {
   success: 'text-emerald-600 dark:text-[var(--color-success)] bg-emerald-50 dark:bg-[var(--color-success-bg)]',
   partial: 'text-orange-600 dark:text-[var(--color-grade-c)] bg-orange-50 dark:bg-[var(--color-warning-bg)]',
   failed:  'text-red-600 dark:text-[var(--color-danger)] bg-red-50 dark:bg-[var(--color-danger-bg)]',
 }
 
+function runStatusVariant(status) {
+  if (OK_STATUSES.has(status)) return 'success'
+  if (status === 'partial') return 'partial'
+  if (FAILED_STATUSES.has(status)) return 'failed'
+  return null
+}
+
 function StatusBadge({ status }) {
-  const style = STATUS_STYLE[status] || 'text-stone-500 dark:text-[var(--color-text-2)] bg-stone-100 dark:bg-[var(--color-surface-2)]'
+  const style = STATUS_STYLE[runStatusVariant(status)] || 'text-stone-500 dark:text-[var(--color-text-2)] bg-stone-100 dark:bg-[var(--color-surface-2)]'
   return (
     <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full uppercase tracking-wide ${style}`}>
       {status || 'unknown'}
@@ -64,7 +80,7 @@ function DataHealthHeader({ allReviews }) {
 
   const lastRun = runs?.[0]
   const fresh = freshness(lastRun?.started_at)
-  const failedLocs = (lastRun?.locations || []).filter(l => l.status !== 'success').length
+  const failedLocs = (lastRun?.locations || []).filter(l => !OK_STATUSES.has(l.status)).length
 
   return (
     <Card className="p-5">
@@ -81,7 +97,7 @@ function DataHealthHeader({ allReviews }) {
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         <HealthStat label="Pipeline Status" value={lastRun?.status ?? '—'}
-                    variant={lastRun?.status === 'success' ? 'success' : lastRun?.status === 'failed' ? 'danger' : 'warning'} />
+                    variant={OK_STATUSES.has(lastRun?.status) ? 'success' : FAILED_STATUSES.has(lastRun?.status) ? 'danger' : 'warning'} />
         <HealthStat label="Reviews This Run" value={lastRun?.new_reviews_count ?? 0} sub="new reviews found" />
         <HealthStat label="Locations Updated" value={`${lastRun?.locations_succeeded ?? 0}/${lastRun?.locations_attempted ?? 0}`}
                     variant={failedLocs > 0 ? 'warning' : 'success'} sub={failedLocs > 0 ? `${failedLocs} failed` : 'all succeeded'} />
@@ -97,7 +113,7 @@ function DataHealthHeader({ allReviews }) {
 
 function RunRow({ run }) {
   const [expanded, setExpanded] = useState(false)
-  const failedLocs = (run.locations || []).filter(l => l.status !== 'success')
+  const failedLocs = (run.locations || []).filter(l => !OK_STATUSES.has(l.status))
 
   return (
     <div className="border-b border-stone-100 dark:border-[var(--color-border)] last:border-b-0">
@@ -128,7 +144,7 @@ function RunRow({ run }) {
           )}
           {(run.locations || []).map(loc => (
             <div key={loc.id} className="flex items-center gap-3 text-xs px-3 py-1.5 rounded-lg bg-stone-50 dark:bg-[var(--color-surface-2)]">
-              <span className={`w-2 h-2 rounded-full shrink-0 ${loc.status === 'success' ? 'bg-emerald-500' : 'bg-red-500'}`} />
+              <span className={`w-2 h-2 rounded-full shrink-0 ${OK_STATUSES.has(loc.status) ? 'bg-emerald-500' : 'bg-red-500'}`} />
               <span className="text-stone-700 dark:text-[var(--color-text-1)] font-medium w-48 truncate">{loc.location_name}</span>
               <span className="text-stone-400 dark:text-[var(--color-text-3)]">{loc.reviews_found ?? 0} found · {loc.reviews_new ?? 0} new</span>
               {loc.error_message && <span className="text-red-500 dark:text-[var(--color-danger)] truncate">{loc.error_message}</span>}
