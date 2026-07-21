@@ -20,6 +20,21 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Python dependencies
+        run: pip install anthropic
+
+      # This workflow must not assume dashboard/reviews.db already has fresh
+      # analytics_cache rows from some other workflow's prior run -- that
+      # assumption silently broke export_chunks.py's location-analytics
+      # validation the first time a dashboard-only push landed on a commit
+      # whose db hadn't yet been through refresh_analytics.py. Running it
+      # here makes this workflow self-sufficient, matching update-reviews.yml's
+      # own guaranteed order (refresh before export).
+      - name: Refresh analytics
+        run: python refresh_analytics.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
       - name: Export data chunks
         run: python export_chunks.py
 
