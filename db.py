@@ -177,7 +177,7 @@ def init_schema(conn: sqlite3.Connection):
 # doesn't control which migrations run. It just lets you tell at a glance,
 # from the DB file alone, whether it's seen the latest migration batch --
 # `sqlite3 reviews.db "PRAGMA user_version"` -- without reading this file.
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def _migrate_schema(conn: sqlite3.Connection):
@@ -209,6 +209,23 @@ def _migrate_schema(conn: sqlite3.Connection):
         # every pre-existing row and for normal per-location failures --
         # both keep using the original (unrelated, unchanged) alert wording.
         "ALTER TABLE scraper_runs ADD COLUMN failure_stage TEXT",
+        # Phase 3 Milestone 1 (sync framework foundation): `provider` names
+        # which Provider implementation wrote this run explicitly ('gbp' |
+        # 'scraper' | 'mock') -- never inferred from `mode`, which keeps its
+        # exact existing values/meaning ('local'/'cloud'/'api_sync') for
+        # every current reader (export_chunks.py's `WHERE mode='api_sync'`
+        # filtering, ScraperStatus.jsx's `run.mode` display). NULL for every
+        # historical row written before this migration.
+        "ALTER TABLE scraper_runs ADD COLUMN provider TEXT",
+        # How many attempts retry.py's backoff used before this location's
+        # fetch succeeded or gave up; 1 = no retry needed. Default 1 (not
+        # NULL) since every pre-existing row represents exactly one
+        # (unretried) attempt under the prior implementation.
+        "ALTER TABLE scraper_run_locations ADD COLUMN attempt_count INTEGER DEFAULT 1",
+        # Machine-readable failure classification, parallel to the existing
+        # free-text error_message (not a replacement): '429'|'403'|'404'|
+        # '5xx'|'network'|'blocked'|NULL.
+        "ALTER TABLE scraper_run_locations ADD COLUMN provider_error_code TEXT",
     ]
     for sql in migrations:
         try:

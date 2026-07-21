@@ -29,6 +29,9 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
+import retry as retry_lib
+from provider_base import ProviderError
+
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 API_BASE = "https://mybusiness.googleapis.com/v4"                          # reviews + reply only
 ACCOUNTS_BASE = "https://mybusinessaccountmanagement.googleapis.com/v1"    # accounts.list
@@ -41,11 +44,16 @@ _BASE_BACKOFF_SECONDS = 1.0
 _access_token_cache = {"token": None, "expires_at": 0}
 
 
-class GBPError(Exception):
-    """Base class for all Google Business Profile API errors."""
+class GBPError(ProviderError):
+    """Base class for all Google Business Profile API errors. Reparented
+    onto the shared ProviderError (Phase 3 Milestone 1) so generic
+    provider-agnostic code can `except ProviderError` and catch this
+    alongside any other provider's failures -- every existing
+    `except ga.GBPError` in gbp_sync.py/gbp_import.py/critical_alert_check.py
+    still catches exactly the same instances, since GBPError itself is
+    unchanged other than its base class."""
     def __init__(self, message, status=None):
-        super().__init__(message)
-        self.status = status
+        super().__init__(message, status=status)
 
 
 class GBPAuthError(GBPError):
@@ -120,12 +128,20 @@ def get_access_token(force_refresh: bool = False) -> str:
 
 def _request(method: str, url: str, body: dict | None = None, params: dict | None = None) -> dict:
     """Single authenticated request against the GBP v4 API, with exponential
-    backoff on 429/5xx and typed exceptions on every failure path."""
+    backoff on 429/5xx and typed exceptions on every failure path.
+
+    The retry loop itself now lives in retry.py (Phase 3 Milestone 1) --
+    this function only builds one attempt (_do_request) and classifies each
+    failure into the right typed exception, exactly as it did inline
+    before. Retry/backoff behavior is unchanged: same attempt count, same
+    exponential formula, same Retry-After honoring on 429/5xx, and a 401
+    still forces a fresh token and retries immediately with no backoff
+    (via retry_after_seconds returning 0 for that case specifically --
+    0 and "not specified" are deliberately different in retry.py)."""
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
 
-    last_err = None
-    for attempt in range(_MAX_RETRIES):
+    def _do_request():
         token = get_access_token()
         headers = {"Authorization": f"Bearer {token}"}
         data = None
@@ -147,28 +163,44 @@ def _request(method: str, url: str, body: dict | None = None, params: dict | Non
                 message = detail[:300]
 
             if status == 401:
-                # Access token expired/revoked mid-run -- force a fresh one and retry.
-                get_access_token(force_refresh=True)
-                last_err = GBPAuthError(f"Unauthorized: {message}", status=status)
-                continue
+                err = GBPAuthError(f"Unauthorized: {message}", status=status)
+                err.retryable = True
+                err.retry_after_override = 0  # retry immediately once the token's refreshed, no backoff
+                raise err from e
             if status == 403:
                 raise GBPPermissionError(f"Permission denied: {message}", status=status) from e
             if status == 404:
                 raise GBPNotFoundError(f"Not found: {message}", status=status) from e
             if status == 429 or status >= 500:
-                last_err = (GBPRateLimitError if status == 429 else GBPServerError)(
+                err = (GBPRateLimitError if status == 429 else GBPServerError)(
                     f"Google API {status}: {message}", status=status)
+                err.retryable = True
                 retry_after = e.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after else _BASE_BACKOFF_SECONDS * (2 ** attempt)
-                time.sleep(min(wait, 30))
-                continue
+                if retry_after:
+                    err.retry_after_override = float(retry_after)
+                raise err from e
             raise GBPError(f"Google API {status}: {message}", status=status) from e
         except urllib.error.URLError as e:
-            last_err = GBPError(f"Network error calling Google API: {e.reason}")
-            time.sleep(_BASE_BACKOFF_SECONDS * (2 ** attempt))
-            continue
+            err = GBPError(f"Network error calling Google API: {e.reason}")
+            err.retryable = True
+            raise err from e
 
-    raise last_err or GBPError("Google API request failed after retries")
+    def _on_retry(err, _attempt):
+        # Access token expired/revoked mid-run -- force a fresh one before
+        # the next attempt (which will call get_access_token() again).
+        if isinstance(err, GBPAuthError):
+            get_access_token(force_refresh=True)
+
+    def _retry_after(err):
+        return getattr(err, "retry_after_override", None)
+
+    return retry_lib.with_retry(
+        _do_request,
+        max_retries=_MAX_RETRIES,
+        base_backoff=_BASE_BACKOFF_SECONDS,
+        retry_after_seconds=_retry_after,
+        on_retry=_on_retry,
+    )
 
 
 def list_accounts() -> list:

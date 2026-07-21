@@ -19,11 +19,13 @@ Exits 0 on success, 1 with a clear message on failure.
 import io
 import json
 import sys
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import google_api as ga
+from provider_base import ProviderError
 
 OLD_ACCOUNTS_URL_PREFIX = "https://mybusiness.googleapis.com/v4/accounts"
 OLD_LOCATIONS_URL_PREFIX = "https://mybusiness.googleapis.com/v4/accounts/123/locations"
@@ -146,12 +148,155 @@ def test_list_reviews_and_reply_still_use_v4():
     )
 
 
+def _http_error(code, message=None, retry_after=None, url="https://example.com"):
+    body = json.dumps({"error": {"message": message}}).encode() if message else b""
+    headers = {"Retry-After": retry_after} if retry_after else {}
+    return urllib.error.HTTPError(url=url, code=code, msg="error", hdrs=headers, fp=io.BytesIO(body))
+
+
+# --- Phase 3 Milestone 1: retry.py extraction must preserve _request()'s
+# exact original retry/backoff behavior for every status-code path. These
+# mock urllib.request.urlopen directly (no real network) and mock
+# time.sleep so they run instantly regardless of backoff duration.
+
+def test_401_forces_token_refresh_and_retries_immediately_without_sleep():
+    call_count = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise _http_error(401, "token expired")
+        return _fake_response({"accounts": []})
+
+    with mock.patch.object(ga, "get_access_token", return_value="fake-token") as token_mock, \
+         mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+         mock.patch("retry.time.sleep") as sleep_mock:
+        result = ga.list_accounts()
+
+    assert result == []
+    assert call_count["n"] == 2, f"expected exactly 2 attempts (1 failure + 1 success), got {call_count['n']}"
+    token_mock.assert_any_call(force_refresh=True)
+    # a 401 must retry immediately (0s wait), not the default exponential backoff
+    sleep_mock.assert_called_once_with(0)
+
+
+def test_429_honors_retry_after_header():
+    call_count = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise _http_error(429, "quota exceeded", retry_after="2")
+        return _fake_response({"accounts": []})
+
+    with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
+         mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+         mock.patch("retry.time.sleep") as sleep_mock:
+        ga.list_accounts()
+
+    sleep_mock.assert_called_once_with(2.0)
+
+
+def test_5xx_retries_with_exponential_backoff_when_no_retry_after_header():
+    call_count = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise _http_error(503, "server error")
+        return _fake_response({"accounts": []})
+
+    with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
+         mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+         mock.patch("retry.time.sleep") as sleep_mock:
+        ga.list_accounts()
+
+    sleep_mock.assert_called_once_with(ga._BASE_BACKOFF_SECONDS * (2 ** 0))
+
+
+def test_403_raises_immediately_without_retry():
+    def fake_urlopen(req, timeout=None):
+        raise _http_error(403, "permission denied")
+
+    with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
+         mock.patch("urllib.request.urlopen", side_effect=fake_urlopen) as urlopen_mock, \
+         mock.patch("retry.time.sleep") as sleep_mock:
+        try:
+            ga.list_accounts()
+            raise AssertionError("expected GBPPermissionError to be raised")
+        except ga.GBPPermissionError as e:
+            assert e.status == 403
+
+    assert urlopen_mock.call_count == 1, "403 must never be retried"
+    sleep_mock.assert_not_called()
+
+
+def test_404_raises_immediately_without_retry():
+    def fake_urlopen(req, timeout=None):
+        raise _http_error(404, "not found")
+
+    with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
+         mock.patch("urllib.request.urlopen", side_effect=fake_urlopen) as urlopen_mock, \
+         mock.patch("retry.time.sleep") as sleep_mock:
+        try:
+            ga.list_accounts()
+            raise AssertionError("expected GBPNotFoundError to be raised")
+        except ga.GBPNotFoundError as e:
+            assert e.status == 404
+
+    assert urlopen_mock.call_count == 1, "404 must never be retried"
+    sleep_mock.assert_not_called()
+
+
+def test_network_error_retries_with_backoff():
+    call_count = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise urllib.error.URLError("connection refused")
+        return _fake_response({"accounts": []})
+
+    with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
+         mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+         mock.patch("retry.time.sleep") as sleep_mock:
+        result = ga.list_accounts()
+
+    assert result == []
+    assert call_count["n"] == 2
+    sleep_mock.assert_called_once_with(ga._BASE_BACKOFF_SECONDS * (2 ** 0))
+
+
+def test_gbp_error_hierarchy_is_reparented_onto_provider_error():
+    """Phase 3 Milestone 1: GBPError and its subclasses must now be
+    ProviderError instances too, so generic provider-agnostic code can
+    `except ProviderError` and catch these alongside any other provider's
+    failures -- while every existing `except ga.GBPError` still works
+    unchanged."""
+    assert issubclass(ga.GBPError, ProviderError)
+    for subclass in (ga.GBPAuthError, ga.GBPRateLimitError, ga.GBPPermissionError,
+                     ga.GBPNotFoundError, ga.GBPServerError):
+        assert issubclass(subclass, ga.GBPError)
+        assert issubclass(subclass, ProviderError)
+
+    err = ga.GBPPermissionError("denied", status=403)
+    assert err.status == 403, "GBPError's own status attribute behavior must be unchanged"
+    assert err.retryable is False, "retryable defaults to False unless explicitly set (e.g. by _request())"
+
+
 def main():
     tests = [
         ("list_accounts() uses the current Account Management API host, not the deprecated v4 path", test_list_accounts_hits_new_host),
         ("list_locations() uses the current Business Information API host + required readMask", test_list_locations_hits_new_host_with_readmask),
         ("list_locations() normalizes an already-account-prefixed name without doubling it", test_list_locations_handles_account_prefixed_name_too),
         ("list_reviews()/reply_to_review() remain on the legacy v4 host (unaffected by the 2022 split)", test_list_reviews_and_reply_still_use_v4),
+        ("_request(): a 401 forces a token refresh and retries immediately with no sleep", test_401_forces_token_refresh_and_retries_immediately_without_sleep),
+        ("_request(): a 429 honors the Retry-After header", test_429_honors_retry_after_header),
+        ("_request(): a 5xx with no Retry-After retries with exponential backoff", test_5xx_retries_with_exponential_backoff_when_no_retry_after_header),
+        ("_request(): a 403 raises immediately, never retried", test_403_raises_immediately_without_retry),
+        ("_request(): a 404 raises immediately, never retried", test_404_raises_immediately_without_retry),
+        ("_request(): a network error retries with exponential backoff", test_network_error_retries_with_backoff),
+        ("GBPError and subclasses are reparented onto the shared ProviderError", test_gbp_error_hierarchy_is_reparented_onto_provider_error),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()
