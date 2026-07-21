@@ -43,13 +43,15 @@ jobs:
       # needs a separate increase request Google hasn't granted yet. Falling
       # back to the Playwright scraper so reviews keep flowing in the
       # meantime. No Google-linked rows exist yet (gbp_review_name is NULL on
-      # every row), so this is a clean, collision-free switch. Swap the two
-      # lines below back once the quota is granted -- see gbp_sync.py.
-      - name: Run scraper (temporary fallback -- see comment above)
+      # every row), so this is a clean, collision-free switch. Once the quota
+      # is granted, switch REVIEW_PROVIDER below from 'scraper' to 'gbp' --
+      # see sync_reviews.py/provider_sync.py.
+      - name: Sync reviews (scraper provider)
         id: scrape
         timeout-minutes: 30
-        run: python auto_update.py
+        run: python sync_reviews.py
         env:
+          REVIEW_PROVIDER: scraper
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PYTHONUNBUFFERED: "1"
 

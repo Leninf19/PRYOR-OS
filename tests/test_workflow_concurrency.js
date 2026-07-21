@@ -109,8 +109,13 @@ function testDeployFrontendPreservesTriggerAndPathFilters() {
 }
 
 function testUpdateReviewsStillPreservesFullPipelineOrder() {
+  // Phase 3 Milestone 4b: the sync step's own command changed from
+  // `auto_update.py` to `sync_reviews.py` (see testUpdateReviewsUsesGenericSyncEntrypoint
+  // below for the explicit, dedicated assertions on that) -- this ordering
+  // check is updated to use the new marker so it keeps proving the *rest*
+  // of the pipeline's order is untouched, not weakened.
   const content = readFileSync(path.join(WORKFLOWS_DIR, 'update-reviews.yml'), 'utf-8')
-  const order = ['auto_update.py', 'refresh_analytics.py', 'export_chunks.py', 'check_db_integrity.py', 'git commit', 'vercel']
+  const order = ['sync_reviews.py', 'refresh_analytics.py', 'export_chunks.py', 'check_db_integrity.py', 'git commit', 'vercel']
   const indices = order.map(marker => content.toLowerCase().indexOf(marker.toLowerCase()))
   indices.forEach((idx, i) => assert(idx !== -1, `update-reviews.yml must still contain "${order[i]}"`))
   for (let i = 1; i < indices.length; i++) {
@@ -119,13 +124,77 @@ function testUpdateReviewsStillPreservesFullPipelineOrder() {
   }
 }
 
+// Phase 3 Milestone 4b: update-reviews.yml now routes through the generic,
+// provider-agnostic sync_reviews.py entrypoint (with REVIEW_PROVIDER=scraper,
+// preserving today's exact active provider) instead of calling
+// auto_update.py directly -- see the Milestone 4b design review. This is a
+// deliberately narrow, isolated migration: only the one step's command/env
+// changed; everything else (id, timeout, downstream output references,
+// concurrency, commit fail-safe, deployment gating) must be provably
+// untouched.
+function testUpdateReviewsUsesGenericSyncEntrypoint() {
+  const content = readFileSync(path.join(WORKFLOWS_DIR, 'update-reviews.yml'), 'utf-8')
+
+  assert(content.includes('run: python sync_reviews.py'),
+    'update-reviews.yml must invoke python sync_reviews.py')
+  assert(!content.includes('python auto_update.py'),
+    'update-reviews.yml must no longer invoke auto_update.py directly')
+
+  // Isolate the sync step's own YAML block (from its "- name:" line up to
+  // the next "- name:"/"- uses:" line) so REVIEW_PROVIDER/id/timeout checks
+  // are scoped to that step specifically, not just anywhere in the file.
+  const syncStepMatch = content.match(/- name: Sync reviews \(scraper provider\)\n([\s\S]*?)(?=\n\s*- (?:name|uses):|\n*$)/)
+  assert(syncStepMatch, 'update-reviews.yml must have a named "Sync reviews (scraper provider)" step')
+  const syncStep = syncStepMatch[1]
+
+  assert(/id:\s*scrape/.test(syncStep), 'the sync step must retain id: scrape')
+  assert(/timeout-minutes:\s*30/.test(syncStep), 'the sync step must retain its 30-minute timeout')
+  assert(/REVIEW_PROVIDER:\s*scraper/.test(syncStep),
+    'the sync step must explicitly set REVIEW_PROVIDER: scraper')
+  assert(/ANTHROPIC_API_KEY:\s*\$\{\{\s*secrets\.ANTHROPIC_API_KEY\s*\}\}/.test(syncStep),
+    'the sync step must retain ANTHROPIC_API_KEY')
+  assert(/PYTHONUNBUFFERED:\s*"1"/.test(syncStep), 'the sync step must retain PYTHONUNBUFFERED')
+}
+
+function testDownstreamScrapeOutputReferencesUnchanged() {
+  const content = readFileSync(path.join(WORKFLOWS_DIR, 'update-reviews.yml'), 'utf-8')
+  assert(content.includes('steps.scrape.outputs.new_count'),
+    'the commit step must still reference steps.scrape.outputs.new_count')
+  assert(content.includes('steps.scrape.outputs.negative_count'),
+    'the email-gate condition must still reference steps.scrape.outputs.negative_count')
+  assert(content.includes('steps.scrape.outputs.email_html'),
+    'the email body must still reference steps.scrape.outputs.email_html')
+}
+
+function testCommitStepStillGatedOnIntegritySuccess() {
+  const content = readFileSync(path.join(WORKFLOWS_DIR, 'update-reviews.yml'), 'utf-8')
+  const commitStepMatch = content.match(/- name: Commit updated data\n([\s\S]*?)(?=\n\s*- name:)/)
+  assert(commitStepMatch, 'update-reviews.yml must have a "Commit updated data" step')
+  assert(/if:\s*always\(\)\s*&&\s*steps\.integrity\.outcome == 'success'/.test(commitStepMatch[0]),
+    "the commit step must still run only when steps.integrity.outcome == 'success'")
+}
+
+function testStalePushFailSafeUnchanged() {
+  const content = readFileSync(path.join(WORKFLOWS_DIR, 'update-reviews.yml'), 'utf-8')
+  assert(content.includes('git push rejected -- main has moved since this job started'),
+    'the stale-push fail-safe error message must remain unchanged')
+  assert(content.includes('no automatic reset/recommit is attempted'),
+    'the fail-safe must still explicitly refuse to auto-reset/recommit')
+  assert(!content.includes('git reset --mixed'),
+    'the fail-safe must not have regressed to the old reset-and-recommit pattern')
+}
+
 run('all 5 reviews.db-writing workflows share the reviews-db-writer concurrency group', testEachWriterHasSharedConcurrencyGroup)
 run('no workflow retains the reset-and-recommit retry pattern', testNoResetAndRecommitAnywhere)
 run('every writer runs the DB integrity check before its commit step', testEachWriterRunsIntegrityCheckBeforeCommit)
 run('non-DB-writing workflows were left out of the concurrency group', testNonWriterWorkflowsUntouched)
 run('deploy-frontend.yml refreshes analytics (with ANTHROPIC_API_KEY) before exporting data chunks', testDeployFrontendRefreshesAnalyticsBeforeExport)
 run('deploy-frontend.yml preserves its existing trigger and path filters', testDeployFrontendPreservesTriggerAndPathFilters)
-run('update-reviews.yml preserves scrape -> refresh -> export -> integrity -> commit -> deploy', testUpdateReviewsStillPreservesFullPipelineOrder)
+run('update-reviews.yml preserves sync -> refresh -> export -> integrity -> commit -> deploy', testUpdateReviewsStillPreservesFullPipelineOrder)
+run('update-reviews.yml routes through sync_reviews.py with REVIEW_PROVIDER=scraper, id/timeout/env retained, auto_update.py no longer invoked directly', testUpdateReviewsUsesGenericSyncEntrypoint)
+run('downstream steps.scrape.outputs.* references are unchanged', testDownstreamScrapeOutputReferencesUnchanged)
+run('the commit step still runs only when integrity succeeds', testCommitStepStillGatedOnIntegritySuccess)
+run('the stale-push fail-safe remains unchanged', testStalePushFailSafeUnchanged)
 
 console.log()
 if (results.every(Boolean)) {
