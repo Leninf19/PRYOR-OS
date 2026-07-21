@@ -24,6 +24,7 @@ const TESTS = [
   'test_http_methods.js',
   'test_workflow_concurrency.js',
   'test_no_direct_data_fetches.js',
+  'test_provider_health_hook.js',
 ]
 
 const results = {}
