@@ -29,3 +29,8 @@ token.json
 # auto_update.py --local's mutation lock (see local_safety.py) -- must
 # never be committed; it's meaningful only on the machine that created it.
 .local_db_mutation.lock
+
+# MockProvider's local snapshot (see bootstrap_mock_snapshot.py/provider_mock.py)
+# -- a point-in-time copy of dashboard/reviews.db for local dev only, never
+# committed; it's meaningful only on the machine that created it.
+dashboard/reviews.snapshot.db
