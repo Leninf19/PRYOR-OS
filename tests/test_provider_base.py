@@ -12,7 +12,8 @@ from provider_base import (
     Provider, ProviderLocation, ProviderReview,
     ProviderError, ProviderAuthError, ProviderRateLimitError,
     ProviderPermissionError, ProviderNotFoundError, ProviderServerError,
-    ProviderConfigError,
+    ProviderConfigError, ProviderParsingError,
+    CAP_READ_REVIEWS, CAP_REPLY, CAP_DELETE_REPLY,
 )
 
 results = []
@@ -176,6 +177,93 @@ def test_complete_provider_subclass_can_be_instantiated_and_reply_defaults_to_no
         assert "complete" in str(e)
 
 
+def test_provider_parsing_error_is_a_provider_error():
+    """Phase 3 Milestone 2: ProviderParsingError -- the response was
+    reachable but could not be parsed / had an unexpected structure (e.g.
+    the scraper's page loaded but its DOM didn't match what was expected)."""
+    assert issubclass(ProviderParsingError, ProviderError)
+    err = ProviderParsingError("could not find the reviews tab")
+    assert isinstance(err, ProviderError)
+    assert err.retryable is False  # default, same as every other ProviderError subclass
+
+
+def test_provider_capabilities_default_to_empty_frozenset():
+    """Phase 3 Milestone 2: additive capabilities attribute. A Provider
+    subclass that declares nothing beyond the ABC's abstract methods must
+    default to capable-of-nothing, not silently inherit some other
+    provider's capabilities."""
+    class BareProvider(Provider):
+        def is_configured(self):
+            return True
+
+        def discover_locations(self):
+            return []
+
+        def fetch_reviews(self, location, *, fast=False):
+            return []
+
+    assert BareProvider.capabilities == frozenset()
+    assert BareProvider().expected_cadence_minutes is None
+
+
+def test_provider_capabilities_are_declared_and_checkable_by_a_generic_caller():
+    """A future UI/caller checks capabilities via `CAP_X in provider.capabilities`
+    -- never by catching NotImplementedError from reply_to_review()."""
+    class ReadOnlyProvider(Provider):
+        capabilities = frozenset({CAP_READ_REVIEWS})
+
+        def is_configured(self):
+            return True
+
+        def discover_locations(self):
+            return []
+
+        def fetch_reviews(self, location, *, fast=False):
+            return []
+
+    provider = ReadOnlyProvider()
+    assert CAP_READ_REVIEWS in provider.capabilities
+    assert CAP_REPLY not in provider.capabilities
+    assert CAP_DELETE_REPLY not in provider.capabilities
+
+
+def test_provider_identity_attributes_are_additive_with_safe_defaults():
+    """Phase 3 Milestone 2: name/display_name/capabilities/expected_cadence_minutes
+    are all additive class attributes with safe defaults -- a Provider
+    subclass predating this milestone (conceptually) still instantiates fine
+    without declaring any of them."""
+    class MinimalProvider(Provider):
+        def is_configured(self):
+            return True
+
+        def discover_locations(self):
+            return []
+
+        def fetch_reviews(self, location, *, fast=False):
+            return []
+
+    p = MinimalProvider()
+    assert p.name == "unknown"
+    assert p.display_name == "Unknown Provider"
+    assert p.capabilities == frozenset()
+    assert p.expected_cadence_minutes is None
+
+
+def test_existing_gbp_provider_remains_compatible_with_the_new_additive_attributes():
+    """Phase 3 Milestone 2's additive Provider changes must not require any
+    change to the already-shipped GBPProvider beyond declaring its own
+    capabilities/cadence -- it must still instantiate, still be a Provider,
+    and its identity attributes must reflect what google_api.py/provider_gbp.py
+    actually implement today."""
+    from provider_gbp import GBPProvider
+    provider = GBPProvider()
+    assert isinstance(provider, Provider)
+    assert provider.name == "gbp"
+    assert provider.display_name == "Google Business Profile"
+    assert provider.capabilities == frozenset({CAP_READ_REVIEWS, CAP_REPLY})
+    assert provider.expected_cadence_minutes == 15
+
+
 def main():
     run("ProviderError defaults (status=None, retryable=False)", test_provider_error_defaults)
     run("ProviderError carries status and retryable through", test_provider_error_carries_status_and_retryable)
@@ -188,6 +276,11 @@ def main():
     run("Provider (the ABC itself) cannot be instantiated directly", test_provider_cannot_be_instantiated_directly)
     run("a Provider subclass missing an abstract method cannot be instantiated", test_incomplete_provider_subclass_cannot_be_instantiated)
     run("a complete Provider subclass instantiates; reply_to_review() defaults to NotImplementedError", test_complete_provider_subclass_can_be_instantiated_and_reply_defaults_to_not_implemented)
+    run("ProviderParsingError is a ProviderError (Phase 3 Milestone 2)", test_provider_parsing_error_is_a_provider_error)
+    run("Provider.capabilities defaults to an empty frozenset", test_provider_capabilities_default_to_empty_frozenset)
+    run("capabilities are declared and checkable via `CAP_X in provider.capabilities`", test_provider_capabilities_are_declared_and_checkable_by_a_generic_caller)
+    run("identity attributes (name/display_name/capabilities/cadence) are additive with safe defaults", test_provider_identity_attributes_are_additive_with_safe_defaults)
+    run("existing GBPProvider remains compatible with the new additive attributes", test_existing_gbp_provider_remains_compatible_with_the_new_additive_attributes)
 
     print()
     if all(results):

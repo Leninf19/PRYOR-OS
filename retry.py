@@ -18,8 +18,9 @@ express on its own:
     google_api.py this is where the access token actually gets refreshed on
     a 401 before the next attempt.
 """
+import asyncio
 import time
-from typing import Callable, Optional, TypeVar
+from typing import Awaitable, Callable, Optional, TypeVar
 
 from provider_base import ProviderError
 
@@ -65,3 +66,40 @@ def with_retry(
     if last_err is not None:
         raise last_err
     raise RuntimeError("with_retry exhausted retries with no captured error")
+
+
+async def with_retry_async(
+    fn: Callable[[], Awaitable[T]],
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_backoff: float = DEFAULT_BASE_BACKOFF_SECONDS,
+    is_retryable: Callable[[Exception], bool] = _default_is_retryable,
+    retry_after_seconds: Callable[[Exception], Optional[float]] = lambda e: None,
+    on_retry: Optional[Callable[[Exception, int], None]] = None,
+) -> T:
+    """Async twin of with_retry() (Phase 3 Milestone 2, added for
+    ScraperProvider, whose Playwright calls are async-only). Identical
+    semantics -- same attempt count, same exponential formula, same
+    MAX_SLEEP_SECONDS cap, same retry_after_seconds/on_retry hooks -- just
+    `await fn()` and `await asyncio.sleep(...)` instead of calling fn()
+    synchronously and blocking the event loop with time.sleep(). with_retry()
+    itself is completely unchanged by this addition, so google_api.py's
+    behavior (and GBPProvider's, which goes through it) is unaffected."""
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            return await fn()
+        except Exception as e:
+            if not is_retryable(e):
+                raise
+            last_err = e
+            if on_retry:
+                on_retry(e, attempt)
+            wait = retry_after_seconds(e)
+            if wait is None:
+                wait = base_backoff * (2 ** attempt)
+            await asyncio.sleep(min(wait, MAX_SLEEP_SECONDS))
+
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("with_retry_async exhausted retries with no captured error")

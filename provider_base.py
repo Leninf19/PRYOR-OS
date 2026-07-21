@@ -52,6 +52,27 @@ class ProviderConfigError(ProviderError):
     pattern (google_api.py's is_configured(), gbp_sync.py's usage of it)."""
 
 
+class ProviderParsingError(ProviderError):
+    """The provider was reachable but its response could not be parsed or
+    had an unexpected structure (Phase 3 Milestone 2). No HTTP-API provider
+    has hit this category yet -- a JSON parse failure would already surface
+    as a different, generic error -- but a browser-driven provider (the
+    scraper, and any future Yelp/Facebook/TripAdvisor-style scraper) can
+    genuinely load a page successfully and still fail to find what it
+    expects on it (markup changed, or the page isn't what was searched
+    for). Never retryable within the same attempt: retrying immediately
+    against an unrecognized page structure won't help."""
+
+
+# Capability identifiers (Phase 3 Milestone 2). Plain strings, not an enum,
+# matching this module's existing style -- checked via `CAP_X in
+# provider.capabilities`. Declared once here so every Provider references
+# the same literal value instead of each spelling it out independently.
+CAP_READ_REVIEWS = "read_reviews"
+CAP_REPLY = "reply"
+CAP_DELETE_REPLY = "delete_reply"  # declared for forward-compatibility; no provider implements it yet
+
+
 @dataclass
 class ProviderLocation:
     """A location as reported by a provider. `external_id` is the
@@ -107,8 +128,25 @@ class ProviderReview:
 
 class Provider(ABC):
     """The common contract. `name` is the short slug written to
-    scraper_runs.provider (e.g. 'gbp', 'scraper', 'mock')."""
+    scraper_runs.provider (e.g. 'gbp', 'scraper', 'mock'); `display_name` is
+    the human-readable label a future UI (e.g. the Provider Health Center)
+    would show instead of the raw slug.
+
+    `capabilities` (Phase 3 Milestone 2) declares what this provider can
+    actually do, as a set of the CAP_* constants above -- e.g. a future UI
+    can check `CAP_REPLY in provider.capabilities` instead of inferring
+    support by catching NotImplementedError from reply_to_review(). Default
+    empty: a provider that can only read reviews (like the scraper) simply
+    never adds anything beyond CAP_READ_REVIEWS.
+
+    `expected_cadence_minutes` (Phase 3 Milestone 2) declares how often this
+    provider is expected to complete a run, for the shared health model in
+    provider_health.py. `None` means "no fixed expectation" (e.g. a Mock
+    Provider run on demand) -- the health model treats that as never stale."""
     name: str = "unknown"
+    display_name: str = "Unknown Provider"
+    capabilities: frozenset[str] = frozenset()
+    expected_cadence_minutes: Optional[int] = None
 
     @abstractmethod
     def is_configured(self) -> bool:

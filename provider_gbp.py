@@ -20,7 +20,10 @@ this is a deliberate design choice to preserve gbp_sync.py's existing
 external behavior byte-for-byte, not an arbitrary exception vs. empty-list
 preference.
 """
-from provider_base import Provider, ProviderLocation, ProviderReview, ProviderAuthError, ProviderConfigError
+from provider_base import (
+    Provider, ProviderLocation, ProviderReview, ProviderAuthError, ProviderConfigError,
+    CAP_READ_REVIEWS, CAP_REPLY,
+)
 import google_api as ga
 
 # Moved here from gbp_sync.py (Phase 3 Milestone 1) along with the review
@@ -35,6 +38,16 @@ STAR_MAP = {"ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5}
 
 class GBPProvider(Provider):
     name = "gbp"
+    display_name = "Google Business Profile"
+    # Phase 3 Milestone 2: matches what google_api.py/this file actually
+    # implement today -- reply_to_review() below calls the real Google API.
+    # No separate "edit reply" capability: Google's reply endpoint is a PUT
+    # (upsert), so editing is the same operation as replying, not distinct.
+    capabilities = frozenset({CAP_READ_REVIEWS, CAP_REPLY})
+    # Matches critical_alert_check.py's actual current invocation cadence
+    # (the 15-minute cron) -- the only thing actually running today, since
+    # a full sync is blocked on Google's quota issue.
+    expected_cadence_minutes = 15
 
     def is_configured(self) -> bool:
         return ga.is_configured()
