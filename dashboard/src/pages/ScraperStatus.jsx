@@ -6,10 +6,12 @@ import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import DataValidation, { buildReport } from './DataValidation.jsx'
+import ProviderHealth from './ProviderHealth.jsx'
 
 const SUBTABS = [
   { id: 'runs',       label: 'Scrape Runs' },
   { id: 'validation', label: 'Data Validation' },
+  { id: 'health',     label: 'Provider Health' },
 ]
 
 // The pipeline has two writers with two different status vocabularies for
@@ -226,6 +228,7 @@ export default function ScraperStatus({ allReviews }) {
 
       {tab === 'runs'       && <ScraperRuns />}
       {tab === 'validation' && <DataValidation allReviews={allReviews} />}
+      {tab === 'health'     && <ProviderHealth />}
     </div>
   )
 }
