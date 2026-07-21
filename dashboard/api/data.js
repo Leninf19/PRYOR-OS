@@ -57,6 +57,7 @@ const EXACT_ALLOWLIST = new Set([
   'validation.json',
   'scraper-status.json',
   'gbp-sync.json',
+  'provider-health.json',
   'analytics/kpis.json',
   'analytics/monthly-trend.json',
   'analytics/location-stats.json',

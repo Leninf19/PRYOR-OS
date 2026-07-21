@@ -386,9 +386,9 @@ const DATA_FILE_REGISTRY = [
   },
   {
     category: 'operational / meta (no location dimension)',
-    files: ['meta.json', 'action-items.json', 'validation.json', 'scraper-status.json', 'gbp-sync.json'],
+    files: ['meta.json', 'action-items.json', 'validation.json', 'scraper-status.json', 'gbp-sync.json', 'provider-health.json'],
     owner: 'yes', marketing: 'yes', location_manager: 'blocked (permanent)', read_only: 'blocked (permanent)',
-    accessModel: 'not one of the architecture\'s 11 named categories -- these are operational/meta files (location directory, validation status, scraper/sync state) with no location dimension at all. Documented explicitly here so the registry accounts for every real allowlisted file rather than silently omitting five of them.',
+    accessModel: 'not one of the architecture\'s 11 named categories -- these are operational/meta files (location directory, validation status, scraper/sync state) with no location dimension at all. Documented explicitly here so the registry accounts for every real allowlisted file rather than silently omitting them. provider-health.json (Phase 3 Milestone 5, a completely separate numbering track from this file\'s own "Milestone 5" in SECTION 7B below -- that one is Phase 2\'s per-location analytics work) was added to data.js\'s allowlist with the exact same owner/marketing-only access as its scraper-status.json/gbp-sync.json siblings -- no new access model needed.',
     milestone: 6,
   },
   {

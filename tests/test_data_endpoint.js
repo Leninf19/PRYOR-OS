@@ -264,6 +264,47 @@ async function testMalformedJsonArtifactReturns500NotCorruptData() {
   }
 }
 
+async function testProviderHealthIsAllowlistedForOwner() {
+  // Phase 3 Milestone 5: provider-health.json didn't exist in the
+  // allowlist before this milestone -- write a real temporary fixture
+  // (mirrors testMalformedJsonArtifactReturns500NotCorruptData's
+  // write-then-restore pattern) since no pipeline run has generated one in
+  // this checkout, then confirm the new allowlist entry actually serves it.
+  await setDirectory()
+  const token = await ownerToken()
+  const fixturePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dashboard', 'private-data', 'provider-health.json')
+  const original = await readFile(fixturePath, 'utf-8').catch(() => null)
+  await writeFile(fixturePath, JSON.stringify({
+    gbp: { state: 'offline', reason: 'gbp is not configured' },
+    scraper: { state: 'healthy', reason: 'most recent run succeeded and is within the expected cadence' },
+  }), 'utf-8')
+  try {
+    const res = await invoke(['provider-health.json'], token)
+    assert(res.statusCode === 200, `expected 200, got ${res.statusCode}, body=${JSON.stringify(res.body)}`)
+    const parsed = JSON.parse(res.body)
+    assert(parsed.scraper?.state === 'healthy', 'provider-health.json payload is served through unchanged')
+  } finally {
+    if (original !== null) await writeFile(fixturePath, original, 'utf-8')
+    else await unlink(fixturePath).catch(() => {})
+  }
+}
+
+async function testProviderHealthStillRequiresAuth() {
+  // Confirms the new allowlist entry didn't bypass requireAuth() -- an
+  // unauthenticated request for it must 401 exactly like every other file.
+  await setDirectory()
+  const fixturePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dashboard', 'private-data', 'provider-health.json')
+  const original = await readFile(fixturePath, 'utf-8').catch(() => null)
+  await writeFile(fixturePath, JSON.stringify({ gbp: { state: 'offline', reason: 'x' } }), 'utf-8')
+  try {
+    const res = await invoke(['provider-health.json'], null)
+    assert(res.statusCode === 401, `expected 401 for unauthenticated request, got ${res.statusCode}`)
+  } finally {
+    if (original !== null) await writeFile(fixturePath, original, 'utf-8')
+    else await unlink(fixturePath).catch(() => {})
+  }
+}
+
 async function testContentTypeIsJson() {
   await setDirectory()
   const token = await ownerToken()
@@ -301,6 +342,8 @@ async function main() {
   await run('empty/missing catch-all path -> rejected', testEmptyCatchAllPathRejected)
   await run('nonexistent but allowlist-pattern-shaped path -> 404 (same as any other unknown file)', testNonexistentAllowlistShapedPathReturns404)
   await run('a corrupted/malformed JSON artifact on disk -> safe 500, never served as-is', testMalformedJsonArtifactReturns500NotCorruptData)
+  await run('provider-health.json is allowlisted and served to an Owner', testProviderHealthIsAllowlistedForOwner)
+  await run('provider-health.json still requires authentication', testProviderHealthStillRequiresAuth)
   await run('response Content-Type is application/json', testContentTypeIsJson)
   await run('no public/CDN caching directive is ever present', testNoPublicOrCdnCacheDirectives)
 
