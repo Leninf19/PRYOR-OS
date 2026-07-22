@@ -31,6 +31,7 @@ const TESTS = [
   'test_provider_health_ui.js',
   'test_account_context.js',
   'test_action_workspace_service.js',
+  'test_action_center_collaboration.js',
   'test_priority_digest.js',
   'test_executive_intelligence_center_ui.js',
   'test_executive_intelligence_prefetch.js',

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
@@ -8,6 +8,8 @@ import ErrorState from '../components/ui/ErrorState.jsx'
 import Tabs from '../components/ui/Tabs.jsx'
 import { useActionCenter, useComplaintIntel } from '../hooks/useIntelligence.js'
 import { useActionWorkspace } from '../hooks/useActionWorkspace.js'
+import { useAccounts } from '../hooks/useAccounts.js'
+import { useAccount } from '../components/AuthGate.jsx'
 import { getUniqueLocations } from '../utils/dataUtils.js'
 
 const PRIORITY_VARIANT = { Critical: 'danger', High: 'danger', Medium: 'warning', Low: 'neutral' }
@@ -28,6 +30,24 @@ const STATUS_VARIANT = {
 }
 const STATUS_PROGRESS = {
   New: 0, Assigned: 20, 'In Progress': 50, Monitoring: 80, Completed: 100, Dismissed: 0,
+}
+
+// A task counts as "open" (still owed work) unless it's been Completed or
+// explicitly Dismissed -- used by both the Overdue filter and the workload
+// summary so the two stay consistent with each other.
+const OPEN_STATUSES = new Set(['New', 'Assigned', 'In Progress', 'Monitoring'])
+
+function displayNameFor(accounts, userId) {
+  return accounts?.find(a => a.userId === userId)?.displayName ?? userId
+}
+
+function todayISODate() {
+  return new Date().toISOString().slice(0, 10)
+}
+
+function isOverdue(entry) {
+  if (!entry?.dueDate || !OPEN_STATUSES.has(entry.status ?? 'New')) return false
+  return entry.dueDate < todayISODate()
 }
 
 // Extracts the id of the complaint/praise category this action is about
@@ -71,11 +91,12 @@ function OutcomeTracker({ actionId, entry, complaintIntel }) {
   )
 }
 
-function ActionCard({ a, entry, onUpdate, locations, complaintIntel }) {
+function ActionCard({ a, entry, onUpdate, locations, complaintIntel, accounts, currentUserId }) {
   const [open, setOpen] = useState(false)
   const hasReviews = a.supportingReviews?.length > 0
   const status = entry?.status ?? 'New'
   const progress = STATUS_PROGRESS[status] ?? 0
+  const overdue = isOverdue(entry)
 
   function handleStatusChange(next) {
     const patch = { status: next }
@@ -90,6 +111,11 @@ function ActionCard({ a, entry, onUpdate, locations, complaintIntel }) {
     onUpdate(a.id, patch, `Status → ${next}`)
   }
 
+  function handleAssignedToChange(userId) {
+    const label = userId ? displayNameFor(accounts, userId) : 'Unassigned'
+    onUpdate(a.id, { assignedTo: userId || null }, `Assigned to ${label}`)
+  }
+
   return (
     <Card className="p-5">
       <div className="flex items-start justify-between gap-3">
@@ -99,6 +125,8 @@ function ActionCard({ a, entry, onUpdate, locations, complaintIntel }) {
             <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>{a.title}</p>
             <Badge variant={PRIORITY_VARIANT[a.priority] ?? 'neutral'}>{a.priority}</Badge>
             <Badge variant={STATUS_VARIANT[status]}>{status}</Badge>
+            {overdue && <Badge variant="danger">Overdue</Badge>}
+            {entry?.assignedTo === currentUserId && <Badge variant="info">Assigned to you</Badge>}
           </div>
           <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)' }}>{a.reason}</p>
         </div>
@@ -146,13 +174,22 @@ function ActionCard({ a, entry, onUpdate, locations, complaintIntel }) {
       <OutcomeTracker actionId={a.id} entry={entry} complaintIntel={complaintIntel} />
 
       {/* Task management */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4 pt-4 border-t" style={{ borderColor: 'var(--color-border)' }}>
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mt-4 pt-4 border-t" style={{ borderColor: 'var(--color-border)' }}>
         <div>
           <label className="text-[9px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>Status</label>
           <select value={status} onChange={e => handleStatusChange(e.target.value)}
                   className="w-full text-xs px-2 py-2 rounded-lg border focus:outline-none"
                   style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}>
             {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="text-[9px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>Assigned To</label>
+          <select value={entry?.assignedTo ?? ''} onChange={e => handleAssignedToChange(e.target.value)}
+                  className="w-full text-xs px-2 py-2 rounded-lg border focus:outline-none"
+                  style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}>
+            <option value="">Unassigned</option>
+            {(accounts ?? []).map(acc => <option key={acc.userId} value={acc.userId}>{acc.displayName}</option>)}
           </select>
         </div>
         <div>
@@ -201,6 +238,7 @@ function ActionCard({ a, entry, onUpdate, locations, complaintIntel }) {
               <li key={i} className="text-xs flex items-baseline gap-2">
                 <span style={{ color: 'var(--color-text-3)' }}>{new Date(h.at).toLocaleString()}</span>
                 <span style={{ color: 'var(--color-text-1)' }}>{h.action}</span>
+                {h.by && <span style={{ color: 'var(--color-text-3)' }}>· {h.by}</span>}
               </li>
             ))}
           </ul>
@@ -238,16 +276,42 @@ export default function ActionCenter() {
   const { data: actions, isLoading, isError, refetch } = useActionCenter()
   const { data: complaintIntel } = useComplaintIntel()
   const { data: ws, setRecord } = useActionWorkspace()
+  const { data: accounts } = useAccounts()
+  const account = useAccount()
   const { allReviews = [] } = useOutletContext() ?? {}
   const [tab, setTab] = useState('All')
   const [statusFilter, setStatusFilter] = useState('All')
+  const [mineOnly, setMineOnly] = useState(false)
+  const [overdueOnly, setOverdueOnly] = useState(false)
 
   const locations = getUniqueLocations(allReviews)
 
   const byPriority = tab === 'All' ? (actions ?? []) : (actions ?? []).filter(a => a.priority === tab)
-  const visible = statusFilter === 'All'
+  const byStatus = statusFilter === 'All'
     ? byPriority
     : byPriority.filter(a => (ws[a.id]?.status ?? 'New') === statusFilter)
+  const visible = byStatus.filter(a => {
+    if (mineOnly && ws[a.id]?.assignedTo !== account?.userId) return false
+    if (overdueOnly && !isOverdue(ws[a.id])) return false
+    return true
+  })
+
+  // Open (not Completed/Dismissed) item count per assignee, across every
+  // current recommendation regardless of the active tab/filter -- so the
+  // summary always reflects the whole board, not just what's on screen.
+  const workload = useMemo(() => {
+    const counts = {}
+    for (const a of actions ?? []) {
+      const entry = ws[a.id]
+      if (!entry?.assignedTo || !OPEN_STATUSES.has(entry.status ?? 'New')) continue
+      counts[entry.assignedTo] ??= { open: 0, overdue: 0 }
+      counts[entry.assignedTo].open += 1
+      if (isOverdue(entry)) counts[entry.assignedTo].overdue += 1
+    }
+    return Object.entries(counts)
+      .map(([userId, c]) => ({ userId, ...c }))
+      .sort((x, y) => y.open - x.open)
+  }, [actions, ws])
 
   return (
     <div className="space-y-6 max-w-[900px]">
@@ -258,9 +322,30 @@ export default function ActionCenter() {
         </p>
       </div>
 
+      {workload.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[9px] font-bold uppercase tracking-widest" style={{ color: 'var(--color-text-3)' }}>Workload</span>
+          {workload.map(w => (
+            <Badge key={w.userId} variant={w.overdue > 0 ? 'danger' : 'neutral'}>
+              {displayNameFor(accounts, w.userId)}: {w.open} open{w.overdue > 0 ? `, ${w.overdue} overdue` : ''}
+            </Badge>
+          ))}
+        </div>
+      )}
+
       <div className="flex flex-col gap-2">
         <Tabs tabs={TABS} value={tab} onChange={setTab} size="sm" />
         <Tabs tabs={['All', ...STATUSES]} value={statusFilter} onChange={setStatusFilter} size="sm" />
+        <div className="flex items-center gap-2">
+          <button type="button" onClick={() => setMineOnly(v => !v)}
+                  className={`badge ${mineOnly ? 'badge-accent' : 'badge-neutral'}`}>
+            Mine
+          </button>
+          <button type="button" onClick={() => setOverdueOnly(v => !v)}
+                  className={`badge ${overdueOnly ? 'badge-danger' : 'badge-neutral'}`}>
+            Overdue
+          </button>
+        </div>
       </div>
 
       {isError ? (
@@ -269,12 +354,13 @@ export default function ActionCenter() {
         <div className="space-y-3">{[1,2,3,4].map(i => <Skeleton key={i} className="h-48 rounded-2xl" />)}</div>
       ) : !visible?.length ? (
         <EmptyState icon="✓" title="No recommendations in this filter"
-                    body="Try a different priority or status filter, or run the analytics pipeline to refresh recommendations." />
+                    body="Try a different priority, status, or Mine/Overdue filter, or run the analytics pipeline to refresh recommendations." />
       ) : (
         <div className="space-y-3">
           {visible.map(a => (
             <ActionCard key={a.id} a={a} entry={ws[a.id]} onUpdate={setRecord}
-                        locations={locations} complaintIntel={complaintIntel} />
+                        locations={locations} complaintIntel={complaintIntel}
+                        accounts={accounts} currentUserId={account?.userId} />
           ))}
         </div>
       )}
