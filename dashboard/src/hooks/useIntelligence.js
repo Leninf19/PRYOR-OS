@@ -51,6 +51,11 @@ export function useGlobalPrefetch() {
       ['competitor-intel',  'intelligence/competitive-intelligence.json'],
       ['action-items',      'action-items.json'],
       ['meta',              'meta.json'],
+      // Phase 3 Milestone 6 (Executive Intelligence Center): its priority
+      // digest needs these two on first load just like every other page's
+      // data, so it isn't the one page without an instant-load cache hit.
+      ['action-center',      'intelligence/action-center.json'],
+      ['operations-impact',  'intelligence/operations-impact.json'],
     ]
     files.forEach(([key, path]) => {
       qc.prefetchQuery({

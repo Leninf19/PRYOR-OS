@@ -28,6 +28,7 @@ const TESTS = [
   'test_provider_health_ui.js',
   'test_priority_digest.js',
   'test_executive_intelligence_center_ui.js',
+  'test_executive_intelligence_prefetch.js',
 ]
 
 const results = {}
