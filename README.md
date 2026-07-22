@@ -62,6 +62,7 @@ Two different patterns, used for different reasons:
     ├── reviews.db, reviews.csv   # committed pipeline state (see Known limitations)
     ├── api/google/               # Vercel serverless functions: OAuth, status, publish,
     │                             # test-connection, trigger-sync (see below)
+    ├── api/actions/[action].js   # Action Accountability Store: GET list / POST update (see above)
     ├── public/data/              # static JSON the SPA fetches — export_chunks.py's output
     └── src/
         ├── pages/                # one file per route
@@ -153,6 +154,26 @@ If you use `vercel env pull` to test any of this locally, it writes every projec
 
 `dashboard/public/` is served by Vercel as static assets to anyone, unauthenticated, forever. **No sensitive operational data may ever be written there** — this includes raw reviews, manager investigations, complaint cases, internal notes, assignments, manager responses, audit history, unpublished reply drafts, AI-generated internal recommendations, account/user information, or any integration status containing private identifiers. `export_chunks.py` writes to `dashboard/private-data/` instead, reachable only through the authenticated `dashboard/api/data/[...path].js` endpoint. When the future Manager Complaint Investigation feature is built, its data must follow the same rule from day one.
 
+## Action Accountability Store
+
+Action Center's task-tracking state (status, assignee, due date, notes, history) is collaborative, shared state — not analytics — and is deliberately isolated from the review-sync pipeline: **no `reviews.db`/SQLite/`analytics_cache` schema change, no `refresh_analytics.py`/`export_chunks.py` change, no provider change**. It lives entirely in Upstash Redis, the same Redis instance already used for rate limiting (`_lib/rateLimit.js`), via one Redis hash (`action_workspace:v1`, one field per action-item id).
+
+- **`dashboard/api/_lib/actionStore.js`** — the Redis seam (`getAllActions()`/`upsertAction()`), same role as `accountStore.js`'s seam over the account directory. Never fails open: an unconfigured or unreachable store always throws (mapped to a 503 by the endpoint), in every environment — unlike rate limiting's dev/test fallback, there is no safe fake success for a write.
+- **`dashboard/api/actions/[action].js`** — the one consolidated serverless function (`GET /api/actions/list`, `POST /api/actions/update`), following the same one-file-many-actions pattern `session/[action].js` already uses to stay under Vercel's function-count ceiling. Same read/write roles as the AI Action Center already had (`owner`, `marketing`) — this does **not** introduce location-scoped authorization; see "Location authorization strategy" above, which is still the blocker for `location_manager` accounts.
+- **`GET /api/session/accounts`** — the reusable identity-directory endpoint (added to the existing `session/[action].js`, not a new file), returning every non-disabled account's safe identity (no `passwordHash`). Deliberately on the identity layer rather than owned by Action Center, so future features (workload reporting, notifications, settings/manager-administration, audit-log attribution) reuse this same endpoint instead of each growing their own account-listing logic.
+
+**Task record shape** (server-authoritative fields are stamped only by `actionStore.js`, from the authenticated caller and the server clock — a client-supplied `createdBy`/`createdAt`/`updatedBy`/`updatedAt`/`history`/`id` in a patch is rejected outright, not silently stripped):
+
+```
+{ id, status, assignedTo, assignedLocation, assignedDepartment, dueDate, notes,
+  outcomeSnapshot, history: [{ at, by, action }],
+  createdBy, createdAt, updatedBy, updatedAt }
+```
+
+`dashboard/src/services/actionWorkspaceService.js` is the exact seam its own original header comment called out as swappable — it now calls this API instead of `localStorage`, with `useActionWorkspace.js`'s public shape (and every `ActionCenter.jsx` caller) unchanged. `dashboard/src/utils/actionWorkspaceUtils.js` holds the shared `isOverdue()`/`OPEN_STATUSES` logic so Action Center's own Overdue filter and the Executive Intelligence Center's "assigned to you and overdue" priority source can never drift apart.
+
+Explicitly deferred (future milestones, not this one): `location_manager`-scoped task visibility, email/digest reminders for overdue tasks (would require a Python-side Redis client and cross the pipeline's batch/email boundary), and promoting the Executive Intelligence Center to the landing page.
+
 ## Deployment
 
 - Dashboard: Vercel, auto-deployed on every push to `dashboard/**` (`deploy-frontend.yml`) and again at the end of every pipeline run (`update-reviews.yml`), since a pipeline run changes the JSON the dashboard serves.
@@ -221,11 +242,12 @@ Settings → Google Integration now shows: connection state, linked account ID, 
 - **Manager Performance Score is a proxy, not a real metric.** The review schema has no manager field — it's aggregate staff-name-mention sentiment, explicitly labeled as such in its `explanation` string.
 - **Single-tenant, no authentication.** One account, one dataset, no login. Any multi-restaurant-group or role-based-access use would need real backend work.
 - **Some AI prompts hardcode "Los Tres Amigos"** by name (pre-existing, in `ai_engine.py`) rather than reading the brand list dynamically.
-- **Workspace state (review notes/assignments/action statuses) lives in `localStorage`**, not a shared backend — it doesn't sync between devices or team members. Isolated behind a service-layer seam (`dashboard/src/services/*Service.js`) specifically so it can be swapped for a real backend later without touching page components.
+- **Review workspace state (notes/assignments/status on individual reviews, `reviewWorkspaceService.js`) still lives in `localStorage`**, not a shared backend — it doesn't sync between devices or team members. Action Center's own task-tracking workspace (`actionWorkspaceService.js`) no longer has this limitation as of the Action Accountability Store (see above) — it's now Redis-backed and collaborative. Both remain isolated behind the same service-layer seam (`dashboard/src/services/*Service.js`) so the review workspace can be migrated the same way later without touching page components.
 - **`dashboard/reviews.db` (37MB+) and `dashboard/reviews.csv` are committed to git and rewritten every ~6 hours**, because GitHub Actions runners are ephemeral and the repo is currently the only persistence layer between runs. This drives unbounded `.git` growth. Recommended options for a future fix (not yet actioned, since it touches the live CI pipeline and needs its own sign-off): move to Git LFS, move the DB to external storage (Vercel Blob / a hosted SQLite service like Turso) and stop committing it, or periodically squash git history.
 
 ## Future roadmap
 
-- Real backend + auth, if/when workspace state needs to be shared across a team instead of per-browser.
+- Migrate the remaining `localStorage`-backed workspace (`reviewWorkspaceService.js`) to a shared backend the same way the Action Accountability Store did for Action Center.
+- Location-scoped task visibility for `location_manager` accounts once the "Location authorization strategy" prerequisite lands.
 - Resolve the `reviews.db` git-bloat tradeoff above.
 - List/table virtualization if review volume grows enough that the current pagination-based approach stops being sufficient.
