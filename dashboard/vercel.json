@@ -5,6 +5,9 @@
   "functions": {
     "api/data.js": {
       "includeFiles": "private-data/**"
+    },
+    "api/actions/[action].js": {
+      "includeFiles": "private-data/location-contacts.json"
     }
   },
   "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }]

@@ -12,6 +12,11 @@ scraped_reviews.csv
 scraped_missing.csv
 gbp_import_report.json
 
+# Local input file for set_location_contacts.py --from-csv -- real contact
+# emails belong in dashboard/reviews.db (already committed, same as every
+# other location field), never as a loose plaintext scratch file in git.
+location_contacts.csv
+
 # Node
 node_modules/
 dashboard/node_modules/

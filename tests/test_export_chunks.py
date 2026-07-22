@@ -458,6 +458,73 @@ def test_export_location_detail_reviews_includes_locationId():
         assert payload[0]["locationId"] == loc_id
 
 
+# --- restaurant bad-review email workflow: hasContact + location-contacts.json --
+
+def test_export_meta_has_contact_true_when_configured_and_active():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Contact Configured Location")
+        db.set_location_contact(ex.conn, loc_id, "manager@example.com", "Jane", active=True)
+        ex.conn.commit()
+        locations = _locations_dict(ex.conn)
+        export_chunks.export_meta(ex.conn, locations)
+        meta = ex.read_json("meta.json")
+        entry = next(l for l in meta["locations"] if l["locationId"] == loc_id)
+        assert entry["hasContact"] is True
+        assert "email" not in entry and "contact_email" not in entry, "meta.json must never carry the actual contact email"
+
+
+def test_export_meta_has_contact_false_when_unconfigured():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "No Contact Location")
+        locations = _locations_dict(ex.conn)
+        export_chunks.export_meta(ex.conn, locations)
+        meta = ex.read_json("meta.json")
+        entry = next(l for l in meta["locations"] if l["locationId"] == loc_id)
+        assert entry["hasContact"] is False
+
+
+def test_export_meta_has_contact_false_when_inactive():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Inactive Contact Location")
+        db.set_location_contact(ex.conn, loc_id, "manager@example.com", None, active=False)
+        ex.conn.commit()
+        locations = _locations_dict(ex.conn)
+        export_chunks.export_meta(ex.conn, locations)
+        meta = ex.read_json("meta.json")
+        entry = next(l for l in meta["locations"] if l["locationId"] == loc_id)
+        assert entry["hasContact"] is False, "an inactive contact must not count as configured"
+
+
+def test_export_location_contacts_includes_only_configured_active_locations():
+    with ScratchExport() as ex:
+        configured_id = _add_location(ex.conn, "Configured")
+        _add_location(ex.conn, "Unconfigured")
+        inactive_id = _add_location(ex.conn, "Inactive Contact")
+        db.set_location_contact(ex.conn, configured_id, "manager@example.com", "Jane", active=True)
+        db.set_location_contact(ex.conn, inactive_id, "old@example.com", None, active=False)
+        ex.conn.commit()
+        locations = _locations_dict(ex.conn)
+
+        export_chunks.export_location_contacts(locations)
+        contacts = ex.read_json("location-contacts.json")
+
+        assert str(configured_id) in contacts
+        assert contacts[str(configured_id)] == {"email": "manager@example.com", "name": "Jane"}
+        assert str(inactive_id) not in contacts, "an inactive contact must be excluded entirely"
+        assert len(contacts) == 1, f"only the one configured+active location should appear, got {contacts}"
+
+
+def test_export_location_contacts_keyed_by_location_id_string():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Keyed Location")
+        db.set_location_contact(ex.conn, loc_id, "manager@example.com", None)
+        ex.conn.commit()
+        locations = _locations_dict(ex.conn)
+        export_chunks.export_location_contacts(locations)
+        contacts = ex.read_json("location-contacts.json")
+        assert str(loc_id) in contacts, "keys must be the canonical numeric locationId (as a string, for JSON object keys)"
+
+
 def main():
     run("review_to_dict() includes a numeric locationId matching locations.id", test_review_to_dict_includes_locationId)
     run("export_meta(): locationId matches the DB id, not the sorted list position", test_export_meta_locationId_matches_db_id_not_sort_position)
@@ -479,6 +546,11 @@ def main():
     run("export_intelligence(): does not clobber an already-present locationId", test_export_intelligence_does_not_clobber_existing_locationId)
     run("export_intelligence(): a stale slug with no matching location does not crash or get a guessed id", test_export_intelligence_handles_stale_slug_without_crashing)
     run("export_location_detail_reviews(): includes locationId (the live per-location review export)", test_export_location_detail_reviews_includes_locationId)
+    run("export_meta(): hasContact is true for a configured, active contact", test_export_meta_has_contact_true_when_configured_and_active)
+    run("export_meta(): hasContact is false when unconfigured", test_export_meta_has_contact_false_when_unconfigured)
+    run("export_meta(): hasContact is false when the contact is inactive", test_export_meta_has_contact_false_when_inactive)
+    run("export_location_contacts(): includes only configured+active locations, keyed by locationId", test_export_location_contacts_includes_only_configured_active_locations)
+    run("export_location_contacts(): keys are the canonical numeric locationId as a string", test_export_location_contacts_keyed_by_location_id_string)
 
     print()
     if all(results):

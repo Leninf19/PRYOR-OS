@@ -177,7 +177,7 @@ def init_schema(conn: sqlite3.Connection):
 # doesn't control which migrations run. It just lets you tell at a glance,
 # from the DB file alone, whether it's seen the latest migration batch --
 # `sqlite3 reviews.db "PRAGMA user_version"` -- without reading this file.
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 def _migrate_schema(conn: sqlite3.Connection):
@@ -226,6 +226,18 @@ def _migrate_schema(conn: sqlite3.Connection):
         # free-text error_message (not a replacement): '429'|'403'|'404'|
         # '5xx'|'network'|'blocked'|NULL.
         "ALTER TABLE scraper_run_locations ADD COLUMN provider_error_code TEXT",
+        # Restaurant bad-review email workflow (recovery-audit milestone):
+        # the authoritative location-to-contact-email mapping. NULL
+        # contact_email (every pre-existing row, and any location that has
+        # never had a contact entered) means "not configured" -- the send
+        # feature must disable sending for that location rather than ever
+        # inventing/guessing a recipient. contact_active is a separate flag
+        # from locations.is_active: a location can be actively operating
+        # while its on-file contact is temporarily stale (staff turnover)
+        # without touching the location's own active status.
+        "ALTER TABLE locations ADD COLUMN contact_email TEXT",
+        "ALTER TABLE locations ADD COLUMN contact_name TEXT",
+        "ALTER TABLE locations ADD COLUMN contact_active INTEGER NOT NULL DEFAULT 1",
     ]
     for sql in migrations:
         try:
@@ -240,6 +252,32 @@ def _migrate_schema(conn: sqlite3.Connection):
     )
 
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+# Same shape as dashboard/api/_lib/accounts.js's account-email validation --
+# kept as a literal duplicate (not a shared module) for the same reason
+# db.py's own BRANDS list duplicates dashboard/src/utils/dataUtils.js's:
+# there is no Python/JS shared-module boundary in this repo.
+_CONTACT_EMAIL_RE = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+
+
+def set_location_contact(conn, location_id: int, email: str, name: str | None = None, active: bool = True) -> None:
+    """Administrative helper for populating the restaurant bad-review email
+    workflow's location-to-contact mapping (recovery-audit milestone). Never
+    called by any scheduled pipeline stage -- a one-off action run by hand
+    (see set_location_contacts.py) or from a trusted admin script, never
+    from anything network-facing. Validates the email shape so a typo fails
+    loudly here rather than silently reaching export_chunks.py or the send
+    endpoint with a garbage recipient."""
+    if not _CONTACT_EMAIL_RE.match((email or "").strip()):
+        raise ValueError(f"invalid contact email for location {location_id}: {email!r}")
+    row = conn.execute("SELECT id FROM locations WHERE id = ?", (location_id,)).fetchone()
+    if not row:
+        raise ValueError(f"no location with id {location_id}")
+    conn.execute(
+        "UPDATE locations SET contact_email = ?, contact_name = ?, contact_active = ? WHERE id = ?",
+        (email.strip(), (name.strip() if name else None), 1 if active else 0, location_id),
+    )
 
 
 def review_content_hash(review_text: str, star_rating) -> str:

@@ -102,6 +102,14 @@ def export_meta(conn, locations: dict) -> None:
             "locationId": l["id"],
             "name": l["name"], "city": l["city"], "brand": l["brand"],
             "slug": slugify(l["name"]), "maps_url": l.get("maps_url") or "",
+            # Restaurant bad-review email workflow: a safe boolean signal
+            # only -- lets the UI disable "Send to Restaurant" for an
+            # unconfigured location without ever exposing the actual
+            # contact email address here. The real address is served only
+            # by dashboard/api/actions/[action].js's preview-review-email
+            # action, read server-side from location-contacts.json (never
+            # added to this file's own allowlist -- see that export).
+            "hasContact": bool(l.get("contact_email") and l.get("contact_active")),
         }
         for l in locations.values()
     ]
@@ -112,6 +120,33 @@ def export_meta(conn, locations: dict) -> None:
         "totalReviews": total,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
     })
+
+
+def export_location_contacts(locations: dict) -> None:
+    """Restaurant bad-review email workflow: the authoritative
+    location-id -> contact-email mapping, keyed by the same numeric
+    locations.id every review already carries as locationId.
+
+    Deliberately NEVER added to dashboard/api/data.js's EXACT_ALLOWLIST/
+    DYNAMIC_ALLOWLIST -- the browser must never be able to fetch this file
+    directly, authenticated or not (see README "Do not expose the full
+    contact directory"). Only dashboard/api/actions/[action].js reads it,
+    directly off disk server-side, exactly the way data.js itself reads
+    private-data files -- and it only ever returns the ONE resolved
+    recipient for the location being acted on, never the whole file.
+
+    Only includes locations with a configured, active contact -- an
+    unconfigured location is simply absent from this file, so a lookup
+    miss is the correct, unambiguous "not configured" signal downstream."""
+    out = {
+        str(loc_id): {
+            "email": l["contact_email"],
+            "name": l.get("contact_name") or None,
+        }
+        for loc_id, l in locations.items()
+        if l.get("contact_email") and l.get("contact_active")
+    }
+    write_json("location-contacts.json", out)
 
 
 def export_analytics_cache(conn) -> None:
@@ -591,6 +626,7 @@ def main():
 
     export_reviews_csv(conn)
     export_meta(conn, locations)
+    export_location_contacts(locations)
     export_analytics_cache(conn)
     export_location_analytics(conn, locations)  # Phase 2 Milestone 5 (Option C)
     export_location_detail_reviews(conn, locations)  # replaces export_reviews_by_location
