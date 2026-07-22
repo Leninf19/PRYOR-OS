@@ -1,5 +1,18 @@
+import { createContext, useContext } from 'react'
 import { useSession } from '../hooks/useSession.js'
 import Login from './Login.jsx'
+
+// The authenticated account (userId/email/role/locationIds/displayName from
+// GET /api/session/whoami), available to any component below AuthGate --
+// null only while unauthenticated, which never overlaps with children being
+// mounted at all (see below). Pages that need "who is logged in" (Action
+// Center's assignee picker/Mine filter, future workload reporting, etc.)
+// call useAccount() instead of re-fetching whoami themselves.
+const AccountContext = createContext(null)
+
+export function useAccount() {
+  return useContext(AccountContext)
+}
 
 // Sits above <App/> (see main.jsx) so no protected data request ever fires
 // before a session is confirmed: children (App, and everything it renders --
@@ -8,7 +21,7 @@ import Login from './Login.jsx'
 // useSession's SESSION_EXPIRED_EVENT listener flips status back to
 // 'unauthenticated', which unmounts App and remounts the login screen here.
 export default function AuthGate({ children }) {
-  const { status, login } = useSession()
+  const { status, account, login } = useSession()
 
   if (status === 'loading') {
     return (
@@ -28,5 +41,5 @@ export default function AuthGate({ children }) {
     return <Login onSuccess={login} />
   }
 
-  return children
+  return <AccountContext.Provider value={account}>{children}</AccountContext.Provider>
 }

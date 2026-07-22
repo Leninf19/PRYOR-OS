@@ -29,6 +29,7 @@ const TESTS = [
   'test_no_direct_data_fetches.js',
   'test_provider_health_hook.js',
   'test_provider_health_ui.js',
+  'test_account_context.js',
   'test_priority_digest.js',
   'test_executive_intelligence_center_ui.js',
   'test_executive_intelligence_prefetch.js',

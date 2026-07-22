@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import Layout               from './components/Layout.jsx'
 import GlobalFilters        from './components/GlobalFilters.jsx'
 import Skeleton              from './components/ui/Skeleton.jsx'
+import { useAccount }        from './components/AuthGate.jsx'
 import { useReviewsData }    from './hooks/useReviewsData.js'
 import { useGlobalPrefetch } from './hooks/useIntelligence.js'
 import { useUnansweredCount } from './hooks/useReviewWorkspace.js'
@@ -105,6 +106,7 @@ function ErrorScreen() {
 
 function RootLayout() {
   useGlobalPrefetch()
+  const account = useAccount()
   const { data: allReviews, isLoading, isError } = useReviewsData()
   const [filters, setFilters] = useState(null)
   const location = useLocation()
@@ -169,7 +171,7 @@ function RootLayout() {
           transition={{ duration: 0.14 }}
         >
           <Suspense fallback={<RouteFallback />}>
-            <Outlet context={{ allReviews, filtered, prevFiltered, filters }} />
+            <Outlet context={{ allReviews, filtered, prevFiltered, filters, account }} />
           </Suspense>
         </motion.div>
       </AnimatePresence>
