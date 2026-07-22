@@ -29,7 +29,16 @@ export function useActionWorkspace() {
     onError: (_err, _vars, context) => {
       if (context?.prev) qc.setQueryData(QK, context.prev)
     },
-    onSuccess: result => qc.setQueryData(QK, result),
+    // The server now returns just the one updated record (server-stamped
+    // createdBy/At, updatedBy/At, history) rather than the whole workspace --
+    // merge it into the existing cache instead of replacing the cache
+    // wholesale, so a concurrent update to a DIFFERENT id (another manager,
+    // or this same tab's own optimistic write to a different row) is never
+    // clobbered by an in-flight response for this one.
+    onSuccess: (record, { id }) => {
+      const prev = qc.getQueryData(QK) ?? {}
+      qc.setQueryData(QK, { ...prev, [id]: record })
+    },
   })
 
   const setRecord = useCallback(
