@@ -9,6 +9,7 @@
 
 import {
   getAllActions,
+  getAction,
   upsertAction,
   ActionStoreUnavailableError,
   _setRedisClientForTests,
@@ -170,6 +171,32 @@ async function testWriteFailureThrowsUnavailable() {
   assert(threw, 'a Redis write failure must surface as ActionStoreUnavailableError, never a silently-dropped write')
 }
 
+async function testGetActionReturnsSingleRecordWithoutFetchingAll() {
+  const client = fakeRedis()
+  _setRedisClientForTests(() => client)
+  await upsertAction('a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
+  await upsertAction('a2', { status: 'Completed' }, OWNER, 'Status -> Completed')
+  const record = await getAction('a1')
+  assert(record.status === 'Assigned', 'getAction must return the requested record')
+  assert(record.id === 'a1', 'getAction must return the correct id')
+}
+
+async function testGetActionReturnsNullForUnknownId() {
+  _setRedisClientForTests(() => fakeRedis())
+  const record = await getAction('does-not-exist')
+  assert(record === null, 'getAction must return null for an id with no record, not throw')
+}
+
+async function testGetActionThrowsWhenUnconfigured() {
+  let threw = false
+  try {
+    await getAction('a1')
+  } catch (err) {
+    threw = err instanceof ActionStoreUnavailableError
+  }
+  assert(threw, 'getAction must throw ActionStoreUnavailableError when unconfigured, same as getAllActions')
+}
+
 async function testMalformedStoredValueIsSkippedNotThrown() {
   _setRedisClientForTests(() => fakeRedis({ a1: 'not valid json {{{' }))
   const all = await getAllActions()
@@ -185,6 +212,9 @@ async function main() {
   await run('a write with no logAction does not append a history entry', testUpsertWithoutLogActionDoesNotAppendHistory)
   await run('client-supplied server-authoritative fields (createdBy/At, updatedBy/At, history) are never trusted', testClientSuppliedServerFieldsAreOverwritten)
   await run('getAllActions returns every stored record independently', testGetAllActionsReturnsMultipleRecords)
+  await run('getAction returns a single record without needing to fetch the whole hash', testGetActionReturnsSingleRecordWithoutFetchingAll)
+  await run('getAction returns null for an unknown id', testGetActionReturnsNullForUnknownId)
+  await run('getAction throws ActionStoreUnavailableError when unconfigured', testGetActionThrowsWhenUnconfigured)
   await run('a Redis read failure surfaces as ActionStoreUnavailableError', testReadFailureThrowsUnavailable)
   await run('a Redis write failure surfaces as ActionStoreUnavailableError', testWriteFailureThrowsUnavailable)
   await run('a corrupted stored record is skipped, not thrown', testMalformedStoredValueIsSkippedNotThrown)

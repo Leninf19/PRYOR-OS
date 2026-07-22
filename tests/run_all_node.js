@@ -36,6 +36,7 @@ const TESTS = [
   'test_location_contacts_reader.js',
   'test_email_sender.js',
   'test_review_email_template.js',
+  'test_send_review_email.js',
   'test_priority_digest.js',
   'test_executive_intelligence_center_ui.js',
   'test_executive_intelligence_prefetch.js',

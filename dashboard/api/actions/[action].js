@@ -17,7 +17,11 @@
 
 import { requireAuth } from '../_lib/auth.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
-import { getAllActions, upsertAction, ActionStoreUnavailableError } from '../_lib/actionStore.js'
+import { getAllActions, getAction, upsertAction, ActionStoreUnavailableError } from '../_lib/actionStore.js'
+import { getLocationContact } from '../_lib/locationContacts.js'
+import { getEscalationCcEmails, getReplyToEmail } from '../_lib/reviewEmailConfig.js'
+import { sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
+import { buildDefaultSubject, buildReviewEmail } from '../_lib/reviewEmailTemplate.js'
 
 const ALLOWED_ROLES = ['owner', 'marketing']
 
@@ -54,6 +58,287 @@ function validatePatch(patch) {
   if ('assignedDepartment' in patch && patch.assignedDepartment !== null && typeof patch.assignedDepartment !== 'string') return null
   if ('logAction' in patch) return null // logAction is a sibling request field, never a patch field
   return patch
+}
+
+// ---------------------------------------------------------------------------
+// Restaurant bad-review email workflow (recovery-audit milestone,
+// Phases 5-6). Adds three actions to this same file/function:
+//   GET  /api/actions/preview-review-email  -- resolve recipient/CC/status
+//   POST /api/actions/send-review-email     -- send + record the outcome
+//   POST /api/actions/update-email-status   -- manual replied/follow_up/resolved
+//
+// email* / source* fields are NEVER reachable through the generic
+// update() action above -- PATCHABLE_FIELDS doesn't list them, and
+// validatePatch() rejects any unrecognized key outright. Only the two
+// handlers below can ever write them, and both construct the patch
+// entirely server-side (never from a client-supplied field-by-field
+// patch object) -- this is what keeps "emailStatus: sent" a trustworthy
+// claim: it can only be set at the moment sendReviewEmail() actually
+// succeeds, and "replied"/"follow_up_required"/"resolved" can only be
+// reached from an email that was actually sent (see updateEmailStatus).
+// ---------------------------------------------------------------------------
+
+// 'queued' is part of the schema (Phase 6) for forward-compatibility with a
+// future async delivery path, but this milestone's direct-delivery
+// architecture (see emailSender.js's header comment) never produces it --
+// every send resolves to 'sent' or 'failed' immediately, never leaves a
+// request in an unknown state.
+//
+// States a human sets by hand, only ever on an item that already has an
+// outgoing email -- never reachable before a send, never a way to fake
+// "sent" without actually sending.
+const MANUAL_EMAIL_STATUSES = new Set(['replied', 'follow_up_required', 'resolved'])
+
+const MANUAL_EMAIL_STATUS_HISTORY_LABEL = {
+  replied: 'Restaurant response recorded',
+  follow_up_required: 'Follow-up required',
+  resolved: 'Email workflow resolved',
+}
+
+function isPositiveInteger(n) {
+  return Number.isInteger(n) && n > 0
+}
+
+// Strips CR/LF so a subject (the one email-adjacent field this action
+// accepts from the client) can never inject extra headers -- defense in
+// depth on top of nodemailer's own header sanitization.
+function sanitizeHeaderValue(value) {
+  return String(value ?? '').replace(/[\r\n]+/g, ' ').trim()
+}
+
+// SMTP/provider error text could in principle echo back configuration
+// details -- strip the configured Gmail credentials defensively (belt and
+// suspenders; nodemailer/Gmail don't echo the password in error text today)
+// and cap length so a verbose provider error can't balloon the stored
+// record or the response body.
+function sanitizeErrorMessage(message) {
+  let out = String(message ?? 'unknown error')
+  if (process.env.GMAIL_APP_PASSWORD) out = out.split(process.env.GMAIL_APP_PASSWORD).join('[redacted]')
+  if (process.env.GMAIL_USER) out = out.split(process.env.GMAIL_USER).join('[redacted]')
+  return out.slice(0, 300)
+}
+
+function buildInternalReferenceUrl(reviewId) {
+  const base = process.env.DASHBOARD_BASE_URL
+    || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null)
+  if (!base) return null
+  return `${base.replace(/\/$/, '')}/explorer?reviewId=${encodeURIComponent(reviewId)}`
+}
+
+// Validates the client-supplied review-content snapshot used to render the
+// email. This content necessarily comes from the client -- the Vercel/Node
+// layer has no reviews.db access of its own (see README "Architecture
+// overview") -- but it is pure display content, never a recipient/
+// authorization decision, which is what stays strictly server-resolved.
+function validateReviewSnapshot(review) {
+  if (typeof review !== 'object' || review === null) return null
+  const { locationName, city, starRating, reviewerName, reviewDate, reviewText, reviewUrl } = review
+  if (typeof locationName !== 'string' || !locationName.trim()) return null
+  if (!Number.isInteger(starRating) || starRating < 1 || starRating > 5) return null
+  for (const [key, val] of Object.entries({ city, reviewerName, reviewDate, reviewText, reviewUrl })) {
+    if (val !== undefined && val !== null && typeof val !== 'string') return null
+  }
+  return {
+    locationName: locationName.trim(),
+    city: city ?? null,
+    starRating,
+    reviewerName: reviewerName ?? null,
+    reviewDate: reviewDate ?? null,
+    reviewText: reviewText ?? null,
+    reviewUrl: reviewUrl ?? null,
+  }
+}
+
+// GET /api/actions/preview-review-email?id=...&locationId=...
+// Resolves and returns the recipient/CC/Reply-To the send action WOULD use
+// (read-only) plus the item's current email-workflow state, so the
+// confirmation panel can show a truthful, server-resolved preview before
+// the user commits to sending. Never returns the whole contact directory
+// -- only the one location being acted on.
+async function previewReviewEmail(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, ALLOWED_ROLES)
+  if (!account) return
+
+  const { id, locationId: locationIdRaw } = req.query ?? {}
+  const locationId = Number(locationIdRaw)
+  if (typeof id !== 'string' || !id.trim() || !isPositiveInteger(locationId)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'id and a positive integer locationId are required.' })
+  }
+
+  try {
+    const [contact, existing] = await Promise.all([getLocationContact(locationId), getAction(id)])
+    return res.status(200).json({
+      recipient: contact ? { email: contact.email, name: contact.name ?? null } : null,
+      cc: getEscalationCcEmails(),
+      replyTo: getReplyToEmail(),
+      existingRecord: existing ? {
+        emailStatus: existing.emailStatus ?? 'not_sent',
+        emailSentAt: existing.emailSentAt ?? null,
+        emailSentBy: existing.emailSentBy ?? null,
+        emailRecipient: existing.emailRecipient ?? null,
+        emailFollowUpDueAt: existing.emailFollowUpDueAt ?? null,
+      } : null,
+    })
+  } catch (err) {
+    if (err instanceof ActionStoreUnavailableError) {
+      console.error(`[actions/preview-review-email] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'The task workspace is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// POST /api/actions/send-review-email
+// { id, locationId, review, subject?, internalNote?, followUpDueAt?, confirmResend? }
+async function sendReviewEmailAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, ALLOWED_ROLES)
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `actions:send-review-email:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  const {
+    id, locationId: locationIdRaw, review, subject: subjectRaw,
+    internalNote, followUpDueAt, confirmResend,
+  } = req.body ?? {}
+
+  const locationId = Number(locationIdRaw)
+  if (typeof id !== 'string' || !id.trim() || !isPositiveInteger(locationId)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'id and a positive integer locationId are required.' })
+  }
+  const reviewSnapshot = validateReviewSnapshot(review)
+  if (!reviewSnapshot) {
+    return res.status(400).json({ error: 'invalid_request', message: 'review must include at least locationName and a 1-5 starRating.' })
+  }
+  if (subjectRaw !== undefined && (typeof subjectRaw !== 'string' || !subjectRaw.trim() || subjectRaw.length > 300)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'subject must be a non-empty string under 300 characters.' })
+  }
+  if (internalNote !== undefined && internalNote !== null && (typeof internalNote !== 'string' || internalNote.length > 2000)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'internalNote must be a string under 2000 characters.' })
+  }
+  if (followUpDueAt !== undefined && followUpDueAt !== null && typeof followUpDueAt !== 'string') {
+    return res.status(400).json({ error: 'invalid_request', message: 'followUpDueAt must be a string date or null.' })
+  }
+
+  let contact, existing
+  try {
+    ;[contact, existing] = await Promise.all([getLocationContact(locationId), getAction(id)])
+  } catch (err) {
+    if (err instanceof ActionStoreUnavailableError) {
+      console.error(`[actions/send-review-email] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'The task workspace is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+
+  // Recipient is ALWAYS resolved server-side from locationId -- the
+  // request body has no recipient/cc field for this action to ever read.
+  if (!contact) {
+    return res.status(400).json({ error: 'no_contact_configured', message: 'This location has no configured restaurant contact email yet.' })
+  }
+
+  // Duplicate-send protection: an item already sent/replied/awaiting
+  // follow-up/resolved requires an explicit confirmResend to proceed.
+  // A previously FAILED send is exempt -- it never actually reached the
+  // restaurant, so retrying it is not a duplicate.
+  const DUPLICATE_STATUSES = new Set(['sent', 'replied', 'follow_up_required', 'resolved'])
+  if (existing && DUPLICATE_STATUSES.has(existing.emailStatus) && !confirmResend) {
+    return res.status(409).json({ error: 'already_sent', message: 'This review already has an email sent to the restaurant. Resend to send it again.', record: existing })
+  }
+
+  const cc = getEscalationCcEmails()
+  const replyTo = getReplyToEmail()
+  const subject = sanitizeHeaderValue(subjectRaw || buildDefaultSubject({ locationName: reviewSnapshot.locationName, starRating: reviewSnapshot.starRating }))
+  const internalReferenceUrl = buildInternalReferenceUrl(id)
+  const { html, text } = buildReviewEmail({
+    review: reviewSnapshot,
+    internalReferenceUrl,
+    internalNote: internalNote || null,
+    replyToEmail: replyTo,
+  })
+
+  const basePatch = {
+    emailRecipient: contact.email,
+    emailCcRecipients: cc,
+    emailSubject: subject,
+    emailFollowUpDueAt: followUpDueAt ?? null,
+    sourceReviewId: id,
+    sourceReviewUrl: reviewSnapshot.reviewUrl,
+    sourceLocationId: locationId,
+  }
+
+  const logLabel = confirmResend ? 'Review email re-sent to restaurant' : 'Review email sent to restaurant'
+
+  try {
+    const { messageId } = await sendReviewEmail({ to: contact.email, cc, replyTo, subject, html, text })
+    const record = await upsertAction(id, {
+      ...basePatch,
+      emailStatus: 'sent',
+      emailSentAt: new Date().toISOString(),
+      emailSentBy: account.userId,
+      emailMessageId: messageId,
+      emailLastError: null,
+    }, account, logLabel)
+    return res.status(200).json({ record })
+  } catch (err) {
+    if (err instanceof EmailSenderUnavailableError) {
+      console.error(`[actions/send-review-email] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Email sending is not configured. Please contact an administrator.' })
+    }
+    // A genuine send failure -- record it truthfully as failed, never as sent.
+    const sanitized = sanitizeErrorMessage(err.message)
+    console.error(`[actions/send-review-email] send failed: ${sanitized}`)
+    let record
+    try {
+      record = await upsertAction(id, { ...basePatch, emailStatus: 'failed', emailLastError: sanitized }, account, 'Send failed')
+    } catch (storeErr) {
+      if (storeErr instanceof ActionStoreUnavailableError) {
+        return res.status(503).json({ error: 'service_unavailable', message: 'The email failed to send, and the task workspace is also unavailable to record it. Please try again shortly.' })
+      }
+      throw storeErr
+    }
+    return res.status(502).json({ error: 'send_failed', message: 'The email could not be sent. See the record for details.', record })
+  }
+}
+
+// POST /api/actions/update-email-status  { id, emailStatus }
+// Manual transitions only -- replied/follow_up_required/resolved -- never
+// reachable before an item has an outgoing email at all.
+async function updateEmailStatus(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, ALLOWED_ROLES)
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `actions:update-email-status:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { id, emailStatus } = req.body ?? {}
+  if (typeof id !== 'string' || !id.trim()) {
+    return res.status(400).json({ error: 'invalid_request', message: 'id is required.' })
+  }
+  if (!MANUAL_EMAIL_STATUSES.has(emailStatus)) {
+    return res.status(400).json({ error: 'invalid_request', message: `emailStatus must be one of: ${[...MANUAL_EMAIL_STATUSES].join(', ')}.` })
+  }
+
+  try {
+    const existing = await getAction(id)
+    if (!existing || !existing.emailStatus || existing.emailStatus === 'not_sent') {
+      return res.status(400).json({ error: 'invalid_request', message: 'This item has no outgoing email to update the status of yet.' })
+    }
+    const record = await upsertAction(id, { emailStatus }, account, MANUAL_EMAIL_STATUS_HISTORY_LABEL[emailStatus])
+    return res.status(200).json({ record })
+  } catch (err) {
+    if (err instanceof ActionStoreUnavailableError) {
+      console.error(`[actions/update-email-status] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'The task workspace is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
 }
 
 // GET /api/actions/list -- returns every task record, keyed by action id.
@@ -116,8 +401,11 @@ async function update(req, res) {
 
 export default async function handler(req, res) {
   switch (req.query?.action) {
-    case 'list':   return list(req, res)
-    case 'update': return update(req, res)
-    default:       return res.status(404).json({ error: 'not_found' })
+    case 'list':                 return list(req, res)
+    case 'update':                return update(req, res)
+    case 'preview-review-email':  return previewReviewEmail(req, res)
+    case 'send-review-email':     return sendReviewEmailAction(req, res)
+    case 'update-email-status':   return updateEmailStatus(req, res)
+    default:                      return res.status(404).json({ error: 'not_found' })
   }
 }

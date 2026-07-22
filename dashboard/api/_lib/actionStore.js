@@ -93,6 +93,22 @@ export async function getAllActions() {
   return out
 }
 
+// Reads a single record without fetching the whole hash -- used by callers
+// that only need to check one id's current state (e.g. duplicate-send
+// checks before sending a review email) rather than the full workspace.
+export async function getAction(id) {
+  const client = getClient()
+  if (!client) throw new ActionStoreUnavailableError('action store is not configured')
+
+  let raw
+  try {
+    raw = await client.hget(ACTION_WORKSPACE_KEY, id)
+  } catch (err) {
+    throw new ActionStoreUnavailableError(`action store unreachable: ${err.message}`)
+  }
+  return parseRecord(raw)
+}
+
 // Merges `patch` (already validated/whitelisted by the caller) into the
 // record for `id`, stamping server-authoritative fields:
 //   - createdBy/createdAt: set once, from the first write, never overwritten

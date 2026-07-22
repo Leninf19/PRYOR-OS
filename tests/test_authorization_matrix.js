@@ -270,6 +270,30 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Action Center Accountability milestone. Rate-limited per-caller (test_actions_endpoint.js). Rejects any patch containing a server-owned field (createdBy/At, updatedBy/At, history, id) with 400, before ever reaching actionStore.js.',
   },
+  {
+    route: 'GET /api/actions/preview-review-email', file: 'api/actions/[action].js', method: 'GET', action: 'preview-review-email',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
+    scope: 'restaurant bad-review email workflow -- same non-goal as GET /api/actions/list; recipient is resolved server-side, never client-supplied',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Recovery-audit milestone (restaurant bad-review email workflow). Read-only preview of the recipient/CC/Reply-To a send WOULD use, for the confirmation panel -- never returns the whole location-contacts.json directory, only the one location requested.',
+  },
+  {
+    route: 'POST /api/actions/send-review-email', file: 'api/actions/[action].js', method: 'POST', action: 'send-review-email',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
+    scope: 'restaurant bad-review email workflow -- same non-goal as GET /api/actions/list',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Recovery-audit milestone. Rate-limited per-caller (test_send_review_email.js). Recipient/CC/Reply-To are always server-resolved (locationContacts.js / reviewEmailConfig.js) -- the request body has no field for any of them. Duplicate-send protection requires confirmResend once an item is sent/replied/follow_up_required/resolved.',
+  },
+  {
+    route: 'POST /api/actions/update-email-status', file: 'api/actions/[action].js', method: 'POST', action: 'update-email-status',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
+    scope: 'restaurant bad-review email workflow -- same non-goal as GET /api/actions/list',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Recovery-audit milestone. Manual replied/follow_up_required/resolved transitions only -- rejects "sent"/"failed"/"queued"/"not_sent" outright, and rejects any item with no prior outgoing email, so this can never be used to fake a send.',
+  },
 ]
 
 // ---------------------------------------------------------------------------
