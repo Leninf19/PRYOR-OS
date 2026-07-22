@@ -268,12 +268,12 @@ function QuickLinks() {
 // ── Page ─────────────────────────────────────────────────────────────────────
 
 export default function ExecutiveIntelligenceCenter() {
-  const { filtered = [], prevFiltered = [], filters = {} } = useOutletContext() ?? {}
+  const { allReviews = [], filtered = [], prevFiltered = [], filters = {} } = useOutletContext() ?? {}
 
   const periodLabel = filters?.start && filters?.end ? `${filters.start} — ${filters.end}` : null
   const prevPeriodLabel = mirroredPrevRange(filters)
   const brief = useExecutiveBrief(filtered, prevFiltered, periodLabel, prevPeriodLabel)
-  const { data: digest, isLoading, isError } = usePriorityDigest(filtered, prevFiltered)
+  const { data: digest, isLoading, isError } = usePriorityDigest(filtered, prevFiltered, allReviews)
 
   if (!filtered.length && !prevFiltered.length) {
     return <EmptyState icon="🔍" title="No data for this period" body="Try widening the selected date range." />

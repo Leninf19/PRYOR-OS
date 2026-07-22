@@ -133,6 +133,25 @@ function testHookComputesAssignedOverdueItemsFromExistingWorkspaceAndAccount() {
   assert(!/fetch\(/.test(content), 'usePriorityDigest.js must still perform no fetch of its own')
 }
 
+// Recovery-audit milestone (restaurant bad-review email workflow): the
+// sixth priority source (overdue restaurant follow-ups) is likewise
+// computed in the hook, cross-referenced against allReviews for a
+// display-friendly location name.
+function testHookComputesEmailFollowUpItemsFromWorkspaceAndAllReviews() {
+  const content = read('hooks/usePriorityDigest.js')
+  assert(/isEmailFollowUpOverdue/.test(content), 'must reuse the shared isEmailFollowUpOverdue() check')
+  assert(/export function usePriorityDigest\(filtered, prevFiltered, allReviews = \[\]\)/.test(content),
+    'usePriorityDigest must accept allReviews to cross-reference email-thread review ids')
+  assert(/emailFollowUpItems/.test(content), 'must pass emailFollowUpItems into priorityDigest()')
+}
+
+function testPagePassesAllReviewsToPriorityDigest() {
+  const content = read('pages/ExecutiveIntelligenceCenter.jsx')
+  assert(/const \{ allReviews = \[\], filtered = \[\], prevFiltered = \[\], filters = \{\} \} = useOutletContext\(\) \?\? \{\}/.test(content),
+    'the page must destructure allReviews from the Outlet context')
+  assert(/usePriorityDigest\(filtered, prevFiltered, allReviews\)/.test(content), 'the page must pass allReviews through to the hook')
+}
+
 const tests = [
   ['App.jsx registers the new route additively', testAppRegistersTheNewRouteAdditively],
   ['App.jsx still registers every previously-existing route', testAppStillRegistersEveryPreviouslyExistingRoute],
@@ -142,6 +161,8 @@ const tests = [
   ['the page renders all five sections in Problems->Wins->Changes->Narrative order', testPageRendersAllFiveSectionsAndLinksOutward],
   ['the page uses the pure digest hook and makes no new backend call', testPageUsesThePureDigestHookAndNoNewBackendCall],
   ['the hook computes assigned-overdue items from existing workspace/account hooks, not a new fetch', testHookComputesAssignedOverdueItemsFromExistingWorkspaceAndAccount],
+  ['the hook computes overdue restaurant follow-ups from the same workspace, cross-referenced against allReviews', testHookComputesEmailFollowUpItemsFromWorkspaceAndAllReviews],
+  ['the page passes allReviews through to usePriorityDigest', testPagePassesAllReviewsToPriorityDigest],
 ]
 
 for (const [name, fn] of tests) run(name, fn)

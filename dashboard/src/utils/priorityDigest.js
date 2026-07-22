@@ -7,13 +7,15 @@
 // produced. This file only merges, ranks, deduplicates, and formats -- it
 // never re-derives a score from raw reviews itself.
 
-// "Today's Priorities" (Section 1) draws from these five sources -- What
+// "Today's Priorities" (Section 1) draws from these six sources -- What
 // Changed's momentum/category-change signals belong to Sections 2/3, not
 // here. The fifth source (Action Center Accountability milestone): tasks
-// overdue and assigned to the CURRENT user, computed by the caller
-// (usePriorityDigest.js, which has access to the workspace + authenticated
-// account) and handed in pre-filtered -- this file stays a pure function
-// with no knowledge of who's logged in or what "overdue" means.
+// overdue and assigned to the CURRENT user. The sixth (recovery-audit
+// milestone, restaurant bad-review email workflow): email threads whose
+// follow-up is overdue. Both are computed by the caller (usePriorityDigest.js,
+// which has access to the workspace + authenticated account + allReviews)
+// and handed in pre-filtered -- this file stays a pure function with no
+// knowledge of who's logged in, what "overdue" means, or review content.
 const OPERATIONS_IMPACT_PRIORITY_SEVERITY = {
   needsAttention: 'critical',
   biggestComplaint: 'critical',
@@ -35,7 +37,7 @@ const SEVERITY_WEIGHT = { critical: 4, high: 3, warning: 2, info: 1 }
 // insertion order alone.
 const SOURCE_ORDER = {
   'Operations Impact': 0, 'Action Center': 1, 'Predictive Alerts': 2, 'Trend Alerts': 3,
-  'My Overdue Tasks': 4,
+  'My Overdue Tasks': 4, 'Restaurant Follow-Up': 5,
 }
 
 const MAX_PRIORITIES = 5
@@ -138,6 +140,28 @@ function collectAssignedOverdueCandidates(assignedOverdueItems) {
     sourceLabel: 'My Overdue Tasks',
     sourcePath: '/action-center',
     subject: normalizeSubject(a.title || a.id),
+  }))
+}
+
+// `emailFollowUpItems` is already-filtered { id (Action Center record id,
+// same as reviewId(review)), reviewId, locationName, emailFollowUpDueAt }[]
+// -- restaurant bad-review email threads whose follow-up is overdue
+// (dashboard/src/utils/actionWorkspaceUtils.js's isEmailFollowUpOverdue()),
+// computed by the caller (usePriorityDigest.js). 'high', not 'critical' --
+// an external loose end worth surfacing, one tier below a personally-owed
+// overdue task.
+function collectEmailFollowUpCandidates(emailFollowUpItems) {
+  const items = Array.isArray(emailFollowUpItems) ? emailFollowUpItems : []
+  return items.map(a => ({
+    id: `email-followup-${a.id}`,
+    title: `Follow-up needed: ${a.locationName || 'Unknown location'}`,
+    explanation: a.emailFollowUpDueAt
+      ? `A restaurant bad-review email is still awaiting follow-up (due ${a.emailFollowUpDueAt}).`
+      : 'A restaurant bad-review email is still awaiting follow-up.',
+    severity: 'high',
+    sourceLabel: 'Restaurant Follow-Up',
+    sourcePath: a.reviewId ? `/explorer?reviewId=${encodeURIComponent(a.reviewId)}` : '/action-center',
+    subject: normalizeSubject(a.locationName || a.id),
   }))
 }
 
@@ -283,6 +307,7 @@ export function priorityDigest({
   momentum = null,
   categoryChanges = null,
   assignedOverdueItems = null,
+  emailFollowUpItems = null,
 } = {}) {
   const priorityCandidates = [
     ...collectOperationsImpactPriorityCandidates(operationsImpact),
@@ -290,6 +315,7 @@ export function priorityDigest({
     ...collectPredictiveAlertPriorityCandidates(predictiveAlerts),
     ...collectTrendAlertPriorityCandidates(trendAlerts),
     ...collectAssignedOverdueCandidates(assignedOverdueItems),
+    ...collectEmailFollowUpCandidates(emailFollowUpItems),
   ]
   const topPriorities = rankAndDedupe(priorityCandidates, MAX_PRIORITIES)
 

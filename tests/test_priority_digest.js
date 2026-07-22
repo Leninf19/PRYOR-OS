@@ -213,6 +213,46 @@ function testAssignedOverdueItemsOutrankLowerSeveritySources() {
   assert(topPriorities[1].sourceLabel === 'Action Center', `expected the High Action Center item second, got ${topPriorities[1].sourceLabel}`)
 }
 
+// ── Recovery-audit milestone: restaurant follow-up source -----------------
+
+function testEmailFollowUpItemProducesHighSeverityCandidateLinkingToReview() {
+  const { topPriorities } = priorityDigest({
+    emailFollowUpItems: [{ id: 'review-1', reviewId: 'review-1', locationName: 'Casa Tequila Brighton', emailFollowUpDueAt: '2026-01-01' }],
+  })
+  assert(topPriorities.length === 1, `expected exactly 1 priority, got ${topPriorities.length}`)
+  const item = topPriorities[0]
+  assert(item.severity === 'high', `an overdue restaurant follow-up must be high severity, got ${item.severity}`)
+  assert(item.sourceLabel === 'Restaurant Follow-Up', `expected sourceLabel "Restaurant Follow-Up", got ${item.sourceLabel}`)
+  assert(item.sourcePath === '/explorer?reviewId=review-1', `expected a Review Explorer deep link, got ${item.sourcePath}`)
+  assert(item.title.includes('Casa Tequila Brighton'), `title must reference the location, got "${item.title}"`)
+  assert(item.explanation.includes('2026-01-01'), `explanation must reference the follow-up due date, got "${item.explanation}"`)
+}
+
+function testEmailFollowUpItemWithoutReviewIdLinksToActionCenter() {
+  const { topPriorities } = priorityDigest({
+    emailFollowUpItems: [{ id: 'review-2', reviewId: null, locationName: 'Unknown Spot', emailFollowUpDueAt: null }],
+  })
+  assert(topPriorities[0].sourcePath === '/action-center', 'without a reviewId, must fall back to linking to Action Center')
+}
+
+function testEmailFollowUpOutranksLowerSeveritySourcesButNotOverdueTasks() {
+  const { topPriorities } = priorityDigest({
+    trendAlerts: [{ name: 'Eastside', delta: -0.2, avgPrev: 4.0, avgCur: 3.8 }], // warning
+    assignedOverdueItems: [{ id: 'a1', title: 'My overdue task', dueDate: '2026-01-01' }], // critical
+    emailFollowUpItems: [{ id: 'review-1', reviewId: 'review-1', locationName: 'Casa Tequila Brighton', emailFollowUpDueAt: '2026-01-01' }], // high
+  })
+  assert(topPriorities[0].sourceLabel === 'My Overdue Tasks', `critical must rank first, got ${topPriorities[0].sourceLabel}`)
+  assert(topPriorities[1].sourceLabel === 'Restaurant Follow-Up', `high must rank second (above warning), got ${topPriorities[1].sourceLabel}`)
+  assert(topPriorities[2].sourceLabel === 'Trend Alerts', `warning must rank last, got ${topPriorities[2].sourceLabel}`)
+}
+
+function testNoEmailFollowUpItemsProducesNoExtraCandidates() {
+  const { topPriorities } = fullDigest()
+  assert(!topPriorities.some(p => p.sourceLabel === 'Restaurant Follow-Up'), 'no "Restaurant Follow-Up" entries should appear when emailFollowUpItems is omitted')
+  const digest = priorityDigest({ emailFollowUpItems: [] })
+  assert(digest.topPriorities.length === 0, 'an empty emailFollowUpItems array must produce zero priorities, not throw')
+}
+
 function testNoAssignedOverdueItemsProducesNoExtraCandidates() {
   // Regression: an empty/absent assignedOverdueItems must not add anything
   // or throw -- most users, most of the time, have nothing overdue.
@@ -236,6 +276,10 @@ const tests = [
   ['an overdue task assigned to you is always critical and correctly attributed', testAssignedOverdueItemIsAlwaysCriticalAndAttributedCorrectly],
   ['assigned-overdue items outrank lower-severity sources', testAssignedOverdueItemsOutrankLowerSeveritySources],
   ['no assigned-overdue items produces no extra candidates (regression)', testNoAssignedOverdueItemsProducesNoExtraCandidates],
+  ['an overdue restaurant follow-up is high severity and links to the review', testEmailFollowUpItemProducesHighSeverityCandidateLinkingToReview],
+  ['an email follow-up item with no reviewId links to Action Center instead', testEmailFollowUpItemWithoutReviewIdLinksToActionCenter],
+  ['email follow-up (high) outranks warning but not a critical overdue task', testEmailFollowUpOutranksLowerSeveritySourcesButNotOverdueTasks],
+  ['no email-follow-up items produces no extra candidates (regression)', testNoEmailFollowUpItemsProducesNoExtraCandidates],
 ]
 
 for (const [name, fn] of tests) run(name, fn)
