@@ -11,6 +11,7 @@ import { useActionWorkspace } from '../hooks/useActionWorkspace.js'
 import { useAccounts } from '../hooks/useAccounts.js'
 import { useAccount } from '../components/AuthGate.jsx'
 import { getUniqueLocations } from '../utils/dataUtils.js'
+import { OPEN_STATUSES, isOverdue } from '../utils/actionWorkspaceUtils.js'
 
 const PRIORITY_VARIANT = { Critical: 'danger', High: 'danger', Medium: 'warning', Low: 'neutral' }
 const TYPE_ICON = { operational: '🛠', marketing: '📣', recognition: '⭐' }
@@ -32,22 +33,8 @@ const STATUS_PROGRESS = {
   New: 0, Assigned: 20, 'In Progress': 50, Monitoring: 80, Completed: 100, Dismissed: 0,
 }
 
-// A task counts as "open" (still owed work) unless it's been Completed or
-// explicitly Dismissed -- used by both the Overdue filter and the workload
-// summary so the two stay consistent with each other.
-const OPEN_STATUSES = new Set(['New', 'Assigned', 'In Progress', 'Monitoring'])
-
 function displayNameFor(accounts, userId) {
   return accounts?.find(a => a.userId === userId)?.displayName ?? userId
-}
-
-function todayISODate() {
-  return new Date().toISOString().slice(0, 10)
-}
-
-function isOverdue(entry) {
-  if (!entry?.dueDate || !OPEN_STATUSES.has(entry.status ?? 'New')) return false
-  return entry.dueDate < todayISODate()
 }
 
 // Extracts the id of the complaint/praise category this action is about

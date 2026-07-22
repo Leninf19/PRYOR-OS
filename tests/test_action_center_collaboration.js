@@ -57,8 +57,8 @@ function testMineAndOverdueFilters() {
   assert(/if \(mineOnly && ws\[a\.id\]\?\.assignedTo !== account\?\.userId\) return false/.test(content),
     'Mine filter must compare assignedTo against the CURRENT authenticated account, not a hardcoded id')
   assert(/if \(overdueOnly && !isOverdue\(ws\[a\.id\]\)\) return false/.test(content), 'Overdue filter must use the shared isOverdue() check')
-  assert(/function isOverdue\(entry\) \{/.test(content), 'isOverdue() must be defined')
-  assert(/return entry\.dueDate < todayISODate\(\)/.test(content), 'overdue must compare dueDate against today, not a hardcoded date')
+  assert(/from '\.\.\/utils\/actionWorkspaceUtils\.js'/.test(content),
+    'isOverdue()/OPEN_STATUSES must be imported from the shared actionWorkspaceUtils.js, not redefined locally -- so Action Center\'s Overdue filter and the Executive Intelligence Center\'s overdue signal can never drift apart')
 }
 
 function testWorkloadSummaryComputedAndRendered() {

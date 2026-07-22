@@ -7,9 +7,13 @@
 // produced. This file only merges, ranks, deduplicates, and formats -- it
 // never re-derives a score from raw reviews itself.
 
-// "Today's Priorities" (Section 1) draws ONLY from these four sources, per
-// the approved design -- What Changed's momentum/category-change signals
-// belong to Sections 2/3, not here.
+// "Today's Priorities" (Section 1) draws from these five sources -- What
+// Changed's momentum/category-change signals belong to Sections 2/3, not
+// here. The fifth source (Action Center Accountability milestone): tasks
+// overdue and assigned to the CURRENT user, computed by the caller
+// (usePriorityDigest.js, which has access to the workspace + authenticated
+// account) and handed in pre-filtered -- this file stays a pure function
+// with no knowledge of who's logged in or what "overdue" means.
 const OPERATIONS_IMPACT_PRIORITY_SEVERITY = {
   needsAttention: 'critical',
   biggestComplaint: 'critical',
@@ -29,7 +33,10 @@ const SEVERITY_WEIGHT = { critical: 4, high: 3, warning: 2, info: 1 }
 // Fixed, deterministic tiebreak when two candidates land on the same
 // severity weight -- arbitrary but stable, so ties never depend on object
 // insertion order alone.
-const SOURCE_ORDER = { 'Operations Impact': 0, 'Action Center': 1, 'Predictive Alerts': 2, 'Trend Alerts': 3 }
+const SOURCE_ORDER = {
+  'Operations Impact': 0, 'Action Center': 1, 'Predictive Alerts': 2, 'Trend Alerts': 3,
+  'My Overdue Tasks': 4,
+}
 
 const MAX_PRIORITIES = 5
 const MAX_WINS = 3
@@ -114,6 +121,24 @@ function collectTrendAlertPriorityCandidates(trendAlerts) {
       sourcePath: '/alerts',
       subject: normalizeSubject(t.name),
     }))
+}
+
+// `assignedOverdueItems` is already-filtered { id, title, dueDate }[] --
+// tasks whose workspace entry has assignedTo === the current user and
+// isOverdue(entry) is true (dashboard/src/utils/actionWorkspaceUtils.js).
+// Always 'critical': an overdue task assigned to you is, by construction,
+// something you personally owe right now.
+function collectAssignedOverdueCandidates(assignedOverdueItems) {
+  const items = Array.isArray(assignedOverdueItems) ? assignedOverdueItems : []
+  return items.map(a => ({
+    id: `overdue-${a.id}`,
+    title: `Overdue: ${a.title}`,
+    explanation: a.dueDate ? `Assigned to you, due ${a.dueDate}.` : 'Assigned to you and overdue.',
+    severity: 'critical',
+    sourceLabel: 'My Overdue Tasks',
+    sourcePath: '/action-center',
+    subject: normalizeSubject(a.title || a.id),
+  }))
 }
 
 function fmt(n) {
@@ -237,7 +262,7 @@ function computeNextActionsFocus(actionCenter) {
 
 /**
  * priorityDigest({ operationsImpact, actionCenter, predictiveAlerts,
- * trendAlerts, momentum, categoryChanges }) -> {
+ * trendAlerts, momentum, categoryChanges, assignedOverdueItems }) -> {
  *   topPriorities,   // max 5, ranked, deduplicated by subject
  *   recentWins,      // max 3, deduplicated by subject
  *   biggestMover,    // single item or null
@@ -247,7 +272,8 @@ function computeNextActionsFocus(actionCenter) {
  *
  * All inputs are the raw JSON payloads / dataUtils.js outputs the caller
  * already fetched/computed -- this function does no fetching and no
- * classification of its own.
+ * classification of its own. assignedOverdueItems is likewise pre-filtered
+ * by the caller (usePriorityDigest.js) -- see collectAssignedOverdueCandidates.
  */
 export function priorityDigest({
   operationsImpact = null,
@@ -256,12 +282,14 @@ export function priorityDigest({
   trendAlerts = null,
   momentum = null,
   categoryChanges = null,
+  assignedOverdueItems = null,
 } = {}) {
   const priorityCandidates = [
     ...collectOperationsImpactPriorityCandidates(operationsImpact),
     ...collectActionCenterPriorityCandidates(actionCenter),
     ...collectPredictiveAlertPriorityCandidates(predictiveAlerts),
     ...collectTrendAlertPriorityCandidates(trendAlerts),
+    ...collectAssignedOverdueCandidates(assignedOverdueItems),
   ]
   const topPriorities = rankAndDedupe(priorityCandidates, MAX_PRIORITIES)
 

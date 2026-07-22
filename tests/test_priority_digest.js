@@ -185,6 +185,43 @@ function testNextActionsFocusSortsByPriorityAndCapsAtThree() {
   assert(nextActionsFocus.items[3] === undefined, 'must never include a 4th item')
 }
 
+// ── Action Center Accountability milestone: assigned-overdue source -------
+// Isolated fixtures (not folded into fullDigest()'s shared fixture) so the
+// existing rank/order assertions above stay byte-for-byte unaffected.
+
+function testAssignedOverdueItemIsAlwaysCriticalAndAttributedCorrectly() {
+  const { topPriorities } = priorityDigest({
+    assignedOverdueItems: [{ id: 'complaint_wait_time', title: 'Address rising wait-time complaints', dueDate: '2026-01-01' }],
+  })
+  assert(topPriorities.length === 1, `expected exactly 1 priority, got ${topPriorities.length}`)
+  const item = topPriorities[0]
+  assert(item.severity === 'critical', `an overdue task assigned to you must always be critical, got ${item.severity}`)
+  assert(item.sourceLabel === 'My Overdue Tasks', `expected sourceLabel "My Overdue Tasks", got ${item.sourceLabel}`)
+  assert(item.sourcePath === '/action-center', `expected sourcePath "/action-center", got ${item.sourcePath}`)
+  assert(item.title.includes('Address rising wait-time complaints'), `title must reference the underlying task, got "${item.title}"`)
+  assert(item.explanation.includes('2026-01-01'), `explanation must reference the due date, got "${item.explanation}"`)
+}
+
+function testAssignedOverdueItemsOutrankLowerSeveritySources() {
+  // A High-severity Action Center item and a critical assigned-overdue item
+  // together -- the overdue one must rank first.
+  const { topPriorities } = priorityDigest({
+    actionCenter: [{ id: 'complaint_cleanliness', title: 'Investigate cleanliness complaints', priority: 'High', reason: 'Cleanliness complaints trending up.' }],
+    assignedOverdueItems: [{ id: 'complaint_wait_time', title: 'Address rising wait-time complaints', dueDate: '2026-01-01' }],
+  })
+  assert(topPriorities[0].sourceLabel === 'My Overdue Tasks', `expected the overdue item to rank first, got ${topPriorities[0].sourceLabel}`)
+  assert(topPriorities[1].sourceLabel === 'Action Center', `expected the High Action Center item second, got ${topPriorities[1].sourceLabel}`)
+}
+
+function testNoAssignedOverdueItemsProducesNoExtraCandidates() {
+  // Regression: an empty/absent assignedOverdueItems must not add anything
+  // or throw -- most users, most of the time, have nothing overdue.
+  const { topPriorities } = fullDigest()
+  assert(!topPriorities.some(p => p.sourceLabel === 'My Overdue Tasks'), 'no "My Overdue Tasks" entries should appear when assignedOverdueItems is omitted')
+  const digest = priorityDigest({ assignedOverdueItems: [] })
+  assert(digest.topPriorities.length === 0, 'an empty assignedOverdueItems array must produce zero priorities, not throw')
+}
+
 const tests = [
   ['hard cap of 5 for Today\'s Priorities', testHardCapOfFivePriorities],
   ['deterministic ordering (severity, then source, then original order)', testDeterministicOrdering],
@@ -196,6 +233,9 @@ const tests = [
   ['biggest mover picks the largest-magnitude change', testBiggestMoverPicksLargestMagnitudeRegardlessOfDirection],
   ['emerging trend picks the highest-count new category', testEmergingTrendPicksHighestCount],
   ['next actions focus sorts by priority and caps at 3', testNextActionsFocusSortsByPriorityAndCapsAtThree],
+  ['an overdue task assigned to you is always critical and correctly attributed', testAssignedOverdueItemIsAlwaysCriticalAndAttributedCorrectly],
+  ['assigned-overdue items outrank lower-severity sources', testAssignedOverdueItemsOutrankLowerSeveritySources],
+  ['no assigned-overdue items produces no extra candidates (regression)', testNoAssignedOverdueItemsProducesNoExtraCandidates],
 ]
 
 for (const [name, fn] of tests) run(name, fn)

@@ -121,6 +121,18 @@ function testPageUsesThePureDigestHookAndNoNewBackendCall() {
   assert(!/fetch\(/.test(content), 'the page must not perform its own fetch -- all data must come through existing hooks')
 }
 
+// Action Center Accountability milestone: the fifth priority source
+// (overdue tasks assigned to the current user) is computed in the hook,
+// not fetched anew and not computed inside priorityDigest.js itself.
+function testHookComputesAssignedOverdueItemsFromExistingWorkspaceAndAccount() {
+  const content = read('hooks/usePriorityDigest.js')
+  assert(/from '\.\/useActionWorkspace\.js'/.test(content), 'must reuse the existing useActionWorkspace() hook, not a new fetch')
+  assert(/from '\.\.\/components\/AuthGate\.jsx'/.test(content), 'must reuse useAccount() for the current user, not invent a new identity source')
+  assert(/from '\.\.\/utils\/actionWorkspaceUtils\.js'/.test(content), 'must reuse the shared isOverdue() check, not redefine overdue logic')
+  assert(/assignedOverdueItems/.test(content), 'must pass assignedOverdueItems into priorityDigest()')
+  assert(!/fetch\(/.test(content), 'usePriorityDigest.js must still perform no fetch of its own')
+}
+
 const tests = [
   ['App.jsx registers the new route additively', testAppRegistersTheNewRouteAdditively],
   ['App.jsx still registers every previously-existing route', testAppStillRegistersEveryPreviouslyExistingRoute],
@@ -129,6 +141,7 @@ const tests = [
   ['usePriorityDigest.js only composes existing hooks/utils', testHookExistsAndOnlyComposesExistingHooksAndUtils],
   ['the page renders all five sections in Problems->Wins->Changes->Narrative order', testPageRendersAllFiveSectionsAndLinksOutward],
   ['the page uses the pure digest hook and makes no new backend call', testPageUsesThePureDigestHookAndNoNewBackendCall],
+  ['the hook computes assigned-overdue items from existing workspace/account hooks, not a new fetch', testHookComputesAssignedOverdueItemsFromExistingWorkspaceAndAccount],
 ]
 
 for (const [name, fn] of tests) run(name, fn)
