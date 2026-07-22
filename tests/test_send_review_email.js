@@ -67,6 +67,11 @@ function fakeMailer(behavior = { ok: true, messageId: 'msg-1' }) {
   })
 }
 
+// Also configures REVIEW_ESCALATION_CC_EMAILS by default -- CC is now
+// mandatory (management visibility on every restaurant escalation is a
+// business requirement, not optional), so every test exercising an actual
+// send/preview needs it configured unless it's specifically testing the
+// missing-CC failure path (which explicitly deletes it after calling this).
 async function setDirectory() {
   const hash = await bcrypt.hash('x', 12)
   process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
@@ -77,6 +82,7 @@ async function setDirectory() {
       { userId: 'usr_readonly', email: 'ro@example.com', passwordHash: hash, role: 'read_only', locationIds: '*', sessionVersion: 1, disabled: false, displayName: 'RO Person' },
     ],
   })
+  process.env.REVIEW_ESCALATION_CC_EMAILS = 'martin@example.com,ruffy@example.com'
 }
 
 async function tokenFor(userId, email, role) {
@@ -205,6 +211,44 @@ async function testMissingContactPreventsSending() {
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody({ locationId: 999 }) })
   assert(res.statusCode === 400, `expected 400, got ${res.statusCode}`)
   assert(res.body.error === 'no_contact_configured', `expected no_contact_configured, got ${res.body.error}`)
+}
+
+// --- Mandatory CC (management visibility) -----------------------------------
+// REVIEW_ESCALATION_CC_EMAILS is mandatory, not best-effort -- an empty CC
+// list must refuse to send/preview entirely (503), never send with no CC.
+
+async function testSendFailsWhenCcNotConfigured() {
+  await setDirectory()
+  delete process.env.REVIEW_ESCALATION_CC_EMAILS
+  _setRedisClientForTests(() => fakeRedis())
+  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setTransportForTests(fakeMailer())
+  const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
+  assert(res.statusCode === 503, `expected 503 when CC is unconfigured, got ${res.statusCode}`)
+  assert(res.body.error === 'service_unavailable', `expected service_unavailable, got ${res.body.error}`)
+  assert(res.body.message === 'Review escalation recipients are not configured.', `expected the exact required message, got "${res.body.message}"`)
+}
+
+async function testSendWithNoRecordWrittenWhenCcNotConfigured() {
+  await setDirectory()
+  delete process.env.REVIEW_ESCALATION_CC_EMAILS
+  const client = fakeRedis()
+  _setRedisClientForTests(() => client)
+  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setTransportForTests(fakeMailer())
+  await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
+  const stored = await client.hget('action_workspace:v1', 'review-1')
+  assert(stored === null, 'no record should be written when CC is unconfigured -- nothing was attempted')
+}
+
+async function testPreviewFailsWhenCcNotConfigured() {
+  await setDirectory()
+  delete process.env.REVIEW_ESCALATION_CC_EMAILS
+  _setRedisClientForTests(() => fakeRedis())
+  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  const res = await invoke({ action: 'preview-review-email', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), query: { id: 'review-1', locationId: '3' } })
+  assert(res.statusCode === 503, `expected 503 when CC is unconfigured, got ${res.statusCode}`)
+  assert(res.body.message === 'Review escalation recipients are not configured.', `expected the exact required message, got "${res.body.message}"`)
 }
 
 // --- Email safety -----------------------------------------------------------
@@ -444,6 +488,9 @@ async function main() {
   await run('CC cannot be overridden by the client -- always REVIEW_ESCALATION_CC_EMAILS', testCcCannotBeOverriddenByClient)
   await run('Reply-To is always the server-configured value, never client-supplied', testReplyToConfiguredFromEnv)
   await run('a location with no configured contact prevents sending', testMissingContactPreventsSending)
+  await run('send-review-email: fails with 503 when REVIEW_ESCALATION_CC_EMAILS is unconfigured', testSendFailsWhenCcNotConfigured)
+  await run('send-review-email: no record is written when CC is unconfigured', testSendWithNoRecordWrittenWhenCcNotConfigured)
+  await run('preview-review-email: fails with 503 when REVIEW_ESCALATION_CC_EMAILS is unconfigured', testPreviewFailsWhenCcNotConfigured)
   await run('CR/LF in an edited subject is stripped (header-injection defense)', testHeaderInjectionInSubjectRejectedStripped)
   await run('both HTML and plain-text bodies are generated', testHtmlAndPlainTextBothGenerated)
   await run('an invalid review snapshot (bad star rating) is rejected', testInvalidReviewSnapshotRejected)

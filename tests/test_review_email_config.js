@@ -3,7 +3,7 @@
 //
 // Run directly: node tests/test_review_email_config.js
 
-import { getEscalationCcEmails, getReplyToEmail } from '../dashboard/api/_lib/reviewEmailConfig.js'
+import { getEscalationCcEmails, getReplyToEmail, getFromName } from '../dashboard/api/_lib/reviewEmailConfig.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -21,6 +21,7 @@ function run(name, fn) {
   } finally {
     delete process.env.REVIEW_ESCALATION_CC_EMAILS
     delete process.env.REVIEW_REPLY_TO_EMAIL
+    delete process.env.REVIEW_FROM_NAME
   }
 }
 
@@ -69,6 +70,27 @@ function testConfigIsNeverClientInfluenced() {
   // is no code path by which a request body/query string could reach them.
   assert(getEscalationCcEmails.length === 0, 'getEscalationCcEmails must take no arguments (env-only)')
   assert(getReplyToEmail.length === 0, 'getReplyToEmail must take no arguments (env-only)')
+  assert(getFromName.length === 0, 'getFromName must take no arguments (env-only)')
+}
+
+function testFromNameDefaultsWhenUnset() {
+  assert(getFromName() === 'LTA Review Dashboard', `expected the default From name, got ${getFromName()}`)
+}
+
+function testFromNameUsesConfiguredValue() {
+  process.env.REVIEW_FROM_NAME = 'Los Tres Amigos Marketing Team'
+  assert(getFromName() === 'Los Tres Amigos Marketing Team', `expected the configured From name, got ${getFromName()}`)
+}
+
+function testFromNameStripsQuotesAndNewlines() {
+  process.env.REVIEW_FROM_NAME = '"LTA"\r\nBcc: attacker@evil.com'
+  const name = getFromName()
+  assert(!name.includes('"') && !name.includes('\r') && !name.includes('\n'), `quotes/CR/LF must be stripped, got ${JSON.stringify(name)}`)
+}
+
+function testFromNameFallsBackWhenConfiguredValueIsOnlyStrippedCharacters() {
+  process.env.REVIEW_FROM_NAME = '"\r\n"'
+  assert(getFromName() === 'LTA Review Dashboard', 'a configured value that strips down to nothing must fall back to the default')
 }
 
 function main() {
@@ -80,6 +102,10 @@ function main() {
   run('Reply-To uses the configured value when valid', testReplyToUsesConfiguredValueWhenValid)
   run('Reply-To falls back to default when configured value is malformed', testReplyToFallsBackToDefaultWhenMalformed)
   run('config functions take no arguments -- structurally never client-influenced', testConfigIsNeverClientInfluenced)
+  run('From name defaults to "LTA Review Dashboard" when unset', testFromNameDefaultsWhenUnset)
+  run('From name uses the configured REVIEW_FROM_NAME value', testFromNameUsesConfiguredValue)
+  run('From name strips quotes/CR/LF (header-injection defense)', testFromNameStripsQuotesAndNewlines)
+  run('From name falls back to default when the configured value strips to nothing', testFromNameFallsBackWhenConfiguredValueIsOnlyStrippedCharacters)
 
   console.log()
   if (results.every(Boolean)) {

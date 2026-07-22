@@ -31,6 +31,7 @@ async function run(name, fn) {
     _resetTransportForTests()
     delete process.env.GMAIL_USER
     delete process.env.GMAIL_APP_PASSWORD
+    delete process.env.REVIEW_FROM_NAME
   }
 }
 
@@ -76,6 +77,19 @@ async function testFromAddressUsesGmailUser() {
   }))
   await sendReviewEmail(BASE_MESSAGE)
   assert(captured.from.includes('dashboard@example.com'), `expected From to reference GMAIL_USER, got ${captured.from}`)
+  assert(captured.from.includes('LTA Review Dashboard'), `expected the default display name when REVIEW_FROM_NAME is unset, got ${captured.from}`)
+}
+
+async function testFromAddressUsesConfiguredDisplayName() {
+  process.env.GMAIL_USER = 'dashboard@example.com'
+  process.env.GMAIL_APP_PASSWORD = 'not-a-real-password'
+  process.env.REVIEW_FROM_NAME = 'Los Tres Amigos Marketing Team'
+  let captured = null
+  _setTransportForTests(() => ({
+    sendMail: async (msg) => { captured = msg; return { messageId: 'x' } },
+  }))
+  await sendReviewEmail(BASE_MESSAGE)
+  assert(captured.from === '"Los Tres Amigos Marketing Team" <dashboard@example.com>', `expected the configured display name, got ${captured.from}`)
 }
 
 async function testEmptyCcOmittedNotSentAsEmptyArray() {
@@ -106,7 +120,8 @@ async function testSendFailurePropagatesAsPlainErrorNotUnavailable() {
 async function main() {
   await run('unconfigured (no Gmail credentials) throws EmailSenderUnavailableError', testUnconfiguredThrowsUnavailableError)
   await run('a successful send returns the provider messageId and passes fields through', testSuccessfulSendReturnsMessageId)
-  await run('the From address is built from GMAIL_USER', testFromAddressUsesGmailUser)
+  await run('the From address is built from GMAIL_USER, with the default display name', testFromAddressUsesGmailUser)
+  await run('the From display name uses REVIEW_FROM_NAME when configured', testFromAddressUsesConfiguredDisplayName)
   await run('an empty cc array is omitted, not sent as []', testEmptyCcOmittedNotSentAsEmptyArray)
   await run('a genuine SMTP send failure propagates as a plain Error, distinct from EmailSenderUnavailableError', testSendFailurePropagatesAsPlainErrorNotUnavailable)
 

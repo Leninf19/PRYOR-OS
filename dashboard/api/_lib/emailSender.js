@@ -31,6 +31,7 @@
 //   Email Workflow" for the exact variable names required.
 
 import nodemailer from 'nodemailer'
+import { getFromName } from './reviewEmailConfig.js'
 
 let transporter = null
 // Test-only seam -- lets tests simulate a real transporter's sendMail()
@@ -75,7 +76,7 @@ export async function sendReviewEmail({ to, cc, replyTo, subject, html, text }) 
   if (!t) throw new EmailSenderUnavailableError('email sending is not configured (GMAIL_USER/GMAIL_APP_PASSWORD missing)')
 
   const info = await t.sendMail({
-    from: `"LTA Review Dashboard" <${process.env.GMAIL_USER}>`,
+    from: `"${getFromName()}" <${process.env.GMAIL_USER}>`,
     to,
     cc: cc && cc.length ? cc : undefined,
     replyTo,

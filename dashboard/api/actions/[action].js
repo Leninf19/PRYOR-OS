@@ -171,11 +171,22 @@ async function previewReviewEmail(req, res) {
     return res.status(400).json({ error: 'invalid_request', message: 'id and a positive integer locationId are required.' })
   }
 
+  // Management visibility (Martin/Ruffy) on every restaurant escalation is
+  // a business requirement, not a nicety -- an empty CC list means the
+  // whole feature is unusable right now, not "send anyway with no CC".
+  // Checked here too (not just in the send action) so the confirmation
+  // panel shows this failure before the user ever reaches Send.
+  const cc = getEscalationCcEmails()
+  if (cc.length === 0) {
+    console.error('[actions/preview-review-email] REVIEW_ESCALATION_CC_EMAILS is not configured')
+    return res.status(503).json({ error: 'service_unavailable', message: 'Review escalation recipients are not configured.' })
+  }
+
   try {
     const [contact, existing] = await Promise.all([getLocationContact(locationId), getAction(id)])
     return res.status(200).json({
       recipient: contact ? { email: contact.email, name: contact.name ?? null } : null,
-      cc: getEscalationCcEmails(),
+      cc,
       replyTo: getReplyToEmail(),
       existingRecord: existing ? {
         emailStatus: existing.emailStatus ?? 'not_sent',
@@ -228,6 +239,16 @@ async function sendReviewEmailAction(req, res) {
     return res.status(400).json({ error: 'invalid_request', message: 'followUpDueAt must be a string date or null.' })
   }
 
+  // Management visibility (Martin/Ruffy) on every restaurant escalation is
+  // a business requirement -- refuse to send with no CC rather than
+  // silently omitting them. Checked before any Redis/contact lookup since
+  // it's a pure config check.
+  const cc = getEscalationCcEmails()
+  if (cc.length === 0) {
+    console.error('[actions/send-review-email] REVIEW_ESCALATION_CC_EMAILS is not configured -- refusing to send without management visibility')
+    return res.status(503).json({ error: 'service_unavailable', message: 'Review escalation recipients are not configured.' })
+  }
+
   let contact, existing
   try {
     ;[contact, existing] = await Promise.all([getLocationContact(locationId), getAction(id)])
@@ -254,7 +275,6 @@ async function sendReviewEmailAction(req, res) {
     return res.status(409).json({ error: 'already_sent', message: 'This review already has an email sent to the restaurant. Resend to send it again.', record: existing })
   }
 
-  const cc = getEscalationCcEmails()
   const replyTo = getReplyToEmail()
   const subject = sanitizeHeaderValue(subjectRaw || buildDefaultSubject({ locationName: reviewSnapshot.locationName, starRating: reviewSnapshot.starRating }))
   const internalReferenceUrl = buildInternalReferenceUrl(id)
