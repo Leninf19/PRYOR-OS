@@ -10,7 +10,7 @@
 // file layout changed, not the API.
 
 import { setCookie, clearCookie } from '../google/_lib/cookies.js'
-import { getAccountByEmail } from '../_lib/accountStore.js'
+import { getAccountByEmail, listAccounts } from '../_lib/accountStore.js'
 import { verifyPassword } from '../_lib/password.js'
 import { requireAuth } from '../_lib/auth.js'
 import { signSession, SESSION_COOKIE } from '../_lib/session.js'
@@ -113,11 +113,41 @@ async function whoami(req, res) {
   return res.status(200).json({ account })
 }
 
+// GET /api/session/accounts -- the reusable identity-directory read: every
+// non-disabled account, sanitized (no passwordHash). Lives on the identity
+// layer, not on any one feature, deliberately -- Action Center's assignee
+// picker is the first consumer, but workload reporting, notifications,
+// settings/manager-administration, and audit-log attribution all need the
+// same "who are the people in this system" list and should call this same
+// endpoint rather than each growing their own account-listing logic.
+// Any authenticated role may call it (same as whoami) -- it exposes no
+// more than every account's own toSafeAccount() shape already reveals to
+// its own owner.
+async function accounts(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+  const account = await requireAuth(req, res, null) // null = any authenticated role
+  if (!account) return
+
+  const safeAccounts = listAccounts()
+    .filter(a => !a.disabled)
+    .map(a => ({
+      userId: a.userId,
+      email: a.email,
+      role: a.role,
+      locationIds: a.locationIds,
+      displayName: a.displayName ?? a.email,
+    }))
+    .sort((a, b) => a.displayName.localeCompare(b.displayName))
+
+  return res.status(200).json({ accounts: safeAccounts })
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
-    case 'login':  return login(req, res)
-    case 'logout': return logout(req, res)
-    case 'whoami': return whoami(req, res)
-    default:       return res.status(404).json({ error: 'not_found' })
+    case 'login':    return login(req, res)
+    case 'logout':   return logout(req, res)
+    case 'whoami':   return whoami(req, res)
+    case 'accounts': return accounts(req, res)
+    default:         return res.status(404).json({ error: 'not_found' })
   }
 }

@@ -1,5 +1,5 @@
-// Confirms every one of the 15 routable dashboard/api/** routes (12
-// serverless functions -- the 3 /api/session/* routes share one
+// Confirms every one of the 16 routable dashboard/api/** routes (12
+// serverless functions -- the 4 /api/session/* routes share one
 // [action].js file, and the 2 /api/actions/* routes share another) rejects
 // unsupported HTTP methods (including HEAD/OPTIONS -- neither should ever
 // fall through to auth/data logic) with 405, before touching auth or data.
@@ -67,6 +67,7 @@ const ROUTES = [
   ['/api/session/login', sessionHandler, 'POST', { query: { action: 'login' } }],
   ['/api/session/logout', sessionHandler, 'POST', { query: { action: 'logout' } }],
   ['/api/session/whoami', sessionHandler, 'GET', { query: { action: 'whoami' } }],
+  ['/api/session/accounts', sessionHandler, 'GET', { query: { action: 'accounts' } }],
   ['/api/actions/list', actionsHandler, 'GET', { query: { action: 'list' } }],
   ['/api/actions/update', actionsHandler, 'POST', { query: { action: 'update' } }],
 ]

@@ -42,6 +42,7 @@ import dataHandler from '../dashboard/api/data.js'
 import executiveBriefHandler from '../dashboard/api/executive-brief.js'
 import rewriteHandler from '../dashboard/api/rewrite.js'
 import sessionHandler from '../dashboard/api/session/[action].js'
+import actionsHandler from '../dashboard/api/actions/[action].js'
 import authHandler from '../dashboard/api/google/auth.js'
 import callbackHandler from '../dashboard/api/google/callback.js'
 import publishHandler from '../dashboard/api/google/publish.js'
@@ -244,6 +245,30 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     knownDefect: 'ERROR_CONTRACT_EXCEPTION_1',
     notes: 'Same fix and the same resolved ERROR_CONTRACT_EXCEPTION_1 as auth.js above, plus an independent CSRF state check (unchanged). Owner-only.',
+  },
+  {
+    route: 'GET /api/session/accounts', file: 'api/session/[action].js', method: 'GET', action: 'accounts',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'account-wide (identity directory listing, no review/location data)',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Action Center Accountability milestone. requireAuth(req, res, null) -- any authenticated, non-disabled, current-sessionVersion role passes, same as whoami. Returns every non-disabled account\'s sanitized identity (no passwordHash) -- deliberately on the identity layer, not owned by any one feature, so future features (workload reporting, notifications, settings, audit logs) reuse this same endpoint instead of each growing their own account-listing logic. There is no "wrong role" case for this endpoint.',
+  },
+  {
+    route: 'GET /api/actions/list', file: 'api/actions/[action].js', method: 'GET', action: 'list',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
+    scope: 'company-wide task workspace -- not part of the location-authorization roadmap (Milestones 6-9 above); this endpoint reads Redis-backed collaborative state, never reviews.db-derived location data',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Action Center Accountability milestone. Same read roles as the AI Action Center already has today (owner, marketing) -- location_manager is deliberately NOT granted here; per README "Location authorization strategy", location-scoped accounts remain unsafe to create until Milestone 6/7\'s location_id propagation lands, and this milestone does not change that.',
+  },
+  {
+    route: 'POST /api/actions/update', file: 'api/actions/[action].js', method: 'POST', action: 'update',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
+    scope: 'company-wide task workspace -- same non-goal as GET /api/actions/list',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Action Center Accountability milestone. Rate-limited per-caller (test_actions_endpoint.js). Rejects any patch containing a server-owned field (createdBy/At, updatedBy/At, history, id) with 400, before ever reaching actionStore.js.',
   },
 ]
 
@@ -541,6 +566,7 @@ const HANDLERS = {
   'api/executive-brief.js': executiveBriefHandler,
   'api/rewrite.js': rewriteHandler,
   'api/session/[action].js': sessionHandler,
+  'api/actions/[action].js': actionsHandler,
   'api/google/auth.js': authHandler,
   'api/google/callback.js': callbackHandler,
   'api/google/publish.js': publishHandler,

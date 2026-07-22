@@ -45,3 +45,11 @@ export function getAccountByEmail(email) {
   if (!accounts) return null
   return findAccountByEmail(accounts, email)
 }
+
+// Returns every account in the directory, or [] if the directory is
+// missing/invalid (same loadDirectoryOrWarn() path/logging as every other
+// lookup in this file). Same "full record, caller sanitizes" contract as
+// getAccountById()/getAccountByEmail().
+export function listAccounts() {
+  return loadDirectoryOrWarn() ?? []
+}
