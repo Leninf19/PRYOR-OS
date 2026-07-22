@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useRef } from 'react'
+import { useState, useMemo, useCallback, useRef, useEffect } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useToast } from '../components/ui/Toast.jsx'
@@ -6,13 +6,14 @@ import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Button from '../components/ui/Button.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
-import { sentimentBucket } from '../utils/dataUtils.js'
+import { sentimentBucket, reviewId } from '../utils/dataUtils.js'
 import { exportCSV } from '../utils/exportUtils.js'
 import { useResponseDrafts, useMeta } from '../hooks/useIntelligence.js'
 import { useReviewWorkspace } from '../hooks/useReviewWorkspace.js'
 import { useActionWorkspace } from '../hooks/useActionWorkspace.js'
 import { useReviewEmailPreview, useSendReviewEmail } from '../hooks/useReviewEmailWorkflow.js'
 import { useAccount } from '../components/AuthGate.jsx'
+import { EMAIL_STATUS_META, DUPLICATE_EMAIL_STATUSES } from '../utils/actionWorkspaceUtils.js'
 
 const PAGE_SIZE = 40
 
@@ -27,20 +28,6 @@ const STATUS_META = {
   failed:        { label: 'Failed',         variant: 'danger',  done: false },
   taken_care_of: { label: 'Done',           variant: 'neutral', done: true  },
 }
-
-// Restaurant bad-review email workflow status badges (recovery-audit
-// milestone) -- a separate workspace/state machine from the response
-// workspace above (STATUS_META tracks the customer-facing Google reply;
-// this tracks the internal "did we email the restaurant" thread).
-const EMAIL_STATUS_META = {
-  not_sent:           { label: 'Not Sent',            variant: 'neutral' },
-  sent:               { label: 'Sent',                variant: 'info' },
-  replied:            { label: 'Replied',             variant: 'success' },
-  follow_up_required: { label: 'Follow-Up Required',  variant: 'warning' },
-  resolved:           { label: 'Resolved',             variant: 'success' },
-  failed:             { label: 'Send Failed',          variant: 'danger' },
-}
-const DUPLICATE_EMAIL_STATUSES = new Set(['sent', 'replied', 'follow_up_required', 'resolved'])
 
 const TONES = [
   { id: 'friendly',     label: 'Friendly'      },
@@ -61,10 +48,6 @@ const FAIL_REASONS = {
   network_error:     'Network error. Check your connection and try again.',
   location_mismatch: 'Could not match this review to a verified Google location.',
   already_replied:   'This review already has an owner response on Google.',
-}
-
-function reviewId(r) {
-  return r.review_id || r.review_url || `${r.review_date}-${r.reviewer_name}`
 }
 
 function fmtWhen(iso) {
@@ -1027,6 +1010,24 @@ export default function ReviewExplorer({ allReviews = [], filtered = [], prevFil
   const [needsResponseOnly, setNeedsResponseOnly] = useState(() => searchParams.get('filter') === 'needs-response')
 
   const resetPage = useCallback(() => setPage(0), [])
+
+  // Best-effort deep link from the restaurant bad-review email's "internal
+  // reference" URL / an Action Center email-thread card ("Open review"):
+  // /explorer?reviewId=<review_id-or-review_url>. Only handles the common
+  // case (a review with a real review_id/review_url, the overwhelming
+  // majority) -- clears this page's own local filters so the target review
+  // isn't hidden by a stale filter, but does NOT touch the parent's global
+  // date-range filter, so a review outside that range still won't be found.
+  useEffect(() => {
+    const targetId = searchParams.get('reviewId')
+    if (!targetId) return
+    const match = allReviews.find(r => (r.review_id || r.review_url) === targetId)
+    if (!match) return
+    setNoReply(false); setStars(''); setSentiment(''); setLength(''); setLocFilter(''); setKeyword(''); setNeedsResponseOnly(false)
+    resetPage()
+    setSelectedKey(targetId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, allReviews])
 
   function toggleNeedsResponse() {
     const next = !needsResponseOnly

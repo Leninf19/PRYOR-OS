@@ -39,6 +39,8 @@ const TESTS = [
   'test_send_review_email.js',
   'test_review_email_workflow_frontend.js',
   'test_review_explorer_send_to_restaurant.js',
+  'test_action_workspace_utils.js',
+  'test_action_center_email_threads.js',
   'test_priority_digest.js',
   'test_executive_intelligence_center_ui.js',
   'test_executive_intelligence_prefetch.js',

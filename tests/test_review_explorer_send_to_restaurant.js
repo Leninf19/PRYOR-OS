@@ -94,9 +94,15 @@ function testStatesRendered() {
 }
 
 function testEmailStatusMetaCoversFullEnum() {
+  // The definition now lives in the shared utils file (reused by
+  // ActionCenter.jsx too) -- ReviewExplorer.jsx must import it, not
+  // redefine it.
   const content = read('pages/ReviewExplorer.jsx')
+  assert(/import \{ EMAIL_STATUS_META, DUPLICATE_EMAIL_STATUSES \} from '\.\.\/utils\/actionWorkspaceUtils\.js'/.test(content),
+    'ReviewExplorer.jsx must import the shared EMAIL_STATUS_META, not redefine it locally')
+  const shared = read('utils/actionWorkspaceUtils.js')
   for (const status of ['not_sent', 'sent', 'replied', 'follow_up_required', 'resolved', 'failed']) {
-    assert(content.includes(`${status}:`), `EMAIL_STATUS_META must cover "${status}"`)
+    assert(shared.includes(`${status}:`), `the shared EMAIL_STATUS_META must cover "${status}"`)
   }
 }
 

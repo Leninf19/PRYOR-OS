@@ -337,6 +337,16 @@ function _diffTags(cur, prev, minCount = 2) {
   }
 }
 
+// The canonical "stable id for a review" used wherever review-scoped
+// client-side state needs a key (review/action workspaces, the restaurant
+// bad-review email workflow's Action Center record id). Was previously
+// defined only inside ReviewExplorer.jsx -- moved here so ActionCenter.jsx
+// can cross-reference the same review a "Send to Restaurant" record
+// belongs to, without duplicating this fallback chain.
+export function reviewId(r) {
+  return r.review_id || r.review_url || `${r.review_date}-${r.reviewer_name}`
+}
+
 export function getCategoryChanges(filtered, prevFiltered, minCount = 2) {
   return {
     complaints: _diffTags(_tallyTags(filtered, 'complaint_tags'), _tallyTags(prevFiltered, 'complaint_tags'), minCount),

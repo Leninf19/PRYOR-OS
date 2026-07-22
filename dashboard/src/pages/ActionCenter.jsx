@@ -10,8 +10,12 @@ import { useActionCenter, useComplaintIntel } from '../hooks/useIntelligence.js'
 import { useActionWorkspace } from '../hooks/useActionWorkspace.js'
 import { useAccounts } from '../hooks/useAccounts.js'
 import { useAccount } from '../components/AuthGate.jsx'
-import { getUniqueLocations } from '../utils/dataUtils.js'
-import { OPEN_STATUSES, isOverdue } from '../utils/actionWorkspaceUtils.js'
+import { useUpdateEmailStatus } from '../hooks/useReviewEmailWorkflow.js'
+import { getUniqueLocations, reviewId } from '../utils/dataUtils.js'
+import {
+  OPEN_STATUSES, isOverdue,
+  EMAIL_STATUS_META, EMAIL_STATUS_TRANSITIONABLE_FROM, isEmailFollowUpOverdue,
+} from '../utils/actionWorkspaceUtils.js'
 
 const PRIORITY_VARIANT = { Critical: 'danger', High: 'danger', Medium: 'warning', Low: 'neutral' }
 const TYPE_ICON = { operational: '🛠', marketing: '📣', recognition: '⭐' }
@@ -75,6 +79,120 @@ function OutcomeTracker({ actionId, entry, complaintIntel }) {
         {isFlat ? 'No change' : `${delta > 0 ? '+' : ''}${delta} mentions`} ({snapshot.count} → {live.count})
       </p>
     </div>
+  )
+}
+
+// Restaurant bad-review email workflow (recovery-audit milestone). Shows
+// email-thread items -- ws entries with an emailStatus, keyed by
+// reviewId(r) rather than an AI-recommendation id -- as their own cards in
+// this SAME page/store, not a second task-management system. `review` is
+// the matching row from allReviews (via reviewId()), for display only;
+// the email itself was already sent from Review Explorer.
+function RestaurantEmailThreadCard({ entryId, entry, review, accounts, onUpdateStatus, onUpdate }) {
+  const statusMeta = EMAIL_STATUS_META[entry.emailStatus] ?? EMAIL_STATUS_META.not_sent
+  const canTransition = EMAIL_STATUS_TRANSITIONABLE_FROM.has(entry.emailStatus)
+  const followUpOverdue = isEmailFollowUpOverdue(entry)
+
+  return (
+    <Card className="p-5">
+      <div className="flex items-start justify-between gap-3 mb-2">
+        <div className="min-w-0">
+          <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>
+            {review?.location_name ?? 'Unknown location'}
+          </p>
+          <p className="text-xs" style={{ color: 'var(--color-text-3)' }}>
+            {review?.reviewer_name || 'Anonymous'} · {review?.star_rating ?? '?'}★ · {review?.review_date ?? ''}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap flex-shrink-0">
+          <Badge variant={statusMeta.variant}>{statusMeta.label}</Badge>
+          {followUpOverdue && <Badge variant="danger">Follow-Up Overdue</Badge>}
+        </div>
+      </div>
+
+      {review?.review_text && (
+        <p className="text-xs italic leading-relaxed mb-3" style={{ color: 'var(--color-text-2)' }}>"{review.review_text}"</p>
+      )}
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+        <div>
+          <p className="text-[9px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>Sent</p>
+          <p className="mt-0.5" style={{ color: 'var(--color-text-1)' }}>{fmtWhen(entry.emailSentAt) || '—'}</p>
+        </div>
+        <div>
+          <p className="text-[9px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>Sent By</p>
+          <p className="mt-0.5" style={{ color: 'var(--color-text-1)' }}>{entry.emailSentBy ? displayNameFor(accounts, entry.emailSentBy) : '—'}</p>
+        </div>
+        <div>
+          <p className="text-[9px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>Recipient</p>
+          <p className="mt-0.5 truncate" style={{ color: 'var(--color-text-1)' }}>{entry.emailRecipient ?? '—'}</p>
+        </div>
+        <div>
+          <p className="text-[9px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>Follow-Up Due</p>
+          <p className="mt-0.5" style={{ color: 'var(--color-text-1)' }}>{entry.emailFollowUpDueAt ?? '—'}</p>
+        </div>
+      </div>
+
+      {entry.emailCcRecipients?.length > 0 && (
+        <p className="text-[10px] mt-2" style={{ color: 'var(--color-text-3)' }}>Cc: {entry.emailCcRecipients.join(', ')}</p>
+      )}
+      {entry.emailStatus === 'failed' && entry.emailLastError && (
+        <p className="text-[10px] mt-2" style={{ color: 'var(--color-danger)' }}>{entry.emailLastError}</p>
+      )}
+
+      {canTransition && (
+        <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--color-border)' }}>
+          <label className="text-[9px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>
+            Email Status
+          </label>
+          <select value={entry.emailStatus} onChange={e => onUpdateStatus(entryId, e.target.value)}
+                  className="text-xs px-2 py-1.5 rounded-lg focus:outline-none"
+                  style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}>
+            <option value="sent" disabled={entry.emailStatus !== 'sent'}>Sent (awaiting response)</option>
+            <option value="replied">Replied</option>
+            <option value="follow_up_required">Follow-Up Required</option>
+            <option value="resolved">Resolved</option>
+          </select>
+        </div>
+      )}
+
+      <div className="flex items-center justify-between mt-3">
+        {review && (
+          <a href={`/explorer?reviewId=${encodeURIComponent(entryId)}`}
+             className="text-xs font-medium" style={{ color: 'var(--color-accent)' }}>
+            Open review in Review Explorer →
+          </a>
+        )}
+      </div>
+
+      <div className="mt-3">
+        <label className="text-[9px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>
+          Internal Notes (paste the restaurant's reply here)
+        </label>
+        <textarea value={entry.notes ?? ''} onChange={e => onUpdate(entryId, { notes: e.target.value })}
+                  onBlur={() => entry.notes && onUpdate(entryId, {}, 'Note updated')}
+                  placeholder="Paste the restaurant's email reply, or add progress notes…" rows={2}
+                  className="w-full text-xs px-2.5 py-2 rounded-lg border resize-y focus:outline-none"
+                  style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }} />
+      </div>
+
+      {entry.history?.length > 0 && (
+        <details className="mt-3">
+          <summary className="text-[10px] font-bold uppercase tracking-wider cursor-pointer" style={{ color: 'var(--color-text-3)' }}>
+            History ({entry.history.length})
+          </summary>
+          <ul className="mt-2 space-y-1">
+            {[...entry.history].reverse().map((h, i) => (
+              <li key={i} className="text-xs flex items-baseline gap-2">
+                <span style={{ color: 'var(--color-text-3)' }}>{new Date(h.at).toLocaleString()}</span>
+                <span style={{ color: 'var(--color-text-1)' }}>{h.action}</span>
+                {h.by && <span style={{ color: 'var(--color-text-3)' }}>· {h.by}</span>}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </Card>
   )
 }
 
@@ -265,6 +383,7 @@ export default function ActionCenter() {
   const { data: ws, setRecord } = useActionWorkspace()
   const { data: accounts } = useAccounts()
   const account = useAccount()
+  const updateEmailStatusMutation = useUpdateEmailStatus()
   const { allReviews = [] } = useOutletContext() ?? {}
   const [tab, setTab] = useState('All')
   const [statusFilter, setStatusFilter] = useState('All')
@@ -300,6 +419,22 @@ export default function ActionCenter() {
       .sort((x, y) => y.open - x.open)
   }, [actions, ws])
 
+  // Restaurant bad-review email threads: ws entries with an emailStatus,
+  // cross-referenced against allReviews (via the shared reviewId()) for
+  // display -- keyed by review id, not an AI-recommendation id, so this is
+  // a distinct list from `actions` above even though both live in the same
+  // store/page. Sorted most-recently-sent first.
+  const emailThreads = useMemo(() => {
+    return Object.entries(ws)
+      .filter(([, entry]) => entry?.emailStatus)
+      .map(([id, entry]) => ({ id, entry, review: allReviews.find(r => reviewId(r) === id) ?? null }))
+      .sort((x, y) => (y.entry.emailSentAt ?? '').localeCompare(x.entry.emailSentAt ?? ''))
+  }, [ws, allReviews])
+
+  function handleUpdateEmailStatus(id, emailStatus) {
+    updateEmailStatusMutation.mutate({ id, emailStatus })
+  }
+
   return (
     <div className="space-y-6 max-w-[900px]">
       <div>
@@ -334,6 +469,18 @@ export default function ActionCenter() {
           </button>
         </div>
       </div>
+
+      {emailThreads.length > 0 && (
+        <div>
+          <h2 className="text-sm font-bold mb-2" style={{ color: 'var(--color-text-1)' }}>Restaurant Email Threads</h2>
+          <div className="space-y-3">
+            {emailThreads.map(({ id, entry, review }) => (
+              <RestaurantEmailThreadCard key={id} entryId={id} entry={entry} review={review}
+                                          accounts={accounts} onUpdateStatus={handleUpdateEmailStatus} onUpdate={setRecord} />
+            ))}
+          </div>
+        </div>
+      )}
 
       {isError ? (
         <ErrorState body="Couldn't load the action center recommendations." onRetry={refetch} />

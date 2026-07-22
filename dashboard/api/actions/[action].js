@@ -88,6 +88,10 @@ function validatePatch(patch) {
 // outgoing email -- never reachable before a send, never a way to fake
 // "sent" without actually sending.
 const MANUAL_EMAIL_STATUSES = new Set(['replied', 'follow_up_required', 'resolved'])
+// Prior states a manual transition may start from -- 'sent' (the normal
+// case) plus any manual state already reached (replied -> resolved, etc).
+// Deliberately excludes 'not_sent' and 'failed'.
+const TRANSITIONABLE_EMAIL_STATUSES = new Set(['sent', 'replied', 'follow_up_required', 'resolved'])
 
 const MANUAL_EMAIL_STATUS_HISTORY_LABEL = {
   replied: 'Restaurant response recorded',
@@ -327,8 +331,13 @@ async function updateEmailStatus(req, res) {
 
   try {
     const existing = await getAction(id)
-    if (!existing || !existing.emailStatus || existing.emailStatus === 'not_sent') {
-      return res.status(400).json({ error: 'invalid_request', message: 'This item has no outgoing email to update the status of yet.' })
+    // A manual transition is only valid from a genuinely-sent email
+    // (including one already in a manual state, so replied -> resolved
+    // etc. is allowed) -- 'not_sent' (nothing sent yet) and 'failed' (never
+    // reached the restaurant) are both excluded, since "replied" or
+    // "resolved" would be a lie if the email never actually arrived.
+    if (!existing || !TRANSITIONABLE_EMAIL_STATUSES.has(existing.emailStatus)) {
+      return res.status(400).json({ error: 'invalid_request', message: 'This item has no successfully-sent outgoing email to update the status of yet.' })
     }
     const record = await upsertAction(id, { emailStatus }, account, MANUAL_EMAIL_STATUS_HISTORY_LABEL[emailStatus])
     return res.status(200).json({ record })

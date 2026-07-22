@@ -415,6 +415,19 @@ async function testUpdateEmailStatusHappyPath() {
   assert(res.body.record.history[1].action === 'Restaurant response recorded')
 }
 
+async function testUpdateEmailStatusRejectsAfterFailedSend() {
+  await setDirectory()
+  const client = fakeRedis()
+  _setRedisClientForTests(() => client)
+  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setTransportForTests(fakeMailer({ ok: false, error: 'bounced' }))
+  const token = await tokenFor('usr_owner', 'owner@example.com', 'owner')
+  await invoke({ action: 'send-review-email', method: 'POST', token, body: sendBody() })
+
+  const res = await invoke({ action: 'update-email-status', method: 'POST', token, body: { id: 'review-1', emailStatus: 'replied' } })
+  assert(res.statusCode === 400, `a FAILED send must never be manually transitionable to replied, got ${res.statusCode}`)
+}
+
 async function testUpdateEmailStatusLocationManagerRejected() {
   await setDirectory()
   const res = await invoke({ action: 'update-email-status', method: 'POST', token: await tokenFor('usr_locmgr', 'locmgr@example.com', 'location_manager'), body: { id: 'review-1', emailStatus: 'resolved' } })
@@ -446,6 +459,7 @@ async function main() {
   await run('update-email-status rejects "sent" as a manually-settable value', testUpdateEmailStatusRejectsSentAsAManualValue)
   await run('update-email-status rejects an item with no prior send', testUpdateEmailStatusRejectsWhenNoPriorSend)
   await run('update-email-status happy path (replied)', testUpdateEmailStatusHappyPath)
+  await run('update-email-status rejects a transition after a FAILED send', testUpdateEmailStatusRejectsAfterFailedSend)
   await run('update-email-status: location_manager rejected -> 403', testUpdateEmailStatusLocationManagerRejected)
 
   console.log()
