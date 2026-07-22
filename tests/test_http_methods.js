@@ -1,8 +1,8 @@
-// Confirms every one of the 13 routable dashboard/api/** routes (11
+// Confirms every one of the 15 routable dashboard/api/** routes (12
 // serverless functions -- the 3 /api/session/* routes share one
-// [action].js file) rejects unsupported HTTP methods (including
-// HEAD/OPTIONS -- neither should ever fall through to auth/data logic)
-// with 405, before touching auth or data.
+// [action].js file, and the 2 /api/actions/* routes share another) rejects
+// unsupported HTTP methods (including HEAD/OPTIONS -- neither should ever
+// fall through to auth/data logic) with 405, before touching auth or data.
 // Handlers that require auth are exercised unauthenticated here on purpose:
 // the method check must be the very first thing that runs, so a wrong
 // method on a protected route still gets 405, not 401 (order matters for
@@ -25,6 +25,7 @@ import triggerImportHandler from '../dashboard/api/google/trigger-import.js'
 import triggerSyncHandler from '../dashboard/api/google/trigger-sync.js'
 import rewriteHandler from '../dashboard/api/rewrite.js'
 import sessionHandler from '../dashboard/api/session/[action].js'
+import actionsHandler from '../dashboard/api/actions/[action].js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -66,6 +67,8 @@ const ROUTES = [
   ['/api/session/login', sessionHandler, 'POST', { query: { action: 'login' } }],
   ['/api/session/logout', sessionHandler, 'POST', { query: { action: 'logout' } }],
   ['/api/session/whoami', sessionHandler, 'GET', { query: { action: 'whoami' } }],
+  ['/api/actions/list', actionsHandler, 'GET', { query: { action: 'list' } }],
+  ['/api/actions/update', actionsHandler, 'POST', { query: { action: 'update' } }],
 ]
 
 const ALL_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']
