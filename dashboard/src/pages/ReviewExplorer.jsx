@@ -8,8 +8,11 @@ import Button from '../components/ui/Button.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
 import { sentimentBucket } from '../utils/dataUtils.js'
 import { exportCSV } from '../utils/exportUtils.js'
-import { useResponseDrafts } from '../hooks/useIntelligence.js'
+import { useResponseDrafts, useMeta } from '../hooks/useIntelligence.js'
 import { useReviewWorkspace } from '../hooks/useReviewWorkspace.js'
+import { useActionWorkspace } from '../hooks/useActionWorkspace.js'
+import { useReviewEmailPreview, useSendReviewEmail } from '../hooks/useReviewEmailWorkflow.js'
+import { useAccount } from '../components/AuthGate.jsx'
 
 const PAGE_SIZE = 40
 
@@ -24,6 +27,20 @@ const STATUS_META = {
   failed:        { label: 'Failed',         variant: 'danger',  done: false },
   taken_care_of: { label: 'Done',           variant: 'neutral', done: true  },
 }
+
+// Restaurant bad-review email workflow status badges (recovery-audit
+// milestone) -- a separate workspace/state machine from the response
+// workspace above (STATUS_META tracks the customer-facing Google reply;
+// this tracks the internal "did we email the restaurant" thread).
+const EMAIL_STATUS_META = {
+  not_sent:           { label: 'Not Sent',            variant: 'neutral' },
+  sent:               { label: 'Sent',                variant: 'info' },
+  replied:            { label: 'Replied',             variant: 'success' },
+  follow_up_required: { label: 'Follow-Up Required',  variant: 'warning' },
+  resolved:           { label: 'Resolved',             variant: 'success' },
+  failed:             { label: 'Send Failed',          variant: 'danger' },
+}
+const DUPLICATE_EMAIL_STATUSES = new Set(['sent', 'replied', 'follow_up_required', 'resolved'])
 
 const TONES = [
   { id: 'friendly',     label: 'Friendly'      },
@@ -642,6 +659,166 @@ function NotesAndAssignment({ r, wsEntry, onUpdate }) {
   )
 }
 
+// Restaurant bad-review email workflow (recovery-audit milestone). Only
+// shown for a negative review (star_rating <= 2, this codebase's existing
+// "negative"/"unanswered" threshold -- see export_action_items.py) to an
+// owner/marketing account. Reuses the SAME Action Center Redis record
+// (keyed by reviewId(r)) rather than a separate store -- Action Center's
+// own card for this item (Phase 8) shows the same emailStatus/history.
+function SendToRestaurantSection({ r }) {
+  const showToast = useToast()
+  const account = useAccount()
+  const { data: meta } = useMeta()
+  const { data: ws } = useActionWorkspace()
+  const sendMutation = useSendReviewEmail()
+
+  const [open, setOpen] = useState(false)
+  const [subject, setSubject] = useState('')
+  const [internalNote, setInternalNote] = useState('')
+  const [followUpDueAt, setFollowUpDueAt] = useState('')
+  const [confirmArmed, setConfirmArmed] = useState(false)
+
+  const isNegative = (r.star_rating ?? 5) <= 2
+  const canSend = account?.role === 'owner' || account?.role === 'marketing'
+
+  const rid = reviewId(r)
+  const entry = ws[rid]
+  const emailStatus = entry?.emailStatus ?? 'not_sent'
+  const statusMeta = EMAIL_STATUS_META[emailStatus] ?? EMAIL_STATUS_META.not_sent
+
+  const locationMeta = (meta?.locations ?? []).find(l => l.locationId === r.locationId)
+  const hasContact = locationMeta?.hasContact ?? false
+
+  const { data: preview, isLoading: previewLoading } = useReviewEmailPreview(rid, r.locationId, open)
+  const isDuplicate = preview?.existingRecord && DUPLICATE_EMAIL_STATUSES.has(preview.existingRecord.emailStatus)
+  const needsConfirmClick = isDuplicate && !confirmArmed
+
+  if (!isNegative || !canSend) return null
+
+  function handleOpen() {
+    setSubject(`Response Requested — ${r.location_name} — ${r.star_rating}-Star Customer Review`)
+    setInternalNote('')
+    setFollowUpDueAt('')
+    setConfirmArmed(false)
+    setOpen(true)
+  }
+
+  async function handleSend() {
+    if (needsConfirmClick) { setConfirmArmed(true); return }
+    try {
+      await sendMutation.mutateAsync({
+        id: rid,
+        locationId: r.locationId,
+        review: {
+          locationName: r.location_name, city: r.city ?? null, starRating: r.star_rating,
+          reviewerName: r.reviewer_name ?? null, reviewDate: r.review_date ?? null,
+          reviewText: r.review_text ?? null, reviewUrl: r.review_url ?? null,
+        },
+        subject,
+        internalNote: internalNote || undefined,
+        followUpDueAt: followUpDueAt || undefined,
+        confirmResend: confirmArmed || isDuplicate,
+      })
+      showToast('Review email sent to the restaurant')
+      setOpen(false)
+    } catch (err) {
+      if (err.code === 'already_sent') setConfirmArmed(true)
+    }
+  }
+
+  return (
+    <div className="pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>
+      <div className="flex items-center justify-between mb-1.5">
+        <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>
+          Restaurant Email
+        </p>
+        <Badge variant={statusMeta.variant}>{statusMeta.label}</Badge>
+      </div>
+
+      {entry?.emailSentAt && (
+        <p className="text-[10px] mb-2" style={{ color: 'var(--color-text-3)' }}>
+          Last sent {fmtWhen(entry.emailSentAt)} to {entry.emailRecipient}
+        </p>
+      )}
+      {entry?.emailStatus === 'failed' && entry?.emailLastError && (
+        <p className="text-[10px] mb-2" style={{ color: 'var(--color-danger)' }}>{entry.emailLastError}</p>
+      )}
+
+      {!open ? (
+        !hasContact ? (
+          <p className="text-xs italic" style={{ color: 'var(--color-text-3)' }}>Restaurant email not configured</p>
+        ) : (
+          <Button variant="secondary" onClick={handleOpen}>
+            {emailStatus === 'not_sent' ? 'Send to Restaurant' : 'Resend to Restaurant'}
+          </Button>
+        )
+      ) : (
+        <div className="space-y-2 p-3 rounded-lg" style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)' }}>
+          {previewLoading ? (
+            <p className="text-xs" style={{ color: 'var(--color-text-3)' }}>Loading recipient…</p>
+          ) : (
+            <>
+              <p className="text-xs">
+                <span style={{ color: 'var(--color-text-3)' }}>To: </span>
+                <span style={{ color: 'var(--color-text-1)' }}>{preview?.recipient?.email ?? '(unavailable)'}</span>
+              </p>
+              {preview?.cc?.length > 0 && (
+                <p className="text-xs">
+                  <span style={{ color: 'var(--color-text-3)' }}>Cc: </span>
+                  <span style={{ color: 'var(--color-text-1)' }}>{preview.cc.join(', ')}</span>
+                </p>
+              )}
+              <p className="text-xs">
+                <span style={{ color: 'var(--color-text-3)' }}>Reply-To: </span>
+                <span style={{ color: 'var(--color-text-1)' }}>{preview?.replyTo}</span>
+              </p>
+            </>
+          )}
+
+          <div>
+            <label className="text-[10px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>Subject</label>
+            <input type="text" value={subject} onChange={e => setSubject(e.target.value)}
+                   className="w-full text-xs px-2 py-1.5 rounded-lg focus:outline-none"
+                   style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }} />
+          </div>
+
+          <div>
+            <label className="text-[10px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>Internal Note (optional)</label>
+            <textarea value={internalNote} onChange={e => setInternalNote(e.target.value)} rows={2}
+                      placeholder="Not included unless you add it here…"
+                      className="w-full text-xs px-2 py-1.5 rounded-lg resize-y focus:outline-none"
+                      style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }} />
+          </div>
+
+          <div>
+            <label className="text-[10px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>Follow-Up Due Date (optional)</label>
+            <input type="date" value={followUpDueAt} onChange={e => setFollowUpDueAt(e.target.value)}
+                   className="w-full text-xs px-2 py-1.5 rounded-lg focus:outline-none"
+                   style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }} />
+          </div>
+
+          {(needsConfirmClick || confirmArmed) && (
+            <p className="text-xs font-semibold" style={{ color: 'var(--color-danger)' }}>
+              This review already has an email sent to the restaurant. Click Send again to confirm resending.
+            </p>
+          )}
+
+          {sendMutation.isError && sendMutation.error?.code !== 'already_sent' && (
+            <p className="text-xs" style={{ color: 'var(--color-danger)' }}>{sendMutation.error.message}</p>
+          )}
+
+          <div className="flex items-center gap-2 pt-1">
+            <Button variant="primary" onClick={handleSend} disabled={sendMutation.isPending || (!preview?.recipient && !previewLoading)}>
+              {sendMutation.isPending ? 'Sending…' : needsConfirmClick ? 'Send' : confirmArmed ? 'Confirm Resend' : 'Send'}
+            </Button>
+            <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ResponseHistory({ history }) {
   if (!history?.length) return null
   const sorted = [...history].reverse()
@@ -776,6 +953,8 @@ function ReviewDetailPanel({ r, draft, allReviews, onClose, wsEntry, onUpdate })
           </div>
 
           <ResponseHistory history={wsEntry?.history} />
+
+          <SendToRestaurantSection r={r} />
 
           {/* Similar reviews */}
           {similar.length > 0 && (
