@@ -26,6 +26,7 @@ const TESTS = [
   'test_no_direct_data_fetches.js',
   'test_provider_health_hook.js',
   'test_provider_health_ui.js',
+  'test_priority_digest.js',
 ]
 
 const results = {}

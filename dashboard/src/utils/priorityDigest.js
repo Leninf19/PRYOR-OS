@@ -1,0 +1,282 @@
+// Phase 3 Milestone 6 (Executive Intelligence Center) -- a pure, deterministic
+// function that merges and ranks signals already computed elsewhere into one
+// digest. No new scoring model, no AI, no backend changes: every input here
+// is data an existing export (operations-impact.json, action-center.json,
+// predictive-alerts.json, action-items.json's trendAlerts) or an existing
+// dataUtils.js function (getLocationMomentum, getCategoryChanges) already
+// produced. This file only merges, ranks, deduplicates, and formats -- it
+// never re-derives a score from raw reviews itself.
+
+// "Today's Priorities" (Section 1) draws ONLY from these four sources, per
+// the approved design -- What Changed's momentum/category-change signals
+// belong to Sections 2/3, not here.
+const OPERATIONS_IMPACT_PRIORITY_SEVERITY = {
+  needsAttention: 'critical',
+  biggestComplaint: 'critical',
+  lowestPerforming: 'critical',
+  fastestGrowingComplaint: 'high',
+  leastConsistent: 'high',
+}
+
+// The mirror-image set: operations-impact.json fields that are inherently
+// positive, used only for Recent Wins (Section 2), never for Priorities.
+const OPERATIONS_IMPACT_WIN_KEYS = [
+  'biggestCompliment', 'fastestGrowingCompliment', 'highestPerforming', 'bestManaged', 'mostConsistent',
+]
+
+const SEVERITY_WEIGHT = { critical: 4, high: 3, warning: 2, info: 1 }
+
+// Fixed, deterministic tiebreak when two candidates land on the same
+// severity weight -- arbitrary but stable, so ties never depend on object
+// insertion order alone.
+const SOURCE_ORDER = { 'Operations Impact': 0, 'Action Center': 1, 'Predictive Alerts': 2, 'Trend Alerts': 3 }
+
+const MAX_PRIORITIES = 5
+const MAX_WINS = 3
+const MAX_NEXT_ACTIONS = 3
+
+function opsImpactHeadline(entry) {
+  if (!entry) return null
+  if (entry.category) return entry.category.name
+  if (entry.location) return entry.location.name
+  return null
+}
+
+function normalizeSubject(s) {
+  return (s || '').toLowerCase().trim()
+}
+
+// ── Section 1 candidate collection ──────────────────────────────────────────
+
+function collectOperationsImpactPriorityCandidates(operationsImpact) {
+  if (!operationsImpact) return []
+  const out = []
+  Object.entries(OPERATIONS_IMPACT_PRIORITY_SEVERITY).forEach(([key, severity]) => {
+    const entry = operationsImpact[key]
+    const headline = opsImpactHeadline(entry)
+    if (!headline || !entry?.explanation) return
+    out.push({
+      id: `opsimpact-${key}`,
+      title: headline,
+      explanation: entry.explanation,
+      severity,
+      sourceLabel: 'Operations Impact',
+      sourcePath: '/operations-impact',
+      subject: normalizeSubject(headline),
+    })
+  })
+  return out
+}
+
+function collectActionCenterPriorityCandidates(actionCenter) {
+  const items = Array.isArray(actionCenter) ? actionCenter : []
+  return items
+    .filter(a => a.priority === 'Critical' || a.priority === 'High')
+    .map(a => ({
+      id: `actioncenter-${a.id}`,
+      title: a.title,
+      explanation: a.reason,
+      severity: a.priority === 'Critical' ? 'critical' : 'high',
+      sourceLabel: 'Action Center',
+      sourcePath: '/action-center',
+      subject: normalizeSubject(a.title || a.id),
+    }))
+}
+
+function collectPredictiveAlertPriorityCandidates(predictiveAlerts) {
+  const arr = Array.isArray(predictiveAlerts) ? predictiveAlerts : (predictiveAlerts?.alerts ?? [])
+  return arr
+    .filter(a => a.severity !== 'positive')
+    .map((a, i) => {
+      const title = a.title ?? a.name ?? 'Predictive signal detected'
+      return {
+        id: `predictive-${i}`,
+        title,
+        explanation: a.body ?? a.description ?? a.message ?? '',
+        severity: a.severity === 'critical' ? 'critical' : 'warning',
+        sourceLabel: 'Predictive Alerts',
+        sourcePath: '/alerts',
+        subject: normalizeSubject(a.location ?? a.locationName ?? title),
+      }
+    })
+}
+
+function collectTrendAlertPriorityCandidates(trendAlerts) {
+  const arr = Array.isArray(trendAlerts) ? trendAlerts : []
+  return arr
+    .filter(t => t.delta < 0)
+    .map(t => ({
+      id: `trendalert-${t.name}`,
+      title: `${t.name} rating is declining`,
+      explanation: `Average rating dropped from ${fmt(t.avgPrev)}★ to ${fmt(t.avgCur)}★.`,
+      severity: 'warning',
+      sourceLabel: 'Trend Alerts',
+      sourcePath: '/alerts',
+      subject: normalizeSubject(t.name),
+    }))
+}
+
+function fmt(n) {
+  return typeof n === 'number' ? n.toFixed(2) : n
+}
+
+function rankAndDedupe(candidates, maxItems) {
+  const ranked = candidates
+    .map((c, i) => ({ ...c, _i: i, _weight: SEVERITY_WEIGHT[c.severity] ?? 0 }))
+    .sort((a, b) => (b._weight - a._weight) || ((SOURCE_ORDER[a.sourceLabel] ?? 9) - (SOURCE_ORDER[b.sourceLabel] ?? 9)) || (a._i - b._i))
+
+  const seen = new Set()
+  const deduped = []
+  for (const c of ranked) {
+    if (seen.has(c.subject)) continue
+    seen.add(c.subject)
+    // eslint-disable-next-line no-unused-vars
+    const { _i, _weight, ...rest } = c
+    deduped.push(rest)
+  }
+  return deduped.slice(0, maxItems).map((item, idx) => ({ ...item, rank: idx + 1 }))
+}
+
+// ── Section 2 candidate collection (Recent Wins) ────────────────────────────
+
+function collectOperationsImpactWinCandidates(operationsImpact) {
+  if (!operationsImpact) return []
+  const out = []
+  OPERATIONS_IMPACT_WIN_KEYS.forEach(key => {
+    const entry = operationsImpact[key]
+    const headline = opsImpactHeadline(entry)
+    if (!headline || !entry?.explanation) return
+    out.push({
+      id: `win-opsimpact-${key}`,
+      title: headline,
+      explanation: entry.explanation,
+      sourceLabel: 'Operations Impact',
+      sourcePath: '/operations-impact',
+      subject: normalizeSubject(headline),
+    })
+  })
+  return out
+}
+
+function collectMomentumWinCandidate(momentum) {
+  // getLocationMomentum() already returns results sorted descending by
+  // delta, so the first entry with a positive delta is the top gainer.
+  const best = (Array.isArray(momentum) ? momentum : []).find(m => m.delta > 0)
+  if (!best) return []
+  return [{
+    id: `win-momentum-${best.name}`,
+    title: `${best.name} is improving`,
+    explanation: `Average rating rose from ${fmt(best.prevAvg)}★ to ${fmt(best.curAvg)}★ (+${fmt(best.delta)}) this period.`,
+    sourceLabel: 'What Changed',
+    sourcePath: '/what-changed',
+    subject: normalizeSubject(best.name),
+  }]
+}
+
+function collectTrendAlertWinCandidate(trendAlerts) {
+  const rising = (Array.isArray(trendAlerts) ? trendAlerts : [])
+    .filter(t => t.delta > 0)
+    .sort((a, b) => b.delta - a.delta)[0]
+  if (!rising) return []
+  return [{
+    id: `win-trendalert-${rising.name}`,
+    title: `${rising.name} rating is improving`,
+    explanation: `Average rating improved from ${fmt(rising.avgPrev)}★ to ${fmt(rising.avgCur)}★.`,
+    sourceLabel: 'Trend Alerts',
+    sourcePath: '/alerts',
+    subject: normalizeSubject(rising.name),
+  }]
+}
+
+function dedupeInOrder(candidates, maxItems) {
+  const seen = new Set()
+  const out = []
+  for (const c of candidates) {
+    if (seen.has(c.subject)) continue
+    seen.add(c.subject)
+    out.push(c)
+    if (out.length >= maxItems) break
+  }
+  return out.map((item, idx) => ({ ...item, rank: idx + 1 }))
+}
+
+// ── Section 3 (What Changed condensed) ──────────────────────────────────────
+
+function computeBiggestMover(momentum) {
+  const arr = Array.isArray(momentum) ? momentum : []
+  if (!arr.length) return null
+  const top = [...arr].sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))[0]
+  return {
+    name: top.name,
+    delta: top.delta,
+    direction: top.delta >= 0 ? 'up' : 'down',
+    curAvg: top.curAvg,
+    prevAvg: top.prevAvg,
+  }
+}
+
+function computeEmergingTrend(categoryChanges) {
+  if (!categoryChanges) return null
+  const complaints = (categoryChanges.complaints?.new ?? []).map(c => ({ ...c, kind: 'complaint' }))
+  const praises = (categoryChanges.praises?.new ?? []).map(p => ({ ...p, kind: 'praise' }))
+  const top = [...complaints, ...praises].sort((a, b) => b.count - a.count)[0]
+  return top ? { id: top.id, count: top.count, prevCount: top.prevCount, kind: top.kind } : null
+}
+
+const ACTION_PRIORITY_ORDER = { Critical: 0, High: 1, Medium: 2, Low: 3 }
+
+function computeNextActionsFocus(actionCenter) {
+  const items = Array.isArray(actionCenter) ? actionCenter : []
+  if (!items.length) return null
+  const sorted = [...items].sort((a, b) => (ACTION_PRIORITY_ORDER[a.priority] ?? 4) - (ACTION_PRIORITY_ORDER[b.priority] ?? 4))
+  return {
+    items: sorted.slice(0, MAX_NEXT_ACTIONS).map(a => ({ id: a.id, title: a.title, priority: a.priority })),
+    total: items.length,
+  }
+}
+
+/**
+ * priorityDigest({ operationsImpact, actionCenter, predictiveAlerts,
+ * trendAlerts, momentum, categoryChanges }) -> {
+ *   topPriorities,   // max 5, ranked, deduplicated by subject
+ *   recentWins,      // max 3, deduplicated by subject
+ *   biggestMover,    // single item or null
+ *   emergingTrend,   // single item or null
+ *   nextActionsFocus,// top-3 action-center items + total count, or null
+ * }
+ *
+ * All inputs are the raw JSON payloads / dataUtils.js outputs the caller
+ * already fetched/computed -- this function does no fetching and no
+ * classification of its own.
+ */
+export function priorityDigest({
+  operationsImpact = null,
+  actionCenter = null,
+  predictiveAlerts = null,
+  trendAlerts = null,
+  momentum = null,
+  categoryChanges = null,
+} = {}) {
+  const priorityCandidates = [
+    ...collectOperationsImpactPriorityCandidates(operationsImpact),
+    ...collectActionCenterPriorityCandidates(actionCenter),
+    ...collectPredictiveAlertPriorityCandidates(predictiveAlerts),
+    ...collectTrendAlertPriorityCandidates(trendAlerts),
+  ]
+  const topPriorities = rankAndDedupe(priorityCandidates, MAX_PRIORITIES)
+
+  const winCandidates = [
+    ...collectOperationsImpactWinCandidates(operationsImpact),
+    ...collectMomentumWinCandidate(momentum),
+    ...collectTrendAlertWinCandidate(trendAlerts),
+  ]
+  const recentWins = dedupeInOrder(winCandidates, MAX_WINS)
+
+  return {
+    topPriorities,
+    recentWins,
+    biggestMover: computeBiggestMover(momentum),
+    emergingTrend: computeEmergingTrend(categoryChanges),
+    nextActionsFocus: computeNextActionsFocus(actionCenter),
+  }
+}
