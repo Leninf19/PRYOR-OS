@@ -11,6 +11,7 @@ import { filterReviews, getDefaultDateRange } from './utils/dataUtils.js'
 
 // Route-level code-splitting -- each page ships in its own chunk, fetched
 // only when its route is visited, instead of one ~480KB bundle up front.
+const ExecutiveIntelligenceCenter = lazy(() => import('./pages/ExecutiveIntelligenceCenter.jsx'))
 const Overview               = lazy(() => import('./pages/Overview.jsx'))
 const LocationDetail         = lazy(() => import('./pages/LocationDetail.jsx'))
 const ReviewExplorer         = lazy(() => import('./pages/ReviewExplorer.jsx'))
@@ -181,6 +182,7 @@ export default function App() {
     <Routes>
       <Route element={<RootLayout />}>
         <Route index                    element={<Navigate to="/overview" replace />} />
+        <Route path="executive-intelligence" element={<ExecutiveIntelligenceCenter />} />
         <Route path="overview"          element={<ROverview />} />
         <Route path="locations"         element={<RLocations />} />
         <Route path="explorer"          element={<RExplorer />} />
