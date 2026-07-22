@@ -54,6 +54,7 @@ Two different patterns, used for different reasons:
 ├── ai_engine.py               # batch AI classification/summaries/drafts
 ├── health_check.py, weekly_report.py   # independent scheduled watchdogs
 ├── migrate_csv_to_sqlite.py, merge_scraped.py   # one-off/manual maintenance
+├── set_location_contacts.py    # admin tool: restaurant contact-email config (see below)
 ├── scripts/legacy/             # pre-pipeline scraping scripts, kept for reference only
 ├── requirements.txt
 ├── .github/workflows/          # update-reviews, critical-alert-check, nightly-digest,
@@ -76,7 +77,8 @@ Two different patterns, used for different reasons:
 | Variable | Where it's used | Where it's set |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | `ai_engine.py` (batch), `dashboard/api/rewrite.js`, `dashboard/api/executive-brief.js` (live) | GitHub Actions secret **and** Vercel project env var (the live functions run on Vercel, not CI) |
-| `GMAIL_USER` / `GMAIL_APP_PASSWORD` | `notify.py`, `health_check.py`, `weekly_report.py`, `critical_alert_check.py`, `nightly_digest.py` | GitHub Actions secrets |
+| `GMAIL_USER` / `GMAIL_APP_PASSWORD` | `notify.py`, `health_check.py`, `weekly_report.py`, `critical_alert_check.py`, `nightly_digest.py` (batch) **and** `dashboard/api/_lib/emailSender.js` (live, restaurant bad-review email workflow) | GitHub Actions secrets **and** Vercel project env var (the live send runs on Vercel, not CI — see "Restaurant Bad-Review Email Workflow" below) |
+| `REVIEW_ESCALATION_CC_EMAILS` / `REVIEW_REPLY_TO_EMAIL` / `DASHBOARD_BASE_URL` | `dashboard/api/_lib/reviewEmailConfig.js` / `actions/[action].js` (restaurant bad-review email workflow) | Vercel project env vars — see "Restaurant Bad-Review Email Workflow" below. All optional except the CC list has no effect if unset (no CC applied, not an error). |
 | `VERCEL_TOKEN` | CI's own `vercel --prod` deploy step | GitHub Actions secret |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REFRESH_TOKEN` | `dashboard/api/google/*.js` (OAuth, status, publish, test-connection) **and** `google_api.py` (`gbp_sync.py`, `gbp_import.py`, `critical_alert_check.py`) | **Both** Vercel project env vars (for the live serverless functions) **and** GitHub Actions secrets (for the scheduled Python sync/alert workflows) — same three values, set in two places. See "Refresh token generation" below; once automation is configured, `GOOGLE_REFRESH_TOKEN` is written to Vercel for you, but still needs manually copying into GitHub Actions secrets since GitHub has no equivalent write API used here. |
 | `VERCEL_API_TOKEN` / `VERCEL_PROJECT_ID` / `VERCEL_ORG_ID` / `VERCEL_DEPLOY_HOOK_URL` | `dashboard/api/google/callback.js` (writes `GOOGLE_REFRESH_TOKEN` to Vercel automatically after OAuth, then triggers a redeploy) | Vercel project env vars. `VERCEL_API_TOKEN` is a personal/team API token scoped to env-var write access — distinct from the GitHub Actions secret of a similar name (`VERCEL_TOKEN`), do not confuse the two. |
@@ -173,6 +175,46 @@ Action Center's task-tracking state (status, assignee, due date, notes, history)
 `dashboard/src/services/actionWorkspaceService.js` is the exact seam its own original header comment called out as swappable — it now calls this API instead of `localStorage`, with `useActionWorkspace.js`'s public shape (and every `ActionCenter.jsx` caller) unchanged. `dashboard/src/utils/actionWorkspaceUtils.js` holds the shared `isOverdue()`/`OPEN_STATUSES` logic so Action Center's own Overdue filter and the Executive Intelligence Center's "assigned to you and overdue" priority source can never drift apart.
 
 Explicitly deferred (future milestones, not this one): `location_manager`-scoped task visibility, email/digest reminders for overdue tasks (would require a Python-side Redis client and cross the pipeline's batch/email boundary), and promoting the Executive Intelligence Center to the landing page.
+
+## Restaurant Bad-Review Email Workflow
+
+Lets marketing (`owner`/`marketing` roles) click **Send to Restaurant** on a negative review (Review Explorer, star rating ≤ 2) to email the location's contact directly, CC Martin/Ruffy, and track the thread through resolution — reusing the Action Accountability Store above rather than a second task-management system. Recovery-audit milestone; the original feature was never previously implemented (see the audit for what was searched and ruled out).
+
+**Architecture**: direct, synchronous delivery from the authenticated Vercel function (nodemailer + Gmail SMTP), not a GitHub Actions `workflow_dispatch`. An async dispatch can't safely report final delivery status back without new callback infrastructure, and this milestone's own requirement is that an email is never marked "sent" merely because a workflow was queued — direct delivery returns a truthful, immediate sent/failed result instead. See `dashboard/api/_lib/emailSender.js`'s header comment for the full tradeoff analysis.
+
+- **`dashboard/api/_lib/locationContacts.js`** — reads `dashboard/private-data/location-contacts.json` (written by `export_chunks.py`'s `export_location_contacts()`) directly off disk, server-side only. **Never added to `data.js`'s allowlist** — the browser can never fetch the whole contact directory, authenticated or not; only the one resolved recipient for the location being acted on is ever returned, via `GET /api/actions/preview-review-email`.
+- **`dashboard/api/_lib/reviewEmailConfig.js`** — `REVIEW_ESCALATION_CC_EMAILS` (comma-separated, validated, malformed entries dropped with a log line) and `REVIEW_REPLY_TO_EMAIL` (falls back to the existing marketing inbox, `advertising@l3amigos.com`, matching every Python alert script's `TO_ADDR`). Server-side only, deliberately separate from `ACCOUNT_DIRECTORY_JSON` — who gets CC'd is a distinct policy decision from who can log in.
+- **`dashboard/api/_lib/emailSender.js`** / **`reviewEmailTemplate.js`** — nodemailer + Gmail SMTP send, and the HTML+plain-text template (all customer-provided content escaped before HTML insertion).
+- **Three new actions on the existing `dashboard/api/actions/[action].js`** (zero new serverless functions): `GET preview-review-email` (recipient/CC/Reply-To preview), `POST send-review-email` (send + record), `POST update-email-status` (manual `replied`/`follow_up_required`/`resolved` transitions, only reachable from a genuinely-sent email — never from `not_sent` or `failed`).
+
+**Environment variables required** (none of their values are documented here):
+
+| Variable | Purpose | Where it's set |
+|---|---|---|
+| `GMAIL_USER` / `GMAIL_APP_PASSWORD` | The actual send — same credentials the Python alert scripts already use, but **must additionally be added as Vercel project env vars** (today they're GitHub-Actions-secrets only; confirmed absent from Vercel during the recovery audit). Without them, sending fails closed with a 503 — nothing is silently dropped. | Vercel project env var (new requirement) **and** existing GitHub Actions secret (unchanged) |
+| `REVIEW_ESCALATION_CC_EMAILS` | Comma-separated CC list (Martin/Ruffy) — always applied on every send, no per-review opt-out | Vercel project env var (new) |
+| `REVIEW_REPLY_TO_EMAIL` | Optional; defaults to `advertising@l3amigos.com` if unset | Vercel project env var (optional, new) |
+| `DASHBOARD_BASE_URL` | Optional; builds the email's "internal reference" deep link (`/explorer?reviewId=...`). Falls back to `https://${VERCEL_URL}` (Vercel's own auto-populated var) if unset, or omits the link entirely if neither is available. | Vercel project env var (optional, new) |
+
+**Contact-email configuration**: `locations.contact_email` / `contact_name` / `contact_active` (additive `db.py` columns). Populate via `python set_location_contacts.py --from-csv <path>` or `--set "Location Name" email@example.com` (never hardcode an address in a React component). Check status anytime with `python set_location_contacts.py --status`. **As of this milestone, all 21 locations remain unconfigured** — no placeholder/production email was invented; the UI shows "Restaurant email not configured" and disables Send until a real contact is entered.
+
+**Permitted roles**: `owner`, `marketing` — same as the AI Action Center's own read access. `location_manager` and `read_only` are explicitly rejected (403), consistent with "Location authorization strategy" above.
+
+**Reply-To / CC behavior**: both are resolved **entirely server-side** from `REVIEW_REPLY_TO_EMAIL`/`REVIEW_ESCALATION_CC_EMAILS` — the request body has no field for either, so a client cannot redirect or suppress them regardless of what it sends. CC fires on every manual send, unconditionally (no severity gating, no opt-out).
+
+**Email-status lifecycle**: `not_sent` (default/absent) → `sent` (a real send succeeded) or `failed` (attempted, recorded truthfully, never claims sent) → manually, from `sent`, to `replied` / `follow_up_required` / `resolved`. A `failed` record can only be retried (producing a fresh `sent`/`failed`), never manually promoted to `replied`. Resending an already-`sent`/`replied`/`follow_up_required`/`resolved` item requires an explicit confirm click in the UI (`confirmResend`).
+
+**Manual restaurant-response process** (Level 1 — no inbound email ingestion, by design; see the recovery audit's Option A/B/C comparison): the restaurant replies normally to the Reply-To inbox. Marketing pastes that reply into the same item's existing Internal Notes field (Action Center's "Restaurant Email Threads" section, or Review Explorer's own notes field for that review) and updates the status to `replied` / `follow_up_required` / `resolved` from Action Center.
+
+**Production verification checklist** (do this before considering the feature live):
+1. Add `GMAIL_USER`/`GMAIL_APP_PASSWORD` to Vercel's Production env vars (Preview too, if verifying there first).
+2. Add `REVIEW_ESCALATION_CC_EMAILS` (Martin + Ruffy's real addresses) and, if desired, `REVIEW_REPLY_TO_EMAIL`/`DASHBOARD_BASE_URL`.
+3. Populate at least one location's `contact_email` via `set_location_contacts.py` — **use a real test recipient you control first**, not a live restaurant address.
+4. Send a real test email end-to-end and confirm it actually arrives in **all** of: the test recipient's inbox, Martin's inbox, Ruffy's inbox, and the configured Reply-To inbox. Do not consider delivery verified on API-response success alone (a 200 confirms nodemailer accepted the send from Gmail's SMTP server, not that every recipient's mail provider delivered it).
+5. Confirm the Action Center record shows `emailStatus: sent` with a real `emailMessageId`, and that history/notes/status-transition controls all work.
+6. Only after that, populate real restaurant contact emails.
+
+**Rollback**: revert the commits — this milestone touches no schema in a way that isn't purely additive (`locations.contact_email`/`contact_name`/`contact_active` are new, nullable columns; the Redis fields are new, optional keys on the same existing record shape) and adds no new serverless function. No data migration to undo. Unpopulated `GMAIL_USER`/`GMAIL_APP_PASSWORD` on Vercel simply means the feature 503s cleanly rather than partially working — safe to leave unset if rolling back the intent to ship this, not just the code.
 
 ## Deployment
 
