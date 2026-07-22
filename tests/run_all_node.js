@@ -15,6 +15,7 @@ const TESTS = [
   'test_permissions.js',
   'test_authorization_matrix.js',
   'test_rate_limit.js',
+  'test_action_store.js',
   'test_login.js',
   'test_data_endpoint.js',
   'test_middleware.js',
