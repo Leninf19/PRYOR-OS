@@ -9,6 +9,7 @@ import { useReviewsData }    from './hooks/useReviewsData.js'
 import { useGlobalPrefetch } from './hooks/useIntelligence.js'
 import { useUnansweredCount } from './hooks/useReviewWorkspace.js'
 import { filterReviews, getDefaultDateRange } from './utils/dataUtils.js'
+import { settingsSections } from './pages/settings/settingsSections.js'
 
 // Route-level code-splitting -- each page ships in its own chunk, fetched
 // only when its route is visited, instead of one ~480KB bundle up front.
@@ -30,7 +31,7 @@ const Alerts                 = lazy(() => import('./pages/Alerts.jsx'))
 const MarketingIntelligence  = lazy(() => import('./pages/MarketingIntelligence.jsx'))
 const EmployeeIntelligence   = lazy(() => import('./pages/EmployeeIntelligence.jsx'))
 const ExecutiveReports       = lazy(() => import('./pages/ExecutiveReports.jsx'))
-const Settings                = lazy(() => import('./pages/Settings.jsx'))
+const SettingsLayout         = lazy(() => import('./pages/settings/SettingsLayout.jsx'))
 
 function RouteFallback() {
   return (
@@ -202,7 +203,14 @@ export default function App() {
         <Route path="alerts"            element={<Alerts />} />
         <Route path="executive-reports" element={<ExecutiveReports />} />
         <Route path="scraper-status"    element={<RScraper />} />
-        <Route path="settings"          element={<Settings />} />
+        <Route path="settings" element={<SettingsLayout />}>
+          {settingsSections.map(s => {
+            const Component = s.component
+            return s.path === ''
+              ? <Route key={s.id} index element={<Component />} />
+              : <Route key={s.id} path={s.path} element={<Component />} />
+          })}
+        </Route>
         {/* Legacy redirects */}
         <Route path="rankings"   element={<Navigate to="/trends"      replace />} />
         <Route path="insights"   element={<Navigate to="/intelligence" replace />} />
