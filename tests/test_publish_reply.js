@@ -10,6 +10,7 @@
 import bcrypt from 'bcryptjs'
 import googleHandler from '../dashboard/api/google/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
+import { _setRedisClientForTests as _setCredentialRedisForTests, setStoredCredential } from '../dashboard/api/_lib/credentialStore.js'
 
 // publish.js was merged into the consolidated dispatch file (Phase 8,
 // Milestone 8.2) -- this wrapper keeps every call site below exactly as it
@@ -18,8 +19,19 @@ function handler(req, res) { return googleHandler({ ...req, query: { ...req.quer
 
 process.env.GOOGLE_CLIENT_ID = 'fake-client-id'
 process.env.GOOGLE_CLIENT_SECRET = 'fake-client-secret'
-process.env.GOOGLE_REFRESH_TOKEN = 'fake-refresh-token'
+process.env.CREDENTIAL_ENCRYPTION_KEY = 'test-encryption-key-not-a-real-secret'
 process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xyz'
+
+// Phase 8, Milestone 8.7: the refresh token now lives in credentialStore.js
+// (Redis), not GOOGLE_REFRESH_TOKEN -- a fake in-memory store, seeded with a
+// connected credential, replaces the old env var for every test below.
+function fakeCredentialRedis(initial = null) {
+  let value = initial
+  return { get: async () => value, set: async (_key, v) => { value = v }, del: async () => { value = null } }
+}
+const credentialClient = fakeCredentialRedis()
+_setCredentialRedisForTests(() => credentialClient)
+await setStoredCredential({ refreshToken: 'fake-refresh-token', connectedAccountName: null })
 
 // publish.js now requires an authenticated Owner/Marketing session (Phase 1
 // endpoint-authorization work) -- every test below authenticates as Owner

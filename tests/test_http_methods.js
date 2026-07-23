@@ -57,6 +57,7 @@ const ROUTES = [
   ['/api/google/test-connection', googleHandler, 'GET', { query: { action: 'test-connection' } }],
   ['/api/google/trigger-import', googleHandler, 'POST', { query: { action: 'trigger-import' } }],
   ['/api/google/trigger-sync', googleHandler, 'POST', { query: { action: 'trigger-sync' } }],
+  ['/api/google/disconnect', googleHandler, 'POST', { query: { action: 'disconnect' } }],
   ['/api/rewrite', rewriteHandler, 'POST', {}],
   ['/api/session/login', sessionHandler, 'POST', { query: { action: 'login' } }],
   ['/api/session/logout', sessionHandler, 'POST', { query: { action: 'logout' } }],

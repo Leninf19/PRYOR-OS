@@ -24,12 +24,31 @@
 import { randomBytes } from 'crypto'
 import { setCookie, parseCookies, clearCookie } from './_lib/cookies.js'
 import { fetchWithRetry } from './_lib/http.js'
-import { upsertEnvVar, triggerRedeploy } from './_lib/vercel.js'
 import { exchangeRefreshToken, getAccessToken } from './_lib/googleAuth.js'
 import { requireAuth, evaluateSession, statusForAuthFailure } from '../_lib/auth.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
+import {
+  getStoredCredential, setStoredCredential, recordSyncOutcome, recordOAuthRefresh,
+  clearStoredCredential, GoogleHealth, CredentialStoreUnavailableError,
+} from '../_lib/credentialStore.js'
+import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
+
+// Fields every status-shaped response echoes back from the stored
+// credential, so the Settings page always has Last Authentication/Last
+// Successful Sync/Last Failed Sync/Token Health available regardless of
+// which branch produced the response.
+function credentialMetaFields(credential) {
+  return {
+    connectedAccountName: credential?.connectedAccountName ?? null,
+    connectedAt: credential?.connectedAt ?? null,
+    lastOAuthRefreshAt: credential?.lastOAuthRefreshAt ?? null,
+    lastSuccessfulSyncAt: credential?.lastSuccessfulSyncAt ?? null,
+    lastFailedSyncAt: credential?.lastFailedSyncAt ?? null,
+    lastFailureReason: credential?.lastFailureReason ?? null,
+  }
+}
 
 function page(title, body) {
   return `<!DOCTYPE html><html><head>
@@ -223,58 +242,52 @@ async function callback(req, res) {
     `))
   }
 
-  const vercelToken     = process.env.VERCEL_API_TOKEN
-  const vercelProjectId = process.env.VERCEL_PROJECT_ID
-  const vercelTeamId    = process.env.VERCEL_ORG_ID
-  const deployHookUrl   = process.env.VERCEL_DEPLOY_HOOK_URL
-
-  if (vercelToken && vercelProjectId && deployHookUrl) {
-    try {
-      await upsertEnvVar({
-        token: vercelToken, projectId: vercelProjectId, teamId: vercelTeamId,
-        key: 'GOOGLE_REFRESH_TOKEN', value: tokens.refresh_token,
-      })
-      await triggerRedeploy(deployHookUrl)
-      return res.send(page('✓ Google connected!', `
-        <p style="color:#16a34a;font-weight:600">Authorization successful. Your refresh token was saved directly to Vercel and a redeploy has started.</p>
-        <p>This page does not show the token — it's stored securely server-side and never reaches the browser.</p>
-        <p>Give the redeploy about 60 seconds, then refresh <a href="/settings">Settings</a> to confirm the connection.</p>
-      `))
-    } catch (err) {
-      return res.status(502).send(page('Connected, but automatic setup failed', `
-        <p style="color:#16a34a;font-weight:600">Authorization with Google succeeded.</p>
-        <p>However, saving the refresh token to Vercel automatically failed: <strong>${err.message}</strong></p>
-        <p>Check <code>VERCEL_API_TOKEN</code>, <code>VERCEL_PROJECT_ID</code>, <code>VERCEL_ORG_ID</code>, and
-        <code>VERCEL_DEPLOY_HOOK_URL</code> in Vercel's environment variables, then try connecting again.</p>
-        <p>As a fallback, you can still add the token manually — see Settings → Google Integration → setup guide.</p>
-      `))
+  // Phase 8, Milestone 8.7: the refresh token is written straight to the
+  // live credential store (Redis, encrypted) -- no Vercel env var, no
+  // redeploy, no ~60s propagation window. Fetch the connected account's
+  // display name once, right now, using the access token this same
+  // authorization_code exchange already returned (no extra refresh-token
+  // round trip needed) so "Connected Google Account" is accurate from the
+  // moment of connection.
+  let connectedAccountName = null
+  try {
+    const r = await fetchWithRetry('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    })
+    if (r.ok) {
+      const data = await r.json()
+      connectedAccountName = (data.accounts || [])[0]?.accountName || null
     }
+  } catch {
+    // Non-fatal -- the connection still succeeds; the account name is
+    // cosmetic and will populate on the next status check if this
+    // best-effort fetch fails.
   }
 
-  // Automation not configured -- the refresh token is NEVER displayed,
-  // logged, or put in a URL. `tokens` (and the refresh token within it)
-  // goes out of scope when this function returns and is not persisted
-  // anywhere; the Owner must configure the Vercel automation env vars and
-  // restart the OAuth flow (which will issue a fresh token, since
-  // `prompt=consent` on the initial request always re-issues one).
-  return res.status(503).send(page('Connected, but automatic setup is incomplete', `
-    <p style="color:#16a34a;font-weight:600">Authorization with Google succeeded.</p>
-    <div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:12px 16px;margin:20px 0">
-      This dashboard cannot save the refresh token automatically because required server
-      configuration is missing:
-      <ul style="margin:8px 0 0 20px">
-        ${!process.env.VERCEL_API_TOKEN ? '<li><code>VERCEL_API_TOKEN</code></li>' : ''}
-        ${!process.env.VERCEL_PROJECT_ID ? '<li><code>VERCEL_PROJECT_ID</code></li>' : ''}
-        ${!process.env.VERCEL_DEPLOY_HOOK_URL ? '<li><code>VERCEL_DEPLOY_HOOK_URL</code></li>' : ''}
-      </ul>
-    </div>
-    <p>For security, the token is not shown here, logged, or stored anywhere by this request.</p>
-    <h3>Next steps</h3>
-    <ol style="line-height:2.2">
-      <li>Add the missing variable(s) above in <strong>vercel.com → your project → Settings → Environment Variables</strong></li>
-      <li>Return to <a href="/settings">Settings</a> and click Connect again to restart the flow</li>
-    </ol>
-    <p style="margin-top:32px"><a href="/settings">← Back to Settings</a></p>
+  try {
+    await setStoredCredential({ refreshToken: tokens.refresh_token, connectedAccountName })
+  } catch (err) {
+    // The refresh token is NEVER displayed, logged, or put in a URL even
+    // on this failure path -- `tokens` goes out of scope when this
+    // function returns and is not persisted anywhere else.
+    return res.status(503).send(page('Connected, but could not be saved', `
+      <p style="color:#16a34a;font-weight:600">Authorization with Google succeeded.</p>
+      <p>However, saving the connection failed: <strong>${err instanceof CredentialStoreUnavailableError ? 'the credential store is temporarily unavailable' : err.message}</strong></p>
+      <p>For security, the token is not shown here, logged, or stored anywhere by this request.</p>
+      <p>Return to <a href="/settings/google">Settings → Google Business Profile</a> and click Connect again to retry.</p>
+    `))
+  }
+
+  await appendAuditEntry({
+    actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+    entity: 'google_oauth', entityId: null, action: 'google.reconnected', changes: null, result: 'success',
+    message: connectedAccountName ? `Connected Google Business Profile account "${connectedAccountName}".` : 'Connected a Google Business Profile account.',
+  })
+
+  return res.send(page('✓ Google connected!', `
+    <p style="color:#16a34a;font-weight:600">Authorization successful. Your connection is saved and active immediately -- no redeploy needed.</p>
+    <p>This page does not show the token — it's encrypted and stored securely server-side, and never reaches the browser.</p>
+    <p>Return to <a href="/settings/google">Settings → Google Business Profile</a> to confirm the connection.</p>
   `))
 }
 
@@ -283,6 +296,19 @@ async function callback(req, res) {
 // Returns { connected, state, accountName?, accountId?, scopes?, tokenExpiresIn? }
 // ---------------------------------------------------------------------------
 
+// Phase 8, Milestone 8.7: `state` is now one of GoogleHealth's five values
+// (connected/token_expired/token_revoked/auth_failed/never_connected) plus
+// 'not_configured' for the one config-level gap (GOOGLE_CLIENT_ID/SECRET
+// missing) that isn't a connection-health problem at all. Every response
+// echoes back credentialMetaFields() so the Settings page always has
+// Connected Account/Last Authentication/Last Successful Sync/Last Failed
+// Sync/Token Health available, regardless of which branch produced it.
+//
+// This is also the "automatic recovery" mechanism in action: an
+// invalid_grant here calls recordSyncOutcome() BEFORE responding, so the
+// health this same response reports is already the corrected value -- the
+// dashboard never shows a stale "Connected" after a token was just found
+// to be revoked.
 async function status(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
 
@@ -292,25 +318,44 @@ async function status(req, res) {
   const allowed = await enforceRateLimit(req, res, `status:${account.userId}`, { requestsPerWindow: 15, windowSeconds: 60 })
   if (!allowed) return
 
-  const hasId      = !!process.env.GOOGLE_CLIENT_ID
-  const hasSecret  = !!process.env.GOOGLE_CLIENT_SECRET
-  const hasToken   = !!process.env.GOOGLE_REFRESH_TOKEN
-
+  const hasId     = !!process.env.GOOGLE_CLIENT_ID
+  const hasSecret = !!process.env.GOOGLE_CLIENT_SECRET
   if (!hasId || !hasSecret) {
     return res.status(200).json({ connected: false, state: 'not_configured' })
   }
-  if (!hasToken) {
-    return res.status(200).json({ connected: false, state: 'needs_token' })
+
+  let credential
+  try {
+    credential = await getStoredCredential()
+  } catch (err) {
+    if (err instanceof CredentialStoreUnavailableError) {
+      return res.status(200).json({ connected: false, state: GoogleHealth.AUTH_FAILED, error: 'The credential store is temporarily unavailable.' })
+    }
+    throw err
+  }
+
+  if (!credential) {
+    return res.status(200).json({ connected: false, state: GoogleHealth.NEVER_CONNECTED })
+  }
+  if (!credential.refreshToken) {
+    // A stored credential exists but couldn't be decrypted (e.g.
+    // CREDENTIAL_ENCRYPTION_KEY changed) -- credentialStore.js already
+    // reflects this as health: auth_failed.
+    return res.status(200).json({ connected: false, state: credential.health, error: 'The stored credential could not be read.', ...credentialMetaFields(credential) })
   }
 
   try {
-    const tokenData = await exchangeRefreshToken()
+    const tokenData = await exchangeRefreshToken(credential.refreshToken)
     if (!tokenData.access_token) {
+      await recordSyncOutcome({ success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
+      const updated = await getStoredCredential()
       return res.status(200).json({
-        connected: false, state: 'invalid_credentials',
+        connected: false, state: updated.health,
         error: tokenData.error_description || tokenData.error || 'Refresh token rejected',
+        ...credentialMetaFields(updated),
       })
     }
+    await recordOAuthRefresh()
 
     // Account listing moved off the legacy v4 host in Google's 2022 API
     // split -- mybusiness.googleapis.com/v4/accounts now 404s. Reviews/reply
@@ -321,26 +366,28 @@ async function status(req, res) {
 
     if (!r.ok) {
       const body = await r.json().catch(() => ({}))
-      return res.status(200).json({
-        connected: false, state: 'api_error',
-        error: body.error?.message || `GBP API ${r.status}`,
-      })
+      await recordSyncOutcome({ success: false, reason: 'api_error', errorDescription: body.error?.message })
+      const updated = await getStoredCredential()
+      return res.status(200).json({ connected: false, state: updated.health, error: body.error?.message || `GBP API ${r.status}`, ...credentialMetaFields(updated) })
     }
 
     const data       = await r.json()
     const gbpAccount = (data.accounts || [])[0]
+    await recordSyncOutcome({ success: true })
+    const updated = await getStoredCredential()
 
     return res.status(200).json({
       connected:      true,
-      state:          'connected',
-      accountName:    gbpAccount?.accountName || 'Google Business Profile',
+      state:          GoogleHealth.CONNECTED,
+      accountName:    gbpAccount?.accountName || updated.connectedAccountName || 'Google Business Profile',
       accountId:      gbpAccount?.name || null,
       accountCount:   (data.accounts || []).length,
       scopes:         (tokenData.scope || 'https://www.googleapis.com/auth/business.manage').split(' '),
       tokenExpiresIn: tokenData.expires_in || null,
+      ...credentialMetaFields(updated),
     })
   } catch (err) {
-    return res.status(200).json({ connected: false, state: 'error', error: err.message })
+    return res.status(200).json({ connected: false, state: GoogleHealth.AUTH_FAILED, error: err.message, ...credentialMetaFields(credential) })
   }
 }
 
@@ -384,7 +431,6 @@ async function testConnection(req, res) {
   const checks = []
   const clientId     = process.env.GOOGLE_CLIENT_ID
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET
-  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN
 
   // 1. OAuth credentials configured
   if (!clientId || !clientSecret) {
@@ -395,15 +441,23 @@ async function testConnection(req, res) {
   checks.push(check('credentials', 'OAuth credentials configured', 'pass',
     'GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are set.'))
 
-  if (!refreshToken) {
+  let credential
+  try {
+    credential = await getStoredCredential()
+  } catch (err) {
     checks.push(check('refresh_token', 'Refresh token present', 'fail',
-      'GOOGLE_REFRESH_TOKEN is not set. Connect a Google account from Settings first.'))
+      err instanceof CredentialStoreUnavailableError ? 'The credential store is temporarily unavailable.' : err.message))
     return res.status(200).json({ overallStatus: 'fail', checks })
   }
-  checks.push(check('refresh_token', 'Refresh token present', 'pass', 'GOOGLE_REFRESH_TOKEN is set.'))
+  if (!credential || !credential.refreshToken) {
+    checks.push(check('refresh_token', 'Refresh token present', 'fail',
+      'No Google account is connected yet. Connect a Google account from Settings first.'))
+    return res.status(200).json({ overallStatus: 'fail', checks })
+  }
+  checks.push(check('refresh_token', 'Refresh token present', 'pass', 'A Google account is connected.'))
 
   // 2. Refresh token exchange
-  const tokenData = await exchangeRefreshToken().catch(err => ({ __networkError: err }))
+  const tokenData = await exchangeRefreshToken(credential.refreshToken).catch(err => ({ __networkError: err }))
   if (tokenData.__networkError) {
     checks.push(check('token_exchange', 'Exchange refresh token for access token', 'fail',
       `Network error reaching Google's token endpoint: ${tokenData.__networkError.message}`))
@@ -411,10 +465,12 @@ async function testConnection(req, res) {
   }
 
   if (!tokenData.access_token) {
+    await recordSyncOutcome({ success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
     checks.push(check('token_exchange', 'Exchange refresh token for access token', 'fail',
       tokenData.error_description || tokenData.error || 'Google rejected the refresh token. It may have been revoked -- reconnect from Settings.'))
     return res.status(200).json({ overallStatus: 'fail', checks })
   }
+  await recordOAuthRefresh()
   checks.push(check('token_exchange', 'Exchange refresh token for access token', 'pass',
     `Access token obtained, expires in ${tokenData.expires_in || '?'}s. Scopes: ${tokenData.scope || 'unknown'}.`))
 
@@ -506,6 +562,7 @@ async function testConnection(req, res) {
   checks.push(check('api_health', 'Google Business Profile API health', 'pass',
     'All API calls in this test completed without errors.'))
 
+  await recordSyncOutcome({ success: true })
   return res.status(200).json({ overallStatus: 'pass', checks })
 }
 
@@ -713,10 +770,23 @@ async function publish(req, res) {
   const allowed = await enforceRateLimit(req, res, `publish:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
   if (!allowed) return
 
-  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_REFRESH_TOKEN) {
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
     return res.status(503).json({
       error:   'not_connected',
-      message: 'Google Business Profile is not connected. Complete setup in Settings → Google Integration.',
+      message: 'Google Business Profile is not connected. Complete setup in Settings → Google Business Profile.',
+    })
+  }
+
+  let credential
+  try {
+    credential = await getStoredCredential()
+  } catch {
+    return res.status(503).json({ error: 'not_connected', message: 'Google Business Profile connection is temporarily unavailable. Please try again shortly.' })
+  }
+  if (!credential || !credential.refreshToken) {
+    return res.status(503).json({
+      error:   'not_connected',
+      message: 'Google Business Profile is not connected. Complete setup in Settings → Google Business Profile.',
     })
   }
 
@@ -726,12 +796,30 @@ async function publish(req, res) {
     return res.status(400).json({ error: 'api_error', message: 'Missing replyText, and either reviewName or locationName.' })
   }
 
+  // Token acquisition is checked/recorded separately from the reply
+  // attempt itself: an invalid_grant here is a CONNECTION health problem
+  // (feeds the "automatic recovery" status flip), while a failure further
+  // down (403/404 from the reply call) is specific to this one review and
+  // must never be mistaken for the whole connection being broken.
+  let token
   try {
-    const token = await getAccessToken()
+    token = await getAccessToken(credential.refreshToken)
+    await recordOAuthRefresh()
+  } catch (err) {
+    if (err.code === 'invalid_grant') {
+      await recordSyncOutcome({ success: false, reason: 'invalid_grant', errorDescription: err.description })
+    }
+    return res.status(503).json({
+      error:   'not_connected',
+      message: 'Google Business Profile needs to be reconnected. See Settings → Google Business Profile.',
+    })
+  }
 
+  try {
     // Preferred: direct resource path, already linked -- no lookup needed.
     if (reviewName) {
       await replyViaReviewName(reviewName, replyText, token)
+      await recordSyncOutcome({ success: true })
       return res.status(200).json({ success: true })
     }
 
@@ -777,6 +865,7 @@ async function publish(req, res) {
     }
 
     await replyViaReviewName(review.name, replyText, token)
+    await recordSyncOutcome({ success: true })
     return res.status(200).json({ success: true })
 
   } catch (err) {
@@ -786,6 +875,51 @@ async function publish(req, res) {
       message: err.message,
     })
   }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/google/disconnect (Phase 8, Milestone 8.7) -- { confirm: "DISCONNECT" }
+// Owner-only. Genuinely removes the stored credential (not a soft-disable) --
+// a fresh Connect afterward is indistinguishable from a first-time
+// connection. Requires the same literal server-enforced confirmation
+// phrase pattern trigger-import.js already uses, so a raw request can't
+// bypass the UI's type-the-word confirmation.
+// ---------------------------------------------------------------------------
+
+const DISCONNECT_CONFIRM_PHRASE = 'DISCONNECT'
+
+async function disconnect(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `disconnect:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
+  if (!allowed) return
+
+  if (req.body?.confirm !== DISCONNECT_CONFIRM_PHRASE) {
+    return res.status(400).json({
+      error:   'confirmation_required',
+      message: `Disconnecting requires confirm: "${DISCONNECT_CONFIRM_PHRASE}" in the request body.`,
+    })
+  }
+
+  try {
+    await clearStoredCredential()
+  } catch (err) {
+    if (err instanceof CredentialStoreUnavailableError) {
+      return res.status(503).json({ error: 'service_unavailable', message: 'The credential store is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+
+  await appendAuditEntry({
+    actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+    entity: 'google_oauth', entityId: null, action: 'google.disconnected', changes: null, result: 'success',
+    message: 'Disconnected the Google Business Profile connection.',
+  })
+
+  return res.status(200).json({ success: true })
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +933,7 @@ export default async function handler(req, res) {
     case 'trigger-sync':     return triggerSync(req, res)
     case 'trigger-import':   return triggerImport(req, res)
     case 'publish':          return publish(req, res)
+    case 'disconnect':       return disconnect(req, res)
     default:                 return res.status(404).json({ error: 'not_found' })
   }
 }

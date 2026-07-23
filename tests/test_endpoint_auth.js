@@ -16,15 +16,23 @@ import googleHandler from '../dashboard/api/google/[action].js'
 import rewriteHandler from '../dashboard/api/rewrite.js'
 import executiveBriefHandler from '../dashboard/api/executive-brief.js'
 import { signSession } from '../dashboard/api/_lib/session.js'
+import { _setRedisClientForTests as _setCredentialRedisForTests, _resetRedisClientForTests as _resetCredentialRedisForTests, setStoredCredential } from '../dashboard/api/_lib/credentialStore.js'
 
-// All four google/*.js files below were merged into the consolidated
-// dispatch file (Phase 8, Milestone 8.2) -- these wrappers keep every call
-// site further down exactly as it read before the merge, just routing
-// through req.query.action.
+// All google/*.js files below were merged into the consolidated dispatch
+// file (Phase 8, Milestone 8.2) -- these wrappers keep every call site
+// further down exactly as it read before the merge, just routing through
+// req.query.action.
 function statusHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'status' } }, res) }
 function testConnectionHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'test-connection' } }, res) }
 function triggerSyncHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'trigger-sync' } }, res) }
 function triggerImportHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'trigger-import' } }, res) }
+function disconnectHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'disconnect' } }, res) }
+
+process.env.CREDENTIAL_ENCRYPTION_KEY = 'test-encryption-key-not-a-real-secret'
+function fakeCredentialRedis(initial = null) {
+  let value = initial
+  return { get: async () => value, set: async (_key, v) => { value = v }, del: async () => { value = null } }
+}
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -63,6 +71,7 @@ async function testAllEndpointsRejectUnauthenticated() {
   await expectUnauthenticated('test-connection.js', testConnectionHandler, 'GET')
   await expectUnauthenticated('trigger-sync.js', triggerSyncHandler, 'POST')
   await expectUnauthenticated('trigger-import.js', triggerImportHandler, 'POST', { apply: false })
+  await expectUnauthenticated('google/disconnect', disconnectHandler, 'POST', { confirm: 'DISCONNECT' })
   await expectUnauthenticated('rewrite.js', rewriteHandler, 'POST', { tone: 'friendly' })
   await expectUnauthenticated('executive-brief.js', executiveBriefHandler, 'POST', { totalReviews: 1 })
 }
@@ -109,11 +118,43 @@ async function testOwnerCanReachTriggerSync() {
   assert(res.statusCode === 200, `expected 200, got ${res.statusCode}`)
 }
 
+async function testDisconnectRequiresConfirmPhrase() {
+  const token = await ownerDirectory()
+  _setCredentialRedisForTests(() => fakeCredentialRedis())
+  try {
+    globalThis.fetch = async (url) => { throw new Error(`fetch must not be called: ${url}`) }
+    const req = { method: 'POST', body: {}, headers: { cookie: `lta_session=${token}` } }
+    const res = fakeRes()
+    await disconnectHandler(req, res)
+    assert(res.statusCode === 400, `expected 400 without confirm phrase, got ${res.statusCode}`)
+    assert(res.body.error === 'confirmation_required', res.body.error)
+  } finally {
+    _resetCredentialRedisForTests()
+  }
+}
+
+async function testDisconnectWithConfirmPhraseSucceeds() {
+  const token = await ownerDirectory()
+  const client = fakeCredentialRedis()
+  _setCredentialRedisForTests(() => client)
+  try {
+    await setStoredCredential({ refreshToken: 'x', connectedAccountName: 'Los Tres Amigos' })
+    const req = { method: 'POST', body: { confirm: 'DISCONNECT' }, headers: { cookie: `lta_session=${token}` } }
+    const res = fakeRes()
+    await disconnectHandler(req, res)
+    assert(res.statusCode === 200 && res.body.success === true, `expected 200 {success:true}, got ${res.statusCode}, body=${JSON.stringify(res.body)}`)
+  } finally {
+    _resetCredentialRedisForTests()
+  }
+}
+
 async function main() {
-  await run('status/test-connection/trigger-sync/trigger-import/rewrite/executive-brief all reject unauthenticated requests with 401 before any network call', testAllEndpointsRejectUnauthenticated)
+  await run('status/test-connection/trigger-sync/trigger-import/google-disconnect/rewrite/executive-brief all reject unauthenticated requests with 401 before any network call', testAllEndpointsRejectUnauthenticated)
   await run('trigger-import.js: apply=true without the confirm phrase -> 400, no dispatch', testTriggerImportApplyRequiresConfirmPhrase)
   await run('trigger-import.js: apply=true with the confirm phrase -> proceeds', testTriggerImportApplyWithConfirmPhraseProceeds)
   await run('trigger-sync.js: authenticated Owner request succeeds', testOwnerCanReachTriggerSync)
+  await run('google/disconnect: requires the literal confirm phrase, matching trigger-import.js\'s pattern', testDisconnectRequiresConfirmPhrase)
+  await run('google/disconnect: succeeds with the correct confirm phrase', testDisconnectWithConfirmPhraseSucceeds)
 
   console.log()
   if (results.every(Boolean)) {

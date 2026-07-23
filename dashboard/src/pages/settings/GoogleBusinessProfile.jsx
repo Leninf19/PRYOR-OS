@@ -1,17 +1,20 @@
 import { useState, useEffect } from 'react'
 import Badge from '../../components/ui/Badge.jsx'
+import Button from '../../components/ui/Button.jsx'
 import Skeleton from '../../components/ui/Skeleton.jsx'
 import EmptyState from '../../components/ui/EmptyState.jsx'
 import ErrorState from '../../components/ui/ErrorState.jsx'
-import { useGoogleStatus } from '../../hooks/useGoogleStatus.js'
+import ConfirmDialog from '../../components/ui/ConfirmDialog.jsx'
+import { useToast } from '../../components/ui/Toast.jsx'
+import { useGoogleOAuthStatus, useDisconnectGoogle } from '../../hooks/useGoogleOAuthStatus.js'
 
-// Moved verbatim out of the old flat Settings.jsx's GBPSection (Phase 8,
-// Milestone 8.1) -- a pure reorganization, zero behavior change. This page
-// is rebuilt for real in Milestone 8.7 (credential-store migration, the
-// Connection Status enum, Connect/Reconnect/Disconnect, health fields) --
-// until then it is exactly today's Google Integration section, just on its
-// own route (Settings → Google Business Profile) instead of a section
-// within one long scrolling page.
+// Rebuilt for Phase 8, Milestone 8.7: the refresh token now lives in
+// credentialStore.js (Redis, encrypted), not a Vercel env var -- reconnect
+// takes effect immediately, no redeploy. Connection Status is one of five
+// states (Connected/Token Expired/Token Revoked/Authentication Failed/
+// Never Connected), matching credentialStore.js's GoogleHealth enum
+// exactly, with a clear recovery action for every non-connected state
+// instead of a raw Google API error.
 
 const GBP_STEPS = [
   {
@@ -42,7 +45,7 @@ const GBP_STEPS = [
   {
     n: 5,
     title: 'Add credentials to Vercel, then connect',
-    body: 'In your Vercel project → Settings → Environment Variables, add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET. Click "Connect Google Account" below — the refresh token is now saved automatically once VERCEL_API_TOKEN / VERCEL_PROJECT_ID / VERCEL_DEPLOY_HOOK_URL are also configured (see README). No manual token copy-paste needed.',
+    body: 'In your Vercel project → Settings → Environment Variables, add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET. Click "Connect Google Account" below — from this point on, connecting and reconnecting never touch Vercel again; the connection is stored securely server-side and takes effect immediately.',
     tag: 'Final step',
   },
 ]
@@ -54,6 +57,50 @@ const PLANNED_GBP = [
   'Full status tracking: Approved → Published → Confirmed on Google',
   'Failure alerts with exact reason (permission missing, review removed, etc.)',
 ]
+
+// Connection Status -- exactly the five states the spec requires, mapped
+// from credentialStore.js's GoogleHealth values (plus not_configured, a
+// config-level gap distinct from a connection-health problem).
+const STATUS_META = {
+  connected:        { label: '✅ Connected', variant: 'success' },
+  token_expired:    { label: '⚠ Token Expired', variant: 'warning' },
+  token_revoked:    { label: '⚠ Token Revoked', variant: 'warning' },
+  auth_failed:      { label: '⚠ Authentication Failed', variant: 'danger' },
+  never_connected:  { label: 'Never Connected', variant: 'neutral' },
+  not_configured:   { label: 'Setup Incomplete', variant: 'neutral' },
+}
+
+const RECOVERY_COPY = {
+  token_expired: 'Your Google connection has expired. Click Reconnect below to restore it -- this takes about 30 seconds and does not affect any other settings.',
+  token_revoked: 'Your Google connection was revoked (often because access was removed in the Google Account, or a password/security change invalidated it). Click Reconnect below to restore it.',
+  auth_failed: 'Something went wrong communicating with Google. Try Reconnect below; if this keeps happening, check the technical details below for the specific reason.',
+}
+
+function fmtWhen(iso) {
+  if (!iso) return 'Never'
+  return new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+function useGbpSyncData() {
+  const [state, setState] = useState({ loading: true, data: null, error: false })
+
+  const load = () => {
+    setState(s => ({ ...s, loading: true }))
+    fetch('/api/data?file=gbp-sync.json')
+      .then(r => {
+        // 404 means no sync has ever run yet -- a legitimate empty state,
+        // not a failure. Anything else (network/parse error) is a real error.
+        if (r.status === 404) return null
+        if (!r.ok) throw new Error(`gbp-sync.json returned ${r.status}`)
+        return r.json()
+      })
+      .then(data => setState({ loading: false, data, error: false }))
+      .catch(() => setState({ loading: false, data: null, error: true }))
+  }
+
+  useEffect(load, [])
+  return { ...state, refetch: load }
+}
 
 // Renders one Test Connection check row.
 function CheckRow({ c }) {
@@ -123,31 +170,17 @@ function TestConnectionPanel() {
   )
 }
 
-function useGbpSyncData() {
-  const [state, setState] = useState({ loading: true, data: null, error: false })
-
-  const load = () => {
-    setState(s => ({ ...s, loading: true }))
-    fetch('/api/data?file=gbp-sync.json')
-      .then(r => {
-        // 404 means no sync has ever run yet -- a legitimate empty state,
-        // not a failure. Anything else (network/parse error) is a real error.
-        if (r.status === 404) return null
-        if (!r.ok) throw new Error(`gbp-sync.json returned ${r.status}`)
-        return r.json()
-      })
-      .then(data => setState({ loading: false, data, error: false }))
-      .catch(() => setState({ loading: false, data: null, error: true }))
-  }
-
-  useEffect(load, [])
-  return { ...state, refetch: load }
-}
-
-function LocationSyncPanel() {
+function LocationSyncPanel({ onLinkedCount }) {
   const { loading, data, error, refetch } = useGbpSyncData()
   const [triggering, setTriggering] = useState(false)
   const [triggerMsg, setTriggerMsg] = useState(null)
+
+  const locations = data?.locations || []
+  const linkedCount = locations.filter(l => l.linked).length
+
+  useEffect(() => {
+    if (!loading && !error) onLinkedCount?.({ linked: linkedCount, total: locations.length })
+  }, [loading, error, linkedCount, locations.length]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const syncNow = async () => {
     setTriggering(true)
@@ -164,9 +197,6 @@ function LocationSyncPanel() {
       setTriggering(false)
     }
   }
-
-  const locations = data?.locations || []
-  const linkedCount = locations.filter(l => l.linked).length
 
   return (
     <div className="rounded-2xl border overflow-hidden"
@@ -327,18 +357,28 @@ function HistoricalImportPanel() {
 }
 
 export default function GoogleBusinessProfile() {
+  const showToast = useToast()
   const [stepsOpen, setStepsOpen] = useState(false)
-  const status = useGoogleStatus()
+  const [disconnectOpen, setDisconnectOpen] = useState(false)
+  const [linkedLocations, setLinkedLocations] = useState(null)
+  const { data: status, isLoading, refetch } = useGoogleOAuthStatus()
+  const disconnectMutation = useDisconnectGoogle()
 
-  const badge = status.loading
-    ? { label: '…', variant: 'neutral' }
-    : status.connected
-      ? { label: 'Connected', variant: 'success' }
-      : status.state === 'needs_token'
-        ? { label: 'Ready to Connect', variant: 'info' }
-        : status.state === 'invalid_credentials'
-          ? { label: 'Auth Error', variant: 'danger' }
-          : { label: 'Not Connected', variant: 'neutral' }
+  const state = status?.state ?? (isLoading ? null : 'never_connected')
+  const meta = STATUS_META[state] ?? STATUS_META.never_connected
+  const isConnected = state === 'connected'
+  const hasEverConnected = state && state !== 'never_connected' && state !== 'not_configured'
+  const needsRecovery = ['token_expired', 'token_revoked', 'auth_failed'].includes(state)
+
+  async function handleDisconnect() {
+    try {
+      await disconnectMutation.mutateAsync('DISCONNECT')
+      showToast('Google Business Profile disconnected', { variant: 'success' })
+      setDisconnectOpen(false)
+    } catch (err) {
+      showToast(err.message || 'Could not disconnect', { variant: 'error' })
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -362,24 +402,32 @@ export default function GoogleBusinessProfile() {
                 Google Business Profile
               </p>
               <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
-                {status.connected
-                  ? `Connected as ${status.accountName || 'Google Business Profile'}`
-                  : 'Read and reply to reviews via the official GBP API'}
+                Read and reply to reviews via the official GBP API
               </p>
             </div>
           </div>
-          <Badge variant={badge.variant}>{badge.label}</Badge>
+          <Badge variant={isLoading ? 'neutral' : meta.variant}>{isLoading ? '…' : meta.label}</Badge>
         </div>
 
         <div className="px-6 py-4 border-t" style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-2)' }}>
-          {status.connected ? (
+          {needsRecovery && (
+            <div className="mb-3 rounded-lg p-3" style={{ background: 'var(--color-danger-bg, rgba(220,38,38,0.06))', border: '1px solid var(--color-danger-border, rgba(220,38,38,0.2))' }}>
+              <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-1)', lineHeight: 1.7 }}>
+                {RECOVERY_COPY[state]}
+              </p>
+            </div>
+          )}
+
+          {hasEverConnected ? (
             <>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
                 {[
-                  { label: 'Account', value: status.accountId || '—' },
-                  { label: 'Accounts found', value: status.accountCount ?? '—' },
-                  { label: 'Token expires in', value: status.tokenExpiresIn ? `${status.tokenExpiresIn}s` : '—' },
-                  { label: 'Scopes', value: (status.scopes || []).map(s => s.split('/').pop()).join(', ') || '—' },
+                  { label: 'Connected Google Account', value: status?.accountName || status?.connectedAccountName || '—' },
+                  { label: 'Last Authentication', value: fmtWhen(status?.lastOAuthRefreshAt) },
+                  { label: 'Last Successful Sync', value: fmtWhen(status?.lastSuccessfulSyncAt) },
+                  { label: 'Last Failed Sync', value: fmtWhen(status?.lastFailedSyncAt) },
+                  { label: 'Token Health', value: isConnected ? (status?.tokenExpiresIn ? `Valid — expires in ${status.tokenExpiresIn}s` : 'Valid') : (status?.lastFailureReason || 'Unavailable') },
+                  { label: 'Number of Linked Locations', value: linkedLocations ? `${linkedLocations.linked} of ${linkedLocations.total}` : '—' },
                 ].map(row => (
                   <div key={row.label}>
                     <p className="text-[10px] font-medium" style={{ color: 'var(--color-text-3)' }}>{row.label}</p>
@@ -387,14 +435,22 @@ export default function GoogleBusinessProfile() {
                   </div>
                 ))}
               </div>
-              <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)', lineHeight: 1.75 }}>
-                One-click publishing is active for all 21 locations. To disconnect, remove
-                <code className="mx-1 text-[10px] px-1.5 py-0.5 rounded"
-                      style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
-                  GOOGLE_REFRESH_TOKEN
-                </code>
-                from Vercel environment variables.
-              </p>
+
+              <div className="flex items-center gap-3 flex-wrap mt-3">
+                <a href="/api/google/auth"
+                   className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
+                   style={{ background: 'var(--color-accent)', borderColor: 'var(--color-accent)', color: 'white' }}>
+                  Reconnect →
+                </a>
+                <Button variant="danger" onClick={() => setDisconnectOpen(true)}>Disconnect</Button>
+              </div>
+
+              {status?.error && (
+                <details className="mt-3">
+                  <summary className="text-[10px] cursor-pointer" style={{ color: 'var(--color-text-3)' }}>Technical details</summary>
+                  <p className="text-[11px] mt-1 font-mono" style={{ color: 'var(--color-text-3)' }}>{status.error}</p>
+                </details>
+              )}
             </>
           ) : (
             <>
@@ -404,7 +460,7 @@ export default function GoogleBusinessProfile() {
                 for every response your team sends.
               </p>
               <div className="mt-3 flex items-center gap-3 flex-wrap">
-                {status.state === 'needs_token' && (
+                {state === 'never_connected' && (
                   <a href="/api/google/auth"
                      className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
                      style={{ background: 'var(--color-accent)', borderColor: 'var(--color-accent)', color: 'white' }}>
@@ -417,7 +473,7 @@ export default function GoogleBusinessProfile() {
                   style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }}>
                   {stepsOpen ? 'Hide setup guide' : 'View setup guide (5 steps)'}
                 </button>
-                {status.state !== 'needs_token' && (
+                {state === 'not_configured' && (
                   <span className="text-[10px]" style={{ color: 'var(--color-text-3)' }}>
                     Requires Google API approval · 1–5 business days
                   </span>
@@ -429,10 +485,10 @@ export default function GoogleBusinessProfile() {
       </div>
 
       {/* Diagnostics -- only meaningful once credentials exist */}
-      {(status.connected || status.state === 'invalid_credentials') && (
+      {hasEverConnected && (
         <>
           <TestConnectionPanel />
-          <LocationSyncPanel />
+          <LocationSyncPanel onLinkedCount={setLinkedLocations} />
           <HistoricalImportPanel />
         </>
       )}
@@ -527,6 +583,18 @@ export default function GoogleBusinessProfile() {
           ))}
         </ul>
       </div>
+
+      <ConfirmDialog
+        open={disconnectOpen}
+        onClose={() => setDisconnectOpen(false)}
+        onConfirm={handleDisconnect}
+        title="Disconnect Google Business Profile"
+        body="This permanently removes the stored connection. Publishing replies and syncing new reviews from Google will stop until you reconnect."
+        confirmLabel="Disconnect"
+        confirmWord="DISCONNECT"
+        danger
+        busy={disconnectMutation.isPending}
+      />
     </div>
   )
 }

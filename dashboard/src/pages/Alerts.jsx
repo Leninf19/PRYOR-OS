@@ -7,7 +7,7 @@ import {
   usePredictiveAlerts, useActionItems, useScraperStatusData,
   useCompetitorIntel,
 } from '../hooks/useIntelligence.js'
-import { useGoogleStatus } from '../hooks/useGoogleStatus.js'
+import { useGoogleOAuthStatus } from '../hooks/useGoogleOAuthStatus.js'
 
 // ── Alert assembly ────────────────────────────────────────────────────────────
 
@@ -232,7 +232,8 @@ export default function Alerts() {
   const { data: actionItems, isLoading: loadA, isError: errA, refetch: refetchA }  = useActionItems()
   const { data: scraperRuns, isLoading: loadS, isError: errS, refetch: refetchS }  = useScraperStatusData()
   const { data: competitorIntel, isLoading: loadC, isError: errC, refetch: refetchC } = useCompetitorIntel()
-  const googleStatus = useGoogleStatus()
+  const { data: googleStatusData, isLoading: googleStatusLoading } = useGoogleOAuthStatus()
+  const googleStatus = { loading: googleStatusLoading, ...(googleStatusData ?? {}) }
   const [tab, setTab] = useState('all')
 
   const isLoading = loadP || loadA || loadS || loadC

@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react'
 import { useScraperStatus } from '../hooks/useScraperStatus.js'
 import { useCompanySummary } from '../hooks/useIntelligence.js'
-import { useGoogleStatus } from '../hooks/useGoogleStatus.js'
+import { useGoogleOAuthStatus } from '../hooks/useGoogleOAuthStatus.js'
 import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
@@ -74,7 +74,8 @@ function HealthStat({ label, value, sub, variant }) {
 function DataHealthHeader({ allReviews }) {
   const { data: runs, isLoading } = useScraperStatus()
   const { data: summary } = useCompanySummary()
-  const googleStatus = useGoogleStatus()
+  const { data: googleStatusData, isLoading: googleStatusLoading } = useGoogleOAuthStatus()
+  const googleStatus = { loading: googleStatusLoading, ...(googleStatusData ?? {}) }
 
   const validation = useMemo(() => buildReport(allReviews ?? []), [allReviews])
 

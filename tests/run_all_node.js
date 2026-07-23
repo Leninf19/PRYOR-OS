@@ -55,6 +55,8 @@ const TESTS = [
   'test_contacts_backfill.js',
   'test_audit_log.js',
   'test_settings_audit_log_endpoint.js',
+  'test_credential_store.js',
+  'test_google_oauth_auto_recovery.js',
 ]
 
 const results = {}

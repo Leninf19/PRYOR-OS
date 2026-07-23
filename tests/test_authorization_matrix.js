@@ -233,6 +233,14 @@ const ENDPOINT_REGISTRY = [
     notes: 'RESOLVED by Milestone 6A (was: ERROR_CONTRACT_EXCEPTION_1). This handler now destructures `reason` from evaluateSession() and uses the shared statusForAuthFailure(reason) helper (dashboard/api/_lib/auth.js) to return 403 for an authenticated-but-wrong-role caller (e.g. Marketing), matching every requireAuth()-based endpoint and the frozen §6 error contract. 401 is still returned for a true identity failure (no session, invalid session, disabled account, stale sessionVersion). See ERROR_CONTRACT_EXCEPTIONS below for the full resolution record.',
   },
   {
+    route: 'POST /api/google/disconnect', file: 'api/google/[action].js', method: 'POST', action: 'disconnect',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'account-wide administrative (removes the stored Google connection entirely)',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Phase 8 Milestone 8.7. Also requires a literal confirm phrase ("DISCONNECT") in the body, matching trigger-import.js\'s confirmation pattern -- covered separately in test_endpoint_auth.js, not by this role-matrix test.',
+  },
+  {
     route: 'GET /api/google/callback', file: 'api/google/[action].js', method: 'GET', action: 'callback',
     authRequired: true, currentAllowedRoles: ['owner'],
     scope: 'account-wide administrative (OAuth callback)',
