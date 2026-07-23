@@ -20,8 +20,21 @@ jobs:
         with:
           python-version: '3.11'
 
+      # export_chunks.py's export_provider_health() unconditionally imports
+      # provider_gbp -> google_api, which (Phase 8, Milestone 8.8) imports
+      # `cryptography` to decrypt the Redis-stored Google refresh token.
+      # This step never installed it, so every run since Milestone 8.8
+      # crashed with "ModuleNotFoundError: No module named 'cryptography'"
+      # at the "Export data chunks" step below -- and because this workflow
+      # has no `if: always()` on later steps, that failure silently
+      # cancelled "Build and deploy to Vercel" every single time. This is
+      # the root cause of git pushes not producing a production deployment.
+      # `playwright` (also in requirements.txt) is deliberately NOT
+      # installed here -- refresh_analytics.py/export_chunks.py never use
+      # it, and it's a large, native-dependency package (greenlet) this
+      # deploy path has no reason to carry.
       - name: Install Python dependencies
-        run: pip install anthropic
+        run: pip install anthropic cryptography
 
       # This workflow must not assume dashboard/reviews.db already has fresh
       # analytics_cache rows from some other workflow's prior run -- that
