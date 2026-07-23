@@ -123,17 +123,27 @@ def export_meta(conn, locations: dict) -> None:
 
 
 def export_location_contacts(locations: dict) -> None:
-    """Restaurant bad-review email workflow: the authoritative
-    location-id -> contact-email mapping, keyed by the same numeric
-    locations.id every review already carries as locationId.
+    """DEPRECATED, RETAINED (Phase 8, Milestone 8.4/8.5): this was the
+    authoritative location-id -> contact-email mapping for the restaurant
+    bad-review email workflow before Restaurant Contacts became
+    dashboard-editable. dashboard/api/_lib/contactStore.js (a live Upstash
+    Redis store, written directly from Settings -> Restaurant Contacts) is
+    now the primary source for every send; dashboard/api/_lib/
+    locationContacts.js reads Redis first and only falls back to this
+    exported file if Redis is unreachable/unconfigured. Kept running (not
+    deleted) purely as that fallback's data source, and because
+    locations.contact_* (db.py) still exists as an emergency-CLI seed via
+    set_location_contacts.py. Still keyed by the same numeric locations.id
+    every review already carries as locationId.
 
     Deliberately NEVER added to dashboard/api/data.js's EXACT_ALLOWLIST/
     DYNAMIC_ALLOWLIST -- the browser must never be able to fetch this file
     directly, authenticated or not (see README "Do not expose the full
-    contact directory"). Only dashboard/api/actions/[action].js reads it,
-    directly off disk server-side, exactly the way data.js itself reads
-    private-data files -- and it only ever returns the ONE resolved
-    recipient for the location being acted on, never the whole file.
+    contact directory"). Only dashboard/api/actions/[action].js reads it
+    (via locationContacts.js), directly off disk server-side, exactly the
+    way data.js itself reads private-data files -- and it only ever returns
+    the ONE resolved recipient for the location being acted on, never the
+    whole file.
 
     Only includes locations with a configured, active contact -- an
     unconfigured location is simply absent from this file, so a lookup

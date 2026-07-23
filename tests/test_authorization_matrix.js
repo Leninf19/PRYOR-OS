@@ -321,6 +321,14 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Phase 8 Milestone 8.3. Same CONTACTS_MANAGE gate as contacts-upsert.',
   },
+  {
+    route: 'POST /api/settings/contacts-backfill-from-legacy', file: 'api/settings/[action].js', method: 'POST', action: 'contacts-backfill-from-legacy',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'one-off admin action -- seeds Redis from the legacy export, Owner-only (stricter than the other contacts-* actions, which are owner+marketing)',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Phase 8 Milestone 8.5. Uses requireAuth([\'owner\']) directly, not requireScopedAuth -- this is a company-wide migration action, not a single-location write.',
+  },
 ]
 
 // ---------------------------------------------------------------------------

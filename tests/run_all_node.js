@@ -52,6 +52,7 @@ const TESTS = [
   'test_settings_contacts_endpoint.js',
   'test_email_validation.js',
   'test_restaurant_contacts_ui.js',
+  'test_contacts_backfill.js',
 ]
 
 const results = {}

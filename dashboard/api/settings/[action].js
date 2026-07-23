@@ -19,13 +19,35 @@
 // POST /api/settings/contacts-upsert        -- create/edit
 // POST /api/settings/contacts-delete        -- genuine removal
 // POST /api/settings/contacts-toggle-active -- Disable/Enable Contact
+// POST /api/settings/contacts-backfill-from-legacy -- Milestone 8.5, see below
 
+import { readFile } from 'fs/promises'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import { requireAuth, requireScopedAuth } from '../_lib/auth.js'
 import { roleHasPermission, Permission } from '../_lib/permissions.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import {
   getAllContacts, getContact, upsertContact, deleteContact, ContactStoreUnavailableError,
 } from '../_lib/contactStore.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const LEGACY_CONTACTS_PATH = path.resolve(__dirname, '..', '..', 'private-data', 'location-contacts.json')
+const META_PATH = path.resolve(__dirname, '..', '..', 'private-data', 'meta.json')
+
+// Test-only seam for the backfill action below -- lets tests inject fixed
+// legacy-contacts/meta content without touching the real filesystem path,
+// same pattern locationContacts.js's own _setContactsForTests uses.
+let legacyContactsOverride = null
+let metaOverride = null
+export function _setLegacyBackfillDataForTests(legacyContacts, meta) {
+  legacyContactsOverride = legacyContacts
+  metaOverride = meta
+}
+export function _resetLegacyBackfillDataForTests() {
+  legacyContactsOverride = null
+  metaOverride = null
+}
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
@@ -231,12 +253,81 @@ async function toggleContactActiveAction(req, res) {
   }
 }
 
+// POST /api/settings/contacts-backfill-from-legacy (Phase 8, Milestone 8.5)
+// Owner-only, idempotent, one-off admin action: seeds contactStore.js
+// (Redis) from the legacy private-data/location-contacts.json for any
+// location_id NOT already present in Redis -- once anything has been
+// edited through Settings -> Restaurant Contacts, Redis always wins;
+// this never overwrites an existing Redis record. Location names are
+// resolved from meta.json (the legacy file only carries email/name).
+// Safe to call more than once -- re-running it after further legacy edits
+// only fills in whatever is still missing from Redis.
+async function backfillContactsFromLegacyAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `settings:contacts-backfill:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
+  if (!allowed) return
+
+  let legacy = legacyContactsOverride
+  if (legacy === null) {
+    try {
+      legacy = JSON.parse(await readFile(LEGACY_CONTACTS_PATH, 'utf-8'))
+    } catch {
+      legacy = {}
+    }
+  }
+  let meta = metaOverride
+  if (meta === null) {
+    try {
+      meta = JSON.parse(await readFile(META_PATH, 'utf-8'))
+    } catch {
+      meta = { locations: [] }
+    }
+  }
+  const nameById = new Map((meta.locations ?? []).map(l => [String(l.locationId), l.name]))
+
+  const seeded = []
+  const skipped = []
+  try {
+    for (const [locationIdStr, entry] of Object.entries(legacy)) {
+      const locationId = Number(locationIdStr)
+      if (!isPositiveInteger(locationId) || !isValidEmail(entry?.email)) continue
+
+      const existing = await getContact(locationId)
+      if (existing) {
+        skipped.push(locationId) // Redis already has this location -- never overwrite
+        continue
+      }
+
+      await upsertContact(locationId, {
+        locationName: nameById.get(locationIdStr) ?? null,
+        managerName: entry.name ?? null,
+        primaryEmail: entry.email,
+        ccEmails: [],
+        active: true,
+      }, account, 'Backfilled from legacy export')
+      seeded.push(locationId)
+    }
+    return res.status(200).json({ seeded, skipped })
+  } catch (err) {
+    if (err instanceof ContactStoreUnavailableError) {
+      console.error(`[settings/contacts-backfill-from-legacy] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Restaurant contacts are temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
-    case 'contacts':                return listContacts(req, res)
-    case 'contacts-upsert':          return upsertContactAction(req, res)
-    case 'contacts-delete':          return deleteContactAction(req, res)
-    case 'contacts-toggle-active':   return toggleContactActiveAction(req, res)
-    default:                         return res.status(404).json({ error: 'not_found' })
+    case 'contacts':                       return listContacts(req, res)
+    case 'contacts-upsert':                 return upsertContactAction(req, res)
+    case 'contacts-delete':                 return deleteContactAction(req, res)
+    case 'contacts-toggle-active':          return toggleContactActiveAction(req, res)
+    case 'contacts-backfill-from-legacy':   return backfillContactsFromLegacyAction(req, res)
+    default:                                return res.status(404).json({ error: 'not_found' })
   }
 }

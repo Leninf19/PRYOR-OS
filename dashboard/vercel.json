@@ -8,6 +8,9 @@
     },
     "api/actions/[action].js": {
       "includeFiles": "private-data/location-contacts.json"
+    },
+    "api/settings/[action].js": {
+      "includeFiles": "private-data/{location-contacts.json,meta.json}"
     }
   },
   "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }]

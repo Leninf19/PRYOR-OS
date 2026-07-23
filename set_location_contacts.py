@@ -4,6 +4,14 @@ workflow's location-to-contact-email mapping (db.py's locations.contact_email
 /contact_name/contact_active columns). Never run by any scheduled pipeline
 stage -- this is a one-off/occasional manual action, run by hand.
 
+SUPERSEDED (Phase 8, Milestone 8.4/8.5): Restaurant Contacts are now
+dashboard-editable and take effect immediately -- Settings -> Restaurant
+Contacts (dashboard/api/_lib/contactStore.js, a live Upstash Redis store)
+is the authoritative source for every send, not these db.py columns. This
+script is retained only as an emergency CLI fallback for if the dashboard
+itself is unreachable, and no longer needs to be run for routine contact
+changes. See README "Restaurant Contacts Store" for the full migration.
+
 Usage:
     python set_location_contacts.py --status
         Lists every location and whether it has a configured, active
