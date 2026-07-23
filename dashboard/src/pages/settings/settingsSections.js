@@ -53,6 +53,17 @@ export const settingsSections = [
     requiredRoles: ['owner', 'marketing', 'location_manager'],
   },
   {
+    id: 'email',
+    path: 'email',
+    label: 'Email System',
+    icon: '✉',
+    component: lazy(() => import('./EmailSystem.jsx')),
+    // EMAIL_VIEW is granted to owner/marketing only, per the approved
+    // Phase 8 role matrix -- location_manager/read_only have no view into
+    // the aggregate, company-wide SMTP status.
+    requiredRoles: ['owner', 'marketing'],
+  },
+  {
     id: 'audit-log',
     path: 'audit-log',
     label: 'Audit Log',

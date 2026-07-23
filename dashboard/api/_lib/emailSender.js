@@ -80,7 +80,12 @@ export class EmailSenderUnavailableError extends Error {}
 // optional (defaults to STARTTLS/false). HOST/USER/PASSWORD have no such
 // safe default -- their absence really does mean "this environment can't
 // send email at all yet".
-function hasSmtpConfig() {
+// Exported (Phase 8, Milestone 8.9) so Settings -> Email can report whether
+// SMTP is configured without duplicating this env-var check or probing a
+// real connection on every page load -- a live login attempt only ever
+// happens when a real send is actually requested (a real review email, or
+// an explicit Send Test Email click), never as a passive status read.
+export function hasSmtpConfig() {
   return Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASSWORD)
 }
 
@@ -150,5 +155,9 @@ export async function sendReviewEmail({ to, cc, replyTo, subject, html, text }) 
     html,
     text,
   })
-  return { messageId: info.messageId }
+  // `response` is nodemailer's raw SMTP server response line (e.g.
+  // "250 2.0.0 OK ..."), additive -- existing callers destructuring only
+  // { messageId } are unaffected. Surfaced by Settings -> Restaurant
+  // Contacts' "Send Test Email" action (Milestone 8.9).
+  return { messageId: info.messageId, response: info.response ?? null }
 }

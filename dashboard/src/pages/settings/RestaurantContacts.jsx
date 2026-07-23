@@ -8,6 +8,7 @@ import ConfirmDialog from '../../components/ui/ConfirmDialog.jsx'
 import { useToast } from '../../components/ui/Toast.jsx'
 import { useMeta } from '../../hooks/useIntelligence.js'
 import { useRestaurantContacts, useDeleteContact, useToggleContactActive } from '../../hooks/useRestaurantContacts.js'
+import { useSendTestEmail } from '../../hooks/useEmailSystemStatus.js'
 import ContactEditorModal from './ContactEditorModal.jsx'
 
 const PAGE_SIZE = 40
@@ -48,6 +49,7 @@ export default function RestaurantContacts() {
   const { data: contacts, isLoading: contactsLoading, isError: contactsError, refetch: refetchContacts } = useRestaurantContacts()
   const deleteMutation = useDeleteContact()
   const toggleActiveMutation = useToggleContactActive()
+  const sendTestEmailMutation = useSendTestEmail()
 
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('all') // all | configured | not_configured | disabled
@@ -123,6 +125,19 @@ export default function RestaurantContacts() {
       showToast(row.active ? `${row.locationName} contact disabled` : `${row.locationName} contact enabled`, { variant: 'success' })
     } catch (err) {
       showToast(err.message || 'Could not update this contact', { variant: 'error' })
+    }
+  }
+
+  // Sends a diagnostic (non-review) email to the location's current primary
+  // + CC recipients via testEmailTemplate.js -- confirms SMTP delivery is
+  // actually working for this contact, without waiting for a real bad
+  // review to test it. Reuses sendReviewEmail() unchanged server-side.
+  async function handleSendTestEmail(row) {
+    try {
+      const result = await sendTestEmailMutation.mutateAsync(row.locationId)
+      showToast(`Test email sent to ${result.sentTo}`, { variant: 'success' })
+    } catch (err) {
+      showToast(err.message || 'Could not send the test email', { variant: 'error' })
     }
   }
 
@@ -224,6 +239,7 @@ export default function RestaurantContacts() {
                     ) : (
                       <div className="flex items-center gap-1.5 flex-wrap">
                         <Button variant="ghost" onClick={() => openEdit(row)}>Edit</Button>
+                        <Button variant="ghost" onClick={() => handleSendTestEmail(row)}>Send Test Email</Button>
                         <Button variant="ghost" onClick={() => handleToggleActive(row)}>{row.active ? 'Disable' : 'Enable'}</Button>
                         <Button variant="ghost" onClick={() => setDeleteTarget({ locationId: row.locationId, locationName: row.locationName })}>Delete</Button>
                       </div>
@@ -260,6 +276,7 @@ export default function RestaurantContacts() {
                 ) : (
                   <>
                     <Button variant="ghost" onClick={() => openEdit(row)}>Edit</Button>
+                    <Button variant="ghost" onClick={() => handleSendTestEmail(row)}>Send Test Email</Button>
                     <Button variant="ghost" onClick={() => handleToggleActive(row)}>{row.active ? 'Disable' : 'Enable'}</Button>
                     <Button variant="ghost" onClick={() => setDeleteTarget({ locationId: row.locationId, locationName: row.locationName })}>Delete</Button>
                   </>

@@ -20,6 +20,9 @@
 // POST /api/settings/contacts-delete        -- genuine removal
 // POST /api/settings/contacts-toggle-active -- Disable/Enable Contact
 // POST /api/settings/contacts-backfill-from-legacy -- Milestone 8.5, see below
+// GET  /api/settings/audit-log              -- Milestone 8.6
+// GET  /api/settings/email-status           -- Milestone 8.9
+// POST /api/settings/contacts-send-test-email -- Milestone 8.9
 
 import { readFile } from 'fs/promises'
 import path from 'path'
@@ -31,9 +34,24 @@ import {
   getAllContacts, getContact, upsertContact, deleteContact, ContactStoreUnavailableError,
 } from '../_lib/contactStore.js'
 import { appendAuditEntry, listAuditEntries, clientIp, AuditLogUnavailableError } from '../_lib/auditLog.js'
+import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
+import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
 
 function actorFields(account, req) {
   return { actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req) }
+}
+
+// Same redaction discipline as actions/[action].js's own copy -- SMTP send
+// errors could in principle echo configured credentials back, so strip them
+// defensively before this ever reaches a log line, an audit entry, or a
+// response body. Duplicated rather than imported, matching this codebase's
+// established convention for small cross-boundary helpers (see auditLog.js's
+// clientIp()).
+function sanitizeErrorMessage(message) {
+  let out = String(message ?? 'unknown error')
+  if (process.env.SMTP_PASSWORD) out = out.split(process.env.SMTP_PASSWORD).join('[redacted]')
+  if (process.env.SMTP_USER) out = out.split(process.env.SMTP_USER).join('[redacted]')
+  return out.slice(0, 300)
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -403,6 +421,156 @@ async function auditLogAction(req, res) {
   }
 }
 
+// GET /api/settings/email-status (Phase 8, Milestone 8.9)
+// Owner/Marketing only. A read-only summary over emailSender.js's own
+// configuration check plus the audit log's `entity: 'email'` entries --
+// never a live SMTP connection probe on a page load (see hasSmtpConfig()'s
+// own header comment: a real login attempt only happens on an actual send).
+// "Pending Queue" is reported explicitly as a direct-delivery model, not a
+// fabricated queue depth -- emailSender.js's documented architecture is
+// synchronous send-or-fail, never a queue.
+async function emailStatusAction(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+
+  if (!roleHasPermission(account.role, Permission.EMAIL_VIEW)) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to view the email system status.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `settings:email-status:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
+
+  const configured = hasSmtpConfig()
+  let lastSuccess = null
+  let lastFailure = null
+  let recentErrors = []
+  let auditDegraded = false
+
+  try {
+    const { entries } = await listAuditEntries({ entity: 'email', limit: 200, offset: 0 })
+    lastSuccess = entries.find(e => e.result === 'success') ?? null
+    lastFailure = entries.find(e => e.result === 'failure') ?? null
+    recentErrors = entries.filter(e => e.result === 'failure').slice(0, 5)
+      .map(e => ({ at: e.at, entityId: e.entityId ?? null, message: e.message ?? null }))
+  } catch (err) {
+    if (err instanceof AuditLogUnavailableError) {
+      console.error(`[settings/email-status] ${err.message}`)
+      auditDegraded = true
+    } else {
+      throw err
+    }
+  }
+
+  return res.status(200).json({
+    configured,
+    host: process.env.SMTP_HOST ?? null,
+    port: Number(process.env.SMTP_PORT) || 587,
+    authenticated: configured,
+    lastSuccessAt: lastSuccess?.at ?? null,
+    lastFailureAt: lastFailure?.at ?? null,
+    lastFailureMessage: lastFailure?.message ?? null,
+    recentErrors,
+    auditDegraded,
+    queueModel: 'direct-synchronous',
+    queueMessage: 'Direct delivery — no queue. Every send resolves immediately as sent or failed.',
+  })
+}
+
+// POST /api/settings/contacts-send-test-email  { locationId }
+// Owner/Marketing only (CONTACTS_MANAGE, same gate as the other contacts-*
+// writes) -- a connectivity/configuration check, not a real customer-facing
+// message, so it reuses sendReviewEmail() unchanged with testEmailTemplate.js's
+// review-agnostic content. Records the outcome to BOTH the contact's own
+// embedded history (contactStore.js) and the global audit log, mirroring
+// actions/[action].js's sendReviewEmailAction -- truthful success/failure,
+// never a queued/unknown state.
+async function sendTestEmailAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const scope = await requireScopedAuth(req, res, {
+    permission: Permission.CONTACTS_MANAGE,
+    resolveLocationId: async (req) => Number(req.body?.locationId),
+  })
+  if (!scope) return
+  const { account, locationId } = scope
+
+  if (!isPositiveInteger(locationId)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'locationId must be a positive integer.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `settings:contacts-send-test-email:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  let contact
+  try {
+    contact = await getContact(locationId)
+  } catch (err) {
+    if (err instanceof ContactStoreUnavailableError) {
+      console.error(`[settings/contacts-send-test-email] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Restaurant contacts are temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+  if (!contact || !contact.primaryEmail) {
+    return res.status(400).json({ error: 'no_contact_configured', message: 'This location has no configured restaurant contact email yet.' })
+  }
+
+  const sentAt = new Date().toISOString()
+  const sentByName = account.displayName ?? account.email
+  const locationName = contact.locationName || `location ${locationId}`
+  const subject = buildTestEmailSubject({ locationName })
+  const { html, text } = buildTestEmail({ locationName, sentByName, sentAt })
+
+  try {
+    const { response } = await sendReviewEmail({ to: contact.primaryEmail, cc: contact.ccEmails, replyTo: undefined, subject, html, text })
+
+    await Promise.all([
+      upsertContact(locationId, {}, account, 'Test email sent'),
+      appendAuditEntry({
+        ...actorFields(account, req),
+        entity: 'email',
+        entityId: String(locationId),
+        action: 'email.test_sent',
+        changes: null,
+        result: 'success',
+        message: `Test email sent to ${contact.primaryEmail} for ${locationName}.`,
+      }),
+    ])
+
+    return res.status(200).json({ sentTo: contact.primaryEmail, response: response ?? null })
+  } catch (err) {
+    if (err instanceof EmailSenderUnavailableError) {
+      console.error(`[settings/contacts-send-test-email] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Email sending is not configured. Please contact an administrator.' })
+    }
+
+    const sanitized = sanitizeErrorMessage(err.message)
+    console.error(`[settings/contacts-send-test-email] send failed: ${sanitized}`)
+
+    try {
+      await Promise.all([
+        upsertContact(locationId, {}, account, 'Test email failed'),
+        appendAuditEntry({
+          ...actorFields(account, req),
+          entity: 'email',
+          entityId: String(locationId),
+          action: 'email.test_failed',
+          changes: null,
+          result: 'failure',
+          message: `Test email to ${contact.primaryEmail} for ${locationName} failed: ${sanitized}`,
+        }),
+      ])
+    } catch (recordErr) {
+      if (!(recordErr instanceof ContactStoreUnavailableError)) throw recordErr
+      console.error(`[settings/contacts-send-test-email] ${recordErr.message}`)
+    }
+
+    return res.status(502).json({ error: 'send_failed', message: 'The test email could not be sent.', detail: sanitized })
+  }
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
     case 'contacts':                       return listContacts(req, res)
@@ -410,7 +578,9 @@ export default async function handler(req, res) {
     case 'contacts-delete':                 return deleteContactAction(req, res)
     case 'contacts-toggle-active':          return toggleContactActiveAction(req, res)
     case 'contacts-backfill-from-legacy':   return backfillContactsFromLegacyAction(req, res)
+    case 'contacts-send-test-email':        return sendTestEmailAction(req, res)
     case 'audit-log':                       return auditLogAction(req, res)
+    case 'email-status':                    return emailStatusAction(req, res)
     default:                                return res.status(404).json({ error: 'not_found' })
   }
 }

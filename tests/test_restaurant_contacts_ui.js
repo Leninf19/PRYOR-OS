@@ -62,6 +62,14 @@ function testConfiguredRowsShowEditDisableDeleteActions() {
   assert(/>Delete</.test(content), 'a configured contact must offer Delete')
 }
 
+function testSendTestEmailActionWiredToTheSharedHook() {
+  const content = read('pages/settings/RestaurantContacts.jsx')
+  assert(/from '\.\.\/\.\.\/hooks\/useEmailSystemStatus\.js'/.test(content), 'must import useSendTestEmail from the shared Email System hook, not a local fetch()')
+  assert(/useSendTestEmail/.test(content), 'must call useSendTestEmail()')
+  assert(/>Send Test Email</.test(content), 'a configured contact must offer Send Test Email (Milestone 8.9)')
+  assert(/sendTestEmailMutation\.mutateAsync\(row\.locationId\)/.test(content), 'must send the test email for the row\'s own locationId, never a hardcoded or client-editable id')
+}
+
 function testDeleteUsesConfirmDialogNotBrowserConfirm() {
   const content = read('pages/settings/RestaurantContacts.jsx')
   assert(/from '\.\.\/\.\.\/components\/ui\/ConfirmDialog\.jsx'/.test(content), 'must use the shared ConfirmDialog, not window.confirm')
@@ -104,6 +112,7 @@ const tests = [
   ['every location gets a row regardless of configuration state', testEveryLocationGetsARowRegardlessOfConfiguration],
   ['Configure Contact appears exactly when a location is unconfigured', testConfigureContactAppearsExactlyWhenUnconfigured],
   ['configured rows show Edit/Disable-Enable/Delete actions', testConfiguredRowsShowEditDisableDeleteActions],
+  ['Send Test Email is wired to the shared useSendTestEmail hook, scoped to the row\'s own location', testSendTestEmailActionWiredToTheSharedHook],
   ['delete uses the shared ConfirmDialog, never window.confirm', testDeleteUsesConfirmDialogNotBrowserConfirm],
   ['search, status filter, sortable headers, and pagination are all present', testSearchFilterSortAndPaginationPresent],
   ['uses the shared Skeleton/EmptyState/ErrorState components', testUsesSharedEmptyLoadingErrorStates],

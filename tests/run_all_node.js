@@ -57,6 +57,9 @@ const TESTS = [
   'test_settings_audit_log_endpoint.js',
   'test_credential_store.js',
   'test_google_oauth_auto_recovery.js',
+  'test_settings_email_status_endpoint.js',
+  'test_settings_send_test_email.js',
+  'test_email_system_ui.js',
 ]
 
 const results = {}

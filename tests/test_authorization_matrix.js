@@ -345,6 +345,22 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Phase 8 Milestone 8.6. Marketing has CONTACTS_MANAGE but deliberately NOT AUDIT_VIEW per the approved role matrix.',
   },
+  {
+    route: 'GET /api/settings/email-status', file: 'api/settings/[action].js', method: 'GET', action: 'email-status',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
+    scope: 'aggregate, company-wide SMTP configuration/send-history summary -- gated by EMAIL_VIEW, same roles as CONTACTS_MANAGE',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Phase 8 Milestone 8.9. Uses requireAuth(req, res, null) + roleHasPermission(EMAIL_VIEW), same pattern as GET /api/settings/contacts -- location_manager/read_only lack EMAIL_VIEW entirely.',
+  },
+  {
+    route: 'POST /api/settings/contacts-send-test-email', file: 'api/settings/[action].js', method: 'POST', action: 'contacts-send-test-email',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
+    scope: 'restaurant contacts -- diagnostic test email, same CONTACTS_MANAGE gate as contacts-upsert',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Phase 8 Milestone 8.9. Second production caller of requireScopedAuth() in this file -- resolveLocationId reads body.locationId, same ordering as contacts-upsert (permission checked before location scope).',
+  },
 ]
 
 // ---------------------------------------------------------------------------
