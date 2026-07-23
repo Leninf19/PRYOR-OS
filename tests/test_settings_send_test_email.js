@@ -233,6 +233,27 @@ async function testOutOfScopeManagerLocationReturns404() {
   assert(res.statusCode === 403, `expected 403 (no CONTACTS_MANAGE permission at all), got ${res.statusCode}`)
 }
 
+// Phase 8, Milestone 8.10 (cross-cutting RBAC verification): a scoped
+// account that DOES hold CONTACTS_MANAGE (hypothetical -- every real
+// owner/marketing account today is company-wide) must 404, never 403, for
+// a location outside its grant -- closing the same gap
+// test_settings_contacts_endpoint.js's own scoped-marketing test closes for
+// contacts-upsert, but for this endpoint's own requireScopedAuth call.
+async function testScopedMarketingAccountGets404ForAnotherLocation() {
+  await setDirectory()
+  process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
+    accounts: [{
+      userId: 'usr_scoped_mkt', email: 'scopedmkt@example.com', passwordHash: await bcrypt.hash('x', 12),
+      role: 'marketing', locationIds: [9], sessionVersion: 1, disabled: false, displayName: 'Scoped Marketing',
+    }],
+  })
+  _setRedisClientForTests(() => fakeRedis())
+  _setTransportForTests(fakeMailer())
+  const token = await tokenFor('usr_scoped_mkt', 'scopedmkt@example.com', 'marketing', [9])
+  const res = await invoke({ token, body: { locationId: 2 } })
+  assert(res.statusCode === 404, `a scoped account WITH CONTACTS_MANAGE must 404 (never 403) for a location outside its grant, got ${res.statusCode}`)
+}
+
 async function main() {
   await run('contacts-send-test-email: unauthenticated -> 401', testRejectsUnauthenticated)
   await run('contacts-send-test-email: location_manager rejected -> 403', testRejectsLocationManager)
@@ -244,6 +265,7 @@ async function main() {
   await run('an authentication failure never leaks SMTP_USER/SMTP_PASSWORD', testAuthFailureRedactsSmtpCredentials)
   await run('an unconfigured email subsystem returns 503', testUnconfiguredEmailSubsystemReturns503)
   await run('location_manager is rejected regardless of location scope (no CONTACTS_MANAGE)', testOutOfScopeManagerLocationReturns404)
+  await run('a scoped account WITH CONTACTS_MANAGE 404s (not 403) for a location outside its grant', testScopedMarketingAccountGets404ForAnotherLocation)
 
   console.log()
   if (results.every(Boolean)) {

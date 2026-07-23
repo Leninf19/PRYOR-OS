@@ -155,6 +155,53 @@ async function testUpsertRejectsOutOfScopeLocationWith404NotForbidden() {
   assert(res.statusCode === 403, `a role with no CONTACTS_MANAGE permission at all must 403 regardless of location, got ${res.statusCode}`)
 }
 
+// Phase 8, Milestone 8.10 (cross-cutting RBAC verification): every real
+// production account with CONTACTS_MANAGE today (owner/marketing) is
+// company-wide (locationIds: '*'), so requireScopedAuth's genuine 404
+// (out-of-scope, permission-holding) branch has never actually been
+// exercised end-to-end by a permitted-but-scoped account -- only by a role
+// that lacks the permission entirely (which 403s before scope is even
+// checked, see above). This constructs a hypothetical marketing account
+// scoped to a single location to close that gap and prove the ordering is
+// really permission-then-scope, not scope-then-permission.
+async function testScopedMarketingAccountCanWriteOwnLocationButGets404ForAnother() {
+  await setDirectory()
+  process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
+    accounts: [{
+      userId: 'usr_scoped_mkt', email: 'scopedmkt@example.com', passwordHash: await bcrypt.hash('x', 12),
+      role: 'marketing', locationIds: [9], sessionVersion: 1, disabled: false, displayName: 'Scoped Marketing',
+    }],
+  })
+  _setRedisClientForTests(() => fakeRedis())
+  const token = await tokenFor('usr_scoped_mkt', 'scopedmkt@example.com', 'marketing', [9])
+
+  const inScope = await invoke({ action: 'contacts-upsert', method: 'POST', token, body: { locationId: 9, patch: { primaryEmail: 'ok@example.com' } } })
+  assert(inScope.statusCode === 200, `a scoped account with CONTACTS_MANAGE must succeed for its own location, got ${inScope.statusCode}`)
+
+  const outOfScope = await invoke({ action: 'contacts-upsert', method: 'POST', token, body: { locationId: 2, patch: { primaryEmail: 'ok@example.com' } } })
+  assert(outOfScope.statusCode === 404, `a scoped account WITH the permission must 404 (never 403) for a location outside its grant, got ${outOfScope.statusCode}`)
+}
+
+// Same gap, closed for contacts-delete and contacts-toggle-active -- both
+// call requireScopedAuth identically to contacts-upsert.
+async function testScopedMarketingAccountGets404FromDeleteAndToggleForAnotherLocation() {
+  await setDirectory()
+  process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
+    accounts: [{
+      userId: 'usr_scoped_mkt', email: 'scopedmkt@example.com', passwordHash: await bcrypt.hash('x', 12),
+      role: 'marketing', locationIds: [9], sessionVersion: 1, disabled: false, displayName: 'Scoped Marketing',
+    }],
+  })
+  _setRedisClientForTests(() => fakeRedis())
+  const token = await tokenFor('usr_scoped_mkt', 'scopedmkt@example.com', 'marketing', [9])
+
+  const deleteRes = await invoke({ action: 'contacts-delete', method: 'POST', token, body: { locationId: 2 } })
+  assert(deleteRes.statusCode === 404, `contacts-delete: expected 404 for an out-of-scope location, got ${deleteRes.statusCode}`)
+
+  const toggleRes = await invoke({ action: 'contacts-toggle-active', method: 'POST', token, body: { locationId: 2, active: false } })
+  assert(toggleRes.statusCode === 404, `contacts-toggle-active: expected 404 for an out-of-scope location, got ${toggleRes.statusCode}`)
+}
+
 async function testUpsertRejectsInvalidEmailFormat() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
@@ -231,6 +278,8 @@ async function main() {
   await run('location_manager sees only their own assigned location\'s contact', testManagerSeesOnlyOwnLocation)
   await run('contacts-upsert rejects location_manager (no CONTACTS_MANAGE) with 403', testUpsertRejectsManager)
   await run('a role with no CONTACTS_MANAGE permission 403s regardless of location scope', testUpsertRejectsOutOfScopeLocationWith404NotForbidden)
+  await run('a scoped account WITH CONTACTS_MANAGE succeeds for its own location and 404s (not 403) for another', testScopedMarketingAccountCanWriteOwnLocationButGets404ForAnother)
+  await run('the same scoped-account 404 behavior holds for contacts-delete and contacts-toggle-active', testScopedMarketingAccountGets404FromDeleteAndToggleForAnotherLocation)
   await run('contacts-upsert rejects a malformed primary email with 400', testUpsertRejectsInvalidEmailFormat)
   await run('contacts-upsert rejects a malformed CC email with 400', testUpsertRejectsInvalidCcEmail)
   await run('contacts-upsert rejects a patch containing a server-owned field outright', testUpsertRejectsUnknownPatchField)
