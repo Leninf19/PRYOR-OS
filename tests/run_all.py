@@ -21,6 +21,7 @@ TESTS = [
     "test_export_chunks.py",
     "test_location_analytics.py",
     "test_google_api_endpoints.py",
+    "test_google_api_redis_token.py",
     "test_gbp_sync.py",
     "test_gbp_import.py",
     "test_critical_alert_check.py",

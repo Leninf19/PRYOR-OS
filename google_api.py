@@ -22,12 +22,16 @@ message -- callers never have to parse or display a raw Google error blob.
 Every call is wrapped with exponential backoff (respecting Retry-After when
 Google sends one) so a transient 429/5xx doesn't fail a whole sync run.
 """
+import base64
+import hashlib
 import json
 import os
 import time
 import urllib.request
 import urllib.error
 import urllib.parse
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import retry as retry_lib
 from provider_base import ProviderError
@@ -84,17 +88,65 @@ def _env(name: str) -> str:
     return val
 
 
+# Phase 8, Milestone 8.8: closes the gap where a dashboard reconnect
+# (Settings -> Google Business Profile, Milestone 8.7) never reached the
+# scheduled Python pipeline -- the two ran on completely separate
+# credential stores (Redis vs. this GitHub Actions secret). This module
+# now tries the SAME live Redis-backed credential store the dashboard
+# writes to first; GOOGLE_REFRESH_TOKEN remains a permanent fallback (not
+# scheduled for removal) for whenever Redis is unreachable or this
+# one-time setup (UPSTASH_REDIS_REST_URL/_TOKEN, CREDENTIAL_ENCRYPTION_KEY
+# as GitHub Actions secrets) hasn't been done in a given environment.
+#
+# Ciphertext format must match dashboard/api/_lib/credentialStore.js
+# exactly: AES-256-GCM, key = SHA-256(CREDENTIAL_ENCRYPTION_KEY as UTF-8
+# bytes), ciphertext/iv/authTag each base64-encoded and stored as SEPARATE
+# JSON fields (Node's crypto API keeps the auth tag separate from the
+# ciphertext; Python's high-level AESGCM.decrypt() wants them concatenated
+# -- ciphertext + tag -- so that concatenation happens here, not a format
+# difference between the two implementations).
+def _fetch_refresh_token_from_redis() -> str | None:
+    url = os.environ.get("UPSTASH_REDIS_REST_URL")
+    rest_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+    encryption_key = os.environ.get("CREDENTIAL_ENCRYPTION_KEY")
+    if not url or not rest_token or not encryption_key:
+        return None
+
+    try:
+        req = urllib.request.Request(
+            f"{url.rstrip('/')}/get/gbp_credentials:v1",
+            headers={"Authorization": f"Bearer {rest_token}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read())
+        raw = body.get("result")
+        if not raw:
+            return None
+        record = json.loads(raw)
+
+        key = hashlib.sha256(encryption_key.encode("utf-8")).digest()
+        iv = base64.b64decode(record["refreshTokenIv"])
+        ciphertext = base64.b64decode(record["refreshTokenCiphertext"])
+        auth_tag = base64.b64decode(record["refreshTokenAuthTag"])
+        plaintext = AESGCM(key).decrypt(iv, ciphertext + auth_tag, None)
+        return plaintext.decode("utf-8")
+    except Exception as e:  # noqa: BLE001 -- any failure here must fall back, never crash the pipeline
+        print(f"[google_api] Redis-stored credential unavailable, falling back to GOOGLE_REFRESH_TOKEN: {e}")
+        return None
+
+
 def get_access_token(force_refresh: bool = False) -> str:
-    """Exchanges GOOGLE_REFRESH_TOKEN for a short-lived access token, cached
-    in-process for the remainder of its lifetime (minus a safety margin) so a
-    single script run doesn't re-exchange it on every API call."""
+    """Exchanges the refresh token (Redis-backed store first, then
+    GOOGLE_REFRESH_TOKEN) for a short-lived access token, cached in-process
+    for the remainder of its lifetime (minus a safety margin) so a single
+    script run doesn't re-exchange it on every API call."""
     now = time.time()
     if not force_refresh and _access_token_cache["token"] and now < _access_token_cache["expires_at"]:
         return _access_token_cache["token"]
 
     client_id = _env("GOOGLE_CLIENT_ID")
     client_secret = _env("GOOGLE_CLIENT_SECRET")
-    refresh_token = _env("GOOGLE_REFRESH_TOKEN")
+    refresh_token = _fetch_refresh_token_from_redis() or _env("GOOGLE_REFRESH_TOKEN")
 
     body = urllib.parse.urlencode({
         "client_id": client_id,
@@ -277,9 +329,18 @@ def reply_to_review(review_name: str, comment: str) -> None:
 def is_configured() -> bool:
     """Cheap check (no network call) for whether Google credentials are
     present at all -- callers can skip the sync entirely rather than fail
-    loudly when the integration hasn't been set up yet."""
-    return bool(
-        os.environ.get("GOOGLE_CLIENT_ID")
-        and os.environ.get("GOOGLE_CLIENT_SECRET")
-        and os.environ.get("GOOGLE_REFRESH_TOKEN")
+    loudly when the integration hasn't been set up yet.
+
+    Phase 8, Milestone 8.8: a refresh token can now come from either
+    GOOGLE_REFRESH_TOKEN (legacy) or the Redis-backed store -- this stays a
+    pure env-var presence check (no network call, preserving the existing
+    contract), so the Redis path is represented by checking its own three
+    required env vars are present, not by actually reaching Upstash."""
+    has_client_creds = bool(os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET"))
+    has_env_refresh_token = bool(os.environ.get("GOOGLE_REFRESH_TOKEN"))
+    has_redis_config = bool(
+        os.environ.get("UPSTASH_REDIS_REST_URL")
+        and os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+        and os.environ.get("CREDENTIAL_ENCRYPTION_KEY")
     )
+    return has_client_creds and (has_env_refresh_token or has_redis_config)
