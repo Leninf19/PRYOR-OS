@@ -89,7 +89,11 @@ export default function AuditLog() {
         <EmptyState icon="🗒" title="No matching audit entries" body="Try a different filter, or check back after the next change is made." />
       ) : (
         <div className="card overflow-hidden">
-          <div className="overflow-x-auto">
+          {/* Desktop: full table. Mobile: stacked cards -- same sm breakpoint
+              and pattern RestaurantContacts.jsx/ReviewExplorer.jsx use
+              (Phase 8, Milestone 8.11 hardening pass; this table was the one
+              new Phase 8 table that hadn't yet gotten a mobile fallback). */}
+          <div className="hidden sm:block overflow-x-auto">
             <table className="w-full text-xs">
               <thead>
                 <tr>
@@ -119,6 +123,20 @@ export default function AuditLog() {
                 ))}
               </tbody>
             </table>
+          </div>
+
+          <div className="sm:hidden divide-y" style={{ borderColor: 'var(--color-border)' }}>
+            {entries.map(e => (
+              <div key={e.id} className="p-4 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="font-semibold text-sm" style={{ color: 'var(--color-text-1)' }}>{e.actorName || e.actorEmail || '—'}</p>
+                  <Badge variant={e.result === 'success' ? 'success' : 'danger'}>{e.result}</Badge>
+                </div>
+                <p style={{ color: 'var(--color-text-2)' }}>{ENTITY_LABELS[e.entity] ?? e.entity} · <span className="font-mono">{e.action}</span></p>
+                {e.message && <p style={{ color: 'var(--color-text-2)' }}>{e.message}</p>}
+                <p className="text-[11px]" style={{ color: 'var(--color-text-3)' }}>{fmtWhen(e.at)}{e.ip ? ` · ${e.ip}` : ''}</p>
+              </div>
+            ))}
           </div>
         </div>
       )}

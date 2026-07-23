@@ -98,6 +98,20 @@ function testMobileResponsiveStackedCardFallback() {
     'must degrade to a stacked-card layout below the sm breakpoint, matching ReviewExplorer.jsx\'s responsive pattern')
 }
 
+// Milestone 8.11 hardening pass finding: ContactEditorModal.jsx's Manager
+// Name / Primary Email <label>s had no htmlFor/id association -- a screen
+// reader tabbing into the input announced no accessible name at all (visual
+// proximity to a sibling <div> is not a programmatic association). Fixed by
+// pairing each label's htmlFor with its input's id.
+function testContactEditorModalLabelsAreProgrammaticallyAssociated() {
+  const content = read('pages/settings/ContactEditorModal.jsx')
+  assert(/htmlFor="contact-manager-name"/.test(content) && /id="contact-manager-name"/.test(content),
+    'Manager Name label must be linked to its input via matching htmlFor/id')
+  assert(/htmlFor="contact-primary-email"/.test(content) && /id="contact-primary-email"/.test(content),
+    'Primary Email label must be linked to its input via matching htmlFor/id')
+  assert(/aria-invalid=\{Boolean\(primaryEmailError\)\}/.test(content), 'the primary email input must expose its validity state via aria-invalid')
+}
+
 function testRegisteredInSettingsSectionsWithCorrectRoles() {
   const content = read('pages/settings/settingsSections.js')
   const sectionMatch = content.match(/\{\s*id:\s*'contacts',[\s\S]*?\n {2}\}/)
@@ -117,6 +131,7 @@ const tests = [
   ['search, status filter, sortable headers, and pagination are all present', testSearchFilterSortAndPaginationPresent],
   ['uses the shared Skeleton/EmptyState/ErrorState components', testUsesSharedEmptyLoadingErrorStates],
   ['degrades to a stacked-card layout on mobile', testMobileResponsiveStackedCardFallback],
+  ['ContactEditorModal\'s labels are programmatically associated with their inputs (Milestone 8.11 fix)', testContactEditorModalLabelsAreProgrammaticallyAssociated],
   ['registered in settingsSections.js with the correct role visibility', testRegisteredInSettingsSectionsWithCorrectRoles],
 ]
 

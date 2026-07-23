@@ -93,10 +93,11 @@ export default function ContactEditorModal({ open, onClose, locationId, location
         </div>
 
         <div>
-          <label className="text-[10px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>
+          <label htmlFor="contact-manager-name" className="text-[10px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>
             Manager Name (optional)
           </label>
           <input
+            id="contact-manager-name"
             type="text"
             value={managerName}
             onChange={e => setManagerName(e.target.value)}
@@ -107,19 +108,22 @@ export default function ContactEditorModal({ open, onClose, locationId, location
         </div>
 
         <div>
-          <label className="text-[10px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>
+          <label htmlFor="contact-primary-email" className="text-[10px] font-bold uppercase tracking-wider mb-1 block" style={{ color: 'var(--color-text-3)' }}>
             Primary Email
           </label>
           <input
+            id="contact-primary-email"
             type="email"
             required
             value={primaryEmail}
             onChange={e => { setPrimaryEmail(e.target.value); setPrimaryEmailError(null) }}
             placeholder="manager@restaurant.com"
+            aria-invalid={Boolean(primaryEmailError)}
+            aria-describedby={primaryEmailError ? 'contact-primary-email-error' : undefined}
             className="w-full text-sm px-2.5 py-2 rounded-lg border focus:outline-none"
             style={{ background: 'var(--color-surface-2)', border: `1px solid ${primaryEmailError ? 'var(--color-danger)' : 'var(--color-border)'}`, color: 'var(--color-text-1)' }}
           />
-          {primaryEmailError && <p className="text-[11px] mt-1" style={{ color: 'var(--color-danger)' }}>{primaryEmailError}</p>}
+          {primaryEmailError && <p id="contact-primary-email-error" className="text-[11px] mt-1" style={{ color: 'var(--color-danger)' }}>{primaryEmailError}</p>}
         </div>
 
         <EmailFieldList label="CC Emails (optional)" emails={ccEmails} onChange={setCcEmails} />

@@ -60,6 +60,8 @@ const TESTS = [
   'test_settings_email_status_endpoint.js',
   'test_settings_send_test_email.js',
   'test_email_system_ui.js',
+  'test_audit_log_ui.js',
+  'test_google_business_profile_ui.js',
 ]
 
 const results = {}

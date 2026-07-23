@@ -329,6 +329,7 @@ function HistoricalImportPanel() {
               value={confirmText}
               onChange={e => setConfirmText(e.target.value)}
               placeholder='Type "IMPORT" to enable'
+              aria-label='Type IMPORT to confirm running the historical import'
               className="text-xs px-2.5 py-2 rounded-lg border w-40 focus:outline-none"
               style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
             />
