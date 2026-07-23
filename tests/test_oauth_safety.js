@@ -11,10 +11,15 @@ process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xy
 import { readFileSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import callbackHandler from '../dashboard/api/google/callback.js'
-import authHandler from '../dashboard/api/google/auth.js'
+import googleHandler from '../dashboard/api/google/[action].js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// Both endpoints now live in the same consolidated dispatch file
+// (Phase 8, Milestone 8.2) -- these wrappers keep every call site below
+// exactly as it read before the merge, just routing through req.query.action.
+function authHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'auth' } }, res) }
+function callbackHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'callback' } }, res) }
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -42,9 +47,9 @@ function fakeRes() {
 }
 
 function testCallbackSourceNeverEmbedsRefreshTokenInHtml() {
-  const source = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'api', 'google', 'callback.js'), 'utf-8')
-  assert(!source.includes('${tokens.refresh_token}'), 'callback.js must never interpolate the refresh token into an HTML response')
-  assert(!/refresh_token[^\n]*console\.log/.test(source), 'callback.js must never log the refresh token')
+  const source = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'api', 'google', '[action].js'), 'utf-8')
+  assert(!source.includes('${tokens.refresh_token}'), 'the callback case must never interpolate the refresh token into an HTML response')
+  assert(!/refresh_token[^\n]*console\.log/.test(source), 'the callback case must never log the refresh token')
 }
 
 async function testCallbackRequiresOwnerSessionBeforeAnythingElse() {

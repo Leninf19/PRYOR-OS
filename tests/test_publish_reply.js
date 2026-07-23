@@ -8,8 +8,13 @@
 // Run directly: node tests/test_publish_reply.js
 
 import bcrypt from 'bcryptjs'
-import handler from '../dashboard/api/google/publish.js'
+import googleHandler from '../dashboard/api/google/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
+
+// publish.js was merged into the consolidated dispatch file (Phase 8,
+// Milestone 8.2) -- this wrapper keeps every call site below exactly as it
+// read before the merge, just routing through req.query.action.
+function handler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'publish' } }, res) }
 
 process.env.GOOGLE_CLIENT_ID = 'fake-client-id'
 process.env.GOOGLE_CLIENT_SECRET = 'fake-client-secret'

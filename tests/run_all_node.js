@@ -47,6 +47,7 @@ const TESTS = [
   'test_no_gmail_in_review_email_workflow.js',
   'test_settings_registry.js',
   'test_settings_routing.js',
+  'test_google_action_dispatch.js',
 ]
 
 const results = {}

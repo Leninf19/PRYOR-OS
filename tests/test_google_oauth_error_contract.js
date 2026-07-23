@@ -19,10 +19,15 @@
 process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xyz'
 
 import bcrypt from 'bcryptjs'
-import authHandler from '../dashboard/api/google/auth.js'
-import callbackHandler from '../dashboard/api/google/callback.js'
+import googleHandler from '../dashboard/api/google/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { statusForAuthFailure } from '../dashboard/api/_lib/auth.js'
+
+// Both endpoints now live in the same consolidated dispatch file
+// (Phase 8, Milestone 8.2) -- these wrappers keep every call site below
+// exactly as it read before the merge, just routing through req.query.action.
+function authHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'auth' } }, res) }
+function callbackHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'callback' } }, res) }
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -268,20 +273,20 @@ async function testStatusForAuthFailureFailsClosedForUnknownReasons() {
 }
 
 async function testNoOtherEndpointBehaviorChanged() {
-  // Static confirmation that this milestone touched only what it claims to:
-  // both files still import evaluateSession, both still gate on ['owner']
-  // only (Marketing was never made eligible), and neither references any
-  // location-scoping helper.
+  // Static confirmation that this milestone (originally Milestone 6A; the
+  // two files it touched were later merged into google/[action].js by
+  // Phase 8's Milestone 8.2) touched only what it claims to: the consolidated
+  // file still calls evaluateSession(req, ['owner']) (Marketing was never
+  // made eligible for either the auth or callback case), and never
+  // references any location-scoping helper anywhere.
   const { readFileSync } = await import('fs')
   const { fileURLToPath } = await import('url')
   const path = await import('path')
   const dashboardDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dashboard')
-  const authSrc = readFileSync(path.join(dashboardDir, 'api', 'google', 'auth.js'), 'utf-8')
-  const callbackSrc = readFileSync(path.join(dashboardDir, 'api', 'google', 'callback.js'), 'utf-8')
-  for (const [name, src] of [['auth.js', authSrc], ['callback.js', callbackSrc]]) {
-    assert(/evaluateSession\(req, \['owner'\]\)/.test(src), `${name} must still gate on ['owner'] only -- Marketing must not become eligible`)
-    assert(!/requireLocationAccess|requireOwnership|requireScopedAuth/.test(src), `${name} must not reference any location-scoping helper`)
-  }
+  const src = readFileSync(path.join(dashboardDir, 'api', 'google', '[action].js'), 'utf-8')
+  const gateCount = (src.match(/evaluateSession\(req, \['owner'\]\)/g) || []).length
+  assert(gateCount === 2, `expected exactly 2 evaluateSession(req, ['owner']) gates (auth + callback cases), found ${gateCount}`)
+  assert(!/requireLocationAccess|requireOwnership|requireScopedAuth/.test(src), 'google/[action].js must not reference any location-scoping helper')
 }
 
 async function main() {

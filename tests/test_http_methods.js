@@ -16,13 +16,7 @@ delete process.env.ACCOUNT_DIRECTORY_JSON
 
 import dataHandler from '../dashboard/api/data.js'
 import executiveBriefHandler from '../dashboard/api/executive-brief.js'
-import authHandler from '../dashboard/api/google/auth.js'
-import callbackHandler from '../dashboard/api/google/callback.js'
-import publishHandler from '../dashboard/api/google/publish.js'
-import statusHandler from '../dashboard/api/google/status.js'
-import testConnectionHandler from '../dashboard/api/google/test-connection.js'
-import triggerImportHandler from '../dashboard/api/google/trigger-import.js'
-import triggerSyncHandler from '../dashboard/api/google/trigger-sync.js'
+import googleHandler from '../dashboard/api/google/[action].js'
 import rewriteHandler from '../dashboard/api/rewrite.js'
 import sessionHandler from '../dashboard/api/session/[action].js'
 import actionsHandler from '../dashboard/api/actions/[action].js'
@@ -56,13 +50,13 @@ function fakeRes() {
 const ROUTES = [
   ['/api/data', dataHandler, 'GET', { query: { file: 'meta.json' } }],
   ['/api/executive-brief', executiveBriefHandler, 'POST', {}],
-  ['/api/google/auth', authHandler, 'GET', { query: {} }],
-  ['/api/google/callback', callbackHandler, 'GET', { query: { code: 'x', state: 'y' } }],
-  ['/api/google/publish', publishHandler, 'POST', {}],
-  ['/api/google/status', statusHandler, 'GET', {}],
-  ['/api/google/test-connection', testConnectionHandler, 'GET', {}],
-  ['/api/google/trigger-import', triggerImportHandler, 'POST', {}],
-  ['/api/google/trigger-sync', triggerSyncHandler, 'POST', {}],
+  ['/api/google/auth', googleHandler, 'GET', { query: { action: 'auth' } }],
+  ['/api/google/callback', googleHandler, 'GET', { query: { action: 'callback', code: 'x', state: 'y' } }],
+  ['/api/google/publish', googleHandler, 'POST', { query: { action: 'publish' } }],
+  ['/api/google/status', googleHandler, 'GET', { query: { action: 'status' } }],
+  ['/api/google/test-connection', googleHandler, 'GET', { query: { action: 'test-connection' } }],
+  ['/api/google/trigger-import', googleHandler, 'POST', { query: { action: 'trigger-import' } }],
+  ['/api/google/trigger-sync', googleHandler, 'POST', { query: { action: 'trigger-sync' } }],
   ['/api/rewrite', rewriteHandler, 'POST', {}],
   ['/api/session/login', sessionHandler, 'POST', { query: { action: 'login' } }],
   ['/api/session/logout', sessionHandler, 'POST', { query: { action: 'logout' } }],

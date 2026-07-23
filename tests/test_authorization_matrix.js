@@ -43,13 +43,7 @@ import executiveBriefHandler from '../dashboard/api/executive-brief.js'
 import rewriteHandler from '../dashboard/api/rewrite.js'
 import sessionHandler from '../dashboard/api/session/[action].js'
 import actionsHandler from '../dashboard/api/actions/[action].js'
-import authHandler from '../dashboard/api/google/auth.js'
-import callbackHandler from '../dashboard/api/google/callback.js'
-import publishHandler from '../dashboard/api/google/publish.js'
-import statusHandler from '../dashboard/api/google/status.js'
-import testConnectionHandler from '../dashboard/api/google/test-connection.js'
-import triggerSyncHandler from '../dashboard/api/google/trigger-sync.js'
-import triggerImportHandler from '../dashboard/api/google/trigger-import.js'
+import googleHandler from '../dashboard/api/google/[action].js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -173,7 +167,7 @@ const ENDPOINT_REGISTRY = [
     notes: 'Idempotent cookie clear; no session required to call it, matching Phase 1 design (no server-side revocation list).',
   },
   {
-    route: 'POST /api/google/publish', file: 'api/google/publish.js', method: 'POST',
+    route: 'POST /api/google/publish', file: 'api/google/[action].js', method: 'POST', action: 'publish',
     authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
     scope: 'reply for any location today; no location filtering exists yet',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
@@ -197,7 +191,7 @@ const ENDPOINT_REGISTRY = [
     notes: 'Per the strict location-scoping rule, a company-wide brief can never be handed to a location-scoped role -- Owner/Marketing-only is a PERMANENT design decision, not a pending gap.',
   },
   {
-    route: 'GET /api/google/status', file: 'api/google/status.js', method: 'GET',
+    route: 'GET /api/google/status', file: 'api/google/[action].js', method: 'GET', action: 'status',
     authRequired: true, currentAllowedRoles: ['owner'],
     scope: 'account-wide administrative (Google connection status)',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
@@ -205,7 +199,7 @@ const ENDPOINT_REGISTRY = [
     notes: 'Owner-only administrative surface; not in scope for any location-aware milestone.',
   },
   {
-    route: 'GET /api/google/test-connection', file: 'api/google/test-connection.js', method: 'GET',
+    route: 'GET /api/google/test-connection', file: 'api/google/[action].js', method: 'GET', action: 'test-connection',
     authRequired: true, currentAllowedRoles: ['owner'],
     scope: 'account-wide administrative',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
@@ -213,7 +207,7 @@ const ENDPOINT_REGISTRY = [
     notes: 'Owner-only administrative surface.',
   },
   {
-    route: 'POST /api/google/trigger-sync', file: 'api/google/trigger-sync.js', method: 'POST',
+    route: 'POST /api/google/trigger-sync', file: 'api/google/[action].js', method: 'POST', action: 'trigger-sync',
     authRequired: true, currentAllowedRoles: ['owner'],
     scope: 'account-wide administrative (workflow trigger)',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
@@ -221,7 +215,7 @@ const ENDPOINT_REGISTRY = [
     notes: 'Owner-only administrative surface.',
   },
   {
-    route: 'POST /api/google/trigger-import', file: 'api/google/trigger-import.js', method: 'POST',
+    route: 'POST /api/google/trigger-import', file: 'api/google/[action].js', method: 'POST', action: 'trigger-import',
     authRequired: true, currentAllowedRoles: ['owner'],
     scope: 'account-wide administrative (workflow trigger)',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
@@ -229,7 +223,7 @@ const ENDPOINT_REGISTRY = [
     notes: 'Owner-only administrative surface.',
   },
   {
-    route: 'GET /api/google/auth', file: 'api/google/auth.js', method: 'GET',
+    route: 'GET /api/google/auth', file: 'api/google/[action].js', method: 'GET', action: 'auth',
     authRequired: true, currentAllowedRoles: ['owner'],
     scope: 'account-wide administrative (OAuth initiation)',
     unauthorizedShape: 'html', wrongRoleStatus: 403,
@@ -238,7 +232,7 @@ const ENDPOINT_REGISTRY = [
     notes: 'RESOLVED by Milestone 6A (was: ERROR_CONTRACT_EXCEPTION_1). This handler now destructures `reason` from evaluateSession() and uses the shared statusForAuthFailure(reason) helper (dashboard/api/_lib/auth.js) to return 403 for an authenticated-but-wrong-role caller (e.g. Marketing), matching every requireAuth()-based endpoint and the frozen §6 error contract. 401 is still returned for a true identity failure (no session, invalid session, disabled account, stale sessionVersion). See ERROR_CONTRACT_EXCEPTIONS below for the full resolution record.',
   },
   {
-    route: 'GET /api/google/callback', file: 'api/google/callback.js', method: 'GET',
+    route: 'GET /api/google/callback', file: 'api/google/[action].js', method: 'GET', action: 'callback',
     authRequired: true, currentAllowedRoles: ['owner'],
     scope: 'account-wide administrative (OAuth callback)',
     unauthorizedShape: 'html', wrongRoleStatus: 403,
@@ -591,13 +585,7 @@ const HANDLERS = {
   'api/rewrite.js': rewriteHandler,
   'api/session/[action].js': sessionHandler,
   'api/actions/[action].js': actionsHandler,
-  'api/google/auth.js': authHandler,
-  'api/google/callback.js': callbackHandler,
-  'api/google/publish.js': publishHandler,
-  'api/google/status.js': statusHandler,
-  'api/google/test-connection.js': testConnectionHandler,
-  'api/google/trigger-sync.js': triggerSyncHandler,
-  'api/google/trigger-import.js': triggerImportHandler,
+  'api/google/[action].js': googleHandler,
 }
 
 function minimalReqFor(entry, token) {
@@ -605,7 +593,7 @@ function minimalReqFor(entry, token) {
   const req = { method: entry.method, headers, body: {} }
   if (entry.action) req.query = { action: entry.action, ...(req.query || {}) }
   if (entry.file === 'api/data.js') req.query = { file: 'meta.json' }
-  if (entry.file === 'api/google/callback.js') req.query = { code: 'x', state: 'y' }
+  if (entry.action === 'callback') req.query = { action: 'callback', code: 'x', state: 'y' }
   return req
 }
 

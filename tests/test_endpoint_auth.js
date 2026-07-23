@@ -12,13 +12,19 @@ process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xy
 delete process.env.ACCOUNT_DIRECTORY_JSON // unauthenticated by construction
 
 import bcrypt from 'bcryptjs'
-import statusHandler from '../dashboard/api/google/status.js'
-import testConnectionHandler from '../dashboard/api/google/test-connection.js'
-import triggerSyncHandler from '../dashboard/api/google/trigger-sync.js'
-import triggerImportHandler from '../dashboard/api/google/trigger-import.js'
+import googleHandler from '../dashboard/api/google/[action].js'
 import rewriteHandler from '../dashboard/api/rewrite.js'
 import executiveBriefHandler from '../dashboard/api/executive-brief.js'
 import { signSession } from '../dashboard/api/_lib/session.js'
+
+// All four google/*.js files below were merged into the consolidated
+// dispatch file (Phase 8, Milestone 8.2) -- these wrappers keep every call
+// site further down exactly as it read before the merge, just routing
+// through req.query.action.
+function statusHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'status' } }, res) }
+function testConnectionHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'test-connection' } }, res) }
+function triggerSyncHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'trigger-sync' } }, res) }
+function triggerImportHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'trigger-import' } }, res) }
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
