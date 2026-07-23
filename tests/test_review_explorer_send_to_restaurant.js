@@ -37,7 +37,11 @@ function read(relPath) {
 
 function testImportsRequiredHooks() {
   const content = read('pages/ReviewExplorer.jsx')
-  assert(/from '\.\.\/hooks\/useIntelligence\.js'/.test(content) && /useMeta/.test(content), 'must reuse useMeta() for the hasContact signal')
+  // Phase 8, Milestone 8.4: the hasContact signal now comes from the live
+  // Redis-backed contact store (useRestaurantContacts), not the baked
+  // meta.json hasContact flag -- a contact added via Settings must be
+  // reflected here immediately, with no export/deploy round trip.
+  assert(/from '\.\.\/hooks\/useRestaurantContacts\.js'/.test(content), 'must use useRestaurantContacts() for the live hasContact signal')
   assert(/from '\.\.\/hooks\/useActionWorkspace\.js'/.test(content), 'must reuse the SAME Action Center workspace hook, not a separate store')
   assert(/from '\.\.\/hooks\/useReviewEmailWorkflow\.js'/.test(content), 'must use the dedicated review-email hooks')
   assert(/from '\.\.\/components\/AuthGate\.jsx'/.test(content), 'must use useAccount() for the current user, not a prop')
@@ -54,8 +58,25 @@ function testGatedByNegativeRatingAndRole() {
 
 function testMissingContactDisablesSendAndShowsMessage() {
   const content = read('pages/ReviewExplorer.jsx')
-  assert(/Restaurant email not configured/.test(content), 'must show the exact required message when unconfigured')
+  // Phase 8, Milestone 8.4: replaces the old inert "Restaurant email not
+  // configured" text with a warning badge plus a "Configure Contact" button
+  // that immediately opens the editor -- per the spec's explicit
+  // requirement not to just show a dead-end message.
+  assert(/No Restaurant Contact Configured/.test(content), 'must show the required warning message when unconfigured')
+  assert(/Configure Contact/.test(content), 'must offer a Configure Contact action, not a dead-end message')
   assert(/!hasContact \?/.test(content), 'must branch on hasContact before ever showing a Send button')
+}
+
+function testConfigureContactOpensEditorModalInPlace() {
+  const content = read('pages/ReviewExplorer.jsx')
+  assert(/from '\.\.\/pages\/settings\/ContactEditorModal\.jsx'|from '\.\/settings\/ContactEditorModal\.jsx'/.test(content),
+    'must import the standalone ContactEditorModal so it can open without navigating away from the review')
+  assert(/setConfigureOpen\(true\)/.test(content), 'the Configure Contact button must open the modal in place')
+  const sectionMatch = content.match(/function SendToRestaurantSection[\s\S]*?\n}\n/)
+  const section = sectionMatch[0]
+  assert(/<ContactEditorModal/.test(section), 'ContactEditorModal must be mounted from within SendToRestaurantSection itself')
+  assert(/locationId=\{r\.locationId\}/.test(section) && /locationName=\{r\.location_name\}/.test(section),
+    'the modal must be pre-filled with this review\'s own location, per the "immediately opens the editor" requirement')
 }
 
 function testRecipientAndCcAreReadOnlyDisplay() {
@@ -113,13 +134,19 @@ function testReusesExistingDesignSystemComponentsOnly() {
   const sectionMatch = content.match(/function SendToRestaurantSection[\s\S]*?\n}\n/)
   const section = sectionMatch[0]
   assert(/<Button /.test(section) && /<Badge /.test(section), 'must reuse the existing Button/Badge components')
-  assert(!/import.*Modal/.test(content), 'must not introduce a new Modal component')
+  // Phase 8, Milestone 8.1 introduced the app's first Modal primitive
+  // specifically so components like this one could reuse it rather than
+  // inventing an ad hoc overlay -- ContactEditorModal (built on Modal.jsx)
+  // is the intended, expected import here now.
+  assert(/from '\.\.\/pages\/settings\/ContactEditorModal\.jsx'|from '\.\/settings\/ContactEditorModal\.jsx'/.test(content),
+    'must reuse the shared ContactEditorModal (built on components/ui/Modal.jsx), not invent a new one')
 }
 
 const tests = [
   ['imports the required hooks (useMeta, useActionWorkspace, useReviewEmailWorkflow, useAccount)', testImportsRequiredHooks],
   ['gated by negative rating (<=2) and owner/marketing role', testGatedByNegativeRatingAndRole],
   ['a location with no configured contact disables Send and shows the exact message', testMissingContactDisablesSendAndShowsMessage],
+  ['Configure Contact opens ContactEditorModal in place, pre-filled with this review\'s location', testConfigureContactOpensEditorModalInPlace],
   ['recipient/CC are read-only display, never editable inputs', testRecipientAndCcAreReadOnlyDisplay],
   ['subject/internal note/follow-up date are editable', testEditableFieldsPresent],
   ['duplicate-send warning requires an explicit confirm click before resending', testDuplicateSendWarningAndConfirmFlow],

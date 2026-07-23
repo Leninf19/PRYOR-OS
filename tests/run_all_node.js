@@ -50,6 +50,8 @@ const TESTS = [
   'test_google_action_dispatch.js',
   'test_contact_store.js',
   'test_settings_contacts_endpoint.js',
+  'test_email_validation.js',
+  'test_restaurant_contacts_ui.js',
 ]
 
 const results = {}

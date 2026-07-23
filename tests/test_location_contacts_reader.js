@@ -1,8 +1,11 @@
 // Regression tests for dashboard/api/_lib/locationContacts.js -- the
-// server-side-only reader for private-data/location-contacts.json. Uses the
-// module's test-only seam (_setContactsForTests) rather than touching the
-// real filesystem path, same pattern as actionStore.js's
-// _setRedisClientForTests.
+// server-side-only resolver for a single location's restaurant contact.
+// Phase 8, Milestone 8.4/8.5: now Redis-first (contactStore.js), with the
+// legacy private-data/location-contacts.json as a fallback only if Redis is
+// unreachable/unconfigured. Uses each store's own test-only seam
+// (_setContactsForTests for the legacy file, contactStore.js's
+// _setRedisClientForTests for Redis) rather than touching real
+// infrastructure.
 //
 // Run directly: node tests/test_location_contacts_reader.js
 
@@ -11,6 +14,15 @@ import {
   _setContactsForTests,
   _resetContactsForTests,
 } from '../dashboard/api/_lib/locationContacts.js'
+import {
+  _setRedisClientForTests,
+  _resetRedisClientForTests,
+} from '../dashboard/api/_lib/contactStore.js'
+
+function fakeRedis(initial = {}) {
+  const store = { ...initial }
+  return { hget: async (_key, field) => store[field] ?? null }
+}
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -27,6 +39,7 @@ async function run(name, fn) {
     results.push(false)
   } finally {
     _resetContactsForTests()
+    _resetRedisClientForTests()
   }
 }
 
@@ -62,11 +75,39 @@ async function testMissingRealFileFallsBackGracefully() {
   assert(contact === null, 'a missing location-contacts.json must resolve to null, never throw')
 }
 
+async function testRedisContactTakesPriorityOverLegacyFile() {
+  _setContactsForTests({ '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
+  _setRedisClientForTests(() => fakeRedis({ 9: JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', managerName: 'Redis Name', active: true }) }))
+  const contact = await getLocationContact(9)
+  assert(contact.email === 'redis@example.com', 'a Redis-configured contact must win over the legacy file')
+  assert(contact.name === 'Redis Name')
+}
+
+async function testRedisUnavailableFallsBackToLegacyFile() {
+  _setContactsForTests({ '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
+  _setRedisClientForTests(() => ({ hget: async () => { throw new Error('ECONNREFUSED fake-upstash-outage') } }))
+  const contact = await getLocationContact(9)
+  assert(contact.email === 'legacy@example.com', 'a Redis outage must fall back to the legacy file, not fail the whole lookup')
+}
+
+async function testRedisContactExplicitlyDisabledNeverFallsBackToLegacy() {
+  // A contact that exists in Redis but is explicitly disabled must resolve
+  // to null -- never silently fall back to a stale legacy entry, which
+  // would resurrect an intentionally-disabled contact.
+  _setContactsForTests({ '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
+  _setRedisClientForTests(() => fakeRedis({ 9: JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', active: false }) }))
+  const contact = await getLocationContact(9)
+  assert(contact === null, 'an explicitly disabled Redis contact must resolve to null, never the legacy fallback')
+}
+
 async function main() {
   await run('returns the configured contact for a known locationId', testReturnsConfiguredContact)
   await run('returns null (never a guessed value) for an unconfigured locationId', testReturnsNullForUnconfiguredLocation)
   await run('numeric and string locationId both resolve correctly', testCoercesNumericLocationIdToStringKey)
   await run('a genuinely missing location-contacts.json falls back to null, not a throw', testMissingRealFileFallsBackGracefully)
+  await run('a Redis-configured contact takes priority over the legacy file', testRedisContactTakesPriorityOverLegacyFile)
+  await run('a Redis outage falls back to the legacy file', testRedisUnavailableFallsBackToLegacyFile)
+  await run('an explicitly disabled Redis contact resolves to null, never the legacy fallback', testRedisContactExplicitlyDisabledNeverFallsBackToLegacy)
 
   console.log()
   if (results.every(Boolean)) {

@@ -8,10 +8,12 @@ import Button from '../components/ui/Button.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
 import { sentimentBucket, reviewId } from '../utils/dataUtils.js'
 import { exportCSV } from '../utils/exportUtils.js'
-import { useResponseDrafts, useMeta } from '../hooks/useIntelligence.js'
+import { useResponseDrafts } from '../hooks/useIntelligence.js'
 import { useReviewWorkspace } from '../hooks/useReviewWorkspace.js'
 import { useActionWorkspace } from '../hooks/useActionWorkspace.js'
 import { useReviewEmailPreview, useSendReviewEmail } from '../hooks/useReviewEmailWorkflow.js'
+import { useRestaurantContacts } from '../hooks/useRestaurantContacts.js'
+import ContactEditorModal from './settings/ContactEditorModal.jsx'
 import { useAccount } from '../components/AuthGate.jsx'
 import { EMAIL_STATUS_META, DUPLICATE_EMAIL_STATUSES } from '../utils/actionWorkspaceUtils.js'
 
@@ -651,8 +653,8 @@ function NotesAndAssignment({ r, wsEntry, onUpdate }) {
 function SendToRestaurantSection({ r }) {
   const showToast = useToast()
   const account = useAccount()
-  const { data: meta } = useMeta()
   const { data: ws } = useActionWorkspace()
+  const { data: contacts } = useRestaurantContacts()
   const sendMutation = useSendReviewEmail()
 
   const [open, setOpen] = useState(false)
@@ -660,6 +662,7 @@ function SendToRestaurantSection({ r }) {
   const [internalNote, setInternalNote] = useState('')
   const [followUpDueAt, setFollowUpDueAt] = useState('')
   const [confirmArmed, setConfirmArmed] = useState(false)
+  const [configureOpen, setConfigureOpen] = useState(false)
 
   const isNegative = (r.star_rating ?? 5) <= 2
   const canSend = account?.role === 'owner' || account?.role === 'marketing'
@@ -669,8 +672,12 @@ function SendToRestaurantSection({ r }) {
   const emailStatus = entry?.emailStatus ?? 'not_sent'
   const statusMeta = EMAIL_STATUS_META[emailStatus] ?? EMAIL_STATUS_META.not_sent
 
-  const locationMeta = (meta?.locations ?? []).find(l => l.locationId === r.locationId)
-  const hasContact = locationMeta?.hasContact ?? false
+  // Phase 8, Milestone 8.4: reads the live Redis-backed contact directly
+  // (same source Settings -> Restaurant Contacts writes to), not the
+  // baked meta.json hasContact flag -- a contact added through Settings is
+  // reflected here immediately, no export/deploy needed.
+  const contact = contacts?.[String(r.locationId)] ?? null
+  const hasContact = Boolean(contact?.active && contact?.primaryEmail)
 
   const { data: preview, isLoading: previewLoading } = useReviewEmailPreview(rid, r.locationId, open)
   const isDuplicate = preview?.existingRecord && DUPLICATE_EMAIL_STATUSES.has(preview.existingRecord.emailStatus)
@@ -729,7 +736,10 @@ function SendToRestaurantSection({ r }) {
 
       {!open ? (
         !hasContact ? (
-          <p className="text-xs italic" style={{ color: 'var(--color-text-3)' }}>Restaurant email not configured</p>
+          <div className="flex items-center gap-2 flex-wrap">
+            <Badge variant="warning">⚠ No Restaurant Contact Configured</Badge>
+            <Button variant="secondary" onClick={() => setConfigureOpen(true)}>Configure Contact</Button>
+          </div>
         ) : (
           <Button variant="secondary" onClick={handleOpen}>
             {emailStatus === 'not_sent' ? 'Send to Restaurant' : 'Resend to Restaurant'}
@@ -797,6 +807,16 @@ function SendToRestaurantSection({ r }) {
             <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
           </div>
         </div>
+      )}
+
+      {configureOpen && (
+        <ContactEditorModal
+          open={configureOpen}
+          onClose={() => setConfigureOpen(false)}
+          locationId={r.locationId}
+          locationName={r.location_name}
+          initialContact={null}
+        />
       )}
     </div>
   )

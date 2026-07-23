@@ -41,4 +41,15 @@ export const settingsSections = [
     component: lazy(() => import('./GoogleBusinessProfile.jsx')),
     requiredRoles: null,
   },
+  {
+    id: 'contacts',
+    path: 'contacts',
+    label: 'Restaurant Contacts',
+    icon: '📇',
+    component: lazy(() => import('./RestaurantContacts.jsx')),
+    // read_only has no CONTACTS_VIEW at all; location_manager sees a
+    // scoped (own-location) view -- both enforced server-side too, this
+    // is nav-visibility only (see the comment above).
+    requiredRoles: ['owner', 'marketing', 'location_manager'],
+  },
 ]

@@ -3,12 +3,23 @@ import { AnimatePresence, motion } from 'framer-motion'
 
 const ToastContext = createContext(null)
 
+// Phase 8, Milestone 8.4: an optional `variant` ('success'|'error'|'info')
+// distinguishes a toast visually via a small colored left border --
+// backward compatible, every pre-existing call site (which never passes
+// `variant`) keeps rendering exactly as before via the 'default' style.
+const VARIANT_BORDER = {
+  success: 'var(--color-success, #16a34a)',
+  error:   'var(--color-danger, #dc2626)',
+  info:    'var(--color-info, #2563eb)',
+  default: 'transparent',
+}
+
 export function ToastProvider({ children }) {
   const [toasts, setToasts] = useState([])
 
-  const showToast = useCallback((message, { duration = 3000 } = {}) => {
+  const showToast = useCallback((message, { duration = 3000, variant = 'default' } = {}) => {
     const id = Date.now() + Math.random()
-    setToasts(t => [...t, { id, message }])
+    setToasts(t => [...t, { id, message, variant }])
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), duration)
   }, [])
 
@@ -25,6 +36,7 @@ export function ToastProvider({ children }) {
               exit={{ opacity: 0, y: 8, scale: 0.95 }}
               transition={{ duration: 0.18 }}
               className="bg-stone-900 text-white text-xs font-medium px-4 py-2.5 rounded-lg shadow-lg dark:border dark:border-[var(--color-border-2)]"
+              style={{ borderLeft: `3px solid ${VARIANT_BORDER[t.variant] ?? VARIANT_BORDER.default}` }}
             >
               {t.message}
             </motion.div>
