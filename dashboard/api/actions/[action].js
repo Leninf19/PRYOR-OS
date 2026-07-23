@@ -111,14 +111,19 @@ function sanitizeHeaderValue(value) {
 }
 
 // SMTP/provider error text could in principle echo back configuration
-// details -- strip the configured Gmail credentials defensively (belt and
-// suspenders; nodemailer/Gmail don't echo the password in error text today)
-// and cap length so a verbose provider error can't balloon the stored
-// record or the response body.
+// details -- strip the configured SMTP credentials defensively (belt and
+// suspenders; nodemailer/mail providers don't echo the password in error
+// text today) and cap length so a verbose provider error (a full
+// Microsoft 365 authentication failure can be quite verbose) can't balloon
+// the stored record or the response body. This is the "sanitized
+// server-side diagnostic" -- the caller still returns a generic top-level
+// message to the response; only this sanitized (never raw) string reaches
+// the Action Center record's emailLastError field for an authenticated
+// owner/marketing viewer, never the public.
 function sanitizeErrorMessage(message) {
   let out = String(message ?? 'unknown error')
-  if (process.env.GMAIL_APP_PASSWORD) out = out.split(process.env.GMAIL_APP_PASSWORD).join('[redacted]')
-  if (process.env.GMAIL_USER) out = out.split(process.env.GMAIL_USER).join('[redacted]')
+  if (process.env.SMTP_PASSWORD) out = out.split(process.env.SMTP_PASSWORD).join('[redacted]')
+  if (process.env.SMTP_USER) out = out.split(process.env.SMTP_USER).join('[redacted]')
   return out.slice(0, 300)
 }
 

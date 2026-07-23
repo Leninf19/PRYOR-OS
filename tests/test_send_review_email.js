@@ -3,7 +3,7 @@
 // send-review-email, update-email-status. Drives the real handler with a
 // fake req/res (same pattern as test_actions_endpoint.js), controlling
 // Redis/email/contact-directory state via each module's test-only seams --
-// no real Upstash, Gmail account, or network call anywhere in this file.
+// no real Upstash, mailbox account, or network call anywhere in this file.
 //
 // Run directly: node tests/test_send_review_email.js
 
@@ -327,12 +327,38 @@ async function testFailedSendDoesNotClaimSent() {
   assert(res.body.record.emailSentAt === undefined || res.body.record.emailSentAt === null, 'a failed send must never carry an emailSentAt')
 }
 
+async function testAuthenticationFailureIsSanitizedAndNeverMarksSent() {
+  await setDirectory()
+  process.env.SMTP_PASSWORD = 'super-secret-m365-password'
+  process.env.SMTP_USER = 'advertising@l3amigos.com'
+  _setRedisClientForTests(() => fakeRedis())
+  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  // Simulates a realistic Microsoft 365 SMTP AUTH failure whose raw error
+  // text happens to echo back the configured credentials (defense in depth
+  // -- real M365/nodemailer errors don't actually do this, but the
+  // sanitizer must strip them if they ever did).
+  _setTransportForTests(fakeMailer({
+    ok: false,
+    error: '535 5.7.139 Authentication unsuccessful for advertising@l3amigos.com, password super-secret-m365-password rejected',
+  }))
+
+  const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
+  assert(res.statusCode === 502, `expected 502 for an authentication failure, got ${res.statusCode}`)
+  assert(res.body.record.emailStatus === 'failed', `an authentication failure must record 'failed', never 'sent', got ${res.body.record.emailStatus}`)
+  assert(res.body.record.emailStatus !== 'sent', 'must never mark sent after an authentication failure')
+  assert(!JSON.stringify(res.body).includes('super-secret-m365-password'), 'the configured SMTP_PASSWORD must never appear anywhere in the response body')
+  assert(!res.body.record.emailLastError.includes('advertising@l3amigos.com'), 'the configured SMTP_USER must be redacted from the stored diagnostic')
+  assert(res.body.record.emailLastError.includes('[redacted]'), 'the redaction marker should appear in place of the stripped credentials')
+  delete process.env.SMTP_PASSWORD
+  delete process.env.SMTP_USER
+}
+
 async function testUnconfiguredEmailSubsystemReturns503NoRecordWritten() {
   await setDirectory()
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
   _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
-  // No test transport factory and no GMAIL_* env vars -- emailSender is unconfigured.
+  // No test transport factory and no SMTP_* env vars -- emailSender is unconfigured.
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
   assert(res.statusCode === 503, `expected 503, got ${res.statusCode}`)
   const stored = await client.hget('action_workspace:v1', 'review-1')
@@ -496,6 +522,7 @@ async function main() {
   await run('an invalid review snapshot (bad star rating) is rejected', testInvalidReviewSnapshotRejected)
   await run('a successful send writes a truthful sent record with one history entry', testSuccessfulSendUpdatesRedisWithSentStatus)
   await run('a failed send never claims sent, records failed + the real error', testFailedSendDoesNotClaimSent)
+  await run('an authentication failure is sanitized (SMTP_USER/PASSWORD redacted) and never marks sent', testAuthenticationFailureIsSanitizedAndNeverMarksSent)
   await run('an unconfigured email subsystem -> 503, no record written at all', testUnconfiguredEmailSubsystemReturns503NoRecordWritten)
   await run('a repeated send without confirmResend -> 409 duplicate warning', testRepeatedSendWithoutConfirmResendReturns409)
   await run('a resend with confirmResend succeeds and adds exactly one more history entry', testResendWithConfirmResendCreatesOneAdditionalHistoryEntry)
