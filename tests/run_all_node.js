@@ -48,6 +48,8 @@ const TESTS = [
   'test_settings_registry.js',
   'test_settings_routing.js',
   'test_google_action_dispatch.js',
+  'test_contact_store.js',
+  'test_settings_contacts_endpoint.js',
 ]
 
 const results = {}

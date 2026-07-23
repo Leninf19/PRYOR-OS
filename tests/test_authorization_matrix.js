@@ -44,6 +44,7 @@ import rewriteHandler from '../dashboard/api/rewrite.js'
 import sessionHandler from '../dashboard/api/session/[action].js'
 import actionsHandler from '../dashboard/api/actions/[action].js'
 import googleHandler from '../dashboard/api/google/[action].js'
+import settingsHandler from '../dashboard/api/settings/[action].js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -287,6 +288,38 @@ const ENDPOINT_REGISTRY = [
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
     notes: 'Recovery-audit milestone. Manual replied/follow_up_required/resolved transitions only -- rejects "sent"/"failed"/"queued"/"not_sent" outright, and rejects any item with no prior outgoing email, so this can never be used to fake a send.',
+  },
+  {
+    route: 'GET /api/settings/contacts', file: 'api/settings/[action].js', method: 'GET', action: 'contacts',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing', 'location_manager'],
+    scope: 'restaurant contacts -- owner/marketing see every location; location_manager sees only their own locationIds grant (never all 21)',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Phase 8 Milestone 8.3 (Restaurant Contacts). The first endpoint location_manager is actually granted access to (CONTACTS_VIEW) -- gated by roleHasPermission(), then filtered by account.locationIds in the handler itself (not requireScopedAuth, since a list has no single resolvable location). read_only has no CONTACTS_VIEW at all.',
+  },
+  {
+    route: 'POST /api/settings/contacts-upsert', file: 'api/settings/[action].js', method: 'POST', action: 'contacts-upsert',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
+    scope: 'restaurant contacts -- create/edit; location_manager explicitly excluded from CONTACTS_MANAGE per the approved Phase 8 role matrix',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Phase 8 Milestone 8.3. First production caller of requireScopedAuth() -- resolveLocationId reads body.locationId; a role lacking CONTACTS_MANAGE (location_manager, read_only) is rejected by the permission check before location scope is ever considered.',
+  },
+  {
+    route: 'POST /api/settings/contacts-delete', file: 'api/settings/[action].js', method: 'POST', action: 'contacts-delete',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
+    scope: 'restaurant contacts -- genuine removal',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Phase 8 Milestone 8.3. Same CONTACTS_MANAGE gate as contacts-upsert.',
+  },
+  {
+    route: 'POST /api/settings/contacts-toggle-active', file: 'api/settings/[action].js', method: 'POST', action: 'contacts-toggle-active',
+    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
+    scope: 'restaurant contacts -- Disable/Enable Contact',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Phase 8 Milestone 8.3. Same CONTACTS_MANAGE gate as contacts-upsert.',
   },
 ]
 
@@ -586,6 +619,7 @@ const HANDLERS = {
   'api/session/[action].js': sessionHandler,
   'api/actions/[action].js': actionsHandler,
   'api/google/[action].js': googleHandler,
+  'api/settings/[action].js': settingsHandler,
 }
 
 function minimalReqFor(entry, token) {
@@ -1186,6 +1220,14 @@ async function testRequireAuthSourceUnchanged() {
   assert(body.includes(`res.status(401).json({ error: 'unauthenticated', message: 'Sign in required.' })`), 'requireAuth unauthenticated branch unchanged')
 }
 
+// Phase 8, Milestone 8.3 is the first production endpoint to actually call
+// requireScopedAuth (Restaurant Contacts' Manager-scoped single-location
+// read/write) -- these helpers were built in Milestone 2 and sat unused
+// until now (mirrors the identical update in test_permissions.js). This
+// test's job going forward is narrower: confirm the helpers are used ONLY
+// by the endpoint(s) that are supposed to use them.
+const EXPECTED_SCOPED_AUTH_CALLERS = new Set([path.join(API_DIR, 'settings', '[action].js')])
+
 async function testNoProductionEndpointImportsTheNewHelpers() {
   const offenders = []
   function walk(dir) {
@@ -1194,12 +1236,13 @@ async function testNoProductionEndpointImportsTheNewHelpers() {
       const full = path.join(dir, entry.name)
       if (entry.isDirectory()) { walk(full); continue }
       if (!entry.name.endsWith('.js')) continue
+      if (EXPECTED_SCOPED_AUTH_CALLERS.has(full)) continue
       const src = readFileSync(full, 'utf-8')
       if (/\brequireScopedAuth\b|\brequireOwnership\b|\brequireLocationAccess\b/.test(src)) offenders.push(full)
     }
   }
   walk(API_DIR)
-  assert(offenders.length === 0, `no production endpoint may import the Milestone 2 helpers yet, found: ${offenders.join(', ')}`)
+  assert(offenders.length === 0, `only ${[...EXPECTED_SCOPED_AUTH_CALLERS].join(', ')} may use these helpers so far, found unexpected use in: ${offenders.join(', ')}`)
 }
 
 async function testMiddlewareAndSessionFilesUntouchedByThisMilestone() {

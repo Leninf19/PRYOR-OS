@@ -63,7 +63,11 @@ async function buildDirectory() {
 
 async function testPermissionRegistryIsFrozenAndComplete() {
   assert(Object.isFrozen(Permission), 'Permission must be frozen')
-  const expected = ['VIEW_ALL', 'VIEW_ASSIGNED', 'REPLY', 'REPLY_ASSIGNED', 'EXPORT', 'EXPORT_ASSIGNED', 'CAMPAIGNS', 'ADMIN']
+  const expected = [
+    'VIEW_ALL', 'VIEW_ASSIGNED', 'REPLY', 'REPLY_ASSIGNED', 'EXPORT', 'EXPORT_ASSIGNED', 'CAMPAIGNS', 'ADMIN',
+    // Phase 8 (Operational Settings Platform)
+    'CONTACTS_VIEW', 'CONTACTS_MANAGE', 'EMAIL_VIEW', 'SETTINGS_ADMIN', 'AUDIT_VIEW',
+  ]
   for (const key of expected) {
     assert(typeof Permission[key] === 'string' && Permission[key].length > 0, `Permission.${key} must be a non-empty string`)
   }
@@ -86,18 +90,22 @@ const EXPECTED_GRANTS = {
   owner: {
     VIEW_ALL: true, VIEW_ASSIGNED: true, REPLY: true, REPLY_ASSIGNED: false,
     EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: true,
+    CONTACTS_VIEW: true, CONTACTS_MANAGE: true, EMAIL_VIEW: true, SETTINGS_ADMIN: true, AUDIT_VIEW: true,
   },
   marketing: {
     VIEW_ALL: true, VIEW_ASSIGNED: true, REPLY: true, REPLY_ASSIGNED: false,
     EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: false,
+    CONTACTS_VIEW: true, CONTACTS_MANAGE: true, EMAIL_VIEW: true, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
   },
   location_manager: {
     VIEW_ALL: false, VIEW_ASSIGNED: true, REPLY: false, REPLY_ASSIGNED: true,
     EXPORT: false, EXPORT_ASSIGNED: true, CAMPAIGNS: false, ADMIN: false,
+    CONTACTS_VIEW: true, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
   },
   read_only: {
     VIEW_ALL: false, VIEW_ASSIGNED: true, REPLY: false, REPLY_ASSIGNED: false,
     EXPORT: false, EXPORT_ASSIGNED: false, CAMPAIGNS: false, ADMIN: false,
+    CONTACTS_VIEW: false, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
   },
 }
 
@@ -239,7 +247,18 @@ async function testRequireAuthSourceUnchanged() {
   assert(body.includes(`res.status(401).json({ error: 'unauthenticated', message: 'Sign in required.' })`), 'requireAuth unauthenticated branch unchanged')
 }
 
-async function testNoProductionEndpointUsesNewHelpersYet() {
+// Phase 8, Milestone 8.3 is the first production endpoint to actually call
+// requireScopedAuth (Restaurant Contacts' Manager-scoped single-location
+// read/write) -- these helpers were built in Milestone 2 and sat unused
+// until now. This test's job going forward is narrower than its original
+// "used by nobody" assertion: confirm the helpers are used ONLY by the
+// endpoint(s) that are supposed to use them, not accidentally picked up
+// elsewhere.
+const EXPECTED_SCOPED_AUTH_CALLERS = new Set([
+  path.join(DASHBOARD_DIR, 'api', 'settings', '[action].js'),
+])
+
+async function testNewHelpersAreUsedOnlyByExpectedEndpoints() {
   const apiDir = path.join(DASHBOARD_DIR, 'api')
   const offenders = []
 
@@ -249,6 +268,7 @@ async function testNoProductionEndpointUsesNewHelpersYet() {
       const full = path.join(dir, entry.name)
       if (entry.isDirectory()) { walk(full); continue }
       if (!entry.name.endsWith('.js')) continue
+      if (EXPECTED_SCOPED_AUTH_CALLERS.has(full)) continue
       const src = readFileSync(full, 'utf-8')
       if (/\brequireScopedAuth\b|\brequireOwnership\b|\brequireLocationAccess\b/.test(src)) {
         offenders.push(full)
@@ -256,7 +276,7 @@ async function testNoProductionEndpointUsesNewHelpersYet() {
     }
   }
   walk(apiDir)
-  assert(offenders.length === 0, `no production endpoint may call the new Milestone 2 helpers yet, found: ${offenders.join(', ')}`)
+  assert(offenders.length === 0, `only ${[...EXPECTED_SCOPED_AUTH_CALLERS].join(', ')} may call these helpers so far, found unexpected use in: ${offenders.join(', ')}`)
 }
 
 async function main() {
@@ -275,7 +295,7 @@ async function main() {
   await run('requireScopedAuth: in-scope location + granted permission -> succeeds', testRequireScopedAuthSucceedsInScope)
   await run('requireScopedAuth: no location scope (company-wide) -> succeeds', testRequireScopedAuthSucceedsWithNoLocationScope)
   await run('requireAuth() source is byte-level unchanged from before Milestone 2', testRequireAuthSourceUnchanged)
-  await run('no production endpoint calls requireScopedAuth/requireOwnership/requireLocationAccess yet', testNoProductionEndpointUsesNewHelpersYet)
+  await run('requireScopedAuth/requireOwnership/requireLocationAccess are used only by the expected endpoint(s)', testNewHelpersAreUsedOnlyByExpectedEndpoints)
 
   console.log()
   if (results.every(Boolean)) {

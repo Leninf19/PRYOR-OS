@@ -24,6 +24,17 @@ export const Permission = Object.freeze({
   EXPORT_ASSIGNED: 'export_assigned',
   CAMPAIGNS:       'campaigns',
   ADMIN:           'admin',
+  // Phase 8 (Operational Settings Platform): Restaurant Contacts, Email
+  // System, and Audit Log capabilities. CONTACTS_VIEW is granted
+  // unrestricted to owner/marketing and location-scoped (via
+  // requireScopedAuth's resolveLocationId) to location_manager --
+  // CONTACTS_MANAGE (add/edit/delete/disable/send-test-email) is NOT
+  // granted to location_manager, per the approved Phase 8 role matrix.
+  CONTACTS_VIEW:   'contacts_view',
+  CONTACTS_MANAGE: 'contacts_manage',
+  EMAIL_VIEW:      'email_view',
+  SETTINGS_ADMIN:  'settings_admin', // Google Business Profile connect/disconnect
+  AUDIT_VIEW:      'audit_view',
 })
 
 // The role table: references Permission.* constants, never raw strings.
@@ -36,13 +47,17 @@ export const ROLE_PERMISSIONS = Object.freeze({
   owner: new Set([
     Permission.VIEW_ALL, Permission.VIEW_ASSIGNED, Permission.REPLY,
     Permission.CAMPAIGNS, Permission.EXPORT, Permission.ADMIN,
+    Permission.CONTACTS_VIEW, Permission.CONTACTS_MANAGE,
+    Permission.EMAIL_VIEW, Permission.SETTINGS_ADMIN, Permission.AUDIT_VIEW,
   ]),
   marketing: new Set([
     Permission.VIEW_ALL, Permission.VIEW_ASSIGNED, Permission.REPLY,
     Permission.CAMPAIGNS, Permission.EXPORT,
+    Permission.CONTACTS_VIEW, Permission.CONTACTS_MANAGE, Permission.EMAIL_VIEW,
   ]),
   location_manager: new Set([
     Permission.VIEW_ASSIGNED, Permission.REPLY_ASSIGNED, Permission.EXPORT_ASSIGNED,
+    Permission.CONTACTS_VIEW, // scoped to their own location via requireScopedAuth
   ]),
   read_only: new Set([
     Permission.VIEW_ASSIGNED,
