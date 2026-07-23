@@ -53,6 +53,8 @@ const TESTS = [
   'test_email_validation.js',
   'test_restaurant_contacts_ui.js',
   'test_contacts_backfill.js',
+  'test_audit_log.js',
+  'test_settings_audit_log_endpoint.js',
 ]
 
 const results = {}

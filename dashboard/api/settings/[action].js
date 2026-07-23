@@ -30,6 +30,11 @@ import { enforceRateLimit } from '../_lib/rateLimit.js'
 import {
   getAllContacts, getContact, upsertContact, deleteContact, ContactStoreUnavailableError,
 } from '../_lib/contactStore.js'
+import { appendAuditEntry, listAuditEntries, clientIp, AuditLogUnavailableError } from '../_lib/auditLog.js'
+
+function actorFields(account, req) {
+  return { actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req) }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const LEGACY_CONTACTS_PATH = path.resolve(__dirname, '..', '..', 'private-data', 'location-contacts.json')
@@ -160,7 +165,8 @@ async function upsertContactAction(req, res) {
 
   try {
     const existing = await getContact(locationId)
-    const record = await upsertContact(locationId, sanitized, account, logAction ?? (existing ? 'Contact updated' : 'Contact created'))
+    const isNew = !existing
+    const record = await upsertContact(locationId, sanitized, account, logAction ?? (isNew ? 'Contact created' : 'Contact updated'))
 
     const warnings = []
     if (sanitized.primaryEmail) {
@@ -172,6 +178,16 @@ async function upsertContactAction(req, res) {
         warnings.push(`${sanitized.primaryEmail} is already the primary contact for ${dupe.locationName || 'another location'}.`)
       }
     }
+
+    await appendAuditEntry({
+      ...actorFields(account, req),
+      entity: 'contact',
+      entityId: String(locationId),
+      action: isNew ? 'contact.created' : 'contact.updated',
+      changes: Object.keys(sanitized).map(field => ({ field, oldValue: existing?.[field] ?? null, newValue: sanitized[field] })),
+      result: 'success',
+      message: `${isNew ? 'Created' : 'Updated'} contact for ${record.locationName || `location ${locationId}`}${warnings.length ? ' (with a duplicate-email warning)' : ''}.`,
+    })
 
     return res.status(200).json({ record, warnings })
   } catch (err) {
@@ -204,7 +220,19 @@ async function deleteContactAction(req, res) {
   if (!allowed) return
 
   try {
+    const existing = await getContact(locationId)
     const removed = await deleteContact(locationId)
+    if (removed) {
+      await appendAuditEntry({
+        ...actorFields(account, req),
+        entity: 'contact',
+        entityId: String(locationId),
+        action: 'contact.deleted',
+        changes: null,
+        result: 'success',
+        message: `Deleted contact for ${existing?.locationName || `location ${locationId}`}.`,
+      })
+    }
     return res.status(200).json({ removed })
   } catch (err) {
     if (err instanceof ContactStoreUnavailableError) {
@@ -243,6 +271,17 @@ async function toggleContactActiveAction(req, res) {
     }
     const active = req.body.active
     const record = await upsertContact(locationId, { active }, account, active ? 'Contact enabled' : 'Contact disabled')
+
+    await appendAuditEntry({
+      ...actorFields(account, req),
+      entity: 'contact',
+      entityId: String(locationId),
+      action: active ? 'contact.enabled' : 'contact.disabled',
+      changes: [{ field: 'active', oldValue: existing.active, newValue: active }],
+      result: 'success',
+      message: `${active ? 'Enabled' : 'Disabled'} contact for ${record.locationName || `location ${locationId}`}.`,
+    })
+
     return res.status(200).json({ record })
   } catch (err) {
     if (err instanceof ContactStoreUnavailableError) {
@@ -311,11 +350,54 @@ async function backfillContactsFromLegacyAction(req, res) {
       }, account, 'Backfilled from legacy export')
       seeded.push(locationId)
     }
+    if (seeded.length > 0) {
+      await appendAuditEntry({
+        ...actorFields(account, req),
+        entity: 'contact',
+        entityId: null,
+        action: 'contacts.backfilled',
+        changes: null,
+        result: 'success',
+        message: `Backfilled ${seeded.length} contact(s) from the legacy export (${skipped.length} already configured, skipped).`,
+      })
+    }
     return res.status(200).json({ seeded, skipped })
   } catch (err) {
     if (err instanceof ContactStoreUnavailableError) {
       console.error(`[settings/contacts-backfill-from-legacy] ${err.message}`)
       return res.status(503).json({ error: 'service_unavailable', message: 'Restaurant contacts are temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// GET /api/settings/audit-log?entity=&actorId=&from=&to=&result=&limit=&offset=
+// Owner-only, per the approved Phase 8 role matrix -- the global,
+// cross-entity audit trail is a company-wide compliance surface, distinct
+// from each contact's own embedded history (visible to owner/marketing,
+// and to location_manager for their own location).
+async function auditLogAction(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `settings:audit-log:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { entity, actorId, from, to, result } = req.query ?? {}
+  const limitRaw = Number(req.query?.limit)
+  const offsetRaw = Number(req.query?.offset)
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 && limitRaw <= 200 ? limitRaw : 50
+  const offset = Number.isInteger(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0
+
+  try {
+    const { entries, total } = await listAuditEntries({ entity, actorId, from, to, result, limit, offset })
+    return res.status(200).json({ entries, total })
+  } catch (err) {
+    if (err instanceof AuditLogUnavailableError) {
+      console.error(`[settings/audit-log] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'The audit log is temporarily unavailable. Please try again shortly.' })
     }
     throw err
   }
@@ -328,6 +410,7 @@ export default async function handler(req, res) {
     case 'contacts-delete':                 return deleteContactAction(req, res)
     case 'contacts-toggle-active':          return toggleContactActiveAction(req, res)
     case 'contacts-backfill-from-legacy':   return backfillContactsFromLegacyAction(req, res)
+    case 'audit-log':                       return auditLogAction(req, res)
     default:                                return res.status(404).json({ error: 'not_found' })
   }
 }

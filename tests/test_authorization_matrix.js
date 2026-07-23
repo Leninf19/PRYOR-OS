@@ -329,6 +329,14 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Phase 8 Milestone 8.5. Uses requireAuth([\'owner\']) directly, not requireScopedAuth -- this is a company-wide migration action, not a single-location write.',
   },
+  {
+    route: 'GET /api/settings/audit-log', file: 'api/settings/[action].js', method: 'GET', action: 'audit-log',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'global, cross-entity, compliance-facing audit trail -- Owner-only, distinct from each contact\'s own embedded history (visible to owner/marketing/scoped location_manager)',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Phase 8 Milestone 8.6. Marketing has CONTACTS_MANAGE but deliberately NOT AUDIT_VIEW per the approved role matrix.',
+  },
 ]
 
 // ---------------------------------------------------------------------------

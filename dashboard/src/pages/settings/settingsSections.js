@@ -52,4 +52,15 @@ export const settingsSections = [
     // is nav-visibility only (see the comment above).
     requiredRoles: ['owner', 'marketing', 'location_manager'],
   },
+  {
+    id: 'audit-log',
+    path: 'audit-log',
+    label: 'Audit Log',
+    icon: '🗒',
+    component: lazy(() => import('./AuditLog.jsx')),
+    // The global, cross-entity, compliance-facing audit trail is
+    // Owner-only per the approved Phase 8 role matrix -- Marketing has
+    // CONTACTS_MANAGE but not AUDIT_VIEW.
+    requiredRoles: ['owner'],
+  },
 ]
