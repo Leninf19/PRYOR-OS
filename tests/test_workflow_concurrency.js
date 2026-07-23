@@ -13,6 +13,14 @@ import { fileURLToPath } from 'url'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const WORKFLOWS_DIR = path.resolve(__dirname, '..', '.github', 'workflows')
 
+// Normalize CRLF so \n-anchored regexes below match regardless of the
+// checkout's line-ending style (Windows checkouts with core.autocrlf=true
+// can rewrite these files to CRLF on any git-triggered checkout, e.g. a
+// rebase -- matching every other source-content test in this suite).
+function read(file) {
+  return readFileSync(path.join(WORKFLOWS_DIR, file), 'utf-8').replace(/\r\n/g, '\n')
+}
+
 const DB_WRITER_WORKFLOWS = [
   'update-reviews.yml',
   'critical-alert-check.yml',
@@ -41,7 +49,7 @@ function run(name, fn) {
 
 function testEachWriterHasSharedConcurrencyGroup() {
   for (const file of DB_WRITER_WORKFLOWS) {
-    const content = readFileSync(path.join(WORKFLOWS_DIR, file), 'utf-8')
+    const content = read(file)
     assert(/group:\s*reviews-db-writer/.test(content), `${file} must declare concurrency group: reviews-db-writer`)
     assert(/cancel-in-progress:\s*false/.test(content), `${file} must set cancel-in-progress: false`)
   }
@@ -49,14 +57,14 @@ function testEachWriterHasSharedConcurrencyGroup() {
 
 function testNoResetAndRecommitAnywhere() {
   for (const file of DB_WRITER_WORKFLOWS) {
-    const content = readFileSync(path.join(WORKFLOWS_DIR, file), 'utf-8')
+    const content = read(file)
     assert(!content.includes('git reset --mixed'), `${file} must not contain the reset-and-recommit retry pattern`)
   }
 }
 
 function testEachWriterRunsIntegrityCheckBeforeCommit() {
   for (const file of DB_WRITER_WORKFLOWS) {
-    const content = readFileSync(path.join(WORKFLOWS_DIR, file), 'utf-8')
+    const content = read(file)
     const checkIdx = content.indexOf('check_db_integrity.py')
     const commitIdx = content.indexOf('git commit')
     assert(checkIdx !== -1, `${file} must run check_db_integrity.py`)
@@ -66,7 +74,7 @@ function testEachWriterRunsIntegrityCheckBeforeCommit() {
 
 function testNonWriterWorkflowsUntouched() {
   for (const file of NON_WRITER_WORKFLOWS) {
-    const content = readFileSync(path.join(WORKFLOWS_DIR, file), 'utf-8')
+    const content = read(file)
     assert(!/group:\s*reviews-db-writer/.test(content), `${file} does not write reviews.db and must not join the concurrency group`)
   }
 }
@@ -79,7 +87,7 @@ function testNonWriterWorkflowsUntouched() {
 // investigation). It must independently refresh analytics first, without
 // becoming a reviews.db writer itself (it never commits the db).
 function testDeployFrontendRefreshesAnalyticsBeforeExport() {
-  const content = readFileSync(path.join(WORKFLOWS_DIR, 'deploy-frontend.yml'), 'utf-8')
+  const content = read('deploy-frontend.yml')
   // Match the actual `run:` invocation lines specifically, not any mention of
   // the script names (e.g. in an explanatory comment), so a maintainer's
   // prose referencing either script elsewhere in the file can't skew this.
@@ -100,7 +108,7 @@ function testDeployFrontendRefreshesAnalyticsBeforeExport() {
 }
 
 function testDeployFrontendPreservesTriggerAndPathFilters() {
-  const content = readFileSync(path.join(WORKFLOWS_DIR, 'deploy-frontend.yml'), 'utf-8')
+  const content = read('deploy-frontend.yml')
   assert(/push:\s*\n\s*branches:\s*\[main\]/.test(content), 'deploy-frontend.yml must still trigger on push to main')
   assert(content.includes("'dashboard/**'"), 'deploy-frontend.yml must still be path-filtered to dashboard/**')
   assert(content.includes("'!dashboard/reviews.db'"), 'deploy-frontend.yml must still exclude dashboard/reviews.db from its path filter')
@@ -114,7 +122,7 @@ function testUpdateReviewsStillPreservesFullPipelineOrder() {
   // below for the explicit, dedicated assertions on that) -- this ordering
   // check is updated to use the new marker so it keeps proving the *rest*
   // of the pipeline's order is untouched, not weakened.
-  const content = readFileSync(path.join(WORKFLOWS_DIR, 'update-reviews.yml'), 'utf-8')
+  const content = read('update-reviews.yml')
   const order = ['sync_reviews.py', 'refresh_analytics.py', 'export_chunks.py', 'check_db_integrity.py', 'git commit', 'vercel']
   const indices = order.map(marker => content.toLowerCase().indexOf(marker.toLowerCase()))
   indices.forEach((idx, i) => assert(idx !== -1, `update-reviews.yml must still contain "${order[i]}"`))
@@ -133,7 +141,7 @@ function testUpdateReviewsStillPreservesFullPipelineOrder() {
 // concurrency, commit fail-safe, deployment gating) must be provably
 // untouched.
 function testUpdateReviewsUsesGenericSyncEntrypoint() {
-  const content = readFileSync(path.join(WORKFLOWS_DIR, 'update-reviews.yml'), 'utf-8')
+  const content = read('update-reviews.yml')
 
   assert(content.includes('run: python sync_reviews.py'),
     'update-reviews.yml must invoke python sync_reviews.py')
@@ -157,7 +165,7 @@ function testUpdateReviewsUsesGenericSyncEntrypoint() {
 }
 
 function testDownstreamScrapeOutputReferencesUnchanged() {
-  const content = readFileSync(path.join(WORKFLOWS_DIR, 'update-reviews.yml'), 'utf-8')
+  const content = read('update-reviews.yml')
   assert(content.includes('steps.scrape.outputs.new_count'),
     'the commit step must still reference steps.scrape.outputs.new_count')
   assert(content.includes('steps.scrape.outputs.negative_count'),
@@ -167,7 +175,7 @@ function testDownstreamScrapeOutputReferencesUnchanged() {
 }
 
 function testCommitStepStillGatedOnIntegritySuccess() {
-  const content = readFileSync(path.join(WORKFLOWS_DIR, 'update-reviews.yml'), 'utf-8')
+  const content = read('update-reviews.yml')
   const commitStepMatch = content.match(/- name: Commit updated data\n([\s\S]*?)(?=\n\s*- name:)/)
   assert(commitStepMatch, 'update-reviews.yml must have a "Commit updated data" step')
   assert(/if:\s*always\(\)\s*&&\s*steps\.integrity\.outcome == 'success'/.test(commitStepMatch[0]),
@@ -175,7 +183,7 @@ function testCommitStepStillGatedOnIntegritySuccess() {
 }
 
 function testStalePushFailSafeUnchanged() {
-  const content = readFileSync(path.join(WORKFLOWS_DIR, 'update-reviews.yml'), 'utf-8')
+  const content = read('update-reviews.yml')
   assert(content.includes('git push rejected -- main has moved since this job started'),
     'the stale-push fail-safe error message must remain unchanged')
   assert(content.includes('no automatic reset/recommit is attempted'),
