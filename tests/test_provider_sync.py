@@ -147,6 +147,26 @@ async def test_discovery_failure_records_early_failure_with_provider_name():
     assert run_row["failure_stage"] == "account_discovery"
 
 
+async def test_discovery_failure_result_carries_error_type_and_status():
+    """Diagnostics-only enrichment: the returned dict must also carry the
+    original exception's class name and HTTP status (not just its stringified
+    message under 'reason') -- this is what lets a caller like
+    critical_alert_check.py distinguish a quota block (429/GBPRateLimitError)
+    from a genuine auth failure (401/GBPAuthError) from anything else,
+    instead of the two of them being indistinguishable strings. Purely
+    additive: 'status'/'reason' (asserted above in the sibling test) are
+    completely unchanged."""
+    _fresh_db()
+    provider = FakeProvider(discover_error=ProviderRateLimitError("simulated 429", status=429))
+    result = await provider_sync.sync_all(provider)
+
+    assert result["status"] == "failed", result
+    assert result["error_type"] == "ProviderRateLimitError", result
+    assert result["error_status"] == 429, result
+    assert result["error_traceback"] and "ProviderRateLimitError" in result["error_traceback"], \
+        "a traceback must be captured for the discovery failure"
+
+
 async def test_non_provider_error_during_discovery_propagates_uncaught():
     """Error propagation: only ProviderError is caught and turned into a
     graceful {"status": "failed"} result -- a plain, unexpected exception
@@ -344,6 +364,7 @@ def main():
         ("sync_all() with an async provider (matches ScraperProvider) -- _maybe_await works for both", test_sync_all_with_async_provider),
         ("sync_all() returns 'skipped' with the provider's display_name when not configured", test_sync_all_skipped_when_not_configured),
         ("a discovery-level ProviderError records an early failure with the correct provider name", test_discovery_failure_records_early_failure_with_provider_name),
+        ("a discovery failure's result carries error_type/error_status/error_traceback", test_discovery_failure_result_carries_error_type_and_status),
         ("a non-ProviderError exception during discovery propagates uncaught", test_non_provider_error_during_discovery_propagates_uncaught),
         ("a single location's failure is isolated -- status 'partial'", test_per_location_failure_is_isolated_status_partial),
         ("every location failing yields 'failed', not 'partial'", test_all_locations_failing_yields_status_failed_not_partial),

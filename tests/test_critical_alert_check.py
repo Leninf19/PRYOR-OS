@@ -122,12 +122,110 @@ def test_sync_failure_still_checks_existing_critical_reviews():
     assert mock_send.called, "expected the alert email path to be invoked despite the sync failure"
 
 
+# --- Diagnostics-only: _describe_sync_failure() classification ---------------
+# Follow-up to the fix above: the printed diagnostic used to read
+# `sync failed -- {sync_result.get('errors')}`, which was always None for
+# exactly this failure shape (provider_sync.py's discovery-failure path
+# returns the message under 'reason', never 'errors'). These tests lock in
+# the replacement classifier -- none of them touch run()'s control flow or
+# assert anything about email/DB behavior beyond what the pre-existing test
+# above already covers, since this change is diagnostics-only.
+
+def test_quota_block_logs_the_expected_fallback_message():
+    sync_result = {
+        "status": "failed",
+        "reason": "Google API 429: Quota exceeded for quota metric 'Requests' and limit "
+                  "'Requests per minute' of service 'mybusinessaccountmanagement.googleapis.com' "
+                  "for consumer 'project_number:786038057684'.",
+        "error_type": "GBPRateLimitError",
+        "error_status": 429,
+    }
+    message = cac._describe_sync_failure(sync_result)
+    assert cac.GBP_QUOTA_BLOCK_MESSAGE in message, f"expected the exact known-quota-block message, got: {message}"
+    assert "reconnect" not in message.lower(), "a quota block must never suggest reconnecting -- it does nothing for this"
+
+
+def test_quota_block_detected_by_status_alone_even_without_error_type():
+    # Belt-and-suspenders: detection must not depend solely on error_type
+    # being populated (e.g. an older/foreign caller that only sets status).
+    sync_result = {"status": "failed", "reason": "Google API 429: rate limited", "error_status": 429}
+    message = cac._describe_sync_failure(sync_result)
+    assert cac.GBP_QUOTA_BLOCK_MESSAGE in message, message
+
+
+def test_authentication_errors_remain_distinguishable_from_quota_block():
+    sync_result = {
+        "status": "failed",
+        "reason": "Unauthorized: Request had invalid authentication credentials.",
+        "error_type": "GBPAuthError",
+        "error_status": 401,
+    }
+    message = cac._describe_sync_failure(sync_result)
+    assert cac.GBP_QUOTA_BLOCK_MESSAGE not in message, "an auth error must never be reported as the quota-block message"
+    assert "authentication" in message.lower(), f"expected an auth-specific message, got: {message}"
+    assert "reconnect" in message.lower(), "an auth error (unlike a quota block) should point at reconnecting"
+
+
+def test_unexpected_errors_never_become_none():
+    # Anything that isn't the known quota or auth shape -- the exact bug
+    # being fixed is that this used to render as the literal string "None".
+    sync_result = {
+        "status": "failed",
+        "reason": "Google API 500: internal error",
+        "error_type": "GBPServerError",
+        "error_status": 500,
+        "error_traceback": "Traceback (most recent call last):\n  ...\nGBPServerError: Google API 500: internal error\n",
+    }
+    message = cac._describe_sync_failure(sync_result)
+    assert message != "None", message
+    assert "None" not in message.split("message=")[-1].split(".")[0], f"the actual detail must never be swallowed into None: {message}"
+    assert "GBPServerError" in message and "500" in message and "internal error" in message, message
+    assert "Traceback" in message, "a captured traceback should be surfaced for an unclassified failure"
+
+
+def test_unexpected_error_with_no_detail_at_all_is_still_never_none():
+    # The absolute worst case this bug produced: an empty dict's .get() calls
+    # all returning None. Must still produce a real, non-"None" message.
+    message = cac._describe_sync_failure({"status": "failed"})
+    assert message != "None"
+    assert "no error detail available" in message, message
+
+
+def test_fallback_database_check_still_runs_for_every_failure_classification():
+    """The core degradation-path guarantee (test_sync_failure_still_checks_existing_critical_reviews
+    above) must hold no matter HOW the failure is classified -- quota, auth,
+    or unexpected. This is a diagnostics-only change: it must never affect
+    whether run() still checks the database and sends the alert."""
+    for sync_result in [
+        {"status": "failed", "reason": "Google API 429: Quota exceeded", "error_type": "GBPRateLimitError", "error_status": 429},
+        {"status": "failed", "reason": "Unauthorized", "error_type": "GBPAuthError", "error_status": 401},
+        {"status": "failed", "reason": "Google API 500: internal error", "error_type": "GBPServerError", "error_status": 500},
+    ]:
+        loc_id = _fresh_db()
+        today = datetime.now(timezone.utc).date().isoformat()
+        _add_review(loc_id, "Extremely dangerous situation, someone could have been hurt badly", 1, "critical", today)
+
+        with mock.patch.object(gbp_sync, "sync_all", return_value=sync_result), \
+             mock.patch("critical_alert_check._send_email") as mock_send:
+            result = cac.run()
+
+        assert result["status"] == "ok", f"{sync_result['error_type']}: {result}"
+        assert result["sent"] == 1, f"{sync_result['error_type']}: expected the pre-existing critical review still found, got {result}"
+        assert mock_send.called, f"{sync_result['error_type']}: expected the alert email path still invoked despite the sync failure"
+
+
 def main():
     tests = [
         ("critical reviews older than the lookback window are excluded", test_old_backlog_excluded_by_lookback_window),
         ("an already-escalated critical review is not re-found (dedup)", test_already_escalated_review_excluded),
         ("a critical review with an owner reply is excluded from immediate escalation", test_answered_review_excluded_even_if_critical),
         ("a failed Google sync still surfaces pre-existing critical reviews", test_sync_failure_still_checks_existing_critical_reviews),
+        ("a quota block (429/GBPRateLimitError) logs the expected fallback message", test_quota_block_logs_the_expected_fallback_message),
+        ("a quota block is detected by status alone, even without error_type", test_quota_block_detected_by_status_alone_even_without_error_type),
+        ("authentication errors remain distinguishable from a quota block", test_authentication_errors_remain_distinguishable_from_quota_block),
+        ("unexpected errors are never rendered as the literal string None", test_unexpected_errors_never_become_none),
+        ("an unexpected error with no detail at all is still never None", test_unexpected_error_with_no_detail_at_all_is_still_never_none),
+        ("the database fallback still runs for every failure classification (quota/auth/unexpected)", test_fallback_database_check_still_runs_for_every_failure_classification),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()

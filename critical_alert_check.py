@@ -28,6 +28,48 @@ APP_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
 
 CLASSIFY_LIMIT = 50  # this path only ever needs to classify a handful of brand-new reviews
 
+# The exact, known production condition (Google Cloud project 786038057684):
+# a 429/RESOURCE_EXHAUSTED at account/location discovery, distinct from a
+# genuine auth failure -- reconnecting Google Business Profile does nothing
+# for this, so the message must never suggest it does.
+GBP_QUOTA_BLOCK_MESSAGE = "GBP sync unavailable due to Google API quota block. Continuing with database fallback."
+
+
+def _describe_sync_failure(sync_result: dict) -> str:
+    """Diagnostics-only -- explains WHY a sync failed as specifically as
+    possible, replacing the previous `sync failed -- {sync_result.get('errors')}`,
+    which silently printed None whenever the failure happened at account/
+    location discovery: provider_sync.py's sync_all() returns that failure's
+    message under the 'reason' key, never 'errors' (which is only populated
+    for a different failure shape -- a per-location review-fetch failure
+    after discovery already succeeded). Pure function: never raises, never
+    mutates sync_result, and has no bearing on run()'s control flow -- the
+    database fallback below always runs regardless of what this returns."""
+    error_type = sync_result.get("error_type")
+    status = sync_result.get("error_status")
+    detail = sync_result.get("reason")
+    if detail is None:
+        errors = sync_result.get("errors")
+        detail = "; ".join(errors) if errors else "no error detail available"
+
+    if error_type == "GBPRateLimitError" or status == 429:
+        return f"{GBP_QUOTA_BLOCK_MESSAGE} (detail: {detail})"
+
+    if error_type == "GBPAuthError" or status == 401:
+        return (f"GBP sync failed due to a Google authentication error (detail: {detail}). "
+                f"Reconnect Google Business Profile from Settings if this persists. "
+                f"Continuing with database fallback.")
+
+    # Anything else is genuinely unclassified from this caller's perspective
+    # -- surface everything known about it (never just None) plus a
+    # traceback when one was captured, so it's actually debuggable.
+    message = (f"GBP sync failed with an unexpected error -- type={error_type or 'unknown'}, "
+               f"status={status}, message={detail}. Continuing with database fallback.")
+    tb = sync_result.get("error_traceback")
+    if tb:
+        message = f"{message}\n{tb}"
+    return message
+
 
 def _send_email(subject: str, html: str) -> None:
     if not FROM_ADDR or not APP_PASS:
@@ -79,7 +121,7 @@ def run() -> dict:
         print(f"critical_alert_check.py: {sync_result.get('reason')}")
         return {"status": "skipped"}
     if sync_result.get("status") == "failed":
-        print(f"critical_alert_check.py: sync failed -- {sync_result.get('errors')}")
+        print(f"critical_alert_check.py: {_describe_sync_failure(sync_result)}")
         # Still worth checking for critical reviews already in the DB from a
         # prior run, so this deliberately does not return early here.
 

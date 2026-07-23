@@ -17,6 +17,7 @@ sync_reviews.py instead is Phase 3 Milestone 4b's job, deliberately deferred
 """
 import inspect
 import re
+import traceback
 from datetime import datetime, timezone
 
 import db
@@ -187,7 +188,22 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
         provider_locations = await _maybe_await(provider.discover_locations())
     except ProviderError as e:
         _record_early_failure(conn, now, str(e), provider.name, mode)
-        return {"status": "failed", "reason": str(e)}
+        # Diagnostics-only additions (error_type/error_status/error_traceback):
+        # `e` already carries its class and (for GBPError/ProviderError
+        # subclasses) an HTTP status, but both were previously discarded the
+        # moment this became a plain dict -- callers (critical_alert_check.py)
+        # had no way to distinguish a quota block from an auth failure from a
+        # genuinely unexpected error, and fell back to a generic 'reason'/
+        # 'errors' key mismatch that silently printed None. Purely additive:
+        # 'status'/'reason' are unchanged, no control flow or DB write here
+        # is different from before.
+        return {
+            "status": "failed",
+            "reason": str(e),
+            "error_type": type(e).__name__,
+            "error_status": e.status,
+            "error_traceback": traceback.format_exc(),
+        }
 
     our_locations = [dict(r) for r in conn.execute("SELECT * FROM locations WHERE is_active = 1").fetchall()]
     linked = _link_locations(conn, provider_locations, our_locations, now)
