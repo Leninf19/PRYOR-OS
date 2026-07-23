@@ -38,8 +38,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      # cryptography is required here: gbp_import.py -> google_api.py
+      # imports AESGCM to decrypt the securely stored Google refresh token
+      # (Phase 8, Milestone 8.8). This step never installed it, so any run
+      # of this workflow would crash with "ModuleNotFoundError: No module
+      # named 'cryptography'" before ever reaching the import logic below --
+      # this bug was dormant only because this workflow had never been
+      # triggered yet.
       - name: Install Python dependencies
-        run: pip install anthropic
+        run: pip install anthropic cryptography
 
       - name: Run historical import
         id: import

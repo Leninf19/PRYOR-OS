@@ -32,8 +32,14 @@ jobs:
         with:
           python-version: '3.11'
 
+      # cryptography is required here: critical_alert_check.py -> gbp_sync.py
+      # -> provider_gbp.py -> google_api.py imports AESGCM to decrypt the
+      # securely stored Google refresh token (Phase 8, Milestone 8.8). This
+      # step never installed it, so every run crashed with
+      # "ModuleNotFoundError: No module named 'cryptography'" before ever
+      # reaching the actual critical-review check below.
       - name: Install Python dependencies
-        run: pip install anthropic
+        run: pip install anthropic cryptography
 
       - name: Check for critical reviews
         run: python critical_alert_check.py

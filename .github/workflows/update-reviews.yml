@@ -31,8 +31,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      # cryptography is required here: sync_reviews.py -> provider_gbp.py ->
+      # google_api.py imports AESGCM to decrypt the securely stored Google
+      # refresh token (Phase 8, Milestone 8.8), and export_chunks.py's
+      # export_provider_health() hits the same import chain. This step never
+      # installed it, so both steps crashed with "ModuleNotFoundError: No
+      # module named 'cryptography'" -- masked here because later steps use
+      # `if: always()`, so the workflow still appeared to "complete".
       - name: Install Python dependencies
-        run: pip install playwright anthropic
+        run: pip install playwright anthropic cryptography
 
       - name: Install Playwright browsers
         run: playwright install chromium --with-deps
