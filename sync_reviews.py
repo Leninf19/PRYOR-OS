@@ -104,6 +104,7 @@ def main() -> int:
     args = parser.parse_args()
 
     provider_name = resolve_provider_name(args.provider)
+    print(f"[sync_reviews] stage=start provider={provider_name} fast={args.fast}")
     try:
         provider = build_provider(provider_name)
     except ValueError as e:
@@ -112,6 +113,8 @@ def main() -> int:
 
     result = asyncio.run(provider_sync.sync_all(provider, fast=args.fast))
     print(result)
+    print(f"[sync_reviews] stage=sync_complete status={result.get('status')} "
+          f"new={result.get('new', 0)} edited={result.get('edited', 0)} deleted={result.get('deleted', 0)}")
 
     print(f"sync_reviews.py: provider={provider_name} locations succeeded={result.get('locations_succeeded', 0)}, "
           f"failed={result.get('locations_failed', 0)}")
@@ -126,6 +129,8 @@ def main() -> int:
         new_reviews = result.get("new_reviews", [])
         new_negative = digest_filters.get_new_negative_reviews(new_reviews)
         excluded = len(new_reviews) - len(new_negative)
+        print(f"[sync_reviews] stage=negative_review_filter new_total={len(new_reviews)} "
+              f"new_negative={len(new_negative)} excluded_positive={excluded}")
         print(f"sync_reviews.py: {len(new_reviews)} genuinely new review(s), "
               f"{len(new_negative)} new 1-2 star, {excluded} excluded (3-5 star)")
         print(f"sync_reviews.py: negative-review email "

@@ -114,6 +114,7 @@ def test_sync_failure_still_checks_existing_critical_reviews():
     _add_review(loc_id, "Extremely dangerous situation, someone could have been hurt badly", 1, "critical", today)
 
     with mock.patch.object(gbp_sync, "sync_all", return_value={"status": "failed", "reason": "Google API 429: Quota exceeded"}), \
+         mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-app-password"), \
          mock.patch("critical_alert_check._send_email") as mock_send:
         result = cac.run()
 
@@ -206,6 +207,7 @@ def test_fallback_database_check_still_runs_for_every_failure_classification():
         _add_review(loc_id, "Extremely dangerous situation, someone could have been hurt badly", 1, "critical", today)
 
         with mock.patch.object(gbp_sync, "sync_all", return_value=sync_result), \
+             mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-app-password"), \
              mock.patch("critical_alert_check._send_email") as mock_send:
             result = cac.run()
 

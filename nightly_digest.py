@@ -38,6 +38,22 @@ APP_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
 NOTIFICATION_TYPE = "nightly_digest_review"
 TARGET_HOUR_ET = 22
 
+# Root-cause fix (production audit): this gate used to require the EXACT
+# hour (`now_et.hour == TARGET_HOUR_ET`), on the assumption that GitHub
+# Actions' cron delay would be small (a few minutes). In production it is
+# not -- this repo's actual scheduled firings have consistently landed
+# 3-4 hours after both cron entries (02:00/03:00 UTC), i.e. around 1-2 AM
+# ET, never at hour 22. Confirmed via live run logs: every single scheduled
+# run printed {'status': 'skipped_wrong_hour', 'hour_et': 1 or 2} --
+# meaning this gate had NEVER once let a real firing through, and zero
+# 'nightly_digest_review' notifications exist anywhere in this project's
+# history. A wide overnight window tolerates that delay (and any similar
+# future delay) while still rejecting a stray daytime trigger. Per-review
+# dedup (already_notified/log_notification, keyed by review id) is what
+# actually prevents duplicate content if both cron entries land in-window
+# on the same night -- this window is intentionally generous, not exact.
+VALID_HOURS_ET = {20, 21, 22, 23, 0, 1, 2, 3, 4}
+
 
 # ---- rendering helpers (mirrors notify.py's review-card style; only used
 # here now that the low-star section has moved out of notify.py) ----
@@ -339,38 +355,66 @@ def send_email(subject, html):
 def run(force: bool = False) -> dict:
     conn = db.get_connection()
     db.init_schema(conn)
+    print(f"[nightly_digest] stage=start force={force}")
 
     now_et = datetime.now(ZoneInfo("America/New_York"))
-    if not force and now_et.hour != TARGET_HOUR_ET:
+    if not force and now_et.hour not in VALID_HOURS_ET:
         conn.close()
+        print(f"[nightly_digest] stage=hour_gate result=skipped hour_et={now_et.hour}")
         return {"status": "skipped_wrong_hour", "hour_et": now_et.hour}
+    print(f"[nightly_digest] stage=hour_gate result=proceed hour_et={now_et.hour}")
 
     reviews = find_new_meaningful_low_star(conn)
+    print(f"[nightly_digest] stage=find_qualifying_reviews count={len(reviews)}")
     if not reviews:
         conn.close()
         return {"status": "no_qualifying_reviews", "count": 0}
 
     for r in reviews:
         r["_escalated"] = is_already_escalated(conn, r["id"])
-        log_notification(conn, NOTIFICATION_TYPE, f"{r['star_rating']}★ at {r['location_name']}",
-                          related_review_id=r["id"])
-    conn.commit()
 
     date_label = now_et.strftime("%B %d, %Y")
     html = build_email(reviews, date_label)
+    critical_n = sum(1 for r in reviews if (r.get("ai_priority") or "").lower() == "critical")
 
+    # Root-cause fix (production audit): notifications used to be logged
+    # (permanently suppressing these exact reviews from ever being
+    # re-considered) BEFORE send_email() was even attempted. A genuine
+    # delivery failure (send_email() raising -- bad credentials rejected by
+    # Gmail, a network error, anything) would still have already committed
+    # the "notified" rows, silently losing that night's entire digest
+    # forever with no way to retry. Logging now happens strictly AFTER a
+    # send either succeeds or is deliberately skipped for a KNOWN,
+    # non-retryable reason (credentials simply not configured yet -- see
+    # below) -- never before, and never for an exception raised by
+    # send_email() itself.
     if not FROM_ADDR or not APP_PASS:
+        # Deliberately still logged: missing credentials is a one-time setup
+        # gap, not a transient failure -- treating it as "already digested"
+        # prevents tonight's entire backlog from flooding the first run
+        # after credentials are finally configured. This exact behavior is
+        # covered by test_dedup_across_runs.
+        for r in reviews:
+            log_notification(conn, NOTIFICATION_TYPE, f"{r['star_rating']}★ at {r['location_name']}",
+                              related_review_id=r["id"])
+        conn.commit()
         conn.close()
+        print(f"[nightly_digest] stage=send result=no_credentials count={len(reviews)}")
         return {"status": "ready_no_credentials", "count": len(reviews)}
 
-    critical_n = sum(1 for r in reviews if (r.get("ai_priority") or "").lower() == "critical")
     subject = (
         f"Nightly Review Digest — {date_label} "
         f"({len(reviews)} review{'s' if len(reviews) != 1 else ''}"
         + (f", {critical_n} critical" if critical_n else "")
         + ")"
     )
-    send_email(subject, html)
+    send_email(subject, html)  # raises on a genuine send failure -- nothing below runs, so these reviews remain eligible for the next run's retry
+    print(f"[nightly_digest] stage=send result=success count={len(reviews)} critical={critical_n}")
+
+    for r in reviews:
+        log_notification(conn, NOTIFICATION_TYPE, f"{r['star_rating']}★ at {r['location_name']}",
+                          related_review_id=r["id"])
+    conn.commit()
     conn.close()
     return {"status": "sent", "count": len(reviews), "critical": critical_n}
 

@@ -115,18 +115,30 @@ def _build_html(reviews: list) -> str:
 def run() -> dict:
     conn = db.get_connection()
     db.init_schema(conn)
+    print("[critical_alert_check] stage=start")
 
+    # Root-cause fix (production audit): a GBP sync outcome of ANY kind --
+    # 'skipped' (not configured) or 'failed' (quota block, auth error,
+    # anything else) -- must NEVER suppress the scraper-based critical-
+    # review check below. This used to return early on 'skipped' only
+    # (the 'failed' branch already correctly fell through) -- meaning if
+    # GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET were ever entirely absent
+    # (not just an invalid/expired token), the database fallback check
+    # never ran at all. sync_reviews.py's own scraper-provider run
+    # (update-reviews.yml) is what actually populates new reviews; this
+    # GBP attempt is a secondary, optional source for this specific check.
     sync_result = gbp_sync.sync_all(fast=True)
-    if sync_result.get("status") == "skipped":
-        print(f"critical_alert_check.py: {sync_result.get('reason')}")
-        return {"status": "skipped"}
-    if sync_result.get("status") == "failed":
-        print(f"critical_alert_check.py: {_describe_sync_failure(sync_result)}")
-        # Still worth checking for critical reviews already in the DB from a
-        # prior run, so this deliberately does not return early here.
+    status = sync_result.get("status")
+    if status == "skipped":
+        print(f"[critical_alert_check] stage=gbp_sync result=skipped reason={sync_result.get('reason')}")
+    elif status == "failed":
+        print(f"[critical_alert_check] stage=gbp_sync result=failed detail={_describe_sync_failure(sync_result)}")
+    else:
+        print(f"[critical_alert_check] stage=gbp_sync result=ok")
 
     if ai_engine.is_available():
         to_classify = db.get_reviews_needing_classification(conn, limit=CLASSIFY_LIMIT)
+        print(f"[critical_alert_check] stage=ai_classification to_classify={len(to_classify)}")
         if to_classify:
             classified = ai_engine.classify_reviews_batch(to_classify)
             for r in to_classify:
@@ -137,14 +149,32 @@ def run() -> dict:
                 db.save_ai_classification(conn, r["id"], result["sentiment"], result["reason"],
                                            result["priority"], content_hash)
             conn.commit()
+            print(f"[critical_alert_check] stage=ai_classification classified={len(classified)}/{len(to_classify)}")
+    else:
+        print("[critical_alert_check] stage=ai_classification result=skipped reason=ai_engine_unavailable")
 
     critical = digest_filters.find_unescalated_critical_reviews(conn)
+    print(f"[critical_alert_check] stage=find_unescalated_critical count={len(critical)}")
     if not critical:
         print("critical_alert_check.py: no new critical reviews. Nothing to send.")
         return {"status": "ok", "sent": 0}
 
     subject = f"Critical Review Alert — {len(critical)} review(s) need immediate attention"
+
+    # Root-cause fix (production audit): logging used to happen unconditionally
+    # after calling _send_email(), but _send_email() silently no-ops (prints
+    # and returns, does not raise) when GMAIL_USER/GMAIL_APP_PASSWORD are
+    # missing -- meaning these critical reviews would have been marked
+    # "notified" forever even though no email was ever sent. A genuine SMTP
+    # failure (a real exception from _send_email()) already correctly
+    # prevents logging today (the exception propagates before the loop
+    # below runs); this closes the missing-credentials gap the same way.
+    if not FROM_ADDR or not APP_PASS:
+        print(f"[critical_alert_check] stage=send result=no_credentials pending={len(critical)}")
+        return {"status": "ready_no_credentials", "sent": 0, "pending": len(critical)}
+
     _send_email(subject, _build_html(critical))
+    print(f"[critical_alert_check] stage=send result=success count={len(critical)}")
 
     for r in critical:
         digest_filters.log_notification(

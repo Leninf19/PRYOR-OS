@@ -27,6 +27,7 @@ TESTS = [
     "test_critical_alert_check.py",
     "test_nightly_digest.py",
     "test_negative_review_notifications.py",
+    "test_notification_pipeline_audit.py",
     "test_local_safety.py",
     "test_check_db_integrity.py",
     "test_auto_update_local_mode.py",
