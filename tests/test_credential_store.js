@@ -17,6 +17,8 @@ import {
   GoogleHealth,
   CredentialStoreUnavailableError,
   CredentialEncryptionKeyMissingError,
+  isQuotaExceededError,
+  extractQuotaProjectNumber,
   _setRedisClientForTests,
   _resetRedisClientForTests,
 } from '../dashboard/api/_lib/credentialStore.js'
@@ -182,6 +184,73 @@ async function testClearStoredCredentialRemovesItCompletely() {
   assert(cred === null, 'after clearStoredCredential, a fresh connect must look indistinguishable from never having connected')
 }
 
+// --- Health classification (Phase 8: 429/RESOURCE_EXHAUSTED quota block) --
+// Production incident, project 786038057684: Settings -> Google Business
+// Profile was showing "Authentication Failed" (and recommending Reconnect)
+// for a genuine Google Cloud project-level quota block, discovered via a
+// live Test Connection run whose "accounts" check returned the exact
+// Google error: "Quota exceeded for quota metric 'Requests' and limit
+// 'Requests per minute' of service 'mybusinessaccountmanagement.googleapis.com'
+// for consumer 'project_number:786038057684'." These tests lock in the
+// four distinct classifications the fix requires so none of them can
+// silently regress into the wrong bucket again.
+
+async function testUnauthorizedReasonMapsToAuthFailed() {
+  const client = fakeRedis()
+  _setRedisClientForTests(() => client)
+  await setStoredCredential({ refreshToken: 'x', connectedAccountName: null })
+  await recordSyncOutcome({ success: false, reason: 'unauthorized', errorDescription: 'Request had invalid authentication credentials.' })
+  const cred = await getStoredCredential()
+  assert(cred.health === GoogleHealth.AUTH_FAILED, `a 401 (reason: unauthorized) must map to auth_failed, got ${cred.health}`)
+}
+
+async function testInvalidGrantMapsToExpiredOrRevoked() {
+  const client = fakeRedis()
+  _setRedisClientForTests(() => client)
+  await setStoredCredential({ refreshToken: 'x', connectedAccountName: null })
+  await recordSyncOutcome({ success: false, reason: 'invalid_grant', errorDescription: 'Token has been expired or revoked.' })
+  const cred = await getStoredCredential()
+  assert([GoogleHealth.TOKEN_EXPIRED, GoogleHealth.TOKEN_REVOKED].includes(cred.health),
+    `invalid_grant must map to token_expired or token_revoked, got ${cred.health}`)
+}
+
+async function testPermissionDeniedReasonMapsToAuthFailed() {
+  const client = fakeRedis()
+  _setRedisClientForTests(() => client)
+  await setStoredCredential({ refreshToken: 'x', connectedAccountName: null })
+  await recordSyncOutcome({ success: false, reason: 'permission_denied', errorDescription: 'The caller does not have permission.' })
+  const cred = await getStoredCredential()
+  assert(cred.health === GoogleHealth.AUTH_FAILED, `a 403 (reason: permission_denied) must map to auth_failed, got ${cred.health}`)
+}
+
+async function testQuotaExceededReasonMapsToQuotaBlockedNotAuthFailed() {
+  const client = fakeRedis()
+  _setRedisClientForTests(() => client)
+  await setStoredCredential({ refreshToken: 'x', connectedAccountName: null })
+  await recordSyncOutcome({
+    success: false, reason: 'quota_exceeded',
+    errorDescription: "Quota exceeded for quota metric 'Requests' and limit 'Requests per minute' of service 'mybusinessaccountmanagement.googleapis.com' for consumer 'project_number:786038057684'.",
+  })
+  const cred = await getStoredCredential()
+  assert(cred.health === GoogleHealth.QUOTA_BLOCKED, `429/RESOURCE_EXHAUSTED (reason: quota_exceeded) must map to its own quota_blocked state, never auth_failed, got ${cred.health}`)
+  assert(cred.health !== GoogleHealth.AUTH_FAILED, 'quota_blocked must be a genuinely distinct state from auth_failed')
+}
+
+function testIsQuotaExceededErrorDetectsBothSignals() {
+  assert(isQuotaExceededError(429, {}) === true, 'a bare HTTP 429 must be detected even with no parseable error body')
+  assert(isQuotaExceededError(200, { error: { status: 'RESOURCE_EXHAUSTED' } }) === true,
+    'error.status === RESOURCE_EXHAUSTED must be detected even if the HTTP status itself is somehow not 429')
+  assert(isQuotaExceededError(403, { error: { status: 'PERMISSION_DENIED' } }) === false, 'a genuine 403/PERMISSION_DENIED must never be misdetected as quota')
+  assert(isQuotaExceededError(401, {}) === false, 'a genuine 401 must never be misdetected as quota')
+}
+
+function testExtractQuotaProjectNumberParsesGooglesRealMessage() {
+  const real = "Quota exceeded for quota metric 'Requests' and limit 'Requests per minute' of service 'mybusinessaccountmanagement.googleapis.com' for consumer 'project_number:786038057684'."
+  assert(extractQuotaProjectNumber(real) === '786038057684', `expected to parse the real project number, got ${extractQuotaProjectNumber(real)}`)
+  assert(extractQuotaProjectNumber('some unrelated error text') === null, 'text with no project_number must return null, never a guessed value')
+  assert(extractQuotaProjectNumber(undefined) === null, 'undefined input must return null, never throw')
+}
+
 async function testReadFailureThrowsUnavailable() {
   _setRedisClientForTests(() => ({ get: async () => { throw new Error('ECONNREFUSED fake-upstash-outage') } }))
   let threw = false
@@ -202,6 +271,12 @@ async function main() {
   await run('a missing encryption key throws a distinct error on set', testMissingEncryptionKeyThrowsOnSet)
   await run('recordSyncOutcome: success restores connected health and clears the failure reason', testRecordSyncOutcomeSuccessRestoresConnectedHealth)
   await run('recordSyncOutcome: failure maps to token_expired vs token_revoked vs auth_failed correctly', testRecordSyncOutcomeFailureMapsRevokedVsExpired)
+  await run('a 401 (reason: unauthorized) maps to auth_failed', testUnauthorizedReasonMapsToAuthFailed)
+  await run('invalid_grant maps to token_expired or token_revoked', testInvalidGrantMapsToExpiredOrRevoked)
+  await run('a 403 (reason: permission_denied) maps to auth_failed', testPermissionDeniedReasonMapsToAuthFailed)
+  await run('a 429/RESOURCE_EXHAUSTED (reason: quota_exceeded) maps to quota_blocked, not auth_failed', testQuotaExceededReasonMapsToQuotaBlockedNotAuthFailed)
+  await run('isQuotaExceededError detects both the HTTP-429 and error.status=RESOURCE_EXHAUSTED signals', testIsQuotaExceededErrorDetectsBothSignals)
+  await run('extractQuotaProjectNumber parses the real production error message', testExtractQuotaProjectNumberParsesGooglesRealMessage)
   await run('recordSyncOutcome is a no-op (never fabricates a credential) when nothing is connected', testRecordSyncOutcomeIsANoOpWhenNeverConnected)
   await run('recordOAuthRefresh updates its timestamp independently of sync outcome', testRecordOAuthRefreshUpdatesTimestampIndependently)
   await run('clearStoredCredential removes the credential completely', testClearStoredCredentialRemovesItCompletely)

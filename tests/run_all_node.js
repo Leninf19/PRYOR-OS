@@ -62,6 +62,7 @@ const TESTS = [
   'test_email_system_ui.js',
   'test_audit_log_ui.js',
   'test_google_business_profile_ui.js',
+  'test_google_oauth_quota_blocked.js',
 ]
 
 const results = {}

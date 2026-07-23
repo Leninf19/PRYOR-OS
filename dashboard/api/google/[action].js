@@ -30,6 +30,7 @@ import { enforceRateLimit } from '../_lib/rateLimit.js'
 import {
   getStoredCredential, setStoredCredential, recordSyncOutcome, recordOAuthRefresh,
   clearStoredCredential, GoogleHealth, CredentialStoreUnavailableError,
+  isQuotaExceededError, extractQuotaProjectNumber,
 } from '../_lib/credentialStore.js'
 import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
 
@@ -366,9 +367,30 @@ async function status(req, res) {
 
     if (!r.ok) {
       const body = await r.json().catch(() => ({}))
-      await recordSyncOutcome({ success: false, reason: 'api_error', errorDescription: body.error?.message })
+      const quotaExceeded = isQuotaExceededError(r.status, body)
+      // A 429/RESOURCE_EXHAUSTED here happens AFTER exchangeRefreshToken()
+      // already succeeded above -- it's a Google Cloud project-level
+      // quota/access problem (production incident, project 786038057684),
+      // not a broken OAuth connection, so it gets its own reason distinct
+      // from a genuine 401/403 -- see healthForFailure()'s comment for why
+      // 401/403 still both bucket into AUTH_FAILED today.
+      const reason = quotaExceeded ? 'quota_exceeded'
+        : r.status === 403 ? 'permission_denied'
+        : r.status === 401 ? 'unauthorized'
+        : 'api_error'
+      await recordSyncOutcome({ success: false, reason, errorDescription: body.error?.message })
       const updated = await getStoredCredential()
-      return res.status(200).json({ connected: false, state: updated.health, error: body.error?.message || `GBP API ${r.status}`, ...credentialMetaFields(updated) })
+      return res.status(200).json({
+        // The Google account connection itself is intact for a quota
+        // block (the refresh token and access-token exchange both just
+        // worked) -- only a genuine auth/permission failure should report
+        // connected:false.
+        connected: quotaExceeded,
+        state: updated.health,
+        error: body.error?.message || `GBP API ${r.status}`,
+        quotaProjectNumber: quotaExceeded ? extractQuotaProjectNumber(body.error?.message) : null,
+        ...credentialMetaFields(updated),
+      })
     }
 
     const data       = await r.json()

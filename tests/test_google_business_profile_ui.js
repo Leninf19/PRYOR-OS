@@ -42,9 +42,44 @@ function testUsesTheRealOAuthStatusHooks() {
 
 function testFiveConnectionStatesAreAllMapped() {
   const content = read('pages/settings/GoogleBusinessProfile.jsx')
-  for (const state of ['connected', 'token_expired', 'token_revoked', 'auth_failed', 'never_connected']) {
+  for (const state of ['connected', 'token_expired', 'token_revoked', 'auth_failed', 'quota_blocked', 'never_connected']) {
     assert(new RegExp(`${state}:`).test(content), `STATUS_META must map the "${state}" GoogleHealth state`)
   }
+}
+
+// Production incident, Google Cloud project 786038057684: a genuine 429/
+// RESOURCE_EXHAUSTED quota block was showing "Authentication Failed" and
+// recommending Reconnect, which does nothing for a quota problem. These
+// assertions lock in the fix's UI-level requirements.
+function testQuotaBlockedHasItsOwnAccurateBadgeNotDanger() {
+  const content = read('pages/settings/GoogleBusinessProfile.jsx')
+  const match = content.match(/quota_blocked:\s*\{[^}]*\}/)
+  assert(match, 'STATUS_META must have a quota_blocked entry')
+  assert(/label:\s*'[^']*Quota Blocked[^']*'/.test(match[0]), 'the quota_blocked badge must say something accurate like "API Quota Blocked", not "Authentication Failed"')
+  assert(!/variant:\s*'danger'/.test(match[0]), 'quota_blocked must not be styled as severely as a genuinely broken connection (danger) -- the OAuth connection itself is fine')
+}
+
+function testQuotaBlockedIsExcludedFromReconnectRecoveryCopy() {
+  const content = read('pages/settings/GoogleBusinessProfile.jsx')
+  assert(/const needsRecovery = \['token_expired', 'token_revoked', 'auth_failed'\]\.includes\(state\)/.test(content),
+    'needsRecovery (which drives the "click Reconnect" RECOVERY_COPY box) must NOT include quota_blocked')
+  assert(/isQuotaBlocked = state === 'quota_blocked'/.test(content), 'quota_blocked must be tracked as its own distinct boolean, not folded into needsRecovery')
+}
+
+function testQuotaGuidanceExplainsTheRealCauseAndNeverRecommendsReconnecting() {
+  const content = read('pages/settings/GoogleBusinessProfile.jsx')
+  const fnMatch = content.match(/function quotaGuidance\([^)]*\)\s*\{[\s\S]*?\n\}/)
+  assert(fnMatch, 'a dedicated quotaGuidance() function must exist, separate from RECOVERY_COPY')
+  const body = fnMatch[0]
+  assert(/quota/i.test(body) && /Business Profile Account Management API/.test(body), 'the guidance must name the specific API that is quota-blocked')
+  assert(/Reconnecting will not fix this/i.test(body), 'the guidance must explicitly say reconnecting will not fix a quota block')
+  assert(/still connected/i.test(body), 'the guidance must state the Google account is still connected')
+}
+
+function testReconnectIsDemotedToSecondaryStylingWhenQuotaBlocked() {
+  const content = read('pages/settings/GoogleBusinessProfile.jsx')
+  assert(/isQuotaBlocked\s*\n?\s*\?\s*\{[^}]*var\(--color-surface\)/.test(content),
+    'Reconnect must render with plain/secondary (non-accent) styling specifically when isQuotaBlocked is true, per "Reconnect only as a secondary action for a quota failure"')
 }
 
 function testDisconnectUsesTypeTheWordConfirmDialog() {
@@ -79,7 +114,11 @@ function testRegisteredInSettingsSectionsVisibleToAllRoles() {
 
 const tests = [
   ['uses the real useGoogleOAuthStatus/useDisconnectGoogle hooks', testUsesTheRealOAuthStatusHooks],
-  ['all five GoogleHealth connection states are mapped', testFiveConnectionStatesAreAllMapped],
+  ['all six GoogleHealth connection states are mapped', testFiveConnectionStatesAreAllMapped],
+  ['quota_blocked has its own accurate badge, not styled as severely as danger', testQuotaBlockedHasItsOwnAccurateBadgeNotDanger],
+  ['quota_blocked is excluded from the "click Reconnect" recovery copy', testQuotaBlockedIsExcludedFromReconnectRecoveryCopy],
+  ['the quota guidance explains the real cause and never recommends reconnecting', testQuotaGuidanceExplainsTheRealCauseAndNeverRecommendsReconnecting],
+  ['Reconnect is demoted to secondary styling specifically when quota-blocked', testReconnectIsDemotedToSecondaryStylingWhenQuotaBlocked],
   ['Disconnect requires typing the word DISCONNECT via the shared ConfirmDialog', testDisconnectUsesTypeTheWordConfirmDialog],
   ['uses the shared Skeleton/EmptyState/ErrorState components', testUsesSharedLoadingEmptyErrorStates],
   ['the historical-import confirm input has an accessible name (Milestone 8.11 fix)', testHistoricalImportConfirmInputHasAnAccessibleName],

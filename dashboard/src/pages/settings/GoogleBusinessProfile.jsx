@@ -58,14 +58,20 @@ const PLANNED_GBP = [
   'Failure alerts with exact reason (permission missing, review removed, etc.)',
 ]
 
-// Connection Status -- exactly the five states the spec requires, mapped
-// from credentialStore.js's GoogleHealth values (plus not_configured, a
+// Connection Status -- the states the spec requires, mapped from
+// credentialStore.js's GoogleHealth values (plus not_configured, a
 // config-level gap distinct from a connection-health problem).
+// 'quota_blocked' is deliberately NOT styled as 'danger' -- unlike the
+// other non-connected states, the OAuth connection itself is fine; this
+// is a Google Cloud project-level quota/access block discovered in
+// production (project 786038057684), and looks (and is) less severe than
+// a genuinely broken connection.
 const STATUS_META = {
   connected:        { label: '✅ Connected', variant: 'success' },
   token_expired:    { label: '⚠ Token Expired', variant: 'warning' },
   token_revoked:    { label: '⚠ Token Revoked', variant: 'warning' },
   auth_failed:      { label: '⚠ Authentication Failed', variant: 'danger' },
+  quota_blocked:    { label: '⚠ API Quota Blocked', variant: 'warning' },
   never_connected:  { label: 'Never Connected', variant: 'neutral' },
   not_configured:   { label: 'Setup Incomplete', variant: 'neutral' },
 }
@@ -74,6 +80,18 @@ const RECOVERY_COPY = {
   token_expired: 'Your Google connection has expired. Click Reconnect below to restore it -- this takes about 30 seconds and does not affect any other settings.',
   token_revoked: 'Your Google connection was revoked (often because access was removed in the Google Account, or a password/security change invalidated it). Click Reconnect below to restore it.',
   auth_failed: 'Something went wrong communicating with Google. Try Reconnect below; if this keeps happening, check the technical details below for the specific reason.',
+}
+
+// Deliberately separate from RECOVERY_COPY above -- a quota block is not a
+// "click Reconnect to fix it" situation (reconnecting re-runs the same
+// OAuth flow and changes nothing about the Cloud project's quota/access),
+// so this never tells the operator to reconnect, and is rendered in its
+// own non-danger info box, not RECOVERY_COPY's box.
+function quotaGuidance(projectNumber) {
+  const projectClause = projectNumber
+    ? `Google Cloud project ${projectNumber}`
+    : 'the connected Google Cloud project'
+  return `Google is blocking API calls for ${projectClause} due to a quota/access limit on the Business Profile Account Management API -- your Google account is still connected and the refresh token is valid, this is not an authentication problem. Ask whoever manages that Google Cloud project to check Google Cloud Console -> APIs & Services -> Business Profile Account Management API -> Quotas, and confirm API access has been fully granted (approval and quota increase are often separate steps). Reconnecting will not fix this.`
 }
 
 function fmtWhen(iso) {
@@ -370,6 +388,10 @@ export default function GoogleBusinessProfile() {
   const isConnected = state === 'connected'
   const hasEverConnected = state && state !== 'never_connected' && state !== 'not_configured'
   const needsRecovery = ['token_expired', 'token_revoked', 'auth_failed'].includes(state)
+  // quota_blocked is intentionally excluded from needsRecovery -- it gets
+  // its own guidance box below (quotaGuidance()), never RECOVERY_COPY's
+  // "click Reconnect" framing.
+  const isQuotaBlocked = state === 'quota_blocked'
 
   async function handleDisconnect() {
     try {
@@ -418,6 +440,13 @@ export default function GoogleBusinessProfile() {
               </p>
             </div>
           )}
+          {isQuotaBlocked && (
+            <div className="mb-3 rounded-lg p-3" style={{ background: 'rgba(217,119,6,0.07)', border: '1px solid rgba(217,119,6,0.2)' }}>
+              <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-1)', lineHeight: 1.7 }}>
+                {quotaGuidance(status?.quotaProjectNumber)}
+              </p>
+            </div>
+          )}
 
           {hasEverConnected ? (
             <>
@@ -427,7 +456,7 @@ export default function GoogleBusinessProfile() {
                   { label: 'Last Authentication', value: fmtWhen(status?.lastOAuthRefreshAt) },
                   { label: 'Last Successful Sync', value: fmtWhen(status?.lastSuccessfulSyncAt) },
                   { label: 'Last Failed Sync', value: fmtWhen(status?.lastFailedSyncAt) },
-                  { label: 'Token Health', value: isConnected ? (status?.tokenExpiresIn ? `Valid — expires in ${status.tokenExpiresIn}s` : 'Valid') : (status?.lastFailureReason || 'Unavailable') },
+                  { label: 'Token Health', value: isConnected ? (status?.tokenExpiresIn ? `Valid — expires in ${status.tokenExpiresIn}s` : 'Valid') : isQuotaBlocked ? 'Valid (Google API quota blocked)' : (status?.lastFailureReason || 'Unavailable') },
                   { label: 'Number of Linked Locations', value: linkedLocations ? `${linkedLocations.linked} of ${linkedLocations.total}` : '—' },
                 ].map(row => (
                   <div key={row.label}>
@@ -438,9 +467,17 @@ export default function GoogleBusinessProfile() {
               </div>
 
               <div className="flex items-center gap-3 flex-wrap mt-3">
+                {/* For a quota block, Reconnect is kept only as a secondary
+                    action (plain surface styling, not the accent primary
+                    button) -- reconnecting doesn't fix a Cloud-project
+                    quota/access problem, so it must never look like the
+                    primary fix the way it correctly does for every other
+                    non-connected state. */}
                 <a href="/api/google/auth"
                    className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
-                   style={{ background: 'var(--color-accent)', borderColor: 'var(--color-accent)', color: 'white' }}>
+                   style={isQuotaBlocked
+                     ? { background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }
+                     : { background: 'var(--color-accent)', borderColor: 'var(--color-accent)', color: 'white' }}>
                   Reconnect →
                 </a>
                 <Button variant="danger" onClick={() => setDisconnectOpen(true)}>Disconnect</Button>

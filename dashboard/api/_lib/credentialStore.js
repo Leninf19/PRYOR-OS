@@ -83,19 +83,27 @@ function decrypt({ ciphertext, iv, authTag }) {
 }
 
 // --- Health state enum ---------------------------------------------------
-// Exactly the five states the Settings -> Google Business Profile page
-// requires. 'auth_failed' covers any non-token-specific failure (network/
-// API error) -- token_expired/token_revoked are reserved for what Google's
-// own error text actually distinguishes (it does not cleanly separate the
-// two at the error-CODE level -- both surface as `invalid_grant`, so the
-// distinction is drawn from the human-readable error_description text
-// Google returns, e.g. this project's own real production error: "Token
-// has been expired or revoked").
+// Six states the Settings -> Google Business Profile page requires.
+// 'auth_failed' covers any non-token-specific, non-quota failure (a
+// generic 401/403/network/API error) -- token_expired/token_revoked are
+// reserved for what Google's own error text actually distinguishes (it
+// does not cleanly separate the two at the error-CODE level -- both
+// surface as `invalid_grant`, so the distinction is drawn from the
+// human-readable error_description text Google returns, e.g. this
+// project's own real production error: "Token has been expired or
+// revoked"). 'quota_blocked' is a DELIBERATELY separate state from
+// 'auth_failed' (added after a real production incident, project
+// 786038057684): a 429/RESOURCE_EXHAUSTED from the Business Profile
+// Account Management API happens AFTER a successful OAuth token exchange
+// -- it's a Google Cloud project-level quota/access problem, not a broken
+// connection, and must never tell the operator to reconnect (reconnecting
+// does nothing for a quota block).
 export const GoogleHealth = Object.freeze({
   CONNECTED: 'connected',
   TOKEN_EXPIRED: 'token_expired',
   TOKEN_REVOKED: 'token_revoked',
   AUTH_FAILED: 'auth_failed',
+  QUOTA_BLOCKED: 'quota_blocked',
   NEVER_CONNECTED: 'never_connected',
 })
 
@@ -105,7 +113,38 @@ function healthForFailure(reason, errorDescription) {
     if (text.includes('expired') && !text.includes('revoked')) return GoogleHealth.TOKEN_EXPIRED
     return GoogleHealth.TOKEN_REVOKED // default for invalid_grant: Google's own text usually says "expired or revoked"
   }
+  if (reason === 'quota_exceeded') return GoogleHealth.QUOTA_BLOCKED
+  // 'permission_denied' (403), 'unauthorized' (401), 'api_error', and any
+  // other reason all remain AUTH_FAILED -- a deliberate design choice, not
+  // an oversight: Settings -> Google Business Profile doesn't have a
+  // dedicated "permission" badge distinct from a generic auth problem
+  // today, so 403/401/unknown correctly surface as "Authentication
+  // Failed" with Google's own message text still preserved verbatim in
+  // the response's `error` field either way.
   return GoogleHealth.AUTH_FAILED
+}
+
+// Google's Business Profile Account Management API returns a 429 with the
+// JSON body's error.status set to "RESOURCE_EXHAUSTED" when the Cloud
+// project hasn't been granted (or has exhausted) quota/allowlist access
+// for this API. Detected via EITHER signal -- the HTTP status code OR the
+// error.status field -- since Google is not perfectly consistent about
+// which one a given response actually carries.
+export function isQuotaExceededError(status, errorBody) {
+  return status === 429 || errorBody?.error?.status === 'RESOURCE_EXHAUSTED'
+}
+
+// Extracts the Google Cloud project number from Google's own error message
+// text (e.g. "...for consumer 'project_number:786038057684'.") so the
+// Settings page can name exactly which project needs its quota/access
+// fixed -- computed fresh from the live error every time, never hardcoded,
+// so it stays correct even if the OAuth client is later moved to a
+// different Google Cloud project. Returns null if the text doesn't
+// contain a recognizable project number (e.g. a differently-worded quota
+// error from a future API version).
+export function extractQuotaProjectNumber(message) {
+  const match = /project_number:(\d+)/.exec(message || '')
+  return match ? match[1] : null
 }
 
 function parseRecord(value) {
