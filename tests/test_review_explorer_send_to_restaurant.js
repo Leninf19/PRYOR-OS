@@ -30,7 +30,9 @@ function run(name, fn) {
 }
 
 function read(relPath) {
-  return readFileSync(path.join(SRC_DIR, relPath), 'utf-8')
+  // Normalize CRLF so the \n-anchored regexes below match regardless of the
+  // checkout's line-ending style (e.g. Windows checkouts with core.autocrlf=true).
+  return readFileSync(path.join(SRC_DIR, relPath), 'utf-8').replace(/\r\n/g, '\n')
 }
 
 function testImportsRequiredHooks() {
