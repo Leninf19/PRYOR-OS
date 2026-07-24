@@ -42,18 +42,4 @@ jobs:
 
       - name: Commit notification log
         if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          MSG="chore: health-check housekeeping [skip ci]"
-          git add dashboard/reviews.db
-          git diff --staged --quiet && exit 0
-          git commit -m "$MSG"
-          # concurrency: above serializes this against every other
-          # reviews.db writer. A rejected push means main moved for some
-          # other reason -- fail loudly rather than reset+recommit (that
-          # previously risked overwriting newer data, see update-reviews.yml).
-          if ! git push; then
-            echo "::error::git push rejected -- main has moved since this job started. This run's changes were NOT saved. Re-run this workflow once main is stable; no automatic reset/recommit is attempted."
-            exit 1
-          fi
+        run: 'bash .github/scripts/commit_and_push.sh "chore: health-check housekeeping [skip ci]" dashboard/reviews.db'

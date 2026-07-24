@@ -66,10 +66,57 @@ function testEachWriterRunsIntegrityCheckBeforeCommit() {
   for (const file of DB_WRITER_WORKFLOWS) {
     const content = read(file)
     const checkIdx = content.indexOf('check_db_integrity.py')
-    const commitIdx = content.indexOf('git commit')
+    // The actual `git commit` now lives inside the shared
+    // .github/scripts/commit_and_push.sh helper (see
+    // testAllWritersDelegateToSharedCommitScript below) -- every workflow's
+    // own commit STEP still invokes it by name, which is the marker to look
+    // for here now.
+    const commitIdx = content.indexOf('commit_and_push.sh')
     assert(checkIdx !== -1, `${file} must run check_db_integrity.py`)
+    assert(commitIdx !== -1, `${file} must invoke the shared commit_and_push.sh script`)
     assert(checkIdx < commitIdx, `${file} must run the integrity check before committing`)
   }
+}
+
+// Concurrency-safety audit (production incident: a critical-alert-check.yml
+// run's git push was rejected -- "main -> main (fetch first)" -- after main
+// advanced during the run). Every reviews.db-writing workflow's commit step
+// now delegates to ONE shared, tested script rather than duplicating the
+// git commit/push/retry logic five times -- exactly the kind of
+// per-workflow drift that already caused the missing-cryptography-dependency
+// incident earlier in this project's history.
+function testAllWritersDelegateToSharedCommitScript() {
+  for (const file of DB_WRITER_WORKFLOWS) {
+    const content = read(file)
+    assert(/bash \.github\/scripts\/commit_and_push\.sh/.test(content),
+      `${file} must delegate its commit/push step to the shared .github/scripts/commit_and_push.sh script`)
+    // The retry/rebase/conflict-safety logic must live in exactly one
+    // place -- no workflow may re-inline its own git push/retry loop.
+    assert(!/git push\s*\n/.test(content) && !content.includes('if ! git push'),
+      `${file} must not re-inline its own git push logic -- it should delegate to the shared script instead`)
+  }
+}
+
+function testSharedCommitScriptIsConcurrencySafe() {
+  const script = readFileSync(path.join(__dirname, '..', '.github', 'scripts', 'commit_and_push.sh'), 'utf-8').replace(/\r\n/g, '\n')
+
+  assert(/git fetch origin main/.test(script), 'the shared script must fetch origin/main on a rejected push')
+  assert(/git rebase origin\/main/.test(script), 'the shared script must rebase onto the latest main on a rejected push')
+  assert(/git push/.test(script), 'the shared script must retry the push')
+
+  // The one property that must never regress: a genuine conflict (both this
+  // run and a concurrent commit touching the same file) must never be
+  // auto-resolved by picking a side -- that risks silently discarding review
+  // data, which is exactly the 2026-07-16 incident this project already
+  // suffered. It must abort and fail loudly instead.
+  assert(/git rebase --abort/.test(script), 'a genuine rebase conflict must abort the rebase, never auto-resolve it')
+  assert(!/git reset --hard origin/.test(script) && !/git reset --mixed/.test(script),
+    'the script must never blindly reset onto the remote and recommit -- that is the exact pattern that caused the 2026-07-16 data-loss incident')
+  assert(!/git push (--force|-f)\b/.test(script), 'the script must never force-push')
+
+  // "No changes remain after rebasing" must be treated as success, not a
+  // reason to keep retrying or to fail.
+  assert(/git log origin\/main\.\.HEAD/.test(script), 'the script must check whether anything is actually left to push after rebasing')
 }
 
 function testNonWriterWorkflowsUntouched() {
@@ -123,7 +170,7 @@ function testUpdateReviewsStillPreservesFullPipelineOrder() {
   // check is updated to use the new marker so it keeps proving the *rest*
   // of the pipeline's order is untouched, not weakened.
   const content = read('update-reviews.yml')
-  const order = ['sync_reviews.py', 'refresh_analytics.py', 'export_chunks.py', 'check_db_integrity.py', 'git commit', 'vercel']
+  const order = ['sync_reviews.py', 'refresh_analytics.py', 'export_chunks.py', 'check_db_integrity.py', 'commit_and_push.sh', 'vercel']
   const indices = order.map(marker => content.toLowerCase().indexOf(marker.toLowerCase()))
   indices.forEach((idx, i) => assert(idx !== -1, `update-reviews.yml must still contain "${order[i]}"`))
   for (let i = 1; i < indices.length; i++) {
@@ -182,19 +229,30 @@ function testCommitStepStillGatedOnIntegritySuccess() {
     "the commit step must still run only when steps.integrity.outcome == 'success'")
 }
 
-function testStalePushFailSafeUnchanged() {
+// The original fail-safe (fail loudly, never auto-resolve a rejected push)
+// used to live inline in update-reviews.yml as a one-off error string. It has
+// been deliberately superseded: rather than just failing loudly, the commit
+// step now fetches + rebases + retries automatically, and ONLY fails loudly
+// when a genuine same-file conflict remains (see testSharedCommitScriptIsConcurrencySafe,
+// which pins that guarantee against the shared script itself). This test
+// proves the migration is complete on the workflow side: update-reviews.yml
+// must delegate to the shared script rather than re-inlining its own
+// (now-superseded, and easy to accidentally resurrect) ad hoc fail-safe text.
+function testStalePushFailSafeMigratedToSharedScript() {
   const content = read('update-reviews.yml')
-  assert(content.includes('git push rejected -- main has moved since this job started'),
-    'the stale-push fail-safe error message must remain unchanged')
-  assert(content.includes('no automatic reset/recommit is attempted'),
-    'the fail-safe must still explicitly refuse to auto-reset/recommit')
+  assert(/bash \.github\/scripts\/commit_and_push\.sh/.test(content),
+    'update-reviews.yml must delegate its commit/push step to the shared, concurrency-safe commit_and_push.sh script')
   assert(!content.includes('git reset --mixed'),
-    'the fail-safe must not have regressed to the old reset-and-recommit pattern')
+    'update-reviews.yml must not have regressed to the old reset-and-recommit pattern')
+  assert(!content.includes('git push (--force|-f)'),
+    'update-reviews.yml must not re-inline a force-push')
 }
 
 run('all 5 reviews.db-writing workflows share the reviews-db-writer concurrency group', testEachWriterHasSharedConcurrencyGroup)
 run('no workflow retains the reset-and-recommit retry pattern', testNoResetAndRecommitAnywhere)
 run('every writer runs the DB integrity check before its commit step', testEachWriterRunsIntegrityCheckBeforeCommit)
+run('every writer delegates to the shared commit_and_push.sh script instead of re-inlining git push logic', testAllWritersDelegateToSharedCommitScript)
+run('the shared commit_and_push.sh script fetches/rebases/retries but never auto-resolves a genuine conflict', testSharedCommitScriptIsConcurrencySafe)
 run('non-DB-writing workflows were left out of the concurrency group', testNonWriterWorkflowsUntouched)
 run('deploy-frontend.yml refreshes analytics (with ANTHROPIC_API_KEY) before exporting data chunks', testDeployFrontendRefreshesAnalyticsBeforeExport)
 run('deploy-frontend.yml preserves its existing trigger and path filters', testDeployFrontendPreservesTriggerAndPathFilters)
@@ -202,7 +260,7 @@ run('update-reviews.yml preserves sync -> refresh -> export -> integrity -> comm
 run('update-reviews.yml routes through sync_reviews.py with REVIEW_PROVIDER=scraper, id/timeout/env retained, auto_update.py no longer invoked directly', testUpdateReviewsUsesGenericSyncEntrypoint)
 run('downstream steps.scrape.outputs.* references are unchanged', testDownstreamScrapeOutputReferencesUnchanged)
 run('the commit step still runs only when integrity succeeds', testCommitStepStillGatedOnIntegritySuccess)
-run('the stale-push fail-safe remains unchanged', testStalePushFailSafeUnchanged)
+run('the stale-push fail-safe has migrated to the shared concurrency-safe script', testStalePushFailSafeMigratedToSharedScript)
 
 console.log()
 if (results.every(Boolean)) {

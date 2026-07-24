@@ -99,24 +99,7 @@ jobs:
 
       - name: Commit updated data
         if: always() && steps.integrity.outcome == 'success'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          MSG="chore: pipeline run (+${{ steps.scrape.outputs.new_count || '0' }} reviews) [skip ci]"
-          git add dashboard/reviews.csv dashboard/reviews.db
-          git diff --staged --quiet && exit 0
-          git commit -m "$MSG"
-          # concurrency: above already prevents another reviews.db-writing
-          # workflow from running at the same time. A rejected push here
-          # means main moved for some other reason (e.g. an unrelated
-          # manual commit) -- fail loudly rather than silently resolving it
-          # by resetting onto remote and recommitting, which previously
-          # risked overwriting newer review data with this run's older copy
-          # (the root cause of the 2026-07-16 incident this replaces).
-          if ! git push; then
-            echo "::error::git push rejected -- main has moved since this job started. This run's changes were NOT saved. Re-run this workflow once main is stable; no automatic reset/recommit is attempted."
-            exit 1
-          fi
+        run: 'bash .github/scripts/commit_and_push.sh "chore: pipeline run (+${{ steps.scrape.outputs.new_count || ''0'' }} reviews) [skip ci]" dashboard/reviews.csv dashboard/reviews.db'
 
       - name: Set up Node
         if: always()
