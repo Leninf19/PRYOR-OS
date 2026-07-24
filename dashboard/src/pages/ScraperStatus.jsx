@@ -22,16 +22,25 @@ const SUBTABS = [
 // isn't matched renders as a false failure.
 const OK_STATUSES = new Set(['ok', 'success'])
 const FAILED_STATUSES = new Set(['error', 'failed'])
+// A run the health-check watchdog reconciled (never self-reported, or was
+// cancelled) -- historical bookkeeping about a dead run, not the same
+// signal as an active failure. Styled distinctly (muted, not red) so a
+// 3-day-old abandoned run in this list doesn't read as "the scraper is
+// currently broken" -- that verdict belongs solely to the Provider Health
+// tab, computed by provider_health.py from the most recent runs.
+const ABANDONED_STATUSES = new Set(['timed_out', 'cancelled'])
 
 const STATUS_STYLE = {
-  success: 'text-emerald-600 dark:text-[var(--color-success)] bg-emerald-50 dark:bg-[var(--color-success-bg)]',
-  partial: 'text-orange-600 dark:text-[var(--color-grade-c)] bg-orange-50 dark:bg-[var(--color-warning-bg)]',
-  failed:  'text-red-600 dark:text-[var(--color-danger)] bg-red-50 dark:bg-[var(--color-danger-bg)]',
+  success:   'text-emerald-600 dark:text-[var(--color-success)] bg-emerald-50 dark:bg-[var(--color-success-bg)]',
+  partial:   'text-orange-600 dark:text-[var(--color-grade-c)] bg-orange-50 dark:bg-[var(--color-warning-bg)]',
+  failed:    'text-red-600 dark:text-[var(--color-danger)] bg-red-50 dark:bg-[var(--color-danger-bg)]',
+  abandoned: 'text-stone-500 dark:text-[var(--color-text-2)] bg-stone-100 dark:bg-[var(--color-surface-2)]',
 }
 
 function runStatusVariant(status) {
   if (OK_STATUSES.has(status)) return 'success'
   if (status === 'partial') return 'partial'
+  if (ABANDONED_STATUSES.has(status)) return 'abandoned'
   if (FAILED_STATUSES.has(status)) return 'failed'
   return null
 }

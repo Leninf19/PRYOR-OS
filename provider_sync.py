@@ -15,13 +15,23 @@ gbp_sync.py directly. Wiring an actual production workflow to call
 sync_reviews.py instead is Phase 3 Milestone 4b's job, deliberately deferred
 (a real production behavior change gets its own explicit review).
 """
+import asyncio
 import inspect
+import os
 import re
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import db
 from provider_base import Provider, ProviderError
+
+# How long a row may sit at status='running' before the watchdog in
+# health_check.py treats it as dead rather than merely slow -- see
+# reconcile_stuck_runs() below. A real sync should never take anywhere near
+# this long (update-reviews.yml's own scrape step has a 30-minute CI
+# timeout); a run still 'running' after a full cron cycle was never going to
+# self-report, not just running late.
+STUCK_RUN_TIMEOUT = timedelta(hours=6)
 
 
 def _norm_name(s: str) -> str:
@@ -145,9 +155,10 @@ def _record_early_failure(conn, now: str, reason: str, provider_name: str, mode:
     mode is provider-dependent (see _mode_for()/_MODE_BY_PROVIDER above),
     not hardcoded -- Phase 3 Milestone 4.1."""
     conn.execute(
-        """INSERT INTO scraper_runs (started_at, finished_at, mode, status, error_summary, failure_stage, provider)
-           VALUES (?, ?, ?, 'failed', ?, 'account_discovery', ?)""",
-        (now, datetime.now(timezone.utc).isoformat(), mode, reason[:2000], provider_name),
+        """INSERT INTO scraper_runs (started_at, finished_at, mode, status, error_summary, failure_stage, provider, workflow_run_id)
+           VALUES (?, ?, ?, 'failed', ?, 'account_discovery', ?, ?)""",
+        (now, datetime.now(timezone.utc).isoformat(), mode, reason[:2000], provider_name,
+         os.environ.get("GITHUB_RUN_ID")),
     )
     conn.commit()
 
@@ -210,9 +221,9 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
     conn.commit()
 
     run_id = conn.execute(
-        """INSERT INTO scraper_runs (started_at, mode, status, locations_attempted, provider)
-           VALUES (?, ?, 'running', ?, ?)""",
-        (now, mode, len(linked), provider.name),
+        """INSERT INTO scraper_runs (started_at, mode, status, locations_attempted, provider, workflow_run_id)
+           VALUES (?, ?, 'running', ?, ?, ?)""",
+        (now, mode, len(linked), provider.name, os.environ.get("GITHUB_RUN_ID")),
     ).lastrowid
     conn.commit()
 
@@ -221,72 +232,119 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
     errors = []
     new_reviews_detail = []
 
-    for _key, loc in linked.items():
-        loc_start = datetime.now(timezone.utc)
-        try:
-            provider_reviews = await _maybe_await(provider.fetch_reviews(loc["location"], fast=fast))
-        except ProviderError as e:
-            locations_failed += 1
-            errors.append(f"{loc['name']}: {e}")
+    # Every path out of this block -- normal completion, an explicit
+    # cancellation, or a completely unexpected exception -- must leave this
+    # run row with a terminal status. Before this fix, only normal
+    # completion did: a non-ProviderError exception anywhere in the loop
+    # below (e.g. a Playwright crash surfacing as a raw exception rather
+    # than a classified ProviderError -- see provider_scraper.py's
+    # classify_scraper_error()/retry.py's is_retryable, which only tolerate
+    # ProviderError) propagated straight out of sync_all() and left the row
+    # at status='running' forever, with no finished_at -- exactly run #159's
+    # symptom. The process being alive to reach an except/finally clause is
+    # the load-bearing assumption here; a hard kill (OOM, host crash) that
+    # never lets Python run this code at all is what reconcile_stuck_runs()
+    # below exists to clean up after the fact.
+    try:
+        for _key, loc in linked.items():
+            loc_start = datetime.now(timezone.utc)
+            try:
+                provider_reviews = await _maybe_await(provider.fetch_reviews(loc["location"], fast=fast))
+            except ProviderError as e:
+                locations_failed += 1
+                errors.append(f"{loc['name']}: {e}")
+                conn.execute(
+                    """INSERT INTO scraper_run_locations (run_id, location_id, status, error_message)
+                       VALUES (?, ?, 'failed', ?)""",
+                    (run_id, loc["id"], str(e)),
+                )
+                conn.commit()
+                continue
+
+            scraped_keys = set()
+            window_min_date = None
+            loc_new = loc_edited = 0
+
+            for preview in provider_reviews:
+                row = preview.as_row()
+                key = db.dedup_key(loc["name"], row)
+                scraped_keys.add(key)
+                if row["review_date"] and (window_min_date is None or row["review_date"] < window_min_date):
+                    window_min_date = row["review_date"]
+                result = db.upsert_review(conn, loc["id"], loc["name"], row, now)
+                if result == "new":
+                    loc_new += 1
+                    new_reviews_detail.append({
+                        "location": loc["name"], "reviewer_name": row["reviewer_name"],
+                        "star_rating": row["star_rating"], "review_text": row["review_text"],
+                    })
+                elif result == "edited":
+                    loc_edited += 1
+
+            # Skipped on the fast/partial path -- a one-page fetch doesn't cover
+            # enough of the review window for detect_deletions to judge absence
+            # correctly (it would misread "not on this page" as "deleted").
+            loc_deleted = (
+                db.detect_deletions(conn, loc["id"], scraped_keys, window_min_date, now)
+                if (window_min_date and not fast) else 0
+            )
+
             conn.execute(
-                """INSERT INTO scraper_run_locations (run_id, location_id, status, error_message)
-                   VALUES (?, ?, 'failed', ?)""",
-                (run_id, loc["id"], str(e)),
+                """INSERT INTO scraper_run_locations
+                   (run_id, location_id, status, reviews_found, reviews_new, duration_ms)
+                   VALUES (?, ?, 'success', ?, ?, ?)""",
+                (run_id, loc["id"], len(provider_reviews), loc_new,
+                 int((datetime.now(timezone.utc) - loc_start).total_seconds() * 1000)),
             )
             conn.commit()
-            continue
 
-        scraped_keys = set()
-        window_min_date = None
-        loc_new = loc_edited = 0
+            locations_succeeded += 1
+            total_new += loc_new
+            total_edited += loc_edited
+            total_deleted += loc_deleted
 
-        for preview in provider_reviews:
-            row = preview.as_row()
-            key = db.dedup_key(loc["name"], row)
-            scraped_keys.add(key)
-            if row["review_date"] and (window_min_date is None or row["review_date"] < window_min_date):
-                window_min_date = row["review_date"]
-            result = db.upsert_review(conn, loc["id"], loc["name"], row, now)
-            if result == "new":
-                loc_new += 1
-                new_reviews_detail.append({
-                    "location": loc["name"], "reviewer_name": row["reviewer_name"],
-                    "star_rating": row["star_rating"], "review_text": row["review_text"],
-                })
-            elif result == "edited":
-                loc_edited += 1
-
-        # Skipped on the fast/partial path -- a one-page fetch doesn't cover
-        # enough of the review window for detect_deletions to judge absence
-        # correctly (it would misread "not on this page" as "deleted").
-        loc_deleted = (
-            db.detect_deletions(conn, loc["id"], scraped_keys, window_min_date, now)
-            if (window_min_date and not fast) else 0
-        )
-
+        status = "ok" if locations_failed == 0 else ("partial" if locations_succeeded > 0 else "failed")
         conn.execute(
-            """INSERT INTO scraper_run_locations
-               (run_id, location_id, status, reviews_found, reviews_new, duration_ms)
-               VALUES (?, ?, 'success', ?, ?, ?)""",
-            (run_id, loc["id"], len(provider_reviews), loc_new,
-             int((datetime.now(timezone.utc) - loc_start).total_seconds() * 1000)),
+            """UPDATE scraper_runs SET finished_at = ?, status = ?, locations_succeeded = ?,
+               locations_failed = ?, new_reviews_count = ?, edited_reviews_count = ?,
+               deleted_reviews_count = ?, error_summary = ? WHERE id = ?""",
+            (datetime.now(timezone.utc).isoformat(), status, locations_succeeded, locations_failed,
+             total_new, total_edited, total_deleted, "; ".join(errors)[:2000] or None, run_id),
         )
         conn.commit()
-
-        locations_succeeded += 1
-        total_new += loc_new
-        total_edited += loc_edited
-        total_deleted += loc_deleted
-
-    status = "ok" if locations_failed == 0 else ("partial" if locations_succeeded > 0 else "failed")
-    conn.execute(
-        """UPDATE scraper_runs SET finished_at = ?, status = ?, locations_succeeded = ?,
-           locations_failed = ?, new_reviews_count = ?, edited_reviews_count = ?,
-           deleted_reviews_count = ?, error_summary = ? WHERE id = ?""",
-        (datetime.now(timezone.utc).isoformat(), status, locations_succeeded, locations_failed,
-         total_new, total_edited, total_deleted, "; ".join(errors)[:2000] or None, run_id),
-    )
-    conn.commit()
+    except asyncio.CancelledError:
+        # Deliberately distinct from 'failed': the process itself observed
+        # and is honoring a cancellation (e.g. the workflow step was
+        # cancelled) rather than hitting a bug. Must still re-raise --
+        # asyncio requires CancelledError to propagate.
+        conn.execute(
+            """UPDATE scraper_runs SET finished_at = ?, status = 'cancelled', locations_succeeded = ?,
+               locations_failed = ?, new_reviews_count = ?, edited_reviews_count = ?,
+               deleted_reviews_count = ?, error_summary = ? WHERE id = ?""",
+            (datetime.now(timezone.utc).isoformat(), locations_succeeded, locations_failed,
+             total_new, total_edited, total_deleted, "run was cancelled before completing", run_id),
+        )
+        conn.commit()
+        raise
+    except Exception as e:
+        # An unexpected, non-ProviderError exception (a bug, an unclassified
+        # Playwright failure, a DB error) -- give the run a terminal status
+        # with as much partial progress as was recorded, then re-raise
+        # unchanged. Matches sync_reviews.py's existing "a genuinely
+        # unexpected error must still surface loudly" contract (see
+        # test_non_provider_error_during_discovery_propagates_uncaught) --
+        # this only adds the missing DB bookkeeping, it does not swallow
+        # the error into a graceful {"status": "failed"} return value.
+        conn.execute(
+            """UPDATE scraper_runs SET finished_at = ?, status = 'failed', locations_succeeded = ?,
+               locations_failed = ?, new_reviews_count = ?, edited_reviews_count = ?,
+               deleted_reviews_count = ?, error_summary = ? WHERE id = ?""",
+            (datetime.now(timezone.utc).isoformat(), locations_succeeded, locations_failed,
+             total_new, total_edited, total_deleted,
+             f"Unhandled exception: {type(e).__name__}: {e}"[:2000], run_id),
+        )
+        conn.commit()
+        raise
 
     return {
         "status": status, "run_id": run_id,
@@ -294,3 +352,53 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
         "new": total_new, "edited": total_edited, "deleted": total_deleted, "errors": errors,
         "new_reviews": new_reviews_detail,
     }
+
+
+def reconcile_stuck_runs(conn, *, now: datetime | None = None,
+                          timeout: timedelta = STUCK_RUN_TIMEOUT) -> list[dict]:
+    """Watchdog reconciliation (see health_check.py, which calls this before
+    its own alerting checks run): finds every scraper_runs row still
+    status='running' after `timeout` has elapsed since it started, and marks
+    it 'timed_out' with a finished_at and explanatory error_summary.
+
+    This is the fix for "the same stuck run alerts forever": once reconciled,
+    a row no longer matches health_check.py's `WHERE status = 'running'`
+    stuck-run query, so it can only ever be surfaced once by that check
+    (health_check.py's own dedup, scoped per-run-id, handles the case where
+    it hasn't been reconciled yet but has already been alerted on). It is
+    also the fix for "an old abandoned run must not look like a current
+    failure": provider_health.compute_health() judges health from the most
+    recent rows *by position in scraper_runs* (i.e. by when they started),
+    not by when they were reconciled -- marking a 3-day-old row 'timed_out'
+    today does not move it to "most recent," it just replaces a silent,
+    perpetual gap with an honest terminal record in its correct chronological
+    slot.
+
+    Never touches a row that might still be legitimately in progress
+    (anything younger than `timeout`) and never deletes or rewrites any
+    review data -- this only ever updates scraper_runs.status/finished_at/
+    error_summary on rows that are already, unambiguously stuck.
+
+    Returns the list of rows just reconciled (as dicts), for the caller to
+    alert on -- each row can only ever appear here once, since reconciliation
+    is a one-way transition out of 'running'."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - timeout).isoformat()
+    stuck = [dict(r) for r in conn.execute(
+        "SELECT * FROM scraper_runs WHERE status = 'running' AND started_at < ? ORDER BY id",
+        (cutoff,),
+    ).fetchall()]
+
+    for row in stuck:
+        conn.execute(
+            """UPDATE scraper_runs SET finished_at = ?, status = 'timed_out',
+               error_summary = ? WHERE id = ?""",
+            (now.isoformat(),
+             f"Reconciled by watchdog: no terminal status was ever recorded within "
+             f"{timeout.total_seconds() / 3600:.0f}h of starting -- the process most likely "
+             f"crashed or was killed before it could update its own run record.",
+             row["id"]),
+        )
+    if stuck:
+        conn.commit()
+    return stuck

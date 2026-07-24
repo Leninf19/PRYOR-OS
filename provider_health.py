@@ -26,6 +26,19 @@ _RUNNING = "running"
 _OK = "ok"
 _PARTIAL = "partial"
 _FAILED = "failed"
+# 'cancelled' (the process itself observed a cancellation) and 'timed_out'
+# (the health_check.py watchdog reconciled a run that never self-reported at
+# all -- see provider_sync.reconcile_stuck_runs()) are both genuine bad
+# outcomes for whichever run they're on, treated identically to _FAILED
+# below. Recency (a run's position in the caller-supplied `runs` list, which
+# is ordered by when each run *started*, not by when it was reconciled) is
+# what keeps an old, long-since-superseded abandoned run from counting as
+# evidence the *current* scraper is failing -- reconciling it today doesn't
+# move it to "most recent," it only replaces a silent gap with an honest
+# terminal record in its original chronological slot.
+_CANCELLED = "cancelled"
+_TIMED_OUT = "timed_out"
+_BAD_STATUSES = {_FAILED, _CANCELLED, _TIMED_OUT}
 
 # Same multipliers ScraperStatus.jsx's freshness() already uses (Fresh <=
 # 1.5x cadence, Stale <= 4x cadence) -- reused, not reinvented.
@@ -75,11 +88,12 @@ def compute_health(
     latest = completed[0]
     latest_status = latest.get("status")
 
-    if latest_status == _FAILED:
-        return {"state": STATE_FAILED, "reason": f"most recent run failed: {latest.get('error_summary') or 'no error summary recorded'}"}
+    if latest_status in _BAD_STATUSES:
+        verb = {_FAILED: "failed", _CANCELLED: "was cancelled", _TIMED_OUT: "timed out"}[latest_status]
+        return {"state": STATE_FAILED, "reason": f"most recent run {verb}: {latest.get('error_summary') or 'no error summary recorded'}"}
 
     window = completed[:_DEGRADED_LOOKBACK]
-    trouble_count = sum(1 for r in window if r.get("status") in (_FAILED, _PARTIAL))
+    trouble_count = sum(1 for r in window if r.get("status") in _BAD_STATUSES or r.get("status") == _PARTIAL)
 
     attempted = latest.get("locations_attempted") or 0
     failed_locations = latest.get("locations_failed") or 0

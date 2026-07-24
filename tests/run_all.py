@@ -32,6 +32,7 @@ TESTS = [
     "test_check_db_integrity.py",
     "test_auto_update_local_mode.py",
     "test_location_contacts.py",
+    "test_health_check.py",
 ]
 
 

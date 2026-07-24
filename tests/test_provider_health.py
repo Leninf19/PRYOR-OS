@@ -68,6 +68,62 @@ def test_failed_ignores_a_currently_running_row_and_looks_at_last_completed():
     assert result["state"] == STATE_FAILED
 
 
+def test_failed_when_latest_completed_run_timed_out():
+    """A 'timed_out' row (health_check.py's watchdog reconciliation --
+    provider_sync.reconcile_stuck_runs()) is exactly as much current evidence
+    of trouble as an explicit 'failed' row when it's genuinely the most
+    recent run: nothing has succeeded since, so the scraper really is in a
+    bad state right now."""
+    runs = [_run(5, status="timed_out", succeeded=0, failed=0)]
+    result = compute_health("scraper", True, runs, 360, now=NOW)
+    assert result["state"] == STATE_FAILED
+    assert "timed out" in result["reason"]
+
+
+def test_failed_when_latest_completed_run_was_cancelled():
+    runs = [_run(5, status="cancelled", succeeded=0, failed=0)]
+    result = compute_health("scraper", True, runs, 360, now=NOW)
+    assert result["state"] == STATE_FAILED
+    assert "cancelled" in result["reason"]
+
+
+def test_old_reconciled_run_does_not_count_as_current_failure_once_superseded():
+    """The core guarantee behind 'do not classify an old abandoned run as
+    evidence the current scraper is failing': a 'timed_out' row that has
+    since been superseded by real completed runs must not affect the
+    verdict -- health is judged from the *latest* run (by position in the
+    list, i.e. by when it started), not from the fact that some older row
+    happens to have been reconciled recently. Reconciling run #159 today
+    does not make it "the latest run" -- it stays in its original
+    chronological slot, several runs back."""
+    runs = [
+        _run(5, status="ok"),
+        _run(365, status="ok"),
+        _run(725, status="ok"),
+        _run(1085, status="timed_out", succeeded=0, failed=0),  # the old, since-superseded abandoned run
+        _run(1445, status="ok"),
+    ]
+    result = compute_health("scraper", True, runs, 360, now=NOW)
+    assert result["state"] == STATE_HEALTHY, result
+
+
+def test_degraded_counts_a_recent_timed_out_run_in_the_trailing_window():
+    """The flip side: if a 'timed_out' row genuinely falls within the recent
+    trailing window (not yet superseded by enough later runs), it must still
+    count toward "degraded" -- otherwise a scraper stuck in a crash loop
+    would misreport as healthy just because each crash eventually got
+    reconciled."""
+    runs = [
+        _run(5, status="ok"),
+        _run(365, status="timed_out", succeeded=0, failed=0),
+        _run(725, status="ok"),
+        _run(1085, status="cancelled", succeeded=0, failed=0),
+        _run(1445, status="ok"),
+    ]
+    result = compute_health("scraper", True, runs, 360, now=NOW)
+    assert result["state"] == STATE_DEGRADED, result
+
+
 # --- Degraded ----------------------------------------------------------------
 
 def test_degraded_when_two_of_last_five_runs_were_failed_or_partial():
@@ -142,6 +198,10 @@ def main():
         ("offline when the only run ever is still running", test_offline_when_only_run_ever_is_still_running),
         ("failed when the latest completed run failed", test_failed_when_latest_completed_run_failed),
         ("failed correctly skips a currently-running row to find the last completed one", test_failed_ignores_a_currently_running_row_and_looks_at_last_completed),
+        ("failed when the latest completed run timed out (watchdog-reconciled)", test_failed_when_latest_completed_run_timed_out),
+        ("failed when the latest completed run was cancelled", test_failed_when_latest_completed_run_was_cancelled),
+        ("an old reconciled/timed-out run does not count as current failure once superseded", test_old_reconciled_run_does_not_count_as_current_failure_once_superseded),
+        ("a recent timed-out run still counts toward degraded", test_degraded_counts_a_recent_timed_out_run_in_the_trailing_window),
         ("degraded when 2 of the last 5 runs were failed/partial", test_degraded_when_two_of_last_five_runs_were_failed_or_partial),
         ("degraded when latest partial run has >25% location failure ratio", test_degraded_when_latest_partial_with_high_location_failure_ratio),
         ("warning when latest partial run is an isolated, low-ratio blip", test_warning_when_latest_partial_but_isolated_low_failure_ratio),

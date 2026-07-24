@@ -1194,8 +1194,8 @@ async def _scrape_and_write(existing: set) -> tuple[list, list]:
     db.init_schema(conn)
     run_mode = "local" if LOCAL_MODE else "cloud"
     run_cur = conn.execute(
-        "INSERT INTO scraper_runs (started_at, mode, status) VALUES (?, ?, 'running')",
-        (datetime.now(timezone.utc).isoformat(), run_mode),
+        "INSERT INTO scraper_runs (started_at, mode, status, workflow_run_id) VALUES (?, ?, 'running', ?)",
+        (datetime.now(timezone.utc).isoformat(), run_mode, os.environ.get("GITHUB_RUN_ID")),
     )
     run_id = run_cur.lastrowid
     conn.commit()
@@ -1203,110 +1203,155 @@ async def _scrape_and_write(existing: set) -> tuple[list, list]:
     run_errors = []
     failed_locs: list[dict] = []
 
-    all_scraped = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=not LOCAL_MODE,
-            args=[
-                # Reduce signals that identify the browser as headless/automated.
-                # Google Maps renders a stripped page for detected bots, which
-                # removes the Reviews tab from the DOM entirely.
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-popup-blocking",
-            ],
-        )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
-            # Real Chrome 137 UA — prevents Google from serving the stripped Maps UI
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/137.0.0.0 Safari/537.36"
-            ),
-        )
-        # Remove the navigator.webdriver flag that headless Chrome exposes
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined })"
-        )
-        for loc in LOCATIONS:
-            run_stats["attempted"] += 1
-            loc_started = datetime.now(timezone.utc)
-            reviews, error, maps_url = await scrape_location(context, loc)
-            duration_ms = int((datetime.now(timezone.utc) - loc_started).total_seconds() * 1000)
-
-            loc_rows = [{
-                "location_name":  loc["name"],
-                "city":           loc["city"],
-                "reviewer_name":  r["reviewer_name"],
-                "review_date":    r["review_date"],
-                "star_rating":    r["star_rating"],
-                "review_text":    r["review_text"],
-                "owner_response": r["owner_response"],
-                "review_url":     r["review_url"],
-            } for r in reviews]
-            all_scraped.extend(loc_rows)
-
-            location_id = db.get_or_create_location(
-                conn, loc["name"], loc["city"], db.get_brand(loc["name"]), loc["search"],
-                maps_url=maps_url,
+    # Everything from here through the final "run finished" UPDATE below is
+    # wrapped so this run row always gets a terminal status, even if the
+    # process is still alive when something goes wrong -- before this fix,
+    # any exception here (a browser crash, an unhandled Playwright error)
+    # propagated straight out of this function and left the row at
+    # status='running' forever, with no finished_at. That is exactly what
+    # happened to run #159. A hard kill that doesn't leave Python alive to
+    # run this except/finally at all is what health_check.py's
+    # reconcile_stuck_runs() watchdog exists to clean up after the fact.
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=not LOCAL_MODE,
+                args=[
+                    # Reduce signals that identify the browser as headless/automated.
+                    # Google Maps renders a stripped page for detected bots, which
+                    # removes the Reviews tab from the DOM entirely.
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-popup-blocking",
+                ],
             )
-            now_iso = datetime.now(timezone.utc).isoformat()
-            scraped_keys = set()
-            window_min_date = None
-            loc_new = loc_edited = 0
-            for row in loc_rows:
-                db_row = dict(row)
-                db_row["star_rating"] = row["star_rating"] or None
-                key = db.dedup_key(loc["name"], db_row)
-                scraped_keys.add(key)
-                if row["review_date"] and (window_min_date is None or row["review_date"] < window_min_date):
-                    window_min_date = row["review_date"]
-                result = db.upsert_review(conn, location_id, loc["name"], db_row, now_iso)
-                if result == "new":
-                    loc_new += 1
-                elif result == "edited":
-                    loc_edited += 1
-
-            loc_deleted = (
-                db.detect_deletions(conn, location_id, scraped_keys, window_min_date, now_iso)
-                if window_min_date else 0
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                # Real Chrome 137 UA — prevents Google from serving the stripped Maps UI
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/137.0.0.0 Safari/537.36"
+                ),
             )
-
-            if error:
-                run_stats["failed"] += 1
-                run_errors.append(f"{loc['name']}: {error}")
-                failed_locs.append({"name": loc["name"], "error": error})
-            else:
-                run_stats["succeeded"] += 1
-            run_stats["new"]     += loc_new
-            run_stats["edited"]  += loc_edited
-            run_stats["deleted"] += loc_deleted
-
-            conn.execute(
-                """INSERT INTO scraper_run_locations
-                   (run_id, location_id, status, reviews_found, reviews_new, error_message, duration_ms)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (run_id, location_id, "error" if error else "ok",
-                 len(reviews), loc_new, error, duration_ms),
+            # Remove the navigator.webdriver flag that headless Chrome exposes
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined })"
             )
-            conn.commit()
-        await browser.close()
+            for loc in LOCATIONS:
+                run_stats["attempted"] += 1
+                loc_started = datetime.now(timezone.utc)
+                reviews, error, maps_url = await scrape_location(context, loc)
+                duration_ms = int((datetime.now(timezone.utc) - loc_started).total_seconds() * 1000)
 
-    run_status = "ok" if run_stats["failed"] == 0 else ("partial" if run_stats["succeeded"] > 0 else "failed")
-    conn.execute(
-        """UPDATE scraper_runs SET finished_at = ?, status = ?, locations_attempted = ?,
-           locations_succeeded = ?, locations_failed = ?, new_reviews_count = ?,
-           edited_reviews_count = ?, deleted_reviews_count = ?, error_summary = ?
-           WHERE id = ?""",
-        (datetime.now(timezone.utc).isoformat(), run_status, run_stats["attempted"],
-         run_stats["succeeded"], run_stats["failed"], run_stats["new"], run_stats["edited"],
-         run_stats["deleted"], "; ".join(run_errors) if run_errors else None, run_id),
-    )
-    conn.commit()
+                loc_rows = [{
+                    "location_name":  loc["name"],
+                    "city":           loc["city"],
+                    "reviewer_name":  r["reviewer_name"],
+                    "review_date":    r["review_date"],
+                    "star_rating":    r["star_rating"],
+                    "review_text":    r["review_text"],
+                    "owner_response": r["owner_response"],
+                    "review_url":     r["review_url"],
+                } for r in reviews]
+                all_scraped.extend(loc_rows)
+
+                location_id = db.get_or_create_location(
+                    conn, loc["name"], loc["city"], db.get_brand(loc["name"]), loc["search"],
+                    maps_url=maps_url,
+                )
+                now_iso = datetime.now(timezone.utc).isoformat()
+                scraped_keys = set()
+                window_min_date = None
+                loc_new = loc_edited = 0
+                for row in loc_rows:
+                    db_row = dict(row)
+                    db_row["star_rating"] = row["star_rating"] or None
+                    key = db.dedup_key(loc["name"], db_row)
+                    scraped_keys.add(key)
+                    if row["review_date"] and (window_min_date is None or row["review_date"] < window_min_date):
+                        window_min_date = row["review_date"]
+                    result = db.upsert_review(conn, location_id, loc["name"], db_row, now_iso)
+                    if result == "new":
+                        loc_new += 1
+                    elif result == "edited":
+                        loc_edited += 1
+
+                loc_deleted = (
+                    db.detect_deletions(conn, location_id, scraped_keys, window_min_date, now_iso)
+                    if window_min_date else 0
+                )
+
+                if error:
+                    run_stats["failed"] += 1
+                    run_errors.append(f"{loc['name']}: {error}")
+                    failed_locs.append({"name": loc["name"], "error": error})
+                else:
+                    run_stats["succeeded"] += 1
+                run_stats["new"]     += loc_new
+                run_stats["edited"]  += loc_edited
+                run_stats["deleted"] += loc_deleted
+
+                conn.execute(
+                    """INSERT INTO scraper_run_locations
+                       (run_id, location_id, status, reviews_found, reviews_new, error_message, duration_ms)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (run_id, location_id, "error" if error else "ok",
+                     len(reviews), loc_new, error, duration_ms),
+                )
+                conn.commit()
+            await browser.close()
+
+        run_status = "ok" if run_stats["failed"] == 0 else ("partial" if run_stats["succeeded"] > 0 else "failed")
+        conn.execute(
+            """UPDATE scraper_runs SET finished_at = ?, status = ?, locations_attempted = ?,
+               locations_succeeded = ?, locations_failed = ?, new_reviews_count = ?,
+               edited_reviews_count = ?, deleted_reviews_count = ?, error_summary = ?
+               WHERE id = ?""",
+            (datetime.now(timezone.utc).isoformat(), run_status, run_stats["attempted"],
+             run_stats["succeeded"], run_stats["failed"], run_stats["new"], run_stats["edited"],
+             run_stats["deleted"], "; ".join(run_errors) if run_errors else None, run_id),
+        )
+        conn.commit()
+    except asyncio.CancelledError:
+        # Distinct from 'failed': the process itself observed and is
+        # honoring a cancellation rather than hitting a bug. Must still
+        # re-raise -- asyncio requires CancelledError to propagate.
+        conn.execute(
+            """UPDATE scraper_runs SET finished_at = ?, status = 'cancelled', locations_attempted = ?,
+               locations_succeeded = ?, locations_failed = ?, new_reviews_count = ?,
+               edited_reviews_count = ?, deleted_reviews_count = ?, error_summary = ?
+               WHERE id = ?""",
+            (datetime.now(timezone.utc).isoformat(), run_stats["attempted"], run_stats["succeeded"],
+             run_stats["failed"], run_stats["new"], run_stats["edited"], run_stats["deleted"],
+             "run was cancelled before completing", run_id),
+        )
+        conn.commit()
+        conn.close()
+        raise
+    except Exception as e:
+        # An unexpected exception (browser crash, unhandled Playwright
+        # error, a bug) -- give the run a terminal status with whatever
+        # partial progress was recorded, then re-raise unchanged so this
+        # still crashes loudly/visibly exactly as before. This is the fix
+        # for run #159: previously nothing here caught this at all, so the
+        # row was left at status='running' with no finished_at forever.
+        conn.execute(
+            """UPDATE scraper_runs SET finished_at = ?, status = 'failed', locations_attempted = ?,
+               locations_succeeded = ?, locations_failed = ?, new_reviews_count = ?,
+               edited_reviews_count = ?, deleted_reviews_count = ?, error_summary = ?
+               WHERE id = ?""",
+            (datetime.now(timezone.utc).isoformat(), run_stats["attempted"], run_stats["succeeded"],
+             run_stats["failed"], run_stats["new"], run_stats["edited"], run_stats["deleted"],
+             f"Unhandled exception: {type(e).__name__}: {e}"[:2000], run_id),
+        )
+        conn.commit()
+        conn.close()
+        raise
+
     conn.close()
     print(f"\nSQLite run #{run_id}: {run_stats} | status={run_status}")
 

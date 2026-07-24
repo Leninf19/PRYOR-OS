@@ -177,7 +177,7 @@ def init_schema(conn: sqlite3.Connection):
 # doesn't control which migrations run. It just lets you tell at a glance,
 # from the DB file alone, whether it's seen the latest migration batch --
 # `sqlite3 reviews.db "PRAGMA user_version"` -- without reading this file.
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 def _migrate_schema(conn: sqlite3.Connection):
@@ -238,6 +238,21 @@ def _migrate_schema(conn: sqlite3.Connection):
         "ALTER TABLE locations ADD COLUMN contact_email TEXT",
         "ALTER TABLE locations ADD COLUMN contact_name TEXT",
         "ALTER TABLE locations ADD COLUMN contact_active INTEGER NOT NULL DEFAULT 1",
+        # Scraper-run-lifecycle audit: lets a stuck/failed/timed-out row be
+        # traced straight back to the actual GitHub Actions run log
+        # (https://github.com/<repo>/actions/runs/<workflow_run_id>) instead
+        # of just a started_at timestamp a human has to manually correlate.
+        # Populated from the GITHUB_RUN_ID env var GitHub Actions sets
+        # automatically; NULL for local/manual runs and every historical row
+        # written before this column existed.
+        "ALTER TABLE scraper_runs ADD COLUMN workflow_run_id TEXT",
+        # Lets a notification be tied to one specific scraper_runs row (e.g.
+        # health_check.py's stuck-run alert) so dedup can be scoped to "have
+        # we already alerted about THIS run" rather than "did any stuck-run
+        # alert fire recently" -- the latter either suppressed a genuinely
+        # new stuck run or re-alerted forever on the same permanently-open
+        # one, depending on timing (the run #159 recurring-alert bug).
+        "ALTER TABLE notifications_log ADD COLUMN related_run_id INTEGER REFERENCES scraper_runs(id)",
     ]
     for sql in migrations:
         try:

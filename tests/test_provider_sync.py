@@ -10,8 +10,10 @@ Run directly: py tests/test_provider_sync.py
 """
 import asyncio
 import inspect
+import os
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -241,6 +243,175 @@ async def test_statistics_sum_correctly_across_multiple_locations():
     assert result["locations_failed"] == 0
 
 
+# --- Run-lifecycle resilience: every run must get a terminal status ----------
+# (the run #159 incident: a non-ProviderError exception escaping the
+# per-location loop left a scraper_runs row at status='running' forever,
+# with no finished_at, since nothing wrapped that loop in a try/except.)
+
+async def _latest_run_row(conn=None):
+    conn = conn or db.get_connection()
+    row = conn.execute("SELECT * FROM scraper_runs ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(row)
+
+
+async def test_non_provider_error_during_fetch_still_gets_terminal_status_and_reraises():
+    """A raw, unclassified exception (never wrapped as ProviderError -- e.g.
+    an uncaught Playwright crash) during a location's fetch must still
+    propagate uncaught (preserving the existing "genuinely unexpected errors
+    crash loudly" contract -- see
+    test_non_provider_error_during_discovery_propagates_uncaught above) AND
+    must leave the run row with a terminal status, not stuck at 'running'."""
+    _fresh_db()
+    loc = ProviderLocation(external_id=None, name="Casa Tequila Testtown", city="Testtown")
+    provider = FakeProvider(
+        locations=[loc],
+        fetch_errors={"Casa Tequila Testtown": RuntimeError("simulated browser crash")},
+    )
+    try:
+        await provider_sync.sync_all(provider)
+        raise AssertionError("expected the RuntimeError to propagate, not be swallowed")
+    except RuntimeError as e:
+        assert "simulated browser crash" in str(e)
+
+    row = await _latest_run_row()
+    assert row["status"] == "failed", row
+    assert row["finished_at"] is not None, "a terminal run must always have finished_at set"
+    assert "simulated browser crash" in (row["error_summary"] or "")
+
+
+async def test_cancelled_error_during_fetch_marks_run_cancelled_and_reraises():
+    _fresh_db()
+    loc = ProviderLocation(external_id=None, name="Casa Tequila Testtown", city="Testtown")
+    provider = FakeProvider(
+        locations=[loc],
+        fetch_errors={"Casa Tequila Testtown": asyncio.CancelledError()},
+    )
+    try:
+        await provider_sync.sync_all(provider)
+        raise AssertionError("expected CancelledError to propagate")
+    except asyncio.CancelledError:
+        pass
+
+    row = await _latest_run_row()
+    assert row["status"] == "cancelled", row
+    assert row["finished_at"] is not None
+
+
+async def test_successful_run_records_workflow_run_id_from_environment():
+    _fresh_db()
+    loc = ProviderLocation(external_id=None, name="Casa Tequila Testtown", city="Testtown")
+    provider = FakeProvider(locations=[loc], reviews_by_name={"Casa Tequila Testtown": [_review()]})
+    old = os.environ.get("GITHUB_RUN_ID")
+    os.environ["GITHUB_RUN_ID"] = "123456789"
+    try:
+        await provider_sync.sync_all(provider)
+    finally:
+        if old is None:
+            os.environ.pop("GITHUB_RUN_ID", None)
+        else:
+            os.environ["GITHUB_RUN_ID"] = old
+
+    row = await _latest_run_row()
+    assert row["workflow_run_id"] == "123456789", row
+
+
+async def test_successful_run_after_an_abandoned_run_is_recorded_independently():
+    """A previously-abandoned run (reconciled to 'timed_out' by the watchdog)
+    must never block or corrupt a later, genuinely successful run -- each
+    run is its own row, and reconciliation never touches review data."""
+    _fresh_db()
+    conn = db.get_connection()
+    old_run_id = conn.execute(
+        "INSERT INTO scraper_runs (started_at, mode, status, provider) VALUES (?, 'cloud', 'running', 'scraper')",
+        ((datetime.now(timezone.utc) - timedelta(hours=10)).isoformat(),),
+    ).lastrowid
+    conn.commit()
+    reconciled = provider_sync.reconcile_stuck_runs(conn, now=datetime.now(timezone.utc))
+    assert [r["id"] for r in reconciled] == [old_run_id]
+    conn.close()
+
+    loc = ProviderLocation(external_id=None, name="Casa Tequila Testtown", city="Testtown")
+    provider = FakeProvider(locations=[loc], reviews_by_name={"Casa Tequila Testtown": [_review()]})
+    result = await provider_sync.sync_all(provider)
+    assert result["status"] == "ok", result
+    assert result["new"] == 1
+
+    conn = db.get_connection()
+    old_row = conn.execute("SELECT status FROM scraper_runs WHERE id = ?", (old_run_id,)).fetchone()
+    new_row = conn.execute("SELECT status FROM scraper_runs WHERE id = ?", (result["run_id"],)).fetchone()
+    conn.close()
+    assert old_row["status"] == "timed_out", "the abandoned run's own status must be left untouched"
+    assert new_row["status"] == "ok"
+
+
+# --- Watchdog reconciliation (health_check.py's reconcile_stuck_runs) --------
+
+async def test_reconcile_marks_only_runs_past_the_timeout():
+    _fresh_db()
+    conn = db.get_connection()
+    now = datetime.now(timezone.utc)
+    stuck_id = conn.execute(
+        "INSERT INTO scraper_runs (started_at, mode, status) VALUES (?, 'cloud', 'running')",
+        ((now - timedelta(hours=8)).isoformat(),),
+    ).lastrowid
+    fresh_id = conn.execute(
+        "INSERT INTO scraper_runs (started_at, mode, status) VALUES (?, 'cloud', 'running')",
+        ((now - timedelta(minutes=5)).isoformat(),),
+    ).lastrowid
+    conn.commit()
+
+    reconciled = provider_sync.reconcile_stuck_runs(conn, now=now, timeout=timedelta(hours=6))
+    assert [r["id"] for r in reconciled] == [stuck_id]
+
+    rows = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM scraper_runs").fetchall()}
+    conn.close()
+    assert rows[stuck_id]["status"] == "timed_out"
+    assert rows[stuck_id]["finished_at"] is not None
+    assert rows[fresh_id]["status"] == "running", "a genuinely recent run must not be touched"
+    assert rows[fresh_id]["finished_at"] is None
+
+
+async def test_reconcile_never_touches_completed_runs_or_review_data():
+    _fresh_db()
+    conn = db.get_connection()
+    now = datetime.now(timezone.utc)
+    old_ok_id = conn.execute(
+        "INSERT INTO scraper_runs (started_at, finished_at, mode, status) VALUES (?, ?, 'cloud', 'ok')",
+        ((now - timedelta(hours=20)).isoformat(), (now - timedelta(hours=19)).isoformat()),
+    ).lastrowid
+    conn.execute("INSERT INTO locations (name, city, brand) VALUES ('Kept Location', 'Testtown', 'Casa Tequila')")
+    conn.commit()
+    review_count_before = conn.execute("SELECT COUNT(*) c FROM reviews").fetchone()["c"]
+
+    reconciled = provider_sync.reconcile_stuck_runs(conn, now=now, timeout=timedelta(hours=6))
+    assert reconciled == []
+
+    row = conn.execute("SELECT status FROM scraper_runs WHERE id = ?", (old_ok_id,)).fetchone()
+    review_count_after = conn.execute("SELECT COUNT(*) c FROM reviews").fetchone()["c"]
+    conn.close()
+    assert row["status"] == "ok", "reconciliation must never touch an already-completed run"
+    assert review_count_after == review_count_before
+
+
+async def test_reconcile_is_idempotent_across_repeated_calls():
+    """Calling reconciliation twice must never re-report or re-touch a row
+    already reconciled -- it's a one-way transition out of 'running'."""
+    _fresh_db()
+    conn = db.get_connection()
+    now = datetime.now(timezone.utc)
+    stuck_id = conn.execute(
+        "INSERT INTO scraper_runs (started_at, mode, status) VALUES (?, 'cloud', 'running')",
+        ((now - timedelta(hours=8)).isoformat(),),
+    ).lastrowid
+    conn.commit()
+
+    first = provider_sync.reconcile_stuck_runs(conn, now=now, timeout=timedelta(hours=6))
+    second = provider_sync.reconcile_stuck_runs(conn, now=now + timedelta(hours=1), timeout=timedelta(hours=6))
+    conn.close()
+    assert [r["id"] for r in first] == [stuck_id]
+    assert second == [], "an already-reconciled run must never be reconciled (or reported) again"
+
+
 # --- Location linking: no-external-id locations never collide ----------------
 
 async def test_multiple_no_external_id_locations_do_not_collide():
@@ -366,6 +537,13 @@ def main():
         ("a discovery-level ProviderError records an early failure with the correct provider name", test_discovery_failure_records_early_failure_with_provider_name),
         ("a discovery failure's result carries error_type/error_status/error_traceback", test_discovery_failure_result_carries_error_type_and_status),
         ("a non-ProviderError exception during discovery propagates uncaught", test_non_provider_error_during_discovery_propagates_uncaught),
+        ("a non-ProviderError exception during fetch still leaves a terminal status and reraises", test_non_provider_error_during_fetch_still_gets_terminal_status_and_reraises),
+        ("a CancelledError during fetch marks the run 'cancelled' and reraises", test_cancelled_error_during_fetch_marks_run_cancelled_and_reraises),
+        ("a successful run records workflow_run_id from $GITHUB_RUN_ID", test_successful_run_records_workflow_run_id_from_environment),
+        ("a successful run after an abandoned/reconciled run is recorded independently", test_successful_run_after_an_abandoned_run_is_recorded_independently),
+        ("reconcile_stuck_runs only marks runs past the timeout, leaves fresh ones alone", test_reconcile_marks_only_runs_past_the_timeout),
+        ("reconcile_stuck_runs never touches completed runs or review data", test_reconcile_never_touches_completed_runs_or_review_data),
+        ("reconcile_stuck_runs is idempotent across repeated calls", test_reconcile_is_idempotent_across_repeated_calls),
         ("a single location's failure is isolated -- status 'partial'", test_per_location_failure_is_isolated_status_partial),
         ("every location failing yields 'failed', not 'partial'", test_all_locations_failing_yields_status_failed_not_partial),
         ("new/edited/deleted statistics sum correctly across multiple locations", test_statistics_sum_correctly_across_multiple_locations),
