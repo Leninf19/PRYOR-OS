@@ -171,13 +171,46 @@ def init_schema(conn: sqlite3.Connection):
     conn.commit()
 
 
+def ensure_validation_flags_open_identity_index(conn: sqlite3.Connection) -> bool:
+    """At most one OPEN row per (review_id, location_id, flag_type). Uses
+    COALESCE(review_id, 0) rather than the bare column because SQLite (like
+    standard SQL generally) never treats two NULLs as equal for uniqueness
+    purposes -- a plain index on the raw columns would silently fail to
+    deduplicate stale_location/unverified_location (both always have
+    review_id IS NULL), only ever protecting the five review-scoped types.
+    review_id is an AUTOINCREMENT PRIMARY KEY starting at 1, so 0 can never
+    collide with a real id.
+
+    Returns True if the index exists after this call, False if a duplicate
+    open flag currently blocks it. Only sqlite3.IntegrityError is caught --
+    that's the one specific, expected failure mode (a uniqueness violation);
+    anything else (a malformed statement, a missing table, a locked
+    database) is a real bug and must propagate, not be swallowed here.
+
+    This is deliberately callable from two places with different reactions
+    to a False result: _migrate_schema() calls it before any business logic
+    has run, so a pre-existing violation is expected and only warned about.
+    validate.run() calls it again immediately after its own self-healing
+    completes, where a False result means self-healing itself is broken and
+    must raise, not silently leave the invariant unenforced."""
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_validation_flags_open_identity "
+            "ON validation_flags(COALESCE(review_id, 0), location_id, flag_type) "
+            "WHERE resolved_at IS NULL"
+        )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
 # Bumped whenever a migration is added to the list below -- purely an
 # observability marker (`PRAGMA user_version`), not a gate: every migration
 # is still individually idempotent via the try/except pattern, so this
 # doesn't control which migrations run. It just lets you tell at a glance,
 # from the DB file alone, whether it's seen the latest migration batch --
 # `sqlite3 reviews.db "PRAGMA user_version"` -- without reading this file.
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 
 def _migrate_schema(conn: sqlite3.Connection):
@@ -265,6 +298,18 @@ def _migrate_schema(conn: sqlite3.Connection):
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_gbp_review_name "
         "ON reviews(gbp_review_name) WHERE gbp_review_name IS NOT NULL"
     )
+
+    # Defense in depth for validate.py's flag-identity invariant (schema v18).
+    # This runs before any business logic has had a chance to self-heal
+    # pre-existing data, so a pre-existing violation here is expected and
+    # must never crash the whole pipeline -- loudly warn instead. validate.py
+    # re-attempts the same call AFTER its own self-healing runs, and raises
+    # loudly if it's still blocked at that point -- see validate.run().
+    if not ensure_validation_flags_open_identity_index(conn):
+        print("::warning::db.py: could not create idx_validation_flags_open_identity yet -- "
+              "a pre-existing duplicate-open validation flag violates it. "
+              "validate.py's own self-healing will resolve this on its next run; "
+              "the index will be created automatically once it does.")
 
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 

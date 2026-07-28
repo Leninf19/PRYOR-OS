@@ -11,6 +11,7 @@ from pathlib import Path
 
 TESTS = [
     "test_retry.py",
+    "test_validate.py",
     "test_provider_base.py",
     "test_provider_scraper.py",
     "test_provider_health.py",
@@ -22,6 +23,7 @@ TESTS = [
     "test_location_analytics.py",
     "test_google_api_endpoints.py",
     "test_google_api_redis_token.py",
+    "test_db.py",
     "test_gbp_sync.py",
     "test_gbp_import.py",
     "test_critical_alert_check.py",
