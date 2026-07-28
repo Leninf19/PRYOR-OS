@@ -26,6 +26,7 @@ TESTS = [
     "test_db.py",
     "test_gbp_sync.py",
     "test_gbp_import.py",
+    "test_prune_validation_flags.py",
     "test_critical_alert_check.py",
     "test_nightly_digest.py",
     "test_negative_review_notifications.py",
