@@ -1,7 +1,17 @@
 name: scratch2
 
+# Push-triggered instead of workflow_dispatch: dispatch-registration for a
+# newly-added workflow_dispatch-only workflow was not becoming available via
+# the API/CLI after repeated retries over 15+ minutes (a platform-side
+# delay/issue, not a config problem -- an already-established workflow
+# dispatched instantly in the same window). A push trigger fires directly
+# from the committed file on the pushed ref with no separate registration
+# step, sidestepping the issue entirely. Scoped to this one throwaway
+# branch only; temporary, to be removed once validation is complete.
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - fix/validation-flag-growth
 
 jobs:
   validate:
