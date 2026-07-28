@@ -44,23 +44,28 @@ jobs:
       - name: Install Playwright browsers
         run: playwright install chromium --with-deps
 
-      # TEMPORARY: gbp_sync.py (Google Business Profile API) is blocked by a
-      # Google Cloud quota of 0 requests/minute on mybusinessaccountmanagement
-      # .googleapis.com -- Basic API Access was approved but the quota itself
-      # needs a separate increase request Google hasn't granted yet. Falling
-      # back to the Playwright scraper so reviews keep flowing in the
-      # meantime. No Google-linked rows exist yet (gbp_review_name is NULL on
-      # every row), so this is a clean, collision-free switch. Once the quota
-      # is granted, switch REVIEW_PROVIDER below from 'scraper' to 'gbp' --
-      # see sync_reviews.py/provider_sync.py.
-      - name: Sync reviews (scraper provider)
+      # Google Cloud project migration resolved the prior quota block on
+      # mybusinessaccountmanagement.googleapis.com -- verified via live,
+      # successful critical-alert-check.yml and historical-import.yml runs
+      # against the new project. Switching this pipeline's primary provider
+      # from the Playwright scraper to the official Google Business Profile
+      # API accordingly. The scraper (auto_update.py/provider_scraper.py)
+      # remains in the repo, untouched, as the documented manual fallback --
+      # see sync_reviews.py/provider_sync.py for provider selection.
+      - name: Sync reviews (GBP provider)
         id: scrape
         timeout-minutes: 30
         run: python sync_reviews.py
         env:
-          REVIEW_PROVIDER: scraper
+          REVIEW_PROVIDER: gbp
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PYTHONUNBUFFERED: "1"
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
 
       - name: Upload debug snapshots
         if: always()
