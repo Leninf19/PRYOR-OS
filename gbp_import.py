@@ -173,6 +173,7 @@ def run(apply: bool = False):
                     db.link_review_to_gbp(
                         conn, scraped_match["id"], row["gbp_review_name"],
                         row["gbp_update_time"], row["gbp_reply_update_time"], row["gbp_language_code"],
+                        owner_response=row["owner_response"],
                     )
             else:
                 loc_report["new_from_api"] += 1

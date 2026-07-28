@@ -390,7 +390,8 @@ def get_or_create_location(conn, name: str, city: str = "", brand: str = "", sea
 
 
 def link_review_to_gbp(conn, review_id: int, gbp_review_name: str, gbp_update_time: str = None,
-                        gbp_reply_update_time: str = None, gbp_language_code: str = None) -> None:
+                        gbp_reply_update_time: str = None, gbp_language_code: str = None,
+                        owner_response: str = None) -> None:
     """Attaches Google API identity to an ALREADY-KNOWN existing review row by
     its own id -- used by gbp_import.py's reconciliation pass once it has
     matched a scraped row to an API review, since routing that through
@@ -407,11 +408,40 @@ def link_review_to_gbp(conn, review_id: int, gbp_review_name: str, gbp_update_ti
     incident this invariant was added to prevent: a row linked here without
     also updating dedup_key looked, to a later upsert_review() call, like a
     brand new review sharing another row's gbp_review_name -- a duplicate
-    insert attempt that violated the partial UNIQUE index)."""
+    insert attempt that violated the partial UNIQUE index).
+
+    owner_response (production incident, 2026-07-28): the caller already has
+    this -- the same API review object that yields gbp_review_name also
+    carries reviewReply.comment, if any -- but this function previously
+    discarded it, linking gbp_reply_update_time (reply METADATA) onto the row
+    while leaving owner_response (the reply TEXT) at whatever the scraper had
+    captured, usually empty. Every consumer of "is this replied" reads
+    owner_response, never gbp_reply_update_time, so this silently produced
+    reviews Google shows as replied that the dashboard, alerts, and digest
+    all still treat as unanswered -- confirmed against production data (77
+    rows, some alerted as unanswered for over a year after Google's own
+    reply timestamp). Uses the same blank-never-erases rule upsert_review()
+    applies: a blank/absent incoming value preserves whatever this row
+    already had, it never blanks out a previously-captured reply.
+
+    Deliberately NOT fabricated the other direction either: if the caller
+    passes a gbp_reply_update_time with no owner_response (Google recorded a
+    reply update time but the comment came back empty -- an anomaly, not a
+    real absence of a reply), this function stores exactly that:
+    gbp_reply_update_time set, owner_response left as whatever it already
+    was (usually still empty). It does not mark the review replied, and it
+    does not invent reply text. That combination -- gbp_reply_update_time
+    IS NOT NULL AND owner_response empty -- is exactly the predicate
+    reconcile_gbp_replies.py's reconciliation utility looks for; this
+    function's job is to store the truth, not to paper over the anomaly."""
+    existing = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    new_response = (owner_response or "").strip()
+    final_response = new_response if new_response else ((existing["owner_response"] if existing else "") or "")
     conn.execute(
         """UPDATE reviews SET gbp_review_name = ?, dedup_key = ?, gbp_update_time = ?,
-           gbp_reply_update_time = ?, gbp_language_code = ? WHERE id = ?""",
-        (gbp_review_name, gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code, review_id),
+           gbp_reply_update_time = ?, gbp_language_code = ?, owner_response = ? WHERE id = ?""",
+        (gbp_review_name, gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
+         final_response, review_id),
     )
 
 

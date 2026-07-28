@@ -326,6 +326,16 @@ def reply_to_review(review_name: str, comment: str) -> None:
     _request("PUT", f"{API_BASE}/{review_name}/reply", body={"comment": comment})
 
 
+def get_review(review_name: str) -> dict:
+    """Fetches a single review by its exact resource name (accounts/*/
+    locations/*/reviews/*) -- used by reconcile_gbp_replies.py to re-check
+    one specific review rather than re-paginating a whole location. Raises
+    GBPNotFoundError (a GBPError/ProviderError) if the review no longer
+    exists; callers decide how to handle that (reconcile_gbp_replies.py
+    reports it as an unresolved fetch error, never invents a result)."""
+    return _request("GET", f"{API_BASE}/{review_name}")
+
+
 def is_configured() -> bool:
     """Cheap check (no network call) for whether Google credentials are
     present at all -- callers can skip the sync entirely rather than fail

@@ -258,6 +258,160 @@ def test_unexpected_collision_surfaces_with_context_not_swallowed():
     assert _review_count(real_conn) == 1
 
 
+# ---------------------------------------------------------------------------
+# Case 6 (PRIMARY -- reproduces the confirmed production bug): linking a
+# scraper row to its GBP identity must preserve the reply Google's own API
+# response already carries. Before the fix, link_review_to_gbp() dropped
+# owner_response on the floor while still recording gbp_reply_update_time --
+# confirmed in production against 77 real rows, some alerted as unanswered
+# for over a year after Google's own reply timestamp.
+# ---------------------------------------------------------------------------
+
+def test_gbp_import_linking_preserves_reply_text():
+    conn, loc_id = _fresh_conn()
+    now = "2026-07-28T00:00:00Z"
+
+    # An existing scraper-only row: no reply ever captured (scraper missed
+    # it, or it didn't exist yet at scrape time), no GBP identity yet.
+    cur = conn.execute(
+        """INSERT INTO reviews (location_id, dedup_key, reviewer_name, review_date,
+           star_rating, review_text, owner_response, first_seen_at, last_seen_at)
+           VALUES (?, 'legacy-scraper-key-6', 'Pat Rivera', '2026-05-15', 1,
+           'Bad experience', '', ?, ?)""",
+        (loc_id, now, now),
+    )
+    conn.commit()
+    review_id = cur.lastrowid
+    assert _review_count(conn) == 1
+
+    # gbp_import.py's row dict for this same review, as parsed from a real
+    # Google API response that DOES include reviewReply.
+    row = {
+        "gbp_review_name": "reviews/HASREPLY1",
+        "gbp_update_time": "2026-05-16T00:00:00Z",
+        "gbp_reply_update_time": "2026-05-20T09:30:00Z",
+        "gbp_language_code": "en",
+        "owner_response": "We're sorry to hear that -- please reach out so we can make it right.",
+    }
+    db.link_review_to_gbp(
+        conn, review_id, row["gbp_review_name"], row["gbp_update_time"],
+        row["gbp_reply_update_time"], row["gbp_language_code"], owner_response=row["owner_response"],
+    )
+    conn.commit()
+
+    assert _review_count(conn) == 1, "linking must never change the review count"
+    linked = conn.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert linked["owner_response"] == row["owner_response"], (
+        f"the Google reply text was not preserved by linking, got {linked['owner_response']!r}"
+    )
+    assert linked["gbp_reply_update_time"] == row["gbp_reply_update_time"]
+    assert linked["gbp_review_name"] == row["gbp_review_name"]
+    assert linked["dedup_key"] == row["gbp_review_name"], "dedup_key must be normalized to the GBP identity"
+
+
+# ---------------------------------------------------------------------------
+# Case 7: an existing non-empty owner_response must never be erased by a
+# blank incoming value -- same blank-never-erases rule upsert_review() uses.
+# ---------------------------------------------------------------------------
+
+def test_link_review_to_gbp_does_not_erase_existing_reply():
+    conn, loc_id = _fresh_conn()
+    now = "2026-07-28T00:00:00Z"
+
+    # This time the scraper DID capture a reply already.
+    cur = conn.execute(
+        """INSERT INTO reviews (location_id, dedup_key, reviewer_name, review_date,
+           star_rating, review_text, owner_response, first_seen_at, last_seen_at)
+           VALUES (?, 'legacy-scraper-key-7', 'Sam Lee', '2026-05-10', 4,
+           'Pretty good', 'Thanks for visiting!', ?, ?)""",
+        (loc_id, now, now),
+    )
+    conn.commit()
+    review_id = cur.lastrowid
+
+    # The GBP import's row for this review has no reply text at all (e.g. a
+    # partial/blank API field) -- must not blank out the scraper's capture.
+    db.link_review_to_gbp(
+        conn, review_id, "reviews/BLANKREPLY", "2026-05-11T00:00:00Z",
+        gbp_reply_update_time=None, gbp_language_code="en", owner_response="",
+    )
+    conn.commit()
+
+    linked = conn.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert linked["owner_response"] == "Thanks for visiting!", (
+        "a blank incoming owner_response must never erase an existing reply"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Case 8: a GBP reply timestamp with no reply comment is an anomaly, not a
+# confirmed reply -- must not be silently marked replied or fabricated.
+# ---------------------------------------------------------------------------
+
+def test_reply_timestamp_without_comment_is_not_treated_as_replied():
+    conn, loc_id = _fresh_conn()
+    now = "2026-07-28T00:00:00Z"
+
+    cur = conn.execute(
+        """INSERT INTO reviews (location_id, dedup_key, reviewer_name, review_date,
+           star_rating, review_text, owner_response, first_seen_at, last_seen_at)
+           VALUES (?, 'legacy-scraper-key-8', 'Jordan Ng', '2026-05-12', 2,
+           'Meh', '', ?, ?)""",
+        (loc_id, now, now),
+    )
+    conn.commit()
+    review_id = cur.lastrowid
+
+    # Google returned reviewReply.updateTime but an empty/missing comment --
+    # exactly the anomaly shape.
+    db.link_review_to_gbp(
+        conn, review_id, "reviews/TIMEONLY", "2026-05-13T00:00:00Z",
+        gbp_reply_update_time="2026-05-14T00:00:00Z", gbp_language_code="en", owner_response="",
+    )
+    conn.commit()
+
+    linked = conn.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert not (linked["owner_response"] or "").strip(), (
+        "must not fabricate reply text -- owner_response must stay empty"
+    )
+    assert linked["gbp_reply_update_time"] == "2026-05-14T00:00:00Z", (
+        "the timestamp must still be stored so the anomaly is detectable"
+    )
+    # This is exactly reconcile_gbp_replies.py's matching predicate.
+    is_anomaly = linked["gbp_reply_update_time"] is not None and not (linked["owner_response"] or "").strip()
+    assert is_anomaly, "row must match the reconciliation utility's anomaly predicate"
+
+
+# ---------------------------------------------------------------------------
+# Case 9: re-running the linking operation with the same data is idempotent.
+# ---------------------------------------------------------------------------
+
+def test_link_review_to_gbp_is_idempotent():
+    conn, loc_id = _fresh_conn()
+    now = "2026-07-28T00:00:00Z"
+
+    cur = conn.execute(
+        """INSERT INTO reviews (location_id, dedup_key, reviewer_name, review_date,
+           star_rating, review_text, owner_response, first_seen_at, last_seen_at)
+           VALUES (?, 'legacy-scraper-key-9', 'Casey Wu', '2026-05-08', 5,
+           'Great!', '', ?, ?)""",
+        (loc_id, now, now),
+    )
+    conn.commit()
+    review_id = cur.lastrowid
+
+    args = (review_id, "reviews/IDEMPOTENT1", "2026-05-09T00:00:00Z", "2026-05-10T00:00:00Z", "en")
+    db.link_review_to_gbp(conn, *args, owner_response="Thank you!")
+    conn.commit()
+    db.link_review_to_gbp(conn, *args, owner_response="Thank you!")
+    conn.commit()
+
+    assert _review_count(conn) == 1, "re-running the link must never insert a duplicate"
+    linked = conn.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert linked["owner_response"] == "Thank you!"
+    assert linked["dedup_key"] == "reviews/IDEMPOTENT1"
+
+
 def main():
     tests = [
         ("Case 1: historically linked row is updated, not duplicated", test_historically_linked_row_is_updated_not_duplicated),
@@ -265,6 +419,10 @@ def main():
         ("Case 3: link_review_to_gbp() normalizes dedup_key atomically", test_link_review_to_gbp_normalizes_dedup_key_atomically),
         ("Case 4: repeated sync never duplicates", test_repeated_sync_never_duplicates),
         ("Case 5: unexpected collision surfaces with context, not swallowed", test_unexpected_collision_surfaces_with_context_not_swallowed),
+        ("Case 6: GBP import linking preserves reply text (PRIMARY)", test_gbp_import_linking_preserves_reply_text),
+        ("Case 7: existing reply is not erased by a blank incoming value", test_link_review_to_gbp_does_not_erase_existing_reply),
+        ("Case 8: reply timestamp without comment is not treated as replied", test_reply_timestamp_without_comment_is_not_treated_as_replied),
+        ("Case 9: link_review_to_gbp() is idempotent", test_link_review_to_gbp_is_idempotent),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()
