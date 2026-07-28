@@ -1,0 +1,31 @@
+name: scratch2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install anthropic cryptography
+      - run: python tests/test_validate.py
+      - if: always()
+        run: python tests/test_db.py
+      - if: always()
+        run: |
+          if [ -f _scratch_validate_flags.py ]; then
+            python _scratch_validate_flags.py
+          else
+            echo "no scratch maintenance driver present yet -- skipping"
+          fi
+      - if: always()
+        run: python tests/run_all.py
+      - if: always()
+        run: |
+          cd dashboard
+          npm ci
+          npm run build
