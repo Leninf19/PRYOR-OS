@@ -351,11 +351,22 @@ def link_review_to_gbp(conn, review_id: int, gbp_review_name: str, gbp_update_ti
     matched a scraped row to an API review, since routing that through
     upsert_review()/dedup_key() would look the row up by gbp_review_name
     (which doesn't exist on it yet) and insert a duplicate instead of
-    updating the row that was actually matched."""
+    updating the row that was actually matched.
+
+    Invariant this function exists to uphold: whenever gbp_review_name is
+    non-null on a row, dedup_key MUST equal it -- gbp_review_name is the
+    canonical identity for any GBP-linked review, and dedup_key is only ever
+    an independently-meaningful value for rows that don't have one yet.
+    Both columns are set in the same UPDATE statement so the row can never
+    be observed in a state where they've diverged (the exact production
+    incident this invariant was added to prevent: a row linked here without
+    also updating dedup_key looked, to a later upsert_review() call, like a
+    brand new review sharing another row's gbp_review_name -- a duplicate
+    insert attempt that violated the partial UNIQUE index)."""
     conn.execute(
-        """UPDATE reviews SET gbp_review_name = ?, gbp_update_time = ?,
+        """UPDATE reviews SET gbp_review_name = ?, dedup_key = ?, gbp_update_time = ?,
            gbp_reply_update_time = ?, gbp_language_code = ? WHERE id = ?""",
-        (gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code, review_id),
+        (gbp_review_name, gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code, review_id),
     )
 
 
@@ -385,31 +396,65 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
     `row` may optionally carry gbp_review_name / gbp_update_time / gbp_reply_update_time /
     gbp_language_code -- populated by the Google Business Profile API sync (gbp_sync.py /
     gbp_import.py), always absent (None) for scraper-sourced rows from auto_update.py.
-    When present, gbp_review_name becomes the identity key (see dedup_key()) and
-    gbp_update_time becomes an authoritative edit signal straight from Google, on top
-    of the existing text/rating/response comparison below.
-    """
-    key = dedup_key(location_name, row)
-    existing = conn.execute("SELECT * FROM reviews WHERE dedup_key = ?", (key,)).fetchone()
+    When present, gbp_review_name is the canonical identity (see link_review_to_gbp()'s
+    docstring for the invariant this upholds) and gbp_update_time becomes an authoritative
+    edit signal straight from Google, on top of the existing text/rating/response
+    comparison below.
 
+    Matching order for a row with a gbp_review_name: look it up BY gbp_review_name
+    directly, first -- never rely on a freshly-computed dedup_key alone to decide
+    whether this review already exists. A row can legitimately have a stale dedup_key
+    (e.g. one attached via link_review_to_gbp() before that function's own dedup_key
+    fix shipped, or any other historical inconsistency) while its gbp_review_name is
+    already correct and authoritative; computing dedup_key() first and searching by
+    that would miss such a row entirely and attempt a duplicate insert, tripping the
+    partial UNIQUE index on gbp_review_name instead of finding the real match. Rows
+    without a gbp_review_name keep the exact original dedup_key-based lookup (canonical
+    scraped review ID, else the composite fallback) -- unchanged, since the scraper
+    remains a fallback provider with no other identity to match by.
+    """
     gbp_review_name = row.get("gbp_review_name")
     gbp_update_time = row.get("gbp_update_time")
     gbp_reply_update_time = row.get("gbp_reply_update_time")
     gbp_language_code = row.get("gbp_language_code")
 
+    existing = None
+    key = None
+    if gbp_review_name:
+        existing = conn.execute(
+            "SELECT * FROM reviews WHERE gbp_review_name = ?", (gbp_review_name,)
+        ).fetchone()
+        key = gbp_review_name
+
     if existing is None:
-        conn.execute(
-            """INSERT INTO reviews
-               (location_id, canonical_review_id, dedup_key, reviewer_name, review_date,
-                star_rating, review_text, owner_response, review_url, first_seen_at, last_seen_at,
-                gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (location_id, canonical_review_id(row.get("review_url", "")), key,
-             row.get("reviewer_name", ""), row.get("review_date", ""),
-             row.get("star_rating") or None, row.get("review_text", ""),
-             row.get("owner_response", ""), row.get("review_url", ""), now, now,
-             gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code),
-        )
+        key = dedup_key(location_name, row)
+        existing = conn.execute("SELECT * FROM reviews WHERE dedup_key = ?", (key,)).fetchone()
+
+    if existing is None:
+        try:
+            conn.execute(
+                """INSERT INTO reviews
+                   (location_id, canonical_review_id, dedup_key, reviewer_name, review_date,
+                    star_rating, review_text, owner_response, review_url, first_seen_at, last_seen_at,
+                    gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (location_id, canonical_review_id(row.get("review_url", "")), key,
+                 row.get("reviewer_name", ""), row.get("review_date", ""),
+                 row.get("star_rating") or None, row.get("review_text", ""),
+                 row.get("owner_response", ""), row.get("review_url", ""), now, now,
+                 gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code),
+            )
+        except sqlite3.IntegrityError as e:
+            # Both lookups above missed, yet the database's own constraint still
+            # caught a real collision -- a genuinely unexpected case (a matching-
+            # logic gap, a race, a data-quality issue), not the known migrated-row
+            # scenario (which is resolved by the gbp_review_name lookup above, not
+            # here). Never silently skip this -- surface enough to actually
+            # investigate it.
+            raise sqlite3.IntegrityError(
+                f"upsert_review: insert collided unexpectedly for location={location_name!r} "
+                f"gbp_review_name={gbp_review_name!r} intended dedup_key={key!r}: {e}"
+            ) from e
         return "new"
 
     changed_fields = []
@@ -449,13 +494,18 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
         """UPDATE reviews SET review_text = ?, owner_response = ?, star_rating = ?,
            last_seen_at = ?, missing_since = NULL, is_deleted = 0, deleted_detected_at = NULL,
            gbp_review_name = COALESCE(?, gbp_review_name),
+           dedup_key = COALESCE(?, dedup_key),
            gbp_update_time = COALESCE(?, gbp_update_time),
            gbp_reply_update_time = COALESCE(?, gbp_reply_update_time),
            gbp_language_code = COALESCE(?, gbp_language_code)
            WHERE id = ?""",
         (final_text, final_response,
          row.get("star_rating") or existing["star_rating"],
-         now, gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
+         # dedup_key is normalized to gbp_review_name whenever this row has (or is
+         # newly gaining) one -- the same invariant link_review_to_gbp() upholds.
+         # COALESCE means a row without a gbp_review_name keeps its existing
+         # dedup_key untouched, exactly as before.
+         now, gbp_review_name, gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
          existing["id"]),
     )
     return "edited" if (changed_fields or gbp_edit_detected) else "unchanged"
