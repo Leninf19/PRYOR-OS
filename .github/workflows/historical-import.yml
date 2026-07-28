@@ -69,7 +69,7 @@ jobs:
       - name: Write report to job summary
         if: always()
         run: |
-          echo "## Historical Import — mode: ${{ inputs.apply == 'true' && 'APPLY (changes written)' || 'DRY RUN (no changes written)' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Historical Import — mode: ${{ inputs.apply && 'APPLY (changes written)' || 'DRY RUN (no changes written)' }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           cat import_output.txt >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -81,9 +81,10 @@ jobs:
           fi
 
       - name: Verify database integrity before commit
-        if: always() && inputs.apply == 'true'
+        id: integrity
+        if: always() && inputs.apply
         run: python check_db_integrity.py
 
       - name: Commit updated data
-        if: always() && inputs.apply == 'true'
+        if: inputs.apply && steps.integrity.outcome == 'success'
         run: 'bash .github/scripts/commit_and_push.sh "chore: historical import applied [skip ci]" dashboard/reviews.db'
