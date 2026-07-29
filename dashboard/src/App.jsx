@@ -13,8 +13,12 @@ import { settingsSections } from './pages/settings/settingsSections.js'
 
 // Route-level code-splitting -- each page ships in its own chunk, fetched
 // only when its route is visited, instead of one ~480KB bundle up front.
-const ExecutiveIntelligenceCenter = lazy(() => import('./pages/ExecutiveIntelligenceCenter.jsx'))
-const Overview               = lazy(() => import('./pages/Overview.jsx'))
+// M4: Today merges Overview/Executive Dashboard/Executive Intelligence
+// Center/Activity Timeline content behind one route. Their page files stay
+// on disk, fully working, for the rollback path the Execution Master Plan
+// v1.0 describes ("redirect /today back to /overview") -- they're just no
+// longer imported here since no route renders them directly anymore.
+const Today                  = lazy(() => import('./pages/Today.jsx'))
 const LocationDetail         = lazy(() => import('./pages/LocationDetail.jsx'))
 const ReviewExplorer         = lazy(() => import('./pages/ReviewExplorer.jsx'))
 const TrendsAnalytics        = lazy(() => import('./pages/TrendsAnalytics.jsx'))
@@ -24,8 +28,6 @@ const DepartmentPerformance  = lazy(() => import('./pages/DepartmentPerformance.
 const ActionCenter           = lazy(() => import('./pages/ActionCenter.jsx'))
 const OperationsImpact       = lazy(() => import('./pages/OperationsImpact.jsx'))
 const WhatChanged            = lazy(() => import('./pages/WhatChanged.jsx'))
-const ActivityTimeline       = lazy(() => import('./pages/ActivityTimeline.jsx'))
-const ExecutiveDashboard     = lazy(() => import('./pages/ExecutiveDashboard.jsx'))
 const CompetitorIntelligence = lazy(() => import('./pages/CompetitorIntelligence.jsx'))
 const Alerts                 = lazy(() => import('./pages/Alerts.jsx'))
 const MarketingIntelligence  = lazy(() => import('./pages/MarketingIntelligence.jsx'))
@@ -43,11 +45,17 @@ function RouteFallback() {
   )
 }
 
-// Pages that don't use the global review filter bar
+// Pages that don't use the global review filter bar. M4 bug fix: this list
+// still had the pre-M3 path names (/intelligence, /action-center,
+// /marketing-intel, /executive-reports) after M3 renamed those routes to
+// /insights, /actions, /studio, /reports -- meaning the filter bar had been
+// incorrectly showing on all four pages since M3 shipped. /executive-dashboard
+// is dropped (it's now a pure redirect to /today, which does want the filter
+// bar, matching Overview.jsx's prior un-excluded behavior).
 const NO_FILTER_PATHS = [
-  '/scraper-status', '/intelligence', '/department-performance', '/action-center',
-  '/operations-impact', '/executive-dashboard', '/competitive', '/alerts', '/marketing-intel',
-  '/employee-intel', '/executive-reports', '/settings',
+  '/scraper-status', '/insights', '/department-performance', '/actions',
+  '/operations-impact', '/competitive', '/alerts', '/studio',
+  '/employee-intel', '/reports', '/settings',
 ]
 
 function buildDefaultFilters(reviews) {
@@ -186,11 +194,11 @@ export default function App() {
       <Route element={<RootLayout />}>
         <Route index                    element={<Navigate to="/overview" replace />} />
 
-        {/* ── M3: final 8-item navigation destinations. Today and Insights
-             are interim aliases onto the existing page that best represents
-             each merge target -- their real merged content ships in M4/M8
-             respectively; nothing here changes what either component renders. ── */}
-        <Route path="today"    element={<ExecutiveIntelligenceCenter />} />
+        {/* ── Final 8-item navigation destinations. M4: /today now ships its
+             real merged content (Today.jsx). Insights remains an interim
+             alias onto the existing page that best represents its merge
+             target until M8 ships its real merged content. ── */}
+        <Route path="today"    element={<Today />} />
         <Route path="reviews"  element={<RExplorer />} />
         <Route path="actions"  element={<ActionCenter />} />
         <Route path="insights" element={<ComplaintIntelligence />} />
@@ -208,16 +216,16 @@ export default function App() {
 
         {/* Pages not yet migrated -- still live at their existing routes,
             content unchanged. Each redirects to its new home once its own
-            content milestone (M4/M7/M8) lands. */}
-        <Route path="overview"          element={<ROverview />} />
+            content milestone (M7/M8) lands. */}
         <Route path="department-performance" element={<DepartmentPerformance />} />
         <Route path="operations-impact" element={<OperationsImpact />} />
         <Route path="what-changed"      element={<WhatChanged />} />
-        <Route path="activity"          element={<ActivityTimeline />} />
-        <Route path="executive-dashboard" element={<ExecutiveDashboard />} />
         <Route path="competitive"       element={<CompetitorIntelligence />} />
         <Route path="employee-intel"    element={<EmployeeIntelligence />} />
         <Route path="trends"            element={<RTrends />} />
+        {/* Alerts is explicitly NOT merged into Today (Execution Master Plan
+            v1.0 M4.4) -- it stays live here as a standalone secondary view,
+            linked from Today's Needs Attention section. */}
         <Route path="alerts"            element={<Alerts />} />
         <Route path="scraper-status"    element={<RScraper />} />
 
@@ -235,13 +243,18 @@ export default function App() {
         <Route path="marketing-intel"        element={<Navigate to="/studio"  replace />} />
         <Route path="executive-reports"      element={<Navigate to="/reports" replace />} />
 
+        {/* M4 migration redirects -- Today now carries this content (Execution
+            Master Plan v1.0 M4.4). /alerts is deliberately excluded above. */}
+        <Route path="overview"            element={<Navigate to="/today" replace />} />
+        <Route path="executive-dashboard" element={<Navigate to="/today" replace />} />
+        <Route path="activity"            element={<Navigate to="/today" replace />} />
+
         <Route path="*"          element={<Navigate to="/overview"    replace />} />
       </Route>
     </Routes>
   )
 }
 
-function ROverview()   { const { allReviews, filtered, prevFiltered, filters } = useOutletContext(); return <Overview allReviews={allReviews} filtered={filtered} prevFiltered={prevFiltered} filters={filters} /> }
 function RLocations()  { const c = useOutletContext(); return <LocationDetail allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} filters={c.filters} /> }
 function RExplorer()   { const { allReviews, filtered, prevFiltered } = useOutletContext(); return <ReviewExplorer allReviews={allReviews} filtered={filtered} prevFiltered={prevFiltered} /> }
 function RTrends()     { const c = useOutletContext(); return <TrendsAnalytics allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} /> }

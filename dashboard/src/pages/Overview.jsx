@@ -1,184 +1,21 @@
-import { useMemo } from 'react'
 import { Link } from 'react-router-dom'
-import { LineChart, Line, ResponsiveContainer, Tooltip } from 'recharts'
 import Card from '../components/ui/Card.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
-import HealthRing from '../components/ui/HealthRing.jsx'
 import Badge from '../components/ui/Badge.jsx'
-import Stat from '../components/ui/Stat.jsx'
 import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
 import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
 import CXIndexGrid from '../components/ui/CXIndexGrid.jsx'
-import ExplainableScore from '../components/ui/ExplainableScore.jsx'
+import RatingTrendCard from '../components/ui/RatingTrendCard.jsx'
+import LocationLeaderboard from '../components/ui/LocationLeaderboard.jsx'
+import AIBriefingCard from '../components/ui/AIBriefingCard.jsx'
+import KPIGrid from '../components/ui/KPIGrid.jsx'
 import {
   useKPIs, useCompanySummary, useMonthlyTrend, useLocationStats,
   usePredictiveAlerts, useComplaintIntel, useActionItems, useCXIndex,
 } from '../hooks/useIntelligence.js'
 import { useExecutiveBrief } from '../hooks/useExecutiveBrief.js'
-import { mirroredPrevRange, explainHealthScore } from '../utils/dataUtils.js'
-
-// ─── AI Summary ──────────────────────────────────────────────────────────────
-// Prefers the live, filter-reactive briefing (regenerates as the date/brand/
-// location filters change); falls back to the last pipeline-generated
-// summary if the live endpoint errors or no API key is configured -- same
-// graceful-degradation pattern used on "What Changed?".
-
-function AISummaryCard({ brief, summary, loading, periodLabel }) {
-  const aiSummaryText = summary?.summary ?? summary?.narrative ?? summary?.text ?? null
-
-  return (
-    <div className="ai-card p-6">
-      <div className="flex items-center gap-2 mb-3">
-        <span className="ai-label">✦ AI Executive Intelligence</span>
-        <span className="text-[10px] ml-auto opacity-40">
-          {summary?.generatedAt ? new Date(summary.generatedAt).toLocaleDateString() : ''}
-        </span>
-      </div>
-      {brief.loading || loading ? (
-        <div className="space-y-2 opacity-30">
-          <Skeleton className="h-4 w-full" />
-          <Skeleton className="h-4 w-5/6" />
-          <Skeleton className="h-4 w-4/6" />
-        </div>
-      ) : brief.text ? (
-        <>
-          <p className="text-sm leading-relaxed" style={{ color: 'var(--ai-card-text-2)' }}>{brief.text}</p>
-          {periodLabel && (
-            <p className="text-[10px] mt-2 opacity-50">Generated live for {periodLabel}</p>
-          )}
-        </>
-      ) : aiSummaryText ? (
-        <>
-          <p className="text-sm leading-relaxed" style={{ color: 'var(--ai-card-text-2)' }}>{aiSummaryText}</p>
-          <p className="text-[10px] mt-2 opacity-50">
-            {brief.error
-              ? 'Live briefing unavailable — showing the last pipeline-generated summary instead.'
-              : 'From the last analytics pipeline run (trailing 30 days).'}
-          </p>
-        </>
-      ) : (
-        <p className="text-sm italic" style={{ color: 'var(--ai-card-text-2)', opacity: 0.5 }}>
-          AI summary will appear here once ANTHROPIC_API_KEY is added to GitHub secrets.
-        </p>
-      )}
-    </div>
-  )
-}
-
-// ─── KPI row ─────────────────────────────────────────────────────────────────
-// Shared chrome (card/label/link/sub) comes from ui/Stat.jsx; each card below
-// passes its own bespoke value markup as children (health ring, colored
-// thresholds, inline badges) since those aren't uniform enough for Stat's
-// built-in value/unit/delta rendering.
-
-function KPIGrid({ kpis, loading }) {
-  const sent   = kpis?.period30dSentiment
-  const health = kpis?.healthScore
-  const delta  = kpis?.ratingDelta30d ?? 0
-
-  if (loading) return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-      {[1,2,3,4,5].map(i => <Skeleton key={i} className="h-24 rounded-[14px]" />)}
-    </div>
-  )
-
-  return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-      <Stat label="Health Score">
-        <ExplainableScore label="Health Score" score={health?.score} explanation={explainHealthScore(health)}>
-          <HealthRing score={health?.score} grade={health?.grade} size={68} />
-        </ExplainableScore>
-      </Stat>
-
-      <Stat label="Avg Rating (30d)" sub={delta !== 0 ? `${delta >= 0 ? '+' : ''}${delta} vs prior period` : 'Stable'}>
-        <div className="flex items-baseline gap-1">
-          <span className="text-3xl font-black tracking-tight" style={{ color: 'var(--color-text-1)', fontWeight: 800 }}>
-            {kpis?.avgRating30d?.toFixed(2) ?? '—'}
-          </span>
-          <span style={{ color: 'var(--color-text-2)' }}>★</span>
-        </div>
-        {delta !== 0 && (
-          <span className={`text-xs font-semibold ${delta > 0 ? 'trend-up' : 'trend-down'}`}>
-            {delta > 0 ? '↑' : '↓'} {Math.abs(delta)}
-          </span>
-        )}
-      </Stat>
-
-      <Stat label="Positive Sentiment" sub={sent ? `${sent.positiveN} of ${sent.n} reviews` : ''}>
-        <span className="text-3xl font-black tracking-tight"
-              style={{ color: (sent?.positive ?? 0) >= 75 ? 'var(--color-success)' : 'var(--color-text-1)', fontWeight: 800 }}>
-          {sent ? `${sent.positive.toFixed(0)}%` : '—'}
-        </span>
-      </Stat>
-
-      <Stat label="Reviews (30d)" sub={`${kpis?.totalReviews?.toLocaleString() ?? '—'} lifetime`}>
-        <span className="text-3xl font-black tracking-tight" style={{ color: 'var(--color-text-1)', fontWeight: 800 }}>
-          {sent?.n?.toLocaleString() ?? '—'}
-        </span>
-      </Stat>
-
-      <Stat label="Needs Response" link="/actions"
-            sub="unanswered ≤2★ reviews">
-        <div className="flex items-baseline gap-1.5">
-          <span className="text-3xl font-black tracking-tight"
-                style={{ color: (kpis?.unansweredCount ?? 0) > 5 ? 'var(--color-danger)' : 'var(--color-text-1)', fontWeight: 800 }}>
-            {kpis?.unansweredCount ?? '—'}
-          </span>
-          {(kpis?.unansweredCount ?? 0) > 0 && (
-            <span className="badge badge-danger">urgent</span>
-          )}
-        </div>
-      </Stat>
-    </div>
-  )
-}
-
-// ─── Trend sparkline ─────────────────────────────────────────────────────────
-
-function TrendCard({ trend, loading }) {
-  const last12 = useMemo(() => (trend ?? []).slice(-12), [trend])
-
-  return (
-    <Card className="p-5">
-      <div className="flex items-center justify-between mb-4">
-        <h3 className="text-label" style={{ color: 'var(--color-text-2)' }}>Rating Trend</h3>
-        <Badge variant="neutral">12 months</Badge>
-      </div>
-      {loading ? <Skeleton className="h-32 w-full" /> : (
-        <>
-          <ResponsiveContainer width="100%" height={80}>
-            <LineChart data={last12}>
-              <Line type="monotone" dataKey="avg" stroke="var(--color-accent)"
-                    strokeWidth={2.5} dot={false} />
-              <Tooltip
-                contentStyle={{ fontSize: 11, border: '1px solid var(--color-border)', borderRadius: 8, boxShadow: 'var(--shadow-md)' }}
-                formatter={(v) => [v ? `${v}★` : '—', 'Avg']}
-                labelFormatter={(l) => l}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-          <div className="mt-3 grid grid-cols-4 gap-1.5">
-            {last12.slice(-4).map(m => (
-              <div key={m.ym} className="text-center py-1.5 rounded-lg"
-                   style={{ background: 'var(--color-surface-2)' }}>
-                <p className="text-[9px] font-medium" style={{ color: 'var(--color-text-3)' }}>
-                  {m.ym.slice(5)}
-                </p>
-                <p className="text-sm font-bold mt-0.5" style={{ color: 'var(--color-text-1)' }}>
-                  {m.avg ?? '—'}
-                </p>
-                <p className="text-[9px]" style={{ color: 'var(--color-text-3)' }}>
-                  {m.count}
-                </p>
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-    </Card>
-  )
-}
+import { mirroredPrevRange } from '../utils/dataUtils.js'
 
 // ─── Priority queue ───────────────────────────────────────────────────────────
 
@@ -274,60 +111,6 @@ function ComplaintSnapshot({ intel, loading }) {
   )
 }
 
-// ─── Location leaderboard ─────────────────────────────────────────────────────
-
-function LocationLeaderboard({ stats, loading }) {
-  if (loading) return <div className="space-y-2">{[1,2,3,4,5].map(i => <Skeleton key={i} className="h-9 w-full" />)}</div>
-
-  const ranked = (stats ?? [])
-    .filter(s => s.periodSentiment?.avgRating != null)
-    .sort((a, b) => (b.periodSentiment.avgRating ?? 0) - (a.periodSentiment.avgRating ?? 0))
-
-  return (
-    <div className="space-y-0.5">
-      {ranked.slice(0, 10).map((loc, i) => {
-        const avg    = loc.periodSentiment.avgRating ?? 0
-        const health = loc.healthScore
-        const barPct = `${((avg - 1) / 4) * 100}%`
-        const barColor = avg >= 4.5 ? 'var(--color-star-5)' : avg >= 4.0 ? 'var(--color-star-4)' : avg >= 3.5 ? 'var(--color-grade-c)' : 'var(--color-star-1)'
-
-        return (
-          <div key={loc.name}
-               className="flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-[var(--color-surface-2)] dark:bg-[var(--color-surface-2)] dark:hover:bg-[var(--color-surface-2)] transition-colors cursor-default">
-            <span className="text-[10px] font-bold w-5 text-right flex-shrink-0"
-                  style={{ color: 'var(--color-text-3)' }}>
-              {i + 1}
-            </span>
-            <div className="flex-1 min-w-0">
-              <p className="text-xs font-semibold truncate" style={{ color: 'var(--color-text-1)' }}>
-                {loc.name}
-              </p>
-              <div className="flex items-center gap-2 mt-0.5">
-                <div className="flex-1 h-1 rounded-full" style={{ background: 'var(--color-border)' }}>
-                  <div className="h-1 rounded-full" style={{ width: barPct, background: barColor }} />
-                </div>
-                <span className="text-[10px] font-bold flex-shrink-0" style={{ color: barColor }}>
-                  {avg.toFixed(2)}★
-                </span>
-              </div>
-            </div>
-            {health?.grade && (
-              <ExplainableScore label={`${loc.name} Health Score`} score={health.score} explanation={explainHealthScore(health)}>
-                <Badge
-                  variant={health.grade === 'A' ? 'success' : health.grade === 'B' ? 'info' : health.grade === 'C' ? 'warning' : 'danger'}
-                  className="flex-shrink-0"
-                >
-                  {health.grade}
-                </Badge>
-              </ExplainableScore>
-            )}
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
 // ─── Predictive alerts ────────────────────────────────────────────────────────
 
 function AlertBanner({ alerts }) {
@@ -374,7 +157,7 @@ export default function Overview({ filtered = [], prevFiltered = [], filters = {
         </p>
       </div>
 
-      <AISummaryCard brief={brief} summary={summary} loading={lSummary} periodLabel={periodLabel} />
+      <AIBriefingCard label="AI Executive Intelligence" brief={brief} summary={summary} loading={lSummary} periodLabel={periodLabel} />
 
       <AlertBanner alerts={alerts} />
 
@@ -391,7 +174,7 @@ export default function Overview({ filtered = [], prevFiltered = [], filters = {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-        <TrendCard trend={trend} loading={lTrend} />
+        <RatingTrendCard trend={trend} loading={lTrend} />
         <PriorityQueue items={actions} loading={lActions} />
         <ComplaintSnapshot intel={intel} loading={lIntel} />
       </div>

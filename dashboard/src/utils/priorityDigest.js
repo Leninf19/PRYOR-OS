@@ -7,6 +7,22 @@
 // produced. This file only merges, ranks, deduplicates, and formats -- it
 // never re-derives a score from raw reviews itself.
 
+import { COMPLAINT_CATEGORIES, PRAISE_CATEGORIES } from './textAnalysis.js'
+
+function buildCategoryLabelMap() {
+  const map = {}
+  COMPLAINT_CATEGORIES.forEach(c => { map[c.id] = c.label })
+  PRAISE_CATEGORIES.forEach(p => { map[p.id] = p.label })
+  return map
+}
+const CATEGORY_LABELS = buildCategoryLabelMap()
+// Same lookup ExecutiveIntelligenceCenter.jsx's own categoryLabel() already
+// uses -- kept in sync here so the M4 theme win/loss candidates (Recent
+// Wins/Losses) render the same human label as every other category display.
+function categoryLabel(id) {
+  return CATEGORY_LABELS[id] ?? id.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+}
+
 // "Today's Priorities" (Section 1) draws from these six sources -- What
 // Changed's momentum/category-change signals belong to Sections 2/3, not
 // here. The fifth source (Action Center Accountability milestone): tasks
@@ -42,6 +58,7 @@ const SOURCE_ORDER = {
 
 const MAX_PRIORITIES = 5
 const MAX_WINS = 3
+const MAX_LOSSES = 3
 const MAX_NEXT_ACTIONS = 3
 
 function opsImpactHeadline(entry) {
@@ -222,6 +239,19 @@ function collectMomentumWinCandidate(momentum) {
   }]
 }
 
+function collectPraiseThemeWinCandidate(categoryChanges) {
+  const top = (categoryChanges?.praises?.new ?? []).sort((a, b) => b.count - a.count)[0]
+  if (!top) return []
+  return [{
+    id: `win-theme-${top.id}`,
+    title: `New praise theme: ${categoryLabel(top.id)}`,
+    explanation: `${top.count} mentions this period.`,
+    sourceLabel: 'Complaint Intelligence',
+    sourcePath: '/insights',
+    subject: normalizeSubject(top.id),
+  }]
+}
+
 function collectTrendAlertWinCandidate(trendAlerts) {
   const rising = (Array.isArray(trendAlerts) ? trendAlerts : [])
     .filter(t => t.delta > 0)
@@ -234,6 +264,74 @@ function collectTrendAlertWinCandidate(trendAlerts) {
     sourceLabel: 'Trend Alerts',
     sourcePath: '/alerts',
     subject: normalizeSubject(rising.name),
+  }]
+}
+
+// ── Section 2b candidate collection (Recent Losses) -- mirrors Recent Wins
+// exactly, from the same already-fetched sources, for Today's "Worsening"
+// column (Design System Specification v1.0 Phase 8 wireframe). Deliberately
+// separate from Section 1's "Needs Attention" priorities: this is a lighter,
+// momentum-only pulse-check (rating direction per location/theme), not the
+// heavier actionable-item queue Section 1 already covers.
+function collectOperationsImpactLossCandidates(operationsImpact) {
+  if (!operationsImpact) return []
+  const out = []
+  Object.entries(OPERATIONS_IMPACT_PRIORITY_SEVERITY).forEach(([key]) => {
+    const entry = operationsImpact[key]
+    const headline = opsImpactHeadline(entry)
+    if (!headline || !entry?.explanation) return
+    out.push({
+      id: `loss-opsimpact-${key}`,
+      title: headline,
+      explanation: entry.explanation,
+      sourceLabel: 'Operations Impact',
+      sourcePath: '/operations-impact',
+      subject: normalizeSubject(headline),
+    })
+  })
+  return out
+}
+
+function collectMomentumLossCandidate(momentum) {
+  const arr = Array.isArray(momentum) ? momentum : []
+  // getLocationMomentum() sorts descending by delta, so the worst decline is last.
+  const worst = [...arr].reverse().find(m => m.delta < 0)
+  if (!worst) return []
+  return [{
+    id: `loss-momentum-${worst.name}`,
+    title: `${worst.name} is declining`,
+    explanation: `Average rating fell from ${fmt(worst.prevAvg)}★ to ${fmt(worst.curAvg)}★ (${fmt(worst.delta)}) this period.`,
+    sourceLabel: 'What Changed',
+    sourcePath: '/what-changed',
+    subject: normalizeSubject(worst.name),
+  }]
+}
+
+function collectTrendAlertLossCandidate(trendAlerts) {
+  const falling = (Array.isArray(trendAlerts) ? trendAlerts : [])
+    .filter(t => t.delta < 0)
+    .sort((a, b) => a.delta - b.delta)[0]
+  if (!falling) return []
+  return [{
+    id: `loss-trendalert-${falling.name}`,
+    title: `${falling.name} rating is declining`,
+    explanation: `Average rating dropped from ${fmt(falling.avgPrev)}★ to ${fmt(falling.avgCur)}★.`,
+    sourceLabel: 'Trend Alerts',
+    sourcePath: '/alerts',
+    subject: normalizeSubject(falling.name),
+  }]
+}
+
+function collectComplaintThemeLossCandidate(categoryChanges) {
+  const top = (categoryChanges?.complaints?.new ?? []).sort((a, b) => b.count - a.count)[0]
+  if (!top) return []
+  return [{
+    id: `loss-theme-${top.id}`,
+    title: `New complaint theme: ${categoryLabel(top.id)}`,
+    explanation: `${top.count} mentions this period.`,
+    sourceLabel: 'Complaint Intelligence',
+    sourcePath: '/insights',
+    subject: normalizeSubject(top.id),
   }]
 }
 
@@ -289,6 +387,8 @@ function computeNextActionsFocus(actionCenter) {
  * trendAlerts, momentum, categoryChanges, assignedOverdueItems }) -> {
  *   topPriorities,   // max 5, ranked, deduplicated by subject
  *   recentWins,      // max 3, deduplicated by subject
+ *   recentLosses,    // max 3, deduplicated by subject -- mirrors recentWins
+ *                     // (Today's "Worsening" column, M4)
  *   biggestMover,    // single item or null
  *   emergingTrend,   // single item or null
  *   nextActionsFocus,// top-3 action-center items + total count, or null
@@ -323,12 +423,22 @@ export function priorityDigest({
     ...collectOperationsImpactWinCandidates(operationsImpact),
     ...collectMomentumWinCandidate(momentum),
     ...collectTrendAlertWinCandidate(trendAlerts),
+    ...collectPraiseThemeWinCandidate(categoryChanges),
   ]
   const recentWins = dedupeInOrder(winCandidates, MAX_WINS)
+
+  const lossCandidates = [
+    ...collectOperationsImpactLossCandidates(operationsImpact),
+    ...collectMomentumLossCandidate(momentum),
+    ...collectTrendAlertLossCandidate(trendAlerts),
+    ...collectComplaintThemeLossCandidate(categoryChanges),
+  ]
+  const recentLosses = dedupeInOrder(lossCandidates, MAX_LOSSES)
 
   return {
     topPriorities,
     recentWins,
+    recentLosses,
     biggestMover: computeBiggestMover(momentum),
     emergingTrend: computeEmergingTrend(categoryChanges),
     nextActionsFocus: computeNextActionsFocus(actionCenter),
