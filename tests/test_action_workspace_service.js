@@ -87,9 +87,20 @@ function testHookPublicInterfaceUnchanged() {
   assert(/return \{ data: data \?\? \{\}, setRecord \}/.test(content), 'hook return shape must be unchanged -- ActionCenter.jsx needs no changes for this migration')
 }
 
-function testActionCenterNeverCallsFetchDirectly() {
+function testActionsNeverCallsFetchDirectly() {
+  // M6: Actions.jsx is the live consumer of this service (ActionCenter.jsx
+  // is an unrouted rollback artifact) -- the "service layer is the only
+  // place responsible for persistence" guarantee must hold for the file
+  // that actually ships.
+  const content = read('pages/Actions.jsx')
+  assert(!/fetch\(/.test(content), 'Actions.jsx must never call fetch() itself -- the service layer is the only place responsible for persistence')
+}
+
+function testActionCenterRollbackArtifactStillNeverCallsFetchDirectly() {
+  // ActionCenter.jsx is kept on disk, unrouted, for rollback -- if it were
+  // ever re-routed it must still hold the same guarantee.
   const content = read('pages/ActionCenter.jsx')
-  assert(!/fetch\(/.test(content), 'ActionCenter.jsx must never call fetch() itself -- the service layer is the only place responsible for persistence')
+  assert(!/fetch\(/.test(content), 'ActionCenter.jsx (rollback artifact) must never call fetch() itself')
 }
 
 const tests = [
@@ -100,7 +111,8 @@ const tests = [
   ['service function signatures are unchanged', testServicePreservesAsyncFunctionSignatures],
   ['hook onSuccess merges the single returned record, not the whole cache', testHookOnSuccessMergesSingleRecordNotWholeCache],
   ['hook public interface (export name, delegation, return shape) is unchanged', testHookPublicInterfaceUnchanged],
-  ['ActionCenter.jsx never calls fetch() directly', testActionCenterNeverCallsFetchDirectly],
+  ['Actions.jsx never calls fetch() directly', testActionsNeverCallsFetchDirectly],
+  ['ActionCenter.jsx (rollback artifact) never calls fetch() directly', testActionCenterRollbackArtifactStillNeverCallsFetchDirectly],
 ]
 
 for (const [name, fn] of tests) run(name, fn)

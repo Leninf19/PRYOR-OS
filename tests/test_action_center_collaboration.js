@@ -91,9 +91,14 @@ function testExistingBehaviorPreserved() {
 }
 
 function testNoSecondWorkflowPageWasCreated() {
+  // M6 replaced ActionCenter with Actions at the /actions route.
+  // ActionCenter.jsx stays on disk as a rollback artifact but must never be
+  // routed again -- exactly one live Actions workflow page, no duplicate.
   const appContent = readFileSync(path.join(SRC_DIR, 'App.jsx'), 'utf-8')
-  const actionCenterRoutes = [...appContent.matchAll(/element={<ActionCenter\s*\/>}/g)]
-  assert(actionCenterRoutes.length === 1, `expected exactly one ActionCenter route, found ${actionCenterRoutes.length}`)
+  const actionsRoutes = [...appContent.matchAll(/element={<Actions\s*\/>}/g)]
+  assert(actionsRoutes.length === 1, `expected exactly one Actions route, found ${actionsRoutes.length}`)
+  assert(!/element={<ActionCenter\s*\/>}/.test(appContent),
+    'ActionCenter.jsx must remain unrouted -- it is a rollback artifact only, not a live route')
   assert(!/pages\/(TaskManager|Workflow|Tasks|Accountability)/i.test(appContent),
     'no second task-management page must be lazily imported into App.jsx')
 }

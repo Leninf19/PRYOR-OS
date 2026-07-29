@@ -28,7 +28,10 @@ const TrendsAnalytics        = lazy(() => import('./pages/TrendsAnalytics.jsx'))
 const ScraperStatus          = lazy(() => import('./pages/ScraperStatus.jsx'))
 const ComplaintIntelligence  = lazy(() => import('./pages/ComplaintIntelligence.jsx'))
 const DepartmentPerformance  = lazy(() => import('./pages/DepartmentPerformance.jsx'))
-const ActionCenter           = lazy(() => import('./pages/ActionCenter.jsx'))
+// M6: Actions replaces ActionCenter at /actions. ActionCenter.jsx stays on
+// disk, fully working, for the same rollback path M4/M5's retired pages use
+// -- just no longer imported here since no route renders it directly anymore.
+const Actions                = lazy(() => import('./pages/Actions.jsx'))
 const OperationsImpact       = lazy(() => import('./pages/OperationsImpact.jsx'))
 const WhatChanged            = lazy(() => import('./pages/WhatChanged.jsx'))
 const CompetitorIntelligence = lazy(() => import('./pages/CompetitorIntelligence.jsx'))
@@ -203,7 +206,7 @@ export default function App() {
              target until M8 ships its real merged content. ── */}
         <Route path="today"    element={<Today />} />
         <Route path="reviews"  element={<RReviews />} />
-        <Route path="actions"  element={<ActionCenter />} />
+        <Route path="actions"  element={<Actions />} />
         <Route path="insights" element={<ComplaintIntelligence />} />
         <Route path="studio"   element={<MarketingIntelligence />} />
         <Route path="reports"  element={<ExecutiveReports />} />

@@ -31,6 +31,10 @@ const FILES_TO_CHECK = [
   'dashboard/src/services/reviewEmailService.js',
   'dashboard/src/hooks/useReviewEmailWorkflow.js',
   'dashboard/src/pages/ReviewExplorer.jsx',
+  // M6: Actions.jsx is the live page rendering the restaurant email workflow
+  // (Restaurant Email Threads section) -- ActionCenter.jsx is kept alongside
+  // it, unrouted, as a rollback artifact that must hold the same guarantee.
+  'dashboard/src/pages/Actions.jsx',
   'dashboard/src/pages/ActionCenter.jsx',
 ]
 
