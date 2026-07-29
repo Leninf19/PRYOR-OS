@@ -32,7 +32,7 @@ function EventRow({ e }) {
     </div>
   )
   if (!e.path) return inner
-  return <Link to={e.path} className="block -mx-2 px-2 rounded-lg hover:bg-stone-50 dark:hover:bg-[var(--color-surface-2)] transition-colors">{inner}</Link>
+  return <Link to={e.path} className="block -mx-2 px-2 rounded-lg hover:bg-[var(--color-surface-2)] dark:hover:bg-[var(--color-surface-2)] transition-colors">{inner}</Link>
 }
 
 export default function ActivityTimeline() {

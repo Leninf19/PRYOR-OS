@@ -293,7 +293,7 @@ function LocationLeaderboard({ stats, loading }) {
 
         return (
           <div key={loc.name}
-               className="flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-stone-50 dark:bg-[var(--color-surface-2)] dark:hover:bg-[var(--color-surface-2)] transition-colors cursor-default">
+               className="flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-[var(--color-surface-2)] dark:bg-[var(--color-surface-2)] dark:hover:bg-[var(--color-surface-2)] transition-colors cursor-default">
             <span className="text-[10px] font-bold w-5 text-right flex-shrink-0"
                   style={{ color: 'var(--color-text-3)' }}>
               {i + 1}

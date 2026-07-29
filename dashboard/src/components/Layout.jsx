@@ -251,7 +251,7 @@ export default function Layout({ unansweredCount = 0, children }) {
             >
               <div className="absolute top-3 right-3">
                 <button onClick={() => setMobileOpen(false)}
-                        className="p-1.5 rounded-lg hover:bg-stone-100 dark:hover:bg-[var(--color-surface-2)]"
+                        className="p-1.5 rounded-lg hover:bg-[var(--color-surface-2)] dark:hover:bg-[var(--color-surface-2)]"
                         aria-label="Close menu"
                         style={{ color: 'var(--color-text-2)' }}>
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>

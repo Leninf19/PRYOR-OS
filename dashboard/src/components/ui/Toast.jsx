@@ -8,9 +8,9 @@ const ToastContext = createContext(null)
 // backward compatible, every pre-existing call site (which never passes
 // `variant`) keeps rendering exactly as before via the 'default' style.
 const VARIANT_BORDER = {
-  success: 'var(--color-success, #16a34a)',
-  error:   'var(--color-danger, #dc2626)',
-  info:    'var(--color-info, #2563eb)',
+  success: 'var(--color-success, var(--toast-success-fallback))',
+  error:   'var(--color-danger, var(--toast-danger-fallback))',
+  info:    'var(--color-info, var(--toast-info-fallback))',
   default: 'transparent',
 }
 
