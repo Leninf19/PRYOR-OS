@@ -34,7 +34,7 @@ function activePreset(filters) {
 }
 
 // ── Pill multi-select ───────────────────────────────────────────────────────
-function Pills({ options, selected, onChange, colorActive = 'bg-amber-500 text-white border-amber-500' }) {
+function Pills({ options, selected, onChange, colorActive = 'bg-[var(--color-accent)] text-white border-[var(--color-accent)] dark:text-[var(--color-bg)]' }) {
   const all = selected.length === 0
   function toggle(v) {
     onChange(selected.includes(v) ? selected.filter(x => x !== v) : [...selected, v])
@@ -45,8 +45,8 @@ function Pills({ options, selected, onChange, colorActive = 'bg-amber-500 text-w
         onClick={() => onChange([])}
         className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
           all
-            ? 'bg-stone-800 text-white border-stone-800 dark:bg-[var(--color-accent)] dark:text-[var(--color-bg)] dark:border-[var(--color-accent)]'
-            : 'bg-transparent text-stone-500 border-stone-200 hover:border-stone-400 hover:text-stone-700 dark:text-[var(--color-text-3)] dark:border-[var(--color-border)] dark:hover:border-[var(--color-border-2)] dark:hover:text-[var(--color-text-1)]'
+            ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)] dark:bg-[var(--color-accent)] dark:text-[var(--color-bg)] dark:border-[var(--color-accent)]'
+            : 'bg-transparent text-[var(--filter-stone-500)] border-[var(--filter-stone-200)] hover:border-[var(--filter-stone-400)] hover:text-[var(--filter-stone-700)] dark:text-[var(--color-text-3)] dark:border-[var(--color-border)] dark:hover:border-[var(--color-border-2)] dark:hover:text-[var(--color-text-1)]'
         }`}
       >
         All
@@ -58,7 +58,7 @@ function Pills({ options, selected, onChange, colorActive = 'bg-amber-500 text-w
           className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
             selected.includes(o)
               ? colorActive
-              : 'bg-transparent text-stone-500 border-stone-200 hover:border-stone-400 hover:text-stone-700 dark:text-[var(--color-text-3)] dark:border-[var(--color-border)] dark:hover:border-[var(--color-border-2)] dark:hover:text-[var(--color-text-1)]'
+              : 'bg-transparent text-[var(--filter-stone-500)] border-[var(--filter-stone-200)] hover:border-[var(--filter-stone-400)] hover:text-[var(--filter-stone-700)] dark:text-[var(--color-text-3)] dark:border-[var(--color-border)] dark:hover:border-[var(--color-border-2)] dark:hover:text-[var(--color-text-1)]'
           }`}
         >
           {o}
@@ -79,8 +79,8 @@ function StarPills({ selected, onChange }) {
         onClick={() => onChange([])}
         className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
           all
-            ? 'bg-stone-800 text-white border-stone-800 dark:bg-[var(--color-accent)] dark:text-[var(--color-bg)] dark:border-[var(--color-accent)]'
-            : 'bg-transparent text-stone-500 border-stone-200 hover:border-stone-400 dark:text-[var(--color-text-3)] dark:border-[var(--color-border)] dark:hover:border-[var(--color-border-2)]'
+            ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)] dark:bg-[var(--color-accent)] dark:text-[var(--color-bg)] dark:border-[var(--color-accent)]'
+            : 'bg-transparent text-[var(--filter-stone-500)] border-[var(--filter-stone-200)] hover:border-[var(--filter-stone-400)] dark:text-[var(--color-text-3)] dark:border-[var(--color-border)] dark:hover:border-[var(--color-border-2)]'
         }`}
       >All</button>
       {[5, 4, 3, 2, 1].map(s => (
@@ -89,8 +89,8 @@ function StarPills({ selected, onChange }) {
           onClick={() => toggle(s)}
           className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
             selected.includes(s)
-              ? 'bg-amber-500 text-white border-amber-500'
-              : 'bg-transparent text-stone-500 border-stone-200 hover:border-stone-400 dark:text-[var(--color-text-3)] dark:border-[var(--color-border)] dark:hover:border-[var(--color-border-2)]'
+              ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)] dark:text-[var(--color-bg)]'
+              : 'bg-transparent text-[var(--filter-stone-500)] border-[var(--filter-stone-200)] hover:border-[var(--filter-stone-400)] dark:text-[var(--color-text-3)] dark:border-[var(--color-border)] dark:hover:border-[var(--color-border-2)]'
           }`}
         >
           {'★'.repeat(s)}
@@ -134,10 +134,10 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
   const hasActive = filters.brands.length || filters.locations.length || filters.stars.length
 
   return (
-    <div className="bg-white border border-stone-200 rounded-2xl shadow-sm overflow-hidden dark:bg-[var(--color-surface)] dark:border-[var(--color-border)]">
+    <div className="bg-[var(--color-surface)] border border-[var(--filter-stone-200)] rounded-2xl shadow-sm overflow-hidden dark:bg-[var(--color-surface)] dark:border-[var(--color-border)]">
 
       {/* ── Top bar: date presets + advanced toggle + clear ── */}
-      <div className="flex flex-wrap items-center gap-2 px-4 py-3 border-b border-stone-100 dark:border-[var(--color-border)]">
+      <div className="flex flex-wrap items-center gap-2 px-4 py-3 border-b border-[var(--filter-stone-100)] dark:border-[var(--color-border)]">
 
         {/* Quick presets */}
         <div className="flex items-center gap-1 flex-wrap">
@@ -147,8 +147,8 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
               onClick={() => applyPreset(days)}
               className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                 current === label
-                  ? 'bg-stone-900 text-amber-400 shadow-sm dark:bg-[var(--color-accent)] dark:text-[var(--color-bg)]'
-                  : 'text-stone-500 hover:bg-stone-100 hover:text-stone-800 dark:text-[var(--color-text-3)] dark:hover:bg-[var(--color-surface-2)] dark:hover:text-[var(--color-text-1)]'
+                  ? 'bg-[var(--color-accent)] text-white shadow-sm dark:bg-[var(--color-accent)] dark:text-[var(--color-bg)]'
+                  : 'text-[var(--filter-stone-500)] hover:bg-[var(--filter-stone-100)] hover:text-[var(--filter-stone-800-hover)] dark:text-[var(--color-text-3)] dark:hover:bg-[var(--color-surface-2)] dark:hover:text-[var(--color-text-1)]'
               }`}
             >
               {label}
@@ -162,15 +162,15 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
             type="date"
             value={filters.start}
             onChange={e => set('start', e.target.value)}
-            className="text-xs bg-white border border-stone-200 rounded-lg px-2 py-1.5 text-stone-700 focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-transparent dark:bg-[var(--color-surface-2)] dark:border-[var(--color-border)] dark:text-[var(--color-text-1)]"
+            className="text-xs bg-[var(--color-surface)] border border-[var(--filter-stone-200)] rounded-lg px-2 py-1.5 text-[var(--filter-stone-700)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent dark:bg-[var(--color-surface-2)] dark:border-[var(--color-border)] dark:text-[var(--color-text-1)]"
             style={{ colorScheme: resolved }}
           />
-          <span className="text-stone-300 text-xs font-medium dark:text-[var(--color-text-3)]">–</span>
+          <span className="text-[var(--filter-stone-300)] text-xs font-medium dark:text-[var(--color-text-3)]">–</span>
           <input
             type="date"
             value={filters.end}
             onChange={e => set('end', e.target.value)}
-            className="text-xs bg-white border border-stone-200 rounded-lg px-2 py-1.5 text-stone-700 focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-transparent dark:bg-[var(--color-surface-2)] dark:border-[var(--color-border)] dark:text-[var(--color-text-1)]"
+            className="text-xs bg-[var(--color-surface)] border border-[var(--filter-stone-200)] rounded-lg px-2 py-1.5 text-[var(--filter-stone-700)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent dark:bg-[var(--color-surface-2)] dark:border-[var(--color-border)] dark:text-[var(--color-text-1)]"
             style={{ colorScheme: resolved }}
           />
         </div>
@@ -180,7 +180,7 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
           {hasActive && (
             <button
               onClick={reset}
-              className="text-xs text-stone-400 hover:text-red-500 transition-colors font-medium flex items-center gap-1 dark:text-[var(--color-text-3)]"
+              className="text-xs text-[var(--filter-stone-400)] hover:text-[var(--color-danger)] transition-colors font-medium flex items-center gap-1 dark:text-[var(--color-text-3)]"
             >
               <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
@@ -192,8 +192,8 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
             onClick={() => setAdvOpen(o => !o)}
             className={`flex items-center gap-1 text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors ${
               advOpen || hasActive
-                ? 'bg-amber-50 text-amber-700 border border-amber-200 dark:bg-[var(--color-accent-lt)] dark:text-[var(--color-accent)] dark:border-[var(--color-accent-md)]'
-                : 'text-stone-500 hover:bg-stone-100 hover:text-stone-700 dark:text-[var(--color-text-3)] dark:hover:bg-[var(--color-surface-2)] dark:hover:text-[var(--color-text-1)]'
+                ? 'bg-[var(--color-accent-lt)] text-[var(--color-accent)] border border-[var(--color-accent-md)] dark:bg-[var(--color-accent-lt)] dark:text-[var(--color-accent)] dark:border-[var(--color-accent-md)]'
+                : 'text-[var(--filter-stone-500)] hover:bg-[var(--filter-stone-100)] hover:text-[var(--filter-stone-700)] dark:text-[var(--color-text-3)] dark:hover:bg-[var(--color-surface-2)] dark:hover:text-[var(--color-text-1)]'
             }`}
           >
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -201,7 +201,7 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
             </svg>
             Filters
             {hasActive > 0 && (
-              <span className="bg-amber-500 text-white text-[9px] font-bold rounded-full min-w-[14px] h-[14px] flex items-center justify-center px-0.5">
+              <span className="bg-[var(--color-accent)] text-white dark:text-[var(--color-bg)] text-[9px] font-bold rounded-full min-w-[14px] h-[14px] flex items-center justify-center px-0.5">
                 {(filters.brands.length + filters.locations.length + filters.stars.length)}
               </span>
             )}
@@ -211,10 +211,10 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
 
       {/* ── Expandable advanced filters ── */}
       {advOpen && (
-        <div className="px-4 py-4 space-y-4 bg-stone-50/50 border-t border-stone-100 dark:bg-[var(--color-surface-2)] dark:border-[var(--color-border)]">
+        <div className="px-4 py-4 space-y-4 bg-[var(--filter-stone-50-alpha)] border-t border-[var(--filter-stone-100)] dark:bg-[var(--color-surface-2)] dark:border-[var(--color-border)]">
           <div className="grid sm:grid-cols-3 gap-4">
             <div>
-              <p className="text-[10px] font-bold tracking-widest text-stone-400 uppercase mb-2 dark:text-[var(--color-text-3)]">Brand</p>
+              <p className="text-[10px] font-bold tracking-widest text-[var(--filter-stone-400)] uppercase mb-2 dark:text-[var(--color-text-3)]">Brand</p>
               <Pills
                 options={allBrands}
                 selected={filters.brands}
@@ -222,7 +222,7 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
               />
             </div>
             <div>
-              <p className="text-[10px] font-bold tracking-widest text-stone-400 uppercase mb-2 dark:text-[var(--color-text-3)]">Location</p>
+              <p className="text-[10px] font-bold tracking-widest text-[var(--filter-stone-400)] uppercase mb-2 dark:text-[var(--color-text-3)]">Location</p>
               <Pills
                 options={allLocations}
                 selected={filters.locations}
@@ -230,7 +230,7 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
               />
             </div>
             <div>
-              <p className="text-[10px] font-bold tracking-widest text-stone-400 uppercase mb-2 dark:text-[var(--color-text-3)]">Stars</p>
+              <p className="text-[10px] font-bold tracking-widest text-[var(--filter-stone-400)] uppercase mb-2 dark:text-[var(--color-text-3)]">Stars</p>
               <StarPills selected={filters.stars} onChange={v => set('stars', v)} />
             </div>
           </div>

@@ -68,6 +68,26 @@
   --toast-danger-fallback:  #dc2626;
   --toast-info-fallback:    #2563eb;
 
+  /* GlobalFilters.jsx neutral/chrome values (M1.1) -- purely decorative
+     stone-scale values (borders, muted/secondary text, dividers) with no
+     exact match anywhere in the semantic/neutral token set above, preserved
+     verbatim rather than shifted onto a similar-but-different token. Named
+     after their original Tailwind shade for traceability. Nothing with
+     accent or semantic-status meaning lives here: the 6 accent-identity
+     states in the same file (active pills, the Filters button, date
+     presets, the filter-count badge) use the existing --color-accent
+     family directly, and the date-input focus ring / Clear-button hover
+     use --color-accent / --color-danger directly -- see those call sites,
+     not this block. */
+  --filter-stone-100:      #f2ebe1; /* divider borders (top bar, advanced panel) */
+  --filter-stone-200:      #e3d4c0; /* default borders (container, pills, date inputs) */
+  --filter-stone-300:      #cbb293; /* date-range separator */
+  --filter-stone-400:      #a8835d; /* muted label/Clear text, pill hover border */
+  --filter-stone-500:      #7e5d3d; /* inactive pill/preset text */
+  --filter-stone-700:      #473426; /* date-input text, pill hover text */
+  --filter-stone-800-hover:#2e2118; /* inactive date-preset hover text */
+  --filter-stone-50-alpha: rgba(251, 248, 244, 0.5); /* advanced-panel background */
+
   /* Shadows */
   --shadow-xs: 0 1px 2px rgba(26,23,20,0.06);
   --shadow-sm: 0 1px 3px rgba(26,23,20,0.08), 0 1px 2px rgba(26,23,20,0.05);
