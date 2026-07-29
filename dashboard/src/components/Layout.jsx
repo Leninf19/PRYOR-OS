@@ -34,57 +34,24 @@ const I = {
   execintel:   <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path d="M10.707 2.293a1 1 0 00-1.414 0l-7 7a1 1 0 001.414 1.414L4 10.414V17a1 1 0 001 1h2a1 1 0 001-1v-2a1 1 0 011-1h2a1 1 0 011 1v2a1 1 0 001 1h2a1 1 0 001-1v-6.586l.293.293a1 1 0 001.414-1.414l-7-7z"/></svg>,
 }
 
-// ── Navigation sections ───────────────────────────────────────────────────────
+// ── Navigation (M3: flat 8-item structure per Navigation Specification v1.0.
+//    Today and Insights are interim aliases onto the existing page that best
+//    represents each merge target until M4/M8 ship their real merged content;
+//    see App.jsx's /today and /insights routes.) ──────────────────────────────
 
-const NAV_SECTIONS = [
-  {
-    label: 'Overview',
-    items: [
-      { id: 'executive-intelligence', path: '/executive-intelligence', label: 'Executive Intelligence', icon: I.execintel },
-      { id: 'overview',   path: '/overview',   label: 'Command Center', icon: I.overview   },
-      { id: 'activity',   path: '/activity',   label: 'Activity Timeline', icon: I.activity },
-      { id: 'locations',  path: '/locations',  label: 'Locations',      icon: I.locations  },
-    ],
-  },
-  {
-    label: 'AI Intelligence',
-    items: [
-      { id: 'intelligence',    path: '/intelligence',    label: 'Complaint Intel',   icon: I.complaint   },
-      { id: 'department-performance', path: '/department-performance', label: 'Department Performance', icon: I.department },
-      { id: 'competitive',     path: '/competitive',     label: 'Competitor Intel',  icon: I.competitive },
-      { id: 'marketing-intel', path: '/marketing-intel', label: 'Marketing Intel',   icon: I.marketing   },
-      { id: 'employee-intel',  path: '/employee-intel',  label: 'Employee Intel',    icon: I.employee    },
-    ],
-  },
-  {
-    label: 'Operations',
-    items: [
-      { id: 'explorer', path: '/explorer', label: 'Customer Experience Center', icon: I.response, badge: 'unanswered' },
-      { id: 'action-center', path: '/action-center', label: 'Action Center', icon: I.actioncenter },
-      { id: 'operations-impact', path: '/operations-impact', label: 'Operations Impact', icon: I.opsimpact },
-      { id: 'what-changed', path: '/what-changed', label: 'What Changed?', icon: I.whatchanged },
-      { id: 'trends',  path: '/trends',  label: 'Trends',          icon: I.trends   },
-      { id: 'alerts',  path: '/alerts',  label: 'Alerts',          icon: I.alerts   },
-    ],
-  },
-  {
-    label: 'Reporting',
-    items: [
-      { id: 'executive-dashboard', path: '/executive-dashboard', label: 'Executive Dashboard', icon: I.execdash },
-      { id: 'executive-reports', path: '/executive-reports', label: 'Executive Reports', icon: I.execreports },
-    ],
-  },
-  {
-    label: 'System',
-    items: [
-      { id: 'scraper',   path: '/scraper-status', label: 'Data Health', icon: I.scraper  },
-      { id: 'settings',  path: '/settings',       label: 'Settings',       icon: I.settings },
-    ],
-  },
+const NAV_ITEMS = [
+  { id: 'today',     path: '/today',     label: 'Today',     icon: I.execintel },
+  { id: 'reviews',   path: '/reviews',   label: 'Reviews',   icon: I.response, badge: 'unanswered' },
+  { id: 'actions',   path: '/actions',   label: 'Actions',   icon: I.actioncenter },
+  { id: 'locations', path: '/locations', label: 'Locations', icon: I.locations },
+  { id: 'insights',  path: '/insights',  label: 'Insights',  icon: I.trends },
+  { id: 'studio',    path: '/studio',    label: 'Studio',    icon: I.marketing },
+  { id: 'reports',   path: '/reports',   label: 'Reports',   icon: I.reports },
+  { id: 'settings',  path: '/settings',  label: 'Settings',  icon: I.settings },
 ]
 
 // Flat list used for "current page" label lookup
-const NAV_FLAT = NAV_SECTIONS.flatMap(s => s.items)
+const NAV_FLAT = NAV_ITEMS
 
 // ── Compact snapshot bar ──────────────────────────────────────────────────────
 
@@ -279,36 +246,29 @@ function SidebarContent({ unansweredCount, onLinkClick }) {
         <SmartSearch />
       </div>
 
-      {/* Nav sections */}
+      {/* Nav -- flat 8-item structure, no section grouping (Navigation
+          Specification v1.0 §5's approved sidebar has none) */}
       <nav className="flex-1 p-3 overflow-y-auto min-h-0">
-        {NAV_SECTIONS.map((section, si) => (
-          <div key={section.label} className={si > 0 ? 'mt-4' : ''}>
-            <p className="text-[9px] font-bold tracking-[0.18em] uppercase px-2 pb-1.5"
-               style={{ color: 'var(--color-text-3)' }}>
-              {section.label}
-            </p>
-            <ul className="space-y-0.5">
-              {section.items.map(item => (
-                <li key={item.id}>
-                  <NavLink
-                    to={item.path}
-                    onClick={onLinkClick}
-                    className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
-                  >
-                    {item.icon}
-                    <span className="flex-1 min-w-0 truncate">{item.label}</span>
-                    {item.badge === 'unanswered' && unansweredCount > 0 && (
-                      <span className="flex-shrink-0 text-white text-[9px] font-bold rounded-full min-w-[17px] h-[17px] flex items-center justify-center px-1"
-                            style={{ background: 'var(--color-danger)' }}>
-                        {unansweredCount > 99 ? '99+' : unansweredCount}
-                      </span>
-                    )}
-                  </NavLink>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ))}
+        <ul className="space-y-0.5">
+          {NAV_ITEMS.map(item => (
+            <li key={item.id}>
+              <NavLink
+                to={item.path}
+                onClick={onLinkClick}
+                className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+              >
+                {item.icon}
+                <span className="flex-1 min-w-0 truncate">{item.label}</span>
+                {item.badge === 'unanswered' && unansweredCount > 0 && (
+                  <span className="flex-shrink-0 text-white text-[9px] font-bold rounded-full min-w-[17px] h-[17px] flex items-center justify-center px-1"
+                        style={{ background: 'var(--color-danger)' }}>
+                    {unansweredCount > 99 ? '99+' : unansweredCount}
+                  </span>
+                )}
+              </NavLink>
+            </li>
+          ))}
+        </ul>
       </nav>
 
       {/* Footer */}
@@ -364,6 +324,7 @@ export default function Layout({ unansweredCount = 0, children }) {
               aria-hidden="true"
             />
             <motion.aside
+              id="mobile-nav-drawer"
               className="fixed inset-y-0 left-0 z-50 flex flex-col w-72 lg:hidden"
               style={{ background: 'var(--color-surface)', borderRight: '1px solid var(--color-border)', boxShadow: 'var(--shadow-xl)' }}
               initial={{ x: '-100%' }} animate={{ x: 0 }} exit={{ x: '-100%' }}
@@ -394,7 +355,9 @@ export default function Layout({ unansweredCount = 0, children }) {
           <button onClick={() => setMobileOpen(true)}
                   className="p-1.5 rounded-lg"
                   style={{ color: 'var(--color-text-2)' }}
-                  aria-label="Open menu">
+                  aria-label="Open menu"
+                  aria-expanded={mobileOpen}
+                  aria-controls="mobile-nav-drawer">
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16"/>
             </svg>

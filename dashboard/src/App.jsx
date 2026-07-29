@@ -185,24 +185,18 @@ export default function App() {
     <Routes>
       <Route element={<RootLayout />}>
         <Route index                    element={<Navigate to="/overview" replace />} />
-        <Route path="executive-intelligence" element={<ExecutiveIntelligenceCenter />} />
-        <Route path="overview"          element={<ROverview />} />
+
+        {/* ── M3: final 8-item navigation destinations. Today and Insights
+             are interim aliases onto the existing page that best represents
+             each merge target -- their real merged content ships in M4/M8
+             respectively; nothing here changes what either component renders. ── */}
+        <Route path="today"    element={<ExecutiveIntelligenceCenter />} />
+        <Route path="reviews"  element={<RExplorer />} />
+        <Route path="actions"  element={<ActionCenter />} />
+        <Route path="insights" element={<ComplaintIntelligence />} />
+        <Route path="studio"   element={<MarketingIntelligence />} />
+        <Route path="reports"  element={<ExecutiveReports />} />
         <Route path="locations"         element={<RLocations />} />
-        <Route path="explorer"          element={<RExplorer />} />
-        <Route path="intelligence"      element={<ComplaintIntelligence />} />
-        <Route path="department-performance" element={<DepartmentPerformance />} />
-        <Route path="action-center"     element={<ActionCenter />} />
-        <Route path="operations-impact" element={<OperationsImpact />} />
-        <Route path="what-changed"      element={<WhatChanged />} />
-        <Route path="activity"          element={<ActivityTimeline />} />
-        <Route path="executive-dashboard" element={<ExecutiveDashboard />} />
-        <Route path="competitive"       element={<CompetitorIntelligence />} />
-        <Route path="marketing-intel"   element={<MarketingIntelligence />} />
-        <Route path="employee-intel"    element={<EmployeeIntelligence />} />
-        <Route path="trends"            element={<RTrends />} />
-        <Route path="alerts"            element={<Alerts />} />
-        <Route path="executive-reports" element={<ExecutiveReports />} />
-        <Route path="scraper-status"    element={<RScraper />} />
         <Route path="settings" element={<SettingsLayout />}>
           {settingsSections.map(s => {
             const Component = s.component
@@ -211,13 +205,36 @@ export default function App() {
               : <Route key={s.id} path={s.path} element={<Component />} />
           })}
         </Route>
-        {/* Legacy redirects */}
+
+        {/* Pages not yet migrated -- still live at their existing routes,
+            content unchanged. Each redirects to its new home once its own
+            content milestone (M4/M7/M8) lands. */}
+        <Route path="overview"          element={<ROverview />} />
+        <Route path="department-performance" element={<DepartmentPerformance />} />
+        <Route path="operations-impact" element={<OperationsImpact />} />
+        <Route path="what-changed"      element={<WhatChanged />} />
+        <Route path="activity"          element={<ActivityTimeline />} />
+        <Route path="executive-dashboard" element={<ExecutiveDashboard />} />
+        <Route path="competitive"       element={<CompetitorIntelligence />} />
+        <Route path="employee-intel"    element={<EmployeeIntelligence />} />
+        <Route path="trends"            element={<RTrends />} />
+        <Route path="alerts"            element={<Alerts />} />
+        <Route path="scraper-status"    element={<RScraper />} />
+
+        {/* Legacy redirects (pre-existing, untouched) */}
         <Route path="rankings"   element={<Navigate to="/trends"      replace />} />
-        <Route path="insights"   element={<Navigate to="/intelligence" replace />} />
         <Route path="validation" element={<Navigate to="/scraper-status" replace />} />
         <Route path="advisor"    element={<Navigate to="/overview"    replace />} />
-        <Route path="actions"    element={<Navigate to="/explorer?filter=needs-response" replace />} />
-        <Route path="reports"    element={<Navigate to="/executive-reports" replace />} />
+
+        {/* M3 migration redirects -- old route superseded by a new, final
+            destination serving identical content */}
+        <Route path="executive-intelligence" element={<Navigate to="/today"    replace />} />
+        <Route path="intelligence"           element={<Navigate to="/insights" replace />} />
+        <Route path="explorer"               element={<Navigate to="/reviews" replace />} />
+        <Route path="action-center"          element={<Navigate to="/actions" replace />} />
+        <Route path="marketing-intel"        element={<Navigate to="/studio"  replace />} />
+        <Route path="executive-reports"      element={<Navigate to="/reports" replace />} />
+
         <Route path="*"          element={<Navigate to="/overview"    replace />} />
       </Route>
     </Routes>
