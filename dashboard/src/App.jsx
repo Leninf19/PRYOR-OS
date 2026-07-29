@@ -20,7 +20,10 @@ import { settingsSections } from './pages/settings/settingsSections.js'
 // longer imported here since no route renders them directly anymore.
 const Today                  = lazy(() => import('./pages/Today.jsx'))
 const LocationDetail         = lazy(() => import('./pages/LocationDetail.jsx'))
-const ReviewExplorer         = lazy(() => import('./pages/ReviewExplorer.jsx'))
+// M5: Reviews replaces ReviewExplorer at /reviews. ReviewExplorer.jsx stays on
+// disk, fully working, for the same rollback path M4's retired pages use --
+// just no longer imported here since no route renders it directly anymore.
+const Reviews                = lazy(() => import('./pages/Reviews.jsx'))
 const TrendsAnalytics        = lazy(() => import('./pages/TrendsAnalytics.jsx'))
 const ScraperStatus          = lazy(() => import('./pages/ScraperStatus.jsx'))
 const ComplaintIntelligence  = lazy(() => import('./pages/ComplaintIntelligence.jsx'))
@@ -199,7 +202,7 @@ export default function App() {
              alias onto the existing page that best represents its merge
              target until M8 ships its real merged content. ── */}
         <Route path="today"    element={<Today />} />
-        <Route path="reviews"  element={<RExplorer />} />
+        <Route path="reviews"  element={<RReviews />} />
         <Route path="actions"  element={<ActionCenter />} />
         <Route path="insights" element={<ComplaintIntelligence />} />
         <Route path="studio"   element={<MarketingIntelligence />} />
@@ -238,7 +241,7 @@ export default function App() {
             destination serving identical content */}
         <Route path="executive-intelligence" element={<Navigate to="/today"    replace />} />
         <Route path="intelligence"           element={<Navigate to="/insights" replace />} />
-        <Route path="explorer"               element={<Navigate to="/reviews" replace />} />
+        <Route path="explorer"               element={<RedirectPreservingSearch to="/reviews" />} />
         <Route path="action-center"          element={<Navigate to="/actions" replace />} />
         <Route path="marketing-intel"        element={<Navigate to="/studio"  replace />} />
         <Route path="executive-reports"      element={<Navigate to="/reports" replace />} />
@@ -256,6 +259,16 @@ export default function App() {
 }
 
 function RLocations()  { const c = useOutletContext(); return <LocationDetail allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} filters={c.filters} /> }
-function RExplorer()   { const { allReviews, filtered, prevFiltered } = useOutletContext(); return <ReviewExplorer allReviews={allReviews} filtered={filtered} prevFiltered={prevFiltered} /> }
+function RReviews()    { const { allReviews, filtered, prevFiltered } = useOutletContext(); return <Reviews allReviews={allReviews} filtered={filtered} prevFiltered={prevFiltered} /> }
 function RTrends()     { const c = useOutletContext(); return <TrendsAnalytics allReviews={c.allReviews} filtered={c.filtered} prevFiltered={c.prevFiltered} /> }
 function RScraper()    { const { allReviews } = useOutletContext(); return <ScraperStatus allReviews={allReviews} /> }
+
+// M5 bug fix: a plain <Navigate to="/reviews" replace /> drops the current
+// URL's query string, silently breaking /explorer?reviewId=X deep links
+// (used by the email-followup priority item, Action Center's "Open review"
+// links, and Activity History) the moment the redirect fires. Preserves
+// location.search across the redirect instead.
+function RedirectPreservingSearch({ to }) {
+  const location = useLocation()
+  return <Navigate to={{ pathname: to, search: location.search }} replace />
+}

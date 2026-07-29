@@ -104,7 +104,7 @@ function collectActionCenterPriorityCandidates(actionCenter) {
       explanation: a.reason,
       severity: a.priority === 'Critical' ? 'critical' : 'high',
       sourceLabel: 'Action Center',
-      sourcePath: '/action-center',
+      sourcePath: '/actions',
       subject: normalizeSubject(a.title || a.id),
     }))
 }
@@ -155,7 +155,7 @@ function collectAssignedOverdueCandidates(assignedOverdueItems) {
     explanation: a.dueDate ? `Assigned to you, due ${a.dueDate}.` : 'Assigned to you and overdue.',
     severity: 'critical',
     sourceLabel: 'My Overdue Tasks',
-    sourcePath: '/action-center',
+    sourcePath: '/actions',
     subject: normalizeSubject(a.title || a.id),
   }))
 }
@@ -177,7 +177,7 @@ function collectEmailFollowUpCandidates(emailFollowUpItems) {
       : 'A restaurant bad-review email is still awaiting follow-up.',
     severity: 'high',
     sourceLabel: 'Restaurant Follow-Up',
-    sourcePath: a.reviewId ? `/explorer?reviewId=${encodeURIComponent(a.reviewId)}` : '/action-center',
+    sourcePath: a.reviewId ? `/reviews?reviewId=${encodeURIComponent(a.reviewId)}` : '/actions',
     subject: normalizeSubject(a.locationName || a.id),
   }))
 }

@@ -63,7 +63,7 @@ export function useActivityFeed(allReviews, filtered, prevFiltered, periodLabel)
           id: `review-${id}-${i}`, at: h.at, icon: '💬',
           title: h.action,
           sub: r ? `${r.reviewer_name || 'Anonymous'} · ${r.location_name}` : 'Review',
-          path: '/explorer',
+          path: '/reviews',
         })
       })
     })
@@ -74,7 +74,7 @@ export function useActivityFeed(allReviews, filtered, prevFiltered, periodLabel)
           id: `action-${id}-${i}`, at: h.at, icon: '🛠',
           title: h.action,
           sub: actionTitleById[id] ?? 'Action Center recommendation',
-          path: '/action-center',
+          path: '/actions',
         })
       })
     })
@@ -82,13 +82,13 @@ export function useActivityFeed(allReviews, filtered, prevFiltered, periodLabel)
     if (summary?.generatedAt) {
       events.push({
         id: 'company-summary', at: summary.generatedAt, icon: '✦',
-        title: 'Executive summary regenerated', sub: 'Pipeline run', path: '/overview',
+        title: 'Executive summary regenerated', sub: 'Pipeline run', path: '/today',
       })
     }
     if (weekly?.generatedAt) {
       events.push({
         id: 'weekly-report', at: weekly.generatedAt, icon: '📋',
-        title: 'Weekly report generated', sub: weekly.weekStr ?? '', path: '/executive-reports',
+        title: 'Weekly report generated', sub: weekly.weekStr ?? '', path: '/reports',
       })
     }
 
@@ -102,7 +102,7 @@ export function useActivityFeed(allReviews, filtered, prevFiltered, periodLabel)
         at: `${r.review_date}T12:00:00`, icon: r.star_rating <= 2 ? '⚠️' : '⭐',
         title: `New ${r.star_rating ?? '?'}★ review`,
         sub: `${r.reviewer_name || 'Anonymous'} · ${r.location_name}`,
-        path: '/explorer',
+        path: '/reviews',
       })
     })
 
@@ -116,15 +116,15 @@ export function useActivityFeed(allReviews, filtered, prevFiltered, periodLabel)
     const changes = getCategoryChanges(filtered ?? [], prevFiltered ?? [])
     changes.complaints.new.forEach(c => out.push({
       icon: '🔴', title: `New complaint theme: ${labelFor(c.id, LABELS.complaints)}`,
-      sub: `${c.count} mentions this period`, path: '/intelligence',
+      sub: `${c.count} mentions this period`, path: '/insights',
     }))
     changes.complaints.resolved.forEach(c => out.push({
       icon: '✅', title: `Complaint theme resolved: ${labelFor(c.id, LABELS.complaints)}`,
-      sub: `Was ${c.prevCount} mentions, now below threshold`, path: '/intelligence',
+      sub: `Was ${c.prevCount} mentions, now below threshold`, path: '/insights',
     }))
     changes.praises.new.forEach(p => out.push({
       icon: '⭐', title: `New praise theme: ${labelFor(p.id, LABELS.praises)}`,
-      sub: `${p.count} mentions this period`, path: '/marketing-intel',
+      sub: `${p.count} mentions this period`, path: '/studio',
     }))
 
     getLocationMomentum(filtered ?? [], prevFiltered ?? []).forEach(l => {

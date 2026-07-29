@@ -11,11 +11,18 @@ const QK = ['action-workspace']
  */
 export function useActionWorkspace() {
   const qc = useQueryClient()
+  // M5 bug fix (same root cause as useReviewWorkspace.js): `initialData: {}`
+  // with `staleTime: Infinity` made react-query treat the seeded empty
+  // object as permanently fresh, so queryFn -- a real fetch('/api/actions/list')
+  // -- never actually ran on mount. Every fresh page load silently served an
+  // empty workspace until a mutation this session repopulated the cache,
+  // discarding real server state (assignment/status/email-thread history)
+  // on reload. staleTime: Infinity is kept (mutations already update the
+  // cache directly); only initialData needed to go.
   const { data } = useQuery({
     queryKey: QK,
     queryFn: actionWorkspaceService.getAll,
     staleTime: Infinity,
-    initialData: {},
   })
 
   const mutation = useMutation({

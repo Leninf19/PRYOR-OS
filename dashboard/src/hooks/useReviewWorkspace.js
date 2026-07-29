@@ -13,11 +13,19 @@ const QK = ['review-workspace']
  */
 export function useReviewWorkspace() {
   const qc = useQueryClient()
+  // M5 bug fix: `initialData: {}` combined with `staleTime: Infinity` made
+  // react-query treat the seeded empty object as permanently fresh data,
+  // so queryFn (the real localStorage read) never actually ran on mount --
+  // every fresh page load silently discarded any previously-saved workspace
+  // state (status/drafts/notes/assignment/history) until a new edit this
+  // session repopulated the cache. staleTime: Infinity is still correct
+  // (this data only changes via explicit mutations, which already update
+  // the cache directly) -- only the initialData needed to go; the `?? {}`
+  // below already guards the brief undefined tick before the first load.
   const { data } = useQuery({
     queryKey: QK,
     queryFn: reviewWorkspaceService.getAll,
     staleTime: Infinity,
-    initialData: {},
   })
 
   const mutation = useMutation({
