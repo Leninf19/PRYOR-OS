@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react'
-import { NavLink, useLocation } from 'react-router-dom'
+import { useState, useEffect, useRef } from 'react'
+import { NavLink, Link, useLocation } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useMeta, usePredictiveAlerts, useActionItems } from '../hooks/useIntelligence.js'
+import { useGoogleOAuthStatus } from '../hooks/useGoogleOAuthStatus.js'
 import ThemeToggle from './ui/ThemeToggle.jsx'
 import SmartSearch from './SmartSearch.jsx'
 import LogoutButton from './LogoutButton.jsx'
@@ -89,8 +90,20 @@ const NAV_FLAT = NAV_SECTIONS.flatMap(s => s.items)
 
 function SnapshotBar() {
   const { data: meta }    = useMeta()
-  const { data: alerts }  = usePredictiveAlerts()
-  const { data: actions } = useActionItems()
+  const { data: alerts, isError: alertsError }   = usePredictiveAlerts()
+  const { data: actions, isError: actionsError } = useActionItems()
+  // Design System Specification v1.0, Phase 7 -- the single canonical
+  // Google-connection source. Alerts.jsx and ScraperStatus.jsx each still
+  // independently render their own copy of this same signal (out of scope
+  // for M2, which only touches Layout.jsx/Breadcrumb.jsx) -- this is the
+  // one persistent, always-visible indicator reachable from every page.
+  const { data: googleStatusData, isLoading: googleStatusLoading, isError: googleStatusIsError } = useGoogleOAuthStatus()
+  const googleConnected = googleStatusData?.connected ?? false
+  const googleStatusText = googleStatusLoading
+    ? 'Checking Google…'
+    : googleStatusIsError
+      ? 'Google status unavailable'
+      : googleConnected ? 'Google Connected' : 'Google Not Connected'
 
   const now        = new Date()
   const dateLabel  = now.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
@@ -134,6 +147,113 @@ function SnapshotBar() {
           )}
         </div>
       ))}
+
+      {/* Connection status -- persistent, always shown (unlike the alert/
+          backlog pills above, which only appear when non-zero) */}
+      <Link to="/settings/google" className="flex items-center gap-1.5 flex-shrink-0"
+            aria-label={`Google Business Profile connection: ${googleStatusText}. View settings.`}>
+        <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+              style={{ background: googleStatusLoading || googleStatusIsError ? 'var(--color-text-3)' : googleConnected ? 'var(--color-success)' : 'var(--color-danger)' }} />
+        <span aria-hidden="true" className="text-[10px] font-medium" style={{ color: 'var(--color-text-2)' }}>
+          {googleStatusText}
+        </span>
+      </Link>
+
+      <NotificationBell alerts={alerts} actions={actions} hasError={alertsError || actionsError} />
+    </div>
+  )
+}
+
+// ── Notification bell ────────────────────────────────────────────────────────
+
+function NotificationBell({ alerts, actions, hasError }) {
+  const [open, setOpen] = useState(false)
+  const buttonRef = useRef(null)
+  const alertList  = Array.isArray(alerts) ? alerts : (alerts?.alerts ?? [])
+  const unanswered = actions?.unanswered ?? []
+  const count = alertList.length + unanswered.length
+  const label = `Notifications${count > 0 ? `, ${count} item${count === 1 ? '' : 's'}` : ''}`
+
+  useEffect(() => {
+    if (!open) return
+    function onKeyDown(e) {
+      if (e.key === 'Escape') {
+        setOpen(false)
+        buttonRef.current?.focus()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [open])
+
+  return (
+    <div className="relative ml-auto flex-shrink-0">
+      <button
+        ref={buttonRef}
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="relative p-1.5 rounded-lg hover:bg-[var(--color-surface-2)]"
+        aria-label={label}
+        aria-expanded={open}
+        aria-controls="notification-bell-panel"
+        style={{ color: 'var(--color-text-2)' }}
+      >
+        <span aria-hidden="true">{I.alerts}</span>
+        {count > 0 && (
+          <span aria-hidden="true"
+                className="absolute -top-0.5 -right-0.5 text-white text-[9px] font-bold rounded-full min-w-[14px] h-[14px] flex items-center justify-center px-0.5"
+                style={{ background: 'var(--color-danger)' }}>
+            {count > 99 ? '99+' : count}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} aria-hidden="true" />
+          <div id="notification-bell-panel"
+               className="absolute right-0 top-full mt-2 w-80 max-h-96 overflow-y-auto rounded-xl z-50"
+               style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', boxShadow: 'var(--shadow-lg)' }}>
+            <div className="px-4 py-3" style={{ borderBottom: '1px solid var(--color-border)' }}>
+              <p className="text-xs font-bold" style={{ color: 'var(--color-text-1)' }}>Notifications</p>
+            </div>
+            {hasError ? (
+              <div className="px-4 py-6 text-center">
+                <p className="text-xs" style={{ color: 'var(--color-danger)' }}>Couldn't load notifications</p>
+              </div>
+            ) : count === 0 ? (
+              <div className="px-4 py-6 text-center">
+                <p className="text-xs" style={{ color: 'var(--color-text-3)' }}>Nothing needs attention right now</p>
+              </div>
+            ) : (
+              <div className="py-1">
+                {alertList.slice(0, 5).map((a, i) => (
+                  <Link key={`alert-${i}`} to="/alerts" onClick={() => setOpen(false)}
+                        className="block px-4 py-2.5 hover:bg-[var(--color-surface-2)]">
+                    <p className="text-xs font-semibold truncate" style={{ color: 'var(--color-text-1)' }}>
+                      {a.title ?? a.message ?? 'Predictive signal detected'}
+                    </p>
+                    <p className="text-[10px] truncate" style={{ color: 'var(--color-text-3)' }}>
+                      {a.location ?? a.locationName ?? 'All locations'}
+                    </p>
+                  </Link>
+                ))}
+                {unanswered.slice(0, 5).map((r, i) => (
+                  <Link key={`unanswered-${i}`} to="/explorer" onClick={() => setOpen(false)}
+                        className="block px-4 py-2.5 hover:bg-[var(--color-surface-2)]">
+                    <p className="text-xs font-semibold truncate" style={{ color: 'var(--color-text-1)' }}>
+                      {r.star_rating ?? '?'}★ from {r.reviewer_name || 'Anonymous'}
+                    </p>
+                    <p className="text-[10px] truncate" style={{ color: 'var(--color-text-3)' }}>
+                      {r.location_name}
+                    </p>
+                  </Link>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   )
 }
