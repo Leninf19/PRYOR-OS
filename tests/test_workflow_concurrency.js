@@ -221,6 +221,52 @@ function testDownstreamScrapeOutputReferencesUnchanged() {
     'the email body must still reference steps.scrape.outputs.email_html')
 }
 
+// Recovery Milestone 1B: the step name that actually performs the commit
+// differs per workflow (health-check.yml's is "Commit notification log",
+// the rest are "Commit updated data") -- named here explicitly so the test
+// below can isolate each workflow's own commit step precisely.
+const COMMIT_STEP_NAME = {
+  'update-reviews.yml': 'Commit updated data',
+  'critical-alert-check.yml': 'Commit updated data',
+  'nightly-digest.yml': 'Commit updated data',
+  'health-check.yml': 'Commit notification log',
+  'historical-import.yml': 'Commit updated data',
+}
+
+// Recovery Milestone 1B (production audit): critical-alert-check.yml,
+// health-check.yml, and nightly-digest.yml previously ran their commit step
+// unconditionally (`if: always()`, no reference to the integrity step's
+// outcome) -- meaning a failed integrity check was detected but never
+// actually acted on: the commit/push was attempted anyway. Only
+// update-reviews.yml (and historical-import.yml, via its own
+// `inputs.apply &&` variant) enforced the gate. This proves, for every one
+// of the 5 DB-writing workflows, both halves of the fix: the integrity step
+// has `id: integrity` so it CAN be referenced, and the commit step's `if:`
+// condition actually references `steps.integrity.outcome == 'success'` so a
+// failed check truly blocks the commit -- not just "runs check_db_integrity.py
+// somewhere before it" (already covered separately by
+// testEachWriterRunsIntegrityCheckBeforeCommit above, which only proves
+// ordering, not gating).
+function testEveryWriterGatesCommitOnIntegritySuccess() {
+  for (const file of DB_WRITER_WORKFLOWS) {
+    const content = read(file)
+
+    const integrityStepMatch = content.match(/- name: Verify database integrity before commit\n([\s\S]*?)(?=\n\s*- (?:name|uses):|\n*$)/)
+    assert(integrityStepMatch, `${file} must have a "Verify database integrity before commit" step`)
+    assert(/id:\s*integrity/.test(integrityStepMatch[1]),
+      `${file}'s integrity step must have id: integrity so the commit step below can reference its outcome`)
+    assert(/if:\s*always\(\)/.test(integrityStepMatch[1]),
+      `${file}'s integrity step must still run with if: always() -- it must run regardless of an earlier step's failure`)
+
+    const stepName = COMMIT_STEP_NAME[file]
+    const commitStepMatch = content.match(new RegExp(`- name: ${stepName}\\n([\\s\\S]*?)(?=\\n\\s*- (?:name|uses):|\\n*$)`))
+    assert(commitStepMatch, `${file} must have a "${stepName}" step`)
+    assert(/steps\.integrity\.outcome == 'success'/.test(commitStepMatch[1]),
+      `${file}'s "${stepName}" step must be gated on steps.integrity.outcome == 'success' -- `
+      + 'a failed integrity check must actually block the commit/push, not just be detected and ignored')
+  }
+}
+
 function testCommitStepStillGatedOnIntegritySuccess() {
   const content = read('update-reviews.yml')
   const commitStepMatch = content.match(/- name: Commit updated data\n([\s\S]*?)(?=\n\s*- name:)/)
@@ -251,6 +297,7 @@ function testStalePushFailSafeMigratedToSharedScript() {
 run('all 5 reviews.db-writing workflows share the reviews-db-writer concurrency group', testEachWriterHasSharedConcurrencyGroup)
 run('no workflow retains the reset-and-recommit retry pattern', testNoResetAndRecommitAnywhere)
 run('every writer runs the DB integrity check before its commit step', testEachWriterRunsIntegrityCheckBeforeCommit)
+run('every writer actually gates its commit step on steps.integrity.outcome == \'success\', not just ordering', testEveryWriterGatesCommitOnIntegritySuccess)
 run('every writer delegates to the shared commit_and_push.sh script instead of re-inlining git push logic', testAllWritersDelegateToSharedCommitScript)
 run('the shared commit_and_push.sh script fetches/rebases/retries but never auto-resolves a genuine conflict', testSharedCommitScriptIsConcurrencySafe)
 run('non-DB-writing workflows were left out of the concurrency group', testNonWriterWorkflowsUntouched)

@@ -43,8 +43,9 @@ jobs:
 
       - name: Verify database integrity before commit
         if: always()
+        id: integrity
         run: python check_db_integrity.py
 
       - name: Commit updated data
-        if: always()
+        if: always() && steps.integrity.outcome == 'success'
         run: 'bash .github/scripts/commit_and_push.sh "chore: nightly digest housekeeping [skip ci]" dashboard/reviews.db'
