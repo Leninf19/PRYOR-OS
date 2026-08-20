@@ -98,6 +98,67 @@ def test_missing_tables_fail_safely_not_crash():
         assert not ok, "a DB missing the expected tables must fail cleanly, not raise"
 
 
+def _pad_to(path: Path, target_bytes: int):
+    """Grows a valid scratch DB to at least target_bytes by appending inert
+    trailing bytes -- SQLite tolerates (and PRAGMA integrity_check ignores)
+    bytes appended after the last real page, so this changes only the file
+    size on disk, not the database's actual content or validity."""
+    current = path.stat().st_size
+    if current < target_bytes:
+        with open(path, "ab") as f:
+            f.write(b"\0" * (target_bytes - current))
+
+
+def test_check_size_under_warn_threshold_is_silent():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "scratch.db"
+        _make_valid_db(path)
+        ok, message = check_db_integrity.check_size(path)
+        assert ok and message is None, "a small file must produce no warning at all"
+
+
+def test_check_size_between_warn_and_fail_is_a_non_fatal_warning():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "scratch.db"
+        _make_valid_db(path)
+        _pad_to(path, check_db_integrity.WARN_SIZE_BYTES + 1024)
+        ok, message = check_db_integrity.check_size(path)
+        assert ok, "the warn tier must still be considered ok=True -- advisory, not fatal"
+        assert message is not None and "advisory threshold" in message
+
+
+def test_check_size_at_or_above_fail_threshold_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "scratch.db"
+        _make_valid_db(path)
+        _pad_to(path, check_db_integrity.FAIL_SIZE_BYTES)
+        ok, message = check_db_integrity.check_size(path)
+        assert not ok, "at or above the fail threshold must be treated as a hard failure"
+        assert "regression-guard threshold" in message
+        assert "prune_validation_flags.py" in message, "the failure message must point at the actual remediation"
+
+
+def test_check_integrity_fails_overall_when_size_guard_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "scratch.db"
+        _make_valid_db(path)
+        _pad_to(path, check_db_integrity.FAIL_SIZE_BYTES)
+        ok, message, counts = check_db_integrity.check_integrity(path)
+        assert not ok, "check_integrity() must propagate a size-guard failure as an overall failure"
+        assert counts is not None, "row counts should still be reported even though the size guard failed"
+        assert "regression-guard threshold" in message
+
+
+def test_check_integrity_still_passes_and_includes_warning_text_in_warn_tier():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "scratch.db"
+        _make_valid_db(path)
+        _pad_to(path, check_db_integrity.WARN_SIZE_BYTES + 1024)
+        ok, message, counts = check_db_integrity.check_integrity(path)
+        assert ok, "the warn tier alone must not fail the overall check"
+        assert "WARNING" in message, "the warning must still be visible in the passing message, not silently dropped"
+
+
 def test_cli_main_exit_code_matches_check_integrity():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "scratch.db"
@@ -117,6 +178,11 @@ def main():
     run("corrupted/truncated file -> fails PRAGMA integrity_check", test_corrupted_file_fails_integrity_check)
     run("a non-SQLite file -> fails safely, does not raise", test_not_a_database_file_fails_safely)
     run("a DB missing the expected tables -> fails safely, does not raise", test_missing_tables_fail_safely_not_crash)
+    run("check_size(): under the warn threshold is silent", test_check_size_under_warn_threshold_is_silent)
+    run("check_size(): between warn and fail is a non-fatal warning", test_check_size_between_warn_and_fail_is_a_non_fatal_warning)
+    run("check_size(): at/above the fail threshold fails, with remediation pointer", test_check_size_at_or_above_fail_threshold_fails)
+    run("check_integrity(): overall fails when the size guard fails", test_check_integrity_fails_overall_when_size_guard_fails)
+    run("check_integrity(): still passes but surfaces the warning text in the warn tier", test_check_integrity_still_passes_and_includes_warning_text_in_warn_tier)
     run("main()'s CLI exit code matches check_integrity()'s ok flag", test_cli_main_exit_code_matches_check_integrity)
 
     print()
