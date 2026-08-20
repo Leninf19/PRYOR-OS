@@ -267,6 +267,62 @@ def test_network_error_retries_with_backoff():
     sleep_mock.assert_called_once_with(ga._BASE_BACKOFF_SECONDS * (2 ** 0))
 
 
+def test_get_access_token_invalid_grant_raises_typed_gbpautherror():
+    """Recovery audit (2026-08-20): production's actual failure mode --
+    the refresh token itself being rejected by Google's token endpoint
+    with invalid_grant -- happens inside get_access_token() itself, a
+    different code path from _request()'s mid-run 401 handling (which is
+    already covered above). This is the exact error shape observed in
+    real GitHub Actions logs: a 400 HTTPError from oauth2.googleapis.com/
+    token whose body is {"error": "invalid_grant", "error_description":
+    "Token has been expired or revoked."}."""
+    ga._access_token_cache["token"] = None
+    ga._access_token_cache["expires_at"] = 0
+
+    body = json.dumps({"error": "invalid_grant", "error_description": "Token has been expired or revoked."}).encode()
+    err = urllib.error.HTTPError(url=ga.TOKEN_URL, code=400, msg="Bad Request", hdrs={}, fp=io.BytesIO(body))
+
+    with mock.patch.dict("os.environ", {
+        "GOOGLE_CLIENT_ID": "fake-client-id",
+        "GOOGLE_CLIENT_SECRET": "fake-client-secret",
+        "GOOGLE_REFRESH_TOKEN": "fake-refresh-token",
+    }, clear=False), \
+         mock.patch.object(ga, "_fetch_refresh_token_from_redis", return_value=None), \
+         mock.patch("urllib.request.urlopen", side_effect=err):
+        try:
+            ga.get_access_token()
+            raise AssertionError("expected GBPAuthError to be raised")
+        except ga.GBPAuthError as e:
+            assert e.status == 400, f"expected status=400, got {e.status}"
+            assert "invalid_grant" in str(e), f"the raw Google error detail must be preserved in the message: {e}"
+        except Exception as e:
+            raise AssertionError(f"expected ga.GBPAuthError specifically, got {type(e).__name__}: {e}")
+
+
+def test_get_access_token_success_caches_token_until_expiry():
+    ga._access_token_cache["token"] = None
+    ga._access_token_cache["expires_at"] = 0
+    call_count = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        call_count["n"] += 1
+        return _fake_response({"access_token": "fresh-token", "expires_in": 3600})
+
+    with mock.patch.dict("os.environ", {
+        "GOOGLE_CLIENT_ID": "fake-client-id",
+        "GOOGLE_CLIENT_SECRET": "fake-client-secret",
+        "GOOGLE_REFRESH_TOKEN": "fake-refresh-token",
+    }, clear=False), \
+         mock.patch.object(ga, "_fetch_refresh_token_from_redis", return_value=None), \
+         mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        first = ga.get_access_token()
+        second = ga.get_access_token()  # must be served from the in-process cache, no second exchange
+
+    assert first == "fresh-token"
+    assert second == "fresh-token"
+    assert call_count["n"] == 1, f"expected exactly one token exchange (second call served from cache), got {call_count['n']}"
+
+
 def test_gbp_error_hierarchy_is_reparented_onto_provider_error():
     """Phase 3 Milestone 1: GBPError and its subclasses must now be
     ProviderError instances too, so generic provider-agnostic code can
@@ -297,6 +353,8 @@ def main():
         ("_request(): a 404 raises immediately, never retried", test_404_raises_immediately_without_retry),
         ("_request(): a network error retries with exponential backoff", test_network_error_retries_with_backoff),
         ("GBPError and subclasses are reparented onto the shared ProviderError", test_gbp_error_hierarchy_is_reparented_onto_provider_error),
+        ("get_access_token(): invalid_grant raises a typed GBPAuthError with the raw detail preserved", test_get_access_token_invalid_grant_raises_typed_gbpautherror),
+        ("get_access_token(): a successful exchange is cached until expiry", test_get_access_token_success_caches_token_until_expiry),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()

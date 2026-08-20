@@ -25,6 +25,7 @@ TESTS = [
     "test_google_api_redis_token.py",
     "test_db.py",
     "test_gbp_sync.py",
+    "test_provider_gbp.py",
     "test_gbp_import.py",
     "test_reconcile_gbp_replies.py",
     "test_prune_validation_flags.py",
