@@ -33,6 +33,9 @@ import {
   isQuotaExceededError, extractQuotaProjectNumber,
 } from '../_lib/credentialStore.js'
 import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
+import {
+  writePublishBridge, getPublishBridges, PublishBridgeUnavailableError,
+} from '../_lib/publishBridgeStore.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -812,10 +815,45 @@ async function publish(req, res) {
     })
   }
 
-  const { reviewName, locationName, reviewerName, replyText } = req.body ?? {}
+  const { reviewName, locationName, reviewerName, replyText, localReviewId, reviewDate } = req.body ?? {}
 
   if (!replyText || (!reviewName && !locationName)) {
     return res.status(400).json({ error: 'api_error', message: 'Missing replyText, and either reviewName or locationName.' })
+  }
+
+  // Recovery Milestone 6B, Part 2: called ONLY after replyViaReviewName()
+  // has already returned successfully -- Google has confirmed the reply
+  // before this ever runs, matching the required ordering (send -> Google
+  // success -> THEN durable write -> THEN respond). If Redis is down or
+  // unconfigured, Google's success is never hidden behind that: the
+  // response is still 200 success:true, just with bridgeWarning:true so
+  // the frontend can say "published, but local confirmation couldn't be
+  // saved" instead of silently claiming full durability it doesn't have.
+  async function respondPublishSuccess(resolvedGbpReviewName) {
+    await recordSyncOutcome({ success: true })
+    if (!localReviewId) {
+      // Frontend didn't send its own review id (older client, or a caller
+      // hitting this endpoint directly) -- Google still succeeded, there's
+      // just nothing to key a bridge record by. Same partial-success shape,
+      // not a hard failure.
+      return res.status(200).json({ success: true, bridgeWarning: true })
+    }
+    try {
+      await writePublishBridge(localReviewId, {
+        gbpReviewName: resolvedGbpReviewName ?? null,
+        responseText: replyText,
+        locationName: locationName ?? null,
+        reviewerName: reviewerName ?? null,
+        reviewDate: reviewDate ?? null,
+      })
+      return res.status(200).json({ success: true })
+    } catch (err) {
+      // PublishBridgeUnavailableError (not configured / Redis unreachable)
+      // or any other write failure -- Google already has the reply, so this
+      // is never reported as a publish failure.
+      console.error(`[publish] bridge write failed after a successful Google publish (localReviewId=${localReviewId}): ${err instanceof PublishBridgeUnavailableError ? err.message : 'unexpected error'}`)
+      return res.status(200).json({ success: true, bridgeWarning: true })
+    }
   }
 
   // Token acquisition is checked/recorded separately from the reply
@@ -841,8 +879,7 @@ async function publish(req, res) {
     // Preferred: direct resource path, already linked -- no lookup needed.
     if (reviewName) {
       await replyViaReviewName(reviewName, replyText, token)
-      await recordSyncOutcome({ success: true })
-      return res.status(200).json({ success: true })
+      return respondPublishSuccess(reviewName)
     }
 
     // Fallback: fuzzy-match by location name, then by reviewer display name.
@@ -887,8 +924,7 @@ async function publish(req, res) {
     }
 
     await replyViaReviewName(review.name, replyText, token)
-    await recordSyncOutcome({ success: true })
-    return res.status(200).json({ success: true })
+    return respondPublishSuccess(review.name)
 
   } catch (err) {
     // err.status/err.code come from replyViaReviewName's own thrown errors
@@ -901,6 +937,66 @@ async function publish(req, res) {
       message: err.message,
     })
   }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/google/publish-bridge -- Recovery Milestone 6B, Part 5: bulk
+// read of durable publish-bridge records for the reviews currently loaded
+// on the page. { ids: string[] } -> { [id]: { status, responseText,
+// publishedAt, gbpReviewName } }. Only ids that currently have a live
+// bridge record appear in the result; everything else is simply absent
+// (the overwhelmingly common case -- no error).
+//
+// A bulk POST (not one GET per review) is deliberate -- Part 5 explicitly
+// calls out avoiding N+1 API calls. Returns only the fields the frontend's
+// reply-state model actually needs, not the full stored record (no
+// location/reviewer/date leak beyond what's already visible in the review
+// list itself).
+// ---------------------------------------------------------------------------
+
+const PUBLISH_BRIDGE_MAX_IDS = 200
+
+async function publishBridge(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed', message: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, PUBLISH_ALLOWED_ROLES)
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `publish-bridge:${account.userId}`, { requestsPerWindow: 60, windowSeconds: 60 })
+  if (!allowed) return
+
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(id => typeof id === 'string' && id) : null
+  if (!ids) {
+    return res.status(400).json({ error: 'api_error', message: 'Missing ids (array of strings).' })
+  }
+  if (ids.length > PUBLISH_BRIDGE_MAX_IDS) {
+    return res.status(400).json({ error: 'api_error', message: `Too many ids (max ${PUBLISH_BRIDGE_MAX_IDS} per request).` })
+  }
+  if (!ids.length) return res.status(200).json({ bridges: {} })
+
+  let records
+  try {
+    records = await getPublishBridges(ids)
+  } catch (err) {
+    if (err instanceof PublishBridgeUnavailableError) {
+      // Degrade gracefully -- the frontend's own localStorage fallback
+      // (Part 3's tier 3) still covers same-browser publishes even if the
+      // bridge itself can't be read right now. Not a hard failure.
+      return res.status(200).json({ bridges: {}, degraded: true })
+    }
+    throw err
+  }
+
+  const bridges = {}
+  for (const [id, record] of Object.entries(records)) {
+    bridges[id] = {
+      status: record.status,
+      responseText: record.responseText,
+      publishedAt: record.publishedAt,
+      gbpReviewName: record.gbpReviewName ?? null,
+    }
+  }
+  return res.status(200).json({ bridges })
 }
 
 // ---------------------------------------------------------------------------
@@ -959,6 +1055,7 @@ export default async function handler(req, res) {
     case 'trigger-sync':     return triggerSync(req, res)
     case 'trigger-import':   return triggerImport(req, res)
     case 'publish':          return publish(req, res)
+    case 'publish-bridge':   return publishBridge(req, res)
     case 'disconnect':       return disconnect(req, res)
     default:                 return res.status(404).json({ error: 'not_found' })
   }

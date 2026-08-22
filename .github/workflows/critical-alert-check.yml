@@ -60,6 +60,27 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
 
+      # Recovery Milestone 6B, Part 7: bounded reconciliation of durable
+      # publish-bridge records (see gbp_reply_bridge_reconcile.py's own
+      # docstring) -- deliberately a separate step/script from
+      # critical_alert_check.py above rather than folded into it, so this
+      # unrelated concern (reply-bridge reconciliation vs. critical-review
+      # alerting) stays independently reviewable and never risks that
+      # script's own logic. Runs every 15 minutes alongside it purely for
+      # cadence -- the two are otherwise unconnected. Only ever touches
+      # reviews that currently have an active bridge record (bounded by
+      # recent publish activity), never a full all-pages sync.
+      - name: Reconcile pending publish-bridge records
+        if: always()
+        run: python gbp_reply_bridge_reconcile.py
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+
       - name: Verify database integrity before commit
         if: always()
         id: integrity

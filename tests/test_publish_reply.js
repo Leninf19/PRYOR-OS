@@ -11,6 +11,10 @@ import bcrypt from 'bcryptjs'
 import googleHandler from '../dashboard/api/google/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests as _setCredentialRedisForTests, setStoredCredential } from '../dashboard/api/_lib/credentialStore.js'
+import {
+  _setRedisClientForTests as _setBridgeRedisForTests,
+  _resetRedisClientForTests as _resetBridgeRedisForTests,
+} from '../dashboard/api/_lib/publishBridgeStore.js'
 
 // publish.js was merged into the consolidated dispatch file (Phase 8,
 // Milestone 8.2) -- this wrapper keeps every call site below exactly as it
@@ -32,6 +36,26 @@ function fakeCredentialRedis(initial = null) {
 const credentialClient = fakeCredentialRedis()
 _setCredentialRedisForTests(() => credentialClient)
 await setStoredCredential({ refreshToken: 'fake-refresh-token', connectedAccountName: null })
+
+// Recovery Milestone 6B: publishBridgeStore.js's own Redis client -- a
+// separate fake from the credential one above, matching the real app
+// (both live in the same Upstash instance, but this test suite fakes each
+// module's client independently so a bridge-specific test can simulate an
+// outage there without disturbing the (already-working) credential store).
+// A working fake is installed by default so every pre-existing test in
+// this file (written before Milestone 6B) keeps getting the exact
+// `{ success: true }` shape it already asserts -- those tests all now
+// include `localReviewId` in their request bodies (below) so the write
+// actually succeeds rather than hitting the bridgeWarning path.
+function fakeBridgeRedis(initial = {}) {
+  const store = { ...initial }
+  return {
+    set: async (key, value) => { store[key] = value },
+    mget: async (...keys) => keys.map(k => store[k] ?? null),
+    del: async (key) => { delete store[key] },
+    _store: store,
+  }
+}
 
 // publish.js now requires an authenticated Owner/Marketing session (Phase 1
 // endpoint-authorization work) -- every test below authenticates as Owner
@@ -66,6 +90,10 @@ function assert(cond, msg) {
 
 const results = []
 async function run(name, fn) {
+  // A fresh, working bridge Redis client before every test -- tests that
+  // want to simulate an unavailable/broken bridge store call
+  // _setBridgeRedisForTests() themselves inside fn() to override this.
+  _setBridgeRedisForTests(() => fakeBridgeRedis())
   try {
     await fn()
     console.log(`PASS: ${name}`)
@@ -73,12 +101,14 @@ async function run(name, fn) {
   } catch (e) {
     console.log(`FAIL: ${name} -- ${e.message}`)
     results.push(false)
+  } finally {
+    _resetBridgeRedisForTests()
   }
 }
 
 async function testDirectReviewNameSuccess() {
   const res = await invoke(
-    { reviewName: 'accounts/123/locations/456/reviews/789', replyText: 'Thank you!' },
+    { reviewName: 'accounts/123/locations/456/reviews/789', replyText: 'Thank you!', localReviewId: 'r1' },
     async (url, opts) => {
       if (url.includes('oauth2.googleapis.com/token')) {
         return { ok: true, status: 200, json: async () => ({ access_token: 'fake-token' }) }
@@ -131,7 +161,7 @@ async function testDirectReviewNameGone() {
 async function testLegacyFallbackPathResolvesCorrectHosts() {
   const calledUrls = []
   const res = await invoke(
-    { locationName: 'Casa Tequila Testtown', reviewerName: 'Jane Doe', replyText: 'Thanks Jane!' },
+    { locationName: 'Casa Tequila Testtown', reviewerName: 'Jane Doe', replyText: 'Thanks Jane!', localReviewId: 'r2' },
     async (url, opts) => {
       calledUrls.push(url)
       if (url.includes('oauth2.googleapis.com/token')) {
@@ -198,7 +228,7 @@ async function testMissingReplyTextReturns400() {
 
 async function testSuccessResponseShapeIsExactlySuccessTrue() {
   const res = await invoke(
-    { reviewName: 'accounts/1/locations/2/reviews/3', replyText: 'Thanks!' },
+    { reviewName: 'accounts/1/locations/2/reviews/3', replyText: 'Thanks!', localReviewId: 'r3' },
     async (url) => {
       if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
       if (url.endsWith('/reply')) return { ok: true, status: 200, json: async () => ({}) }
@@ -245,6 +275,138 @@ async function testWrongHttpMethodReturns405WithConsistentShape() {
   assert(typeof res.body.message === 'string' && res.body.message.length > 0, 'a 405 must also carry a message string')
 }
 
+// --- Recovery Milestone 6B: durable publish bridge (Part 1/2). ------------
+
+function bridgeHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'publish-bridge' } }, res) }
+
+async function testBridgeIsWrittenAfterGoogleSuccessDirectPath() {
+  const client = fakeBridgeRedis()
+  _setBridgeRedisForTests(() => client)
+  const res = await invoke(
+    { reviewName: 'accounts/1/locations/2/reviews/42', replyText: 'Thanks so much!', localReviewId: 'r4', reviewDate: '2026-08-07' },
+    async (url) => {
+      if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
+      if (url.endsWith('/reply')) return { ok: true, status: 200, json: async () => ({}) }
+      throw new Error(`unexpected fetch: ${url}`)
+    }
+  )
+  assert(res.statusCode === 200 && res.body.success === true, 'publish must still succeed')
+  assert(!res.body.bridgeWarning, 'no bridgeWarning expected when the bridge write succeeds')
+  const stored = JSON.parse(client._store['publish_bridge:v1:r4'])
+  assert(stored.gbpReviewName === 'accounts/1/locations/2/reviews/42', 'bridge must record the resolved gbpReviewName')
+  assert(stored.responseText === 'Thanks so much!', 'bridge must record the actual reply text')
+  assert(stored.status === 'pending_google_reconciliation', 'a freshly written bridge is pending reconciliation')
+  assert(stored.source === 'future_insights', 'bridge must record its own source')
+}
+
+async function testBridgeRecordsResolvedGbpReviewNameOnFallbackPath() {
+  // The fallback (locationName+reviewerName) path only discovers the real
+  // gbp_review_name AFTER matching the review server-side -- the bridge
+  // must record THAT resolved identity, not something derived from the
+  // request body (which never had it).
+  const client = fakeBridgeRedis()
+  _setBridgeRedisForTests(() => client)
+  await invoke(
+    { locationName: 'Casa Tequila Testtown', reviewerName: 'Jane Doe', replyText: 'Thanks Jane!', localReviewId: 'r5' },
+    async (url) => {
+      if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
+      if (url.startsWith('https://mybusinessaccountmanagement.googleapis.com/v1/accounts')) {
+        return { ok: true, status: 200, json: async () => ({ accounts: [{ name: 'accounts/123', accountName: 'Test' }] }) }
+      }
+      if (url.startsWith('https://mybusinessbusinessinformation.googleapis.com/v1/accounts/123/locations')) {
+        return { ok: true, status: 200, json: async () => ({ locations: [{ name: 'locations/456', title: 'Casa Tequila Testtown' }] }) }
+      }
+      if (url.includes('/reviews') && !url.includes('/reply')) {
+        return { ok: true, status: 200, json: async () => ({ reviews: [{ name: 'accounts/123/locations/456/reviews/999', reviewer: { displayName: 'Jane Doe' } }] }) }
+      }
+      if (url.endsWith('/reviews/999/reply')) return { ok: true, status: 200, json: async () => ({}) }
+      throw new Error(`unexpected fetch: ${url}`)
+    }
+  )
+  const stored = JSON.parse(client._store['publish_bridge:v1:r5'])
+  assert(stored.gbpReviewName === 'accounts/123/locations/456/reviews/999',
+    `bridge must record the SERVER-RESOLVED review identity, got ${stored.gbpReviewName}`)
+}
+
+async function testGoogleSuccessRedisFailureIsPartialSuccessNotFailure() {
+  _setBridgeRedisForTests(() => ({
+    set: async () => { throw new Error('Upstash unreachable') },
+    mget: async (...keys) => keys.map(() => null),
+    del: async () => {},
+  }))
+  const res = await invoke(
+    { reviewName: 'accounts/1/locations/2/reviews/3', replyText: 'Thanks!', localReviewId: 'r6' },
+    async (url) => {
+      if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
+      if (url.endsWith('/reply')) return { ok: true, status: 200, json: async () => ({}) }
+      throw new Error(`unexpected fetch: ${url}`)
+    }
+  )
+  assert(res.statusCode === 200, `Google already succeeded -- this must never be reported as a non-200 failure, got ${res.statusCode}`)
+  assert(res.body.success === true, 'success:true must still be reported -- Google DID publish the reply')
+  assert(res.body.bridgeWarning === true, 'bridgeWarning must be set so the frontend can show the reconciliation message')
+  assert(!res.body.error, 'must never carry an error field -- this is not a failure')
+}
+
+async function testMissingLocalReviewIdStillSucceedsWithBridgeWarning() {
+  const res = await invoke(
+    { reviewName: 'accounts/1/locations/2/reviews/3', replyText: 'Thanks!' }, // no localReviewId at all
+    async (url) => {
+      if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
+      if (url.endsWith('/reply')) return { ok: true, status: 200, json: async () => ({}) }
+      throw new Error(`unexpected fetch: ${url}`)
+    }
+  )
+  assert(res.statusCode === 200 && res.body.success === true, 'a caller not sending localReviewId must still get a successful publish')
+  assert(res.body.bridgeWarning === true, 'nothing to key a bridge record by -- bridgeWarning must be set')
+}
+
+async function testGoogleFailureNeverWritesABridgeRecord() {
+  const client = fakeBridgeRedis()
+  _setBridgeRedisForTests(() => client)
+  const res = await invoke(
+    { reviewName: 'accounts/1/locations/2/reviews/3', replyText: 'Thanks!', localReviewId: 'r7' },
+    async (url) => {
+      if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
+      return { ok: false, status: 403, json: async () => ({ error: { message: 'denied' } }) }
+    }
+  )
+  assert(res.statusCode === 403, `expected a failure status, got ${res.statusCode}`)
+  assert(Object.keys(client._store).length === 0, 'a Google failure must never write a bridge record -- write only happens AFTER Google confirms success')
+}
+
+async function testBulkBridgeReadReturnsOnlyMatchingIds() {
+  const client = fakeBridgeRedis()
+  _setBridgeRedisForTests(() => client)
+  await invoke({ reviewName: 'accounts/1/locations/2/reviews/9', replyText: 'Thanks!', localReviewId: 'r8' }, async (url) => {
+    if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
+    if (url.endsWith('/reply')) return { ok: true, status: 200, json: async () => ({}) }
+    throw new Error(`unexpected fetch: ${url}`)
+  })
+
+  const res = fakeRes()
+  await bridgeHandler({ method: 'POST', body: { ids: ['r8', 'r-unknown'] }, headers: { cookie: `lta_session=${AUTH_COOKIE}` } }, res)
+  assert(res.statusCode === 200, `expected 200, got ${res.statusCode}`)
+  assert(res.body.bridges.r8 && res.body.bridges.r8.responseText === 'Thanks!', 'r8 must be present with its response text')
+  assert(!('r-unknown' in res.body.bridges), 'an id with no bridge record must simply be absent')
+}
+
+async function testBulkBridgeReadRequiresAuth() {
+  const res = fakeRes()
+  await bridgeHandler({ method: 'POST', body: { ids: ['r1'] }, headers: {} }, res)
+  assert(res.statusCode === 401 || res.statusCode === 403, `expected an auth failure status, got ${res.statusCode}`)
+}
+
+async function testBulkBridgeReadDegradesGracefullyWhenUnavailable() {
+  _setBridgeRedisForTests(() => ({
+    mget: async () => { throw new Error('Upstash unreachable') },
+  }))
+  const res = fakeRes()
+  await bridgeHandler({ method: 'POST', body: { ids: ['r1'] }, headers: { cookie: `lta_session=${AUTH_COOKIE}` } }, res)
+  assert(res.statusCode === 200, `an unavailable bridge store must degrade gracefully, not fail the whole request, got ${res.statusCode}`)
+  assert(res.body.degraded === true, 'must flag degraded:true so callers know this result is incomplete, not authoritative')
+}
+
 async function main() {
   await run('direct reviewName path: successful reply', testDirectReviewNameSuccess)
   await run('direct reviewName path: 403 maps to missing_permission', testDirectReviewNamePermissionDenied)
@@ -255,6 +417,14 @@ async function main() {
   await run('success response shape is exactly { success: true }', testSuccessResponseShapeIsExactlySuccessTrue)
   await run('every failure response carries non-empty error + message strings', testEveryFailureResponseHasErrorAndMessageStrings)
   await run('a non-POST request returns 405 with the same error+message shape as every other failure', testWrongHttpMethodReturns405WithConsistentShape)
+  await run('bridge is written after Google success (direct reviewName path)', testBridgeIsWrittenAfterGoogleSuccessDirectPath)
+  await run('bridge records the server-resolved gbp_review_name on the fallback path', testBridgeRecordsResolvedGbpReviewNameOnFallbackPath)
+  await run('Google success + Redis failure is partial success, never reported as a publish failure', testGoogleSuccessRedisFailureIsPartialSuccessNotFailure)
+  await run('missing localReviewId still succeeds, with bridgeWarning set', testMissingLocalReviewIdStillSucceedsWithBridgeWarning)
+  await run('a Google failure never writes a bridge record', testGoogleFailureNeverWritesABridgeRecord)
+  await run('bulk bridge read returns only ids that have a record', testBulkBridgeReadReturnsOnlyMatchingIds)
+  await run('bulk bridge read requires authentication', testBulkBridgeReadRequiresAuth)
+  await run('bulk bridge read degrades gracefully (200, degraded:true) when the store is unavailable', testBulkBridgeReadDegradesGracefullyWhenUnavailable)
 
   console.log()
   if (results.every(Boolean)) {

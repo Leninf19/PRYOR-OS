@@ -1,4 +1,5 @@
 import { useState, useMemo, useCallback, useRef, useEffect, useSyncExternalStore } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useToast } from '../components/ui/Toast.jsx'
@@ -16,7 +17,7 @@ import { useRestaurantContacts } from '../hooks/useRestaurantContacts.js'
 import ContactEditorModal from './settings/ContactEditorModal.jsx'
 import { useAccount } from '../components/AuthGate.jsx'
 import { EMAIL_STATUS_META, DUPLICATE_EMAIL_STATUSES } from '../utils/actionWorkspaceUtils.js'
-import { REPLY_STATE_META, computeReplyState, isActionableReplyState, isSeriousReview } from '../utils/replyState.js'
+import { REPLY_STATE_META, computeReplyState, isActionableReplyState, isAnsweredReplyState, isSeriousReview } from '../utils/replyState.js'
 
 const PAGE_SIZE = 40
 
@@ -131,6 +132,28 @@ function computeTrendAlerts(current, prior) {
   return alerts.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
 }
 
+// Recovery Milestone 6B, Part 5: bulk read of the durable publish-bridge
+// records for a bounded set of reviews -- one request for up to
+// PUBLISH_BRIDGE_MAX_IDS_CLIENT ids, never one request per review. Returns
+// {} on any failure (network error, degraded backend, unauthenticated) --
+// this is a best-effort enrichment layer, never something that should block
+// the page from rendering the reviews it already has.
+async function fetchPublishBridges(ids) {
+  if (!ids.length) return {}
+  try {
+    const res = await fetch('/api/google/publish-bridge', {
+      method:  'POST',
+      headers: { 'content-type': 'application/json' },
+      body:    JSON.stringify({ ids }),
+    })
+    if (!res.ok) return {}
+    const data = await res.json().catch(() => ({}))
+    return data.bridges || {}
+  } catch {
+    return {}
+  }
+}
+
 async function callRewrite(payload) {
   const res = await fetch('/api/rewrite', {
     method:  'POST',
@@ -187,7 +210,7 @@ function GBPBanner() {
 
 // ─── Workspace stats bar (shown when the "Needs Response" quick filter is active) ──
 
-function WorkspaceStats({ reviews, ws, draftByReviewId }) {
+function WorkspaceStats({ reviews, ws, draftByReviewId, bridges }) {
   const total     = reviews.length
   // Recovery Milestone 5, Problem 3: this only counted the scheduled batch
   // export (draftByReviewId), so once on-demand/prewarmed generation started
@@ -201,7 +224,14 @@ function WorkspaceStats({ reviews, ws, draftByReviewId }) {
     Boolean(draftByReviewId[r.review_id || r.review_url || '']) || ws[reviewId(r)]?.status === 'draft_ready'
   ).length
   const urgent    = reviews.filter(r => (r.star_rating ?? 5) <= 1).length
-  const done      = reviews.filter(r => STATUS_META[ws[reviewId(r)]?.status]?.done).length
+  // Recovery Milestone 6B, Part 10: "done" now also recognizes the durable
+  // publish bridge and Google's own owner_response (isAnsweredReplyState),
+  // not just a same-browser workspace 'published'/'taken_care_of' status --
+  // otherwise this count would under-report exactly the same way "AI Draft
+  // Ready" did before Milestone 5 fixed its own equivalent gap.
+  const done      = reviews.filter(r =>
+    isAnsweredReplyState(r, ws[reviewId(r)], bridges[reviewId(r)]) || STATUS_META[ws[reviewId(r)]?.status]?.done
+  ).length
 
   return (
     <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -275,14 +305,14 @@ function PriorityBadge({ r }) {
   return <Badge variant={meta.variant}>{meta.label}</Badge>
 }
 
-function ReplyStateBadge({ r, wsEntry }) {
+function ReplyStateBadge({ r, wsEntry, bridgeEntry }) {
   // taken_care_of is a separate, unrelated operational status (handled, no
   // reply needed) -- keeps its own existing "Done" badge rather than being
   // forced into one of the 5 reply-state values it doesn't semantically fit.
   if (wsEntry?.status === 'taken_care_of') {
     return <Badge variant={STATUS_META.taken_care_of.variant}>{STATUS_META.taken_care_of.label}</Badge>
   }
-  const state = computeReplyState(r, wsEntry)
+  const state = computeReplyState(r, wsEntry, bridgeEntry)
   const meta = REPLY_STATE_META[state]
   return <Badge variant={meta.variant}>{meta.label}</Badge>
 }
@@ -425,7 +455,7 @@ function FilterBar({
 // Specification v1.0 Phase 2 ("36px 'compact' variant... for the Reviews
 // inbox, which needs to show more rows per screen than an analytics table").
 
-function ReviewRow({ r, selected, onSelect, wsEntry }) {
+function ReviewRow({ r, selected, onSelect, wsEntry, bridgeEntry }) {
   return (
     <div
       className="flex items-center gap-3 px-4 border-b cursor-pointer transition-colors"
@@ -450,7 +480,7 @@ function ReviewRow({ r, selected, onSelect, wsEntry }) {
       <span className="hidden sm:inline flex-shrink-0 text-[10px]" style={{ color: 'var(--color-text-3)' }}>
         {r.review_date}
       </span>
-      <span className="flex-shrink-0"><ReplyStateBadge r={r} wsEntry={wsEntry} /></span>
+      <span className="flex-shrink-0"><ReplyStateBadge r={r} wsEntry={wsEntry} bridgeEntry={bridgeEntry} /></span>
     </div>
   )
 }
@@ -632,17 +662,35 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
       const res = await fetch('/api/google/publish', {
         method:  'POST',
         headers: { 'content-type': 'application/json' },
-        body:    JSON.stringify(
-          r.gbp_review_name
-            ? { reviewName: r.gbp_review_name, replyText: localDraft }
-            : { locationName: r.location_name, reviewerName: r.reviewer_name, replyText: localDraft }
-        ),
+        body:    JSON.stringify({
+          ...(r.gbp_review_name
+            ? { reviewName: r.gbp_review_name }
+            : { locationName: r.location_name, reviewerName: r.reviewer_name }),
+          replyText: localDraft,
+          // Recovery Milestone 6B, Part 1/2: sent so the server can key a
+          // durable Redis publish-bridge record by the SAME id this app's
+          // own workspace already uses (see dataUtils.js's reviewId()) --
+          // without it, a successful publish still reaches Google but has
+          // no durable, cross-browser record of having done so.
+          localReviewId: rid,
+          reviewDate: r.review_date ?? null,
+        }),
         signal: controller.signal,
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
         onUpdate(rid, { status: 'published', publishedAt: new Date().toISOString(), failReason: null }, 'Published to Google')
-        showToast('Response published to Google')
+        // Recovery Milestone 6B, Part 2: bridgeWarning means Google already
+        // has the reply -- the durable record just couldn't be saved. This
+        // is never a failure: still removed from the active queue and
+        // auto-advanced, just with a message that doesn't encourage
+        // republishing (the same-browser workspace 'published' status above
+        // is itself a valid, if not cross-device, completion record).
+        showToast(
+          data.bridgeWarning
+            ? "Published to Google, but local confirmation couldn't be saved. It will reconcile automatically."
+            : 'Response published to Google'
+        )
         onPublishSuccess?.() // auto-advance to the next actionable review
         // No setPublishState('idle') here: this instance either unmounts
         // (queue empties) or a fresh instance mounts for the next review
@@ -1088,7 +1136,7 @@ function ResponseHistory({ history }) {
 // ─── Detail content (shared by the desktop persistent panel and the mobile
 // overlay panel -- inbox layout shell, M5.1) ───────────────────────────────
 
-function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate, onPublishSuccess }) {
+function ReviewDetailContent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpdate, onPublishSuccess }) {
   const link = buildReviewLink(r)
   const sentiment = sentimentBucket(r)
   const sentMeta = SENTIMENT_META[sentiment]
@@ -1107,7 +1155,7 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate, onPublis
     <div className="space-y-4">
       <div className="flex items-center gap-2 flex-wrap">
         <StarBadge n={r.star_rating ?? 1} />
-        <ReplyStateBadge r={r} wsEntry={wsEntry} />
+        <ReplyStateBadge r={r} wsEntry={wsEntry} bridgeEntry={bridgeEntry} />
         {sentMeta && <Badge variant={sentMeta.variant}>{sentMeta.icon} {sentMeta.label}</Badge>}
         {priMeta && <Badge variant={priMeta.variant}>{priMeta.label} priority</Badge>}
       </div>
@@ -1148,7 +1196,13 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate, onPublis
         {reviewLength(r.review_text) && ` · ${(r.review_text || '').trim().length} characters`}
       </p>
 
-      {/* Owner response (already replied on Google) */}
+      {/* Owner response (already replied on Google) -- or, Recovery
+          Milestone 6B Part 4: a durable publish-bridge record, proof this
+          app's own Confirm & Publish already reached Google even though
+          the next GBP sync hasn't written owner_response back into
+          reviews.db yet. Showing the actual bridge text here (not just an
+          empty gap) is what makes the review read as done immediately,
+          cross-browser/cross-device, without waiting on that sync. */}
       {r.owner_response ? (
         <div>
           <p className="text-[10px] font-bold uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-3)' }}>
@@ -1158,6 +1212,19 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate, onPublis
                style={{ background: 'var(--color-accent-lt)', border: '1px solid var(--color-accent-md)', color: 'var(--color-text-2)' }}>
             {r.owner_response}
           </div>
+        </div>
+      ) : bridgeEntry ? (
+        <div>
+          <p className="text-[10px] font-bold uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-3)' }}>
+            Published via Future Insights
+          </p>
+          <div className="p-3 rounded-xl text-xs leading-relaxed italic"
+               style={{ background: 'var(--color-accent-lt)', border: '1px solid var(--color-accent-md)', color: 'var(--color-text-2)' }}>
+            {bridgeEntry.responseText}
+          </div>
+          <p className="text-[10px] mt-1.5" style={{ color: 'var(--color-text-3)' }}>
+            Published to Google · awaiting the next sync to confirm it here. No action needed.
+          </p>
         </div>
       ) : (
         /* Not yet replied -- full response workspace (draft/edit/rewrite/publish) */
@@ -1216,7 +1283,7 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate, onPublis
 
 // ─── Desktop persistent detail panel (lg+, inbox layout shell) ────────────────
 
-function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, onUpdate, onPublishSuccess }) {
+function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpdate, onPublishSuccess }) {
   if (!r) {
     return (
       <Card className="p-8 h-full flex items-center justify-center text-center">
@@ -1237,7 +1304,7 @@ function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, onUpdate, onPub
           etc.) always starts fresh for a newly-selected review rather than
           depending on React's own reconciliation heuristics happening to
           treat this as a remount every time. */}
-      <ReviewDetailContent key={reviewId(r)} r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
+      <ReviewDetailContent key={reviewId(r)} r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} bridgeEntry={bridgeEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
     </Card>
   )
 }
@@ -1246,7 +1313,7 @@ function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, onUpdate, onPub
 // prior ReviewExplorer.jsx, a fixed 460px panel doesn't fit a phone/tablet
 // viewport the way it does on desktop) ─────────────────────────────────────
 
-function ReviewDetailOverlay({ r, draft, allReviews, onClose, wsEntry, onUpdate, onPublishSuccess }) {
+function ReviewDetailOverlay({ r, draft, allReviews, onClose, wsEntry, bridgeEntry, onUpdate, onPublishSuccess }) {
   return (
     <>
       <motion.div
@@ -1277,7 +1344,7 @@ function ReviewDetailOverlay({ r, draft, allReviews, onClose, wsEntry, onUpdate,
           </button>
         </div>
         <div className="flex-1 p-5">
-          <ReviewDetailContent key={reviewId(r)} r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
+          <ReviewDetailContent key={reviewId(r)} r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} bridgeEntry={bridgeEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
         </div>
       </motion.aside>
     </>
@@ -1310,6 +1377,35 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
   const { data: drafts } = useResponseDrafts()
   const { data: ws, setRecord } = useReviewWorkspace()
   const [searchParams, setSearchParams] = useSearchParams()
+
+  // Recovery Milestone 6B, Part 5: bulk-fetch durable publish-bridge
+  // records for the reviews a bridge could actually matter for -- anything
+  // still owner_response-empty AND not already locally marked 'published'.
+  // A review that already has either signal doesn't need bridge
+  // disambiguation to show as done, so excluding them keeps this bounded to
+  // roughly the size of the actionable queue itself, not the full
+  // multi-thousand-review corpus. Capped at PUBLISH_BRIDGE_MAX_IDS_CLIENT
+  // (matching the server's own per-request cap) and taken in `filtered`'s
+  // existing order, so it naturally prioritizes whatever's about to be
+  // shown; a bridge-confirmed review far down an unfiltered, all-locations
+  // list may not be covered until it's actually paged/filtered into view --
+  // an accepted, documented tradeoff for a single bounded bulk call instead
+  // of paginating this lookup across the entire dataset.
+  const PUBLISH_BRIDGE_MAX_IDS_CLIENT = 200
+  const bridgeCandidateIds = useMemo(() => {
+    return filtered
+      .filter(r => !r.owner_response && ws[reviewId(r)]?.status !== 'published')
+      .slice(0, PUBLISH_BRIDGE_MAX_IDS_CLIENT)
+      .map(r => reviewId(r))
+  }, [filtered, ws])
+  const { data: bridges } = useQuery({
+    queryKey: ['publish-bridges', bridgeCandidateIds.join(',')],
+    queryFn:  () => fetchPublishBridges(bridgeCandidateIds),
+    enabled:  bridgeCandidateIds.length > 0,
+    staleTime: 30000,
+    refetchInterval: 60000, // catches server-side reconciliation clearing a bridge without a manual reload
+  })
+  const bridgesData = bridges ?? {}
 
   const [sortKey, setSortKey]     = useState('review_date')
   const [sortDir, setSortDir]     = useState('desc')
@@ -1363,8 +1459,8 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
 
   const processed = useMemo(() => {
     let rows = filtered
-    if (needsResponseOnly) rows = rows.filter(r => isActionableReplyState(computeReplyState(r, ws[reviewId(r)])))
-    if (replyStates.length) rows = rows.filter(r => replyStates.includes(computeReplyState(r, ws[reviewId(r)])))
+    if (needsResponseOnly) rows = rows.filter(r => isActionableReplyState(computeReplyState(r, ws[reviewId(r)], bridgesData[reviewId(r)])))
+    if (replyStates.length) rows = rows.filter(r => replyStates.includes(computeReplyState(r, ws[reviewId(r)], bridgesData[reviewId(r)])))
     if (stars)     rows = rows.filter(r => r.star_rating === Number(stars))
     if (locFilter) rows = rows.filter(r => r.location_name === locFilter)
     if (sentiment) rows = rows.filter(r => sentimentBucket(r) === sentiment)
@@ -1385,7 +1481,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
       if (av > bv) return sortDir === 'asc' ?  1 : -1
       return 0
     })
-  }, [filtered, needsResponseOnly, replyStates, ws, stars, locFilter, sentiment, length, keyword, sortKey, sortDir])
+  }, [filtered, needsResponseOnly, replyStates, ws, bridgesData, stars, locFilter, sentiment, length, keyword, sortKey, sortDir])
 
   const totalPages = Math.max(1, Math.ceil(processed.length / PAGE_SIZE))
   const safePage   = Math.min(page, totalPages - 1)
@@ -1456,18 +1552,24 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
   const PREWARM_IDLE_POLL_MS = 1000
   const prewarmedRef = useRef(new Set())
   const prewarmLiveRef = useRef(null)
-  prewarmLiveRef.current = { selectedKey, visible, ws, draftByReviewId }
+  prewarmLiveRef.current = { selectedKey, visible, ws, draftByReviewId, bridges: bridgesData }
   useEffect(() => {
     let cancelled = false
     ;(async () => {
       while (!cancelled) {
-        const { selectedKey: sk, visible: vis, ws: wsNow, draftByReviewId: dbid } = prewarmLiveRef.current
+        const { selectedKey: sk, visible: vis, ws: wsNow, draftByReviewId: dbid, bridges: br } = prewarmLiveRef.current
         const idx = vis.findIndex((r, i) => `${r.review_id || r.review_url || i}` === sk)
         const start = idx === -1 ? 0 : idx + 1
         const next = vis.slice(start, start + PREWARM_COUNT).find(r => {
           const id = reviewId(r)
           if (prewarmedRef.current.has(id)) return false
-          if ((r.owner_response || '').trim()) return false
+          // Recovery Milestone 6B, Part 9: a review answered via Google's
+          // owner_response, the durable publish bridge, or a same-browser
+          // 'published' workspace record must never consume Anthropic
+          // credits preparing another response -- checked here in addition
+          // to (not instead of) the needsResponseOnly filter upstream,
+          // since prewarm also runs over `visible` when that filter is off.
+          if (isAnsweredReplyState(r, wsNow[id], br[id])) return false
           if (wsNow[id]?.editedDraft) return false
           if (dbid[r.review_id || r.review_url || '']?.draft) return false
           return true
@@ -1499,6 +1601,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
   )
   const selectedDraft = selected ? draftByReviewId[selected.review_id || selected.review_url || ''] : null
   const selectedWsEntry = selected ? ws[reviewId(selected)] : null
+  const selectedBridgeEntry = selected ? bridgesData[reviewId(selected)] : null
 
   function handleExportCSV() {
     const headers = ['Date','Location','City','Stars','AI Sentiment','AI Priority','Reviewer','Review','Owner Response','Response Status','Review URL']
@@ -1540,7 +1643,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
           {needsResponseOnly && (
             <>
               <GBPBanner />
-              <WorkspaceStats reviews={processed} ws={ws} draftByReviewId={draftByReviewId} />
+              <WorkspaceStats reviews={processed} ws={ws} draftByReviewId={draftByReviewId} bridges={bridgesData} />
             </>
           )}
 
@@ -1611,6 +1714,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
                     selected={selectedKey === key}
                     onSelect={() => setSelectedKey(key)}
                     wsEntry={ws[reviewId(r)]}
+                    bridgeEntry={bridgesData[reviewId(r)]}
                   />
                 )
               })}
@@ -1674,6 +1778,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
               draft={selectedDraft}
               allReviews={filtered}
               wsEntry={selectedWsEntry}
+              bridgeEntry={selectedBridgeEntry}
               onUpdate={setRecord}
               onPublishSuccess={advanceToNext}
             />
@@ -1692,6 +1797,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
               allReviews={filtered}
               onClose={() => setSelectedKey(null)}
               wsEntry={selectedWsEntry}
+              bridgeEntry={selectedBridgeEntry}
               onUpdate={setRecord}
               onPublishSuccess={advanceToNext}
             />

@@ -28,6 +28,7 @@ TESTS = [
     "test_provider_gbp.py",
     "test_gbp_import.py",
     "test_reconcile_gbp_replies.py",
+    "test_gbp_reply_bridge_reconcile.py",
     "test_prune_validation_flags.py",
     "test_critical_alert_check.py",
     "test_nightly_digest.py",
