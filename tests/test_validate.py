@@ -331,6 +331,36 @@ def test_run_raises_if_index_still_blocked_after_self_heal():
         validate.get_open_flags = real_get_open_flags
 
 
+def test_run_never_touches_a_flag_type_it_does_not_own():
+    """Recovery Milestone 3: provider_sync.py writes its own
+    'duplicate_gbp_listing' flag_type into this same table (via the shared
+    insert_flag()), with its own independent open/resolve reconciliation in
+    _reconcile_collision_flags() -- scoped by flag_type, never by
+    validate.py's CHECK_TYPES. Before get_open_flags() was scoped to
+    CHECK_TYPES, validate.run() would see that row as "open but not
+    detected this run" (since validate.py never checks for that condition
+    at all) and incorrectly resolve it on every single run, silently
+    undoing the whole point of that flag persisting until the real
+    duplicate Google listing is merged. A location-level flag_type outside
+    CHECK_TYPES must survive any number of validate.run() calls untouched."""
+    conn = _fresh_conn()
+    loc_id = _add_location(conn)
+    validate.insert_flag(conn, None, loc_id, "duplicate_gbp_listing",
+                          "gbp_name='Casa Tequila Prime' existing_gbp_id='A' conflicting_gbp_id='B'",
+                          "2026-08-22T00:00:00+00:00")
+    conn.commit()
+
+    for _ in range(3):
+        validate.run(conn)
+
+    row = conn.execute(
+        "SELECT resolved_at FROM validation_flags WHERE flag_type = 'duplicate_gbp_listing'"
+    ).fetchone()
+    assert row is not None, "the foreign flag_type row must still exist"
+    assert row["resolved_at"] is None, \
+        "validate.run() must never resolve a flag_type it does not itself check for"
+
+
 def main():
     tests = [
         ("Repeated validation does not grow open-flag count", test_repeated_validation_does_not_grow_open_flags),
@@ -339,6 +369,7 @@ def main():
         ("Isolation across reviews and flag types", test_isolation_across_reviews_and_flag_types),
         ("Pre-existing duplicate open flags self-heal", test_preexisting_duplicate_open_flags_self_heal),
         ("run() raises if the index is still blocked after self-heal", test_run_raises_if_index_still_blocked_after_self_heal),
+        ("run() never resolves a flag_type it does not own (e.g. duplicate_gbp_listing)", test_run_never_touches_a_flag_type_it_does_not_own),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()

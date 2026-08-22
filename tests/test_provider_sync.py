@@ -464,6 +464,275 @@ async def test_gbp_info_only_written_when_external_id_present():
     assert rows["Linked Spot"]["gbp_last_synced_at"] is not None
 
 
+# --- GBP location collisions (Recovery Milestone 3) ---------------------------
+#
+# Real production case, found via gbp_location_diagnostic.py (2026-08-22):
+# Casa Tequila Prime has two live GBP listings, same name and address --
+#   accounts/109439479242615524495/locations/1272278994573166380  (linked, 61 real reviews)
+#   accounts/109439479242615524495/locations/6020849166564084064  (duplicate, 0 reviews)
+# The fixtures below use clearly-fake IDs (never the real ones above, which
+# only appear in this comment for traceability) so no production identifier
+# ever appears in application logic or test data.
+
+def _link_local(name="Casa Tequila Prime", city="Testtown", gbp_location_name=None):
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO locations (name, city, brand, gbp_account_name, gbp_location_name) "
+        "VALUES (?, ?, 'Casa Tequila', ?, ?)",
+        (name, city, "accounts/999" if gbp_location_name else None, gbp_location_name),
+    )
+    conn.commit()
+    conn.close()
+
+
+async def test_exact_resource_id_match_is_always_allowed():
+    """Linked local row + rediscovering the SAME resource ID -- unaffected
+    by the collision logic, exactly like before."""
+    _fresh_db()
+    _link_local(gbp_location_name="accounts/999/locations/AAA111")
+
+    ploc = ProviderLocation(external_id="accounts/999/locations/AAA111", name="Casa Tequila Prime",
+                             city="Testtown", provider_metadata={"account_name": "accounts/999"})
+    provider = FakeProvider(locations=[ploc], reviews_by_name={"Casa Tequila Prime": [_review()]})
+    result = await provider_sync.sync_all(provider)
+
+    assert result["status"] == "ok", result
+    assert result["location_collisions"] == [], result
+    assert result["locations_succeeded"] == 1
+    assert result["new"] == 1
+
+    conn = db.get_connection()
+    row = conn.execute("SELECT gbp_location_name FROM locations WHERE name = 'Casa Tequila Prime'").fetchone()
+    conn.close()
+    assert row["gbp_location_name"] == "accounts/999/locations/AAA111"
+
+
+async def test_unlinked_local_row_unique_fuzzy_match_allowed_to_link():
+    """A never-before-linked local row + one uniquely-matching discovered
+    name -- an ordinary first-time link, not a collision."""
+    _fresh_db()
+    _link_local(gbp_location_name=None)  # not yet linked to any GBP resource
+
+    ploc = ProviderLocation(external_id="accounts/999/locations/AAA111", name="Casa Tequila Prime",
+                             city="Testtown", provider_metadata={"account_name": "accounts/999"})
+    provider = FakeProvider(locations=[ploc], reviews_by_name={"Casa Tequila Prime": [_review()]})
+    result = await provider_sync.sync_all(provider)
+
+    assert result["location_collisions"] == [], result
+    assert result["locations_succeeded"] == 1
+    conn = db.get_connection()
+    row = conn.execute("SELECT gbp_location_name FROM locations WHERE name = 'Casa Tequila Prime'").fetchone()
+    conn.close()
+    assert row["gbp_location_name"] == "accounts/999/locations/AAA111"
+
+
+async def test_two_completely_different_names_no_collision():
+    """Two discovered locations with genuinely different names never collide
+    with each other or with an unrelated existing local row."""
+    _fresh_db()
+    _link_local(name="Casa Tequila Prime", gbp_location_name="accounts/999/locations/AAA111")
+
+    ploc = ProviderLocation(external_id="accounts/999/locations/ZZZ999", name="Rio Luna Tacos",
+                             city="Elsewhere", provider_metadata={"account_name": "accounts/999"})
+    provider = FakeProvider(locations=[ploc], reviews_by_name={"Rio Luna Tacos": [_review()]})
+    result = await provider_sync.sync_all(provider)
+
+    assert result["location_collisions"] == [], result
+    conn = db.get_connection()
+    names = {r["name"] for r in conn.execute("SELECT name FROM locations").fetchall()}
+    conn.close()
+    assert "Rio Luna Tacos" in names, "a genuinely new, non-colliding location must still be created"
+
+
+async def test_casa_tequila_prime_regression_duplicate_gbp_listing_blocked():
+    """THE regression fixture for the real production case: a local row
+    already linked to A, discovery returns the SAME business twice under
+    two different resource IDs (B first, then A -- matching the real
+    discovery order gbp_location_diagnostic.py observed). Asserts every
+    behavior Recovery Milestone 3 requires."""
+    _fresh_db()
+    _link_local(gbp_location_name="accounts/999/locations/AAA111")
+
+    ploc_b = ProviderLocation(external_id="accounts/999/locations/BBB222", name="Casa Tequila Prime",
+                               city="Testtown", provider_metadata={"account_name": "accounts/999"})
+    ploc_a = ProviderLocation(external_id="accounts/999/locations/AAA111", name="Casa Tequila Prime",
+                               city="Testtown", provider_metadata={"account_name": "accounts/999"})
+    provider = FakeProvider(locations=[ploc_b, ploc_a], reviews_by_name={"Casa Tequila Prime": [_review()]})
+    result = await provider_sync.sync_all(provider)
+
+    # local row remains linked to A; B never overwrites A
+    conn = db.get_connection()
+    row = conn.execute("SELECT id, gbp_location_name FROM locations WHERE name = 'Casa Tequila Prime'").fetchone()
+    assert row["gbp_location_name"] == "accounts/999/locations/AAA111", \
+        "B must never overwrite the existing A link"
+
+    # collision is detected and surfaced in the result
+    assert len(result["location_collisions"]) == 1, result
+    collision = result["location_collisions"][0]
+    assert collision["kind"] == "duplicate_gbp_listing"
+    assert collision["existing_gbp_id"] == "accounts/999/locations/AAA111"
+    assert collision["conflicting_gbp_id"] == "accounts/999/locations/BBB222"
+    assert collision["location_id"] == row["id"]
+
+    # collision is surfaced as a validation flag
+    flag = conn.execute(
+        "SELECT location_id, flag_type, detail, resolved_at FROM validation_flags "
+        "WHERE flag_type = 'duplicate_gbp_listing'"
+    ).fetchone()
+    assert flag is not None, "a duplicate_gbp_listing validation flag must be written"
+    assert flag["location_id"] == row["id"]
+    assert flag["resolved_at"] is None
+    assert "BBB222" in flag["detail"] and "AAA111" in flag["detail"]
+
+    # B's reviews are not silently attached to A's local identity: only the
+    # one review from the single fetch_reviews() call (against A, the only
+    # entry that made it into `linked`) exists.
+    reviews = conn.execute("SELECT COUNT(*) c FROM reviews WHERE location_id = ?", (row["id"],)).fetchone()
+    assert reviews["c"] == 1, "exactly one review (fetched for A) must exist -- B was never fetched"
+
+    # healthy accounting: the collision is not counted as a failure
+    assert result["status"] == "ok", result
+    assert result["locations_succeeded"] == 1, "only A was attempted -- B was excluded from linking entirely"
+    assert result["locations_failed"] == 0, "a collision is not a fetch failure"
+    conn.close()
+
+
+async def test_collision_does_not_affect_healthy_locations_in_same_run():
+    """A collision on one location must not prevent an unrelated, healthy
+    location discovered in the same batch from syncing normally."""
+    _fresh_db()
+    _link_local(name="Casa Tequila Prime", gbp_location_name="accounts/999/locations/AAA111")
+    conn = db.get_connection()
+    conn.execute("INSERT INTO locations (name, city, brand) VALUES ('Rio Luna Tacos', 'Elsewhere', 'Rio Luna')")
+    conn.commit()
+    conn.close()
+
+    ploc_b = ProviderLocation(external_id="accounts/999/locations/BBB222", name="Casa Tequila Prime",
+                               city="Testtown", provider_metadata={"account_name": "accounts/999"})
+    ploc_healthy = ProviderLocation(external_id="accounts/999/locations/CCC333", name="Rio Luna Tacos",
+                                     city="Elsewhere", provider_metadata={"account_name": "accounts/999"})
+    provider = FakeProvider(
+        locations=[ploc_b, ploc_healthy],
+        reviews_by_name={"Rio Luna Tacos": [_review()]},
+    )
+    result = await provider_sync.sync_all(provider)
+
+    assert result["status"] == "ok", result
+    assert result["locations_succeeded"] == 1, "the healthy location must still sync despite the collision"
+    assert len(result["location_collisions"]) == 1
+    assert result["new"] == 1
+
+
+async def test_ambiguous_fuzzy_match_never_chosen_arbitrarily():
+    """A discovered name that fuzzy-matches MORE than one local row is
+    ambiguous -- must never guess (the old next()-based fallback silently
+    picked the first candidate). Neither 'Los Tres Amigos' nor 'Los Tres
+    Amigos Jackson' normalizes to exactly 'lostresamigosjacksonheights' (so
+    neither takes the exact-normalized-name path), but BOTH are substrings
+    of it, which is exactly the ambiguity this guards against."""
+    _fresh_db()
+    conn = db.get_connection()
+    conn.execute("INSERT INTO locations (name, city, brand) VALUES ('Los Tres Amigos', 'Metro', 'Los Tres Amigos')")
+    conn.execute("INSERT INTO locations (name, city, brand) VALUES ('Los Tres Amigos Jackson', 'Jackson', 'Los Tres Amigos')")
+    conn.commit()
+    conn.close()
+
+    ploc = ProviderLocation(external_id="accounts/999/locations/DDD444", name="Los Tres Amigos Jackson Heights",
+                             city="Jackson Heights", provider_metadata={"account_name": "accounts/999"})
+    provider = FakeProvider(locations=[ploc], reviews_by_name={})
+    result = await provider_sync.sync_all(provider)
+
+    assert len(result["location_collisions"]) == 1, result
+    assert result["location_collisions"][0]["kind"] == "ambiguous_fuzzy_match"
+    assert result["locations_succeeded"] == 0, "an ambiguous match must not be linked to either candidate"
+
+    conn = db.get_connection()
+    rows = conn.execute("SELECT name, gbp_location_name FROM locations").fetchall()
+    conn.close()
+    for r in rows:
+        assert r["gbp_location_name"] is None, \
+            f"neither ambiguous candidate ({r['name']}) may be linked arbitrarily"
+
+
+async def test_repeated_collision_across_multiple_runs_deterministic_no_duplicate_growth():
+    """The same collision recurring on every sync (the expected state until
+    the duplicate Google listing is merged/excluded) must stay at exactly
+    one open validation flag, never grow, and never flip which resource ID
+    is linked."""
+    _fresh_db()
+    _link_local(gbp_location_name="accounts/999/locations/AAA111")
+
+    def _discovery():
+        return [
+            ProviderLocation(external_id="accounts/999/locations/BBB222", name="Casa Tequila Prime",
+                              city="Testtown", provider_metadata={"account_name": "accounts/999"}),
+            ProviderLocation(external_id="accounts/999/locations/AAA111", name="Casa Tequila Prime",
+                              city="Testtown", provider_metadata={"account_name": "accounts/999"}),
+        ]
+
+    for _ in range(3):
+        provider = FakeProvider(locations=_discovery(), reviews_by_name={"Casa Tequila Prime": [_review()]})
+        result = await provider_sync.sync_all(provider)
+        assert len(result["location_collisions"]) == 1, result
+
+    conn = db.get_connection()
+    open_flags = conn.execute(
+        "SELECT COUNT(*) c FROM validation_flags WHERE flag_type = 'duplicate_gbp_listing' AND resolved_at IS NULL"
+    ).fetchone()
+    all_flags = conn.execute(
+        "SELECT COUNT(*) c FROM validation_flags WHERE flag_type = 'duplicate_gbp_listing'"
+    ).fetchone()
+    row = conn.execute("SELECT gbp_location_name FROM locations WHERE name = 'Casa Tequila Prime'").fetchone()
+    conn.close()
+    assert open_flags["c"] == 1, "exactly one open flag after 3 runs -- no duplicate growth"
+    assert all_flags["c"] == 1, "no resolved-then-reopened churn either -- the same row stays open throughout"
+    assert row["gbp_location_name"] == "accounts/999/locations/AAA111", "A must never flip to B across repeated runs"
+
+
+async def test_collision_flag_resolves_once_no_longer_detected():
+    """If a future discovery run no longer finds the duplicate (the Google
+    listing was merged/removed), the previously-open flag must resolve --
+    matching validate.py's own resolve-when-condition-clears behavior."""
+    _fresh_db()
+    _link_local(gbp_location_name="accounts/999/locations/AAA111")
+
+    colliding = FakeProvider(
+        locations=[
+            ProviderLocation(external_id="accounts/999/locations/BBB222", name="Casa Tequila Prime",
+                              city="Testtown", provider_metadata={"account_name": "accounts/999"}),
+            ProviderLocation(external_id="accounts/999/locations/AAA111", name="Casa Tequila Prime",
+                              city="Testtown", provider_metadata={"account_name": "accounts/999"}),
+        ],
+        reviews_by_name={"Casa Tequila Prime": [_review()]},
+    )
+    await provider_sync.sync_all(colliding)
+
+    conn = db.get_connection()
+    still_open = conn.execute(
+        "SELECT COUNT(*) c FROM validation_flags WHERE flag_type = 'duplicate_gbp_listing' AND resolved_at IS NULL"
+    ).fetchone()["c"]
+    conn.close()
+    assert still_open == 1, "flag must be open after the colliding run"
+
+    # Next run: the duplicate is gone (merged on Google's side).
+    healthy = FakeProvider(
+        locations=[
+            ProviderLocation(external_id="accounts/999/locations/AAA111", name="Casa Tequila Prime",
+                              city="Testtown", provider_metadata={"account_name": "accounts/999"}),
+        ],
+        reviews_by_name={"Casa Tequila Prime": [_review()]},
+    )
+    result = await provider_sync.sync_all(healthy)
+    assert result["location_collisions"] == [], result
+
+    conn = db.get_connection()
+    resolved = conn.execute(
+        "SELECT COUNT(*) c FROM validation_flags WHERE flag_type = 'duplicate_gbp_listing' AND resolved_at IS NOT NULL"
+    ).fetchone()["c"]
+    conn.close()
+    assert resolved == 1, "the flag must resolve once the collision is no longer detected"
+
+
 # --- Provider-dependent mode (Phase 3 Milestone 4.1) --------------------------
 
 def test_mode_for_matches_each_real_provider_class():
@@ -549,6 +818,14 @@ def main():
         ("new/edited/deleted statistics sum correctly across multiple locations", test_statistics_sum_correctly_across_multiple_locations),
         ("multiple external_id=None locations are linked independently, never collide", test_multiple_no_external_id_locations_do_not_collide),
         ("gbp_last_synced_at is only written for a location with a real external_id", test_gbp_info_only_written_when_external_id_present),
+        ("exact resource-ID match is always allowed, unaffected by collision logic", test_exact_resource_id_match_is_always_allowed),
+        ("an unlinked local row + a unique fuzzy name match is allowed to link", test_unlinked_local_row_unique_fuzzy_match_allowed_to_link),
+        ("two completely different names never collide", test_two_completely_different_names_no_collision),
+        ("Casa Tequila Prime regression: a duplicate GBP listing is blocked, not silently merged", test_casa_tequila_prime_regression_duplicate_gbp_listing_blocked),
+        ("a location collision does not affect healthy locations synced in the same run", test_collision_does_not_affect_healthy_locations_in_same_run),
+        ("an ambiguous fuzzy match (matches >1 local row) is never chosen arbitrarily", test_ambiguous_fuzzy_match_never_chosen_arbitrarily),
+        ("a repeated collision across multiple runs stays deterministic, no duplicate flag growth", test_repeated_collision_across_multiple_runs_deterministic_no_duplicate_growth),
+        ("a collision flag resolves once the collision is no longer detected", test_collision_flag_resolves_once_no_longer_detected),
         ("_mode_for() maps each real provider class to its correct mode value", test_mode_for_matches_each_real_provider_class),
         ("_mode_for() defaults an unknown provider to 'api_sync'", test_mode_for_unknown_provider_defaults_to_api_sync),
         ("a scraper run records mode='cloud', never 'api_sync'", test_scraper_run_records_cloud_mode_never_api_sync),

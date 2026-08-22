@@ -58,14 +58,27 @@ def insert_flag(conn, review_id, location_id, flag_type, detail, now):
 
 
 def get_open_flags(conn) -> dict:
-    """Every currently-open flag, keyed by identity (review_id, location_id,
-    flag_type) -> list of rows. Normally at most one row per identity;
-    kept as a list rather than a single row so a pre-existing anomaly (more
-    than one simultaneously-open row for the same identity, e.g. leftover
-    from before this fix) can be detected and self-healed by run() rather
-    than silently hidden by a dict that only remembers the last one seen."""
+    """Every currently-open flag of one of THIS module's own CHECK_TYPES,
+    keyed by identity (review_id, location_id, flag_type) -> list of rows.
+    Normally at most one row per identity; kept as a list rather than a
+    single row so a pre-existing anomaly (more than one simultaneously-open
+    row for the same identity, e.g. leftover from before this fix) can be
+    detected and self-healed by run() rather than silently hidden by a dict
+    that only remembers the last one seen.
+
+    Scoped to CHECK_TYPES (Recovery Milestone 3): other modules write other
+    flag_types into this same table -- e.g. provider_sync.py's
+    'duplicate_gbp_listing', which has its own independent open/resolve
+    reconciliation in _reconcile_collision_flags(). Without this filter,
+    run()'s resolve loop below would see those rows as "open but not
+    detected this run" (since this module never checks for that condition
+    at all) and incorrectly resolve them on every single validate.py run --
+    silently undoing that flag's whole purpose."""
+    placeholders = ",".join("?" * len(CHECK_TYPES))
     rows = conn.execute(
-        "SELECT id, review_id, location_id, flag_type FROM validation_flags WHERE resolved_at IS NULL"
+        f"SELECT id, review_id, location_id, flag_type FROM validation_flags "
+        f"WHERE resolved_at IS NULL AND flag_type IN ({placeholders})",
+        CHECK_TYPES,
     ).fetchall()
     by_identity: dict = {}
     for r in rows:

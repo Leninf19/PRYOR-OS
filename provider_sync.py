@@ -23,6 +23,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 import db
+import validate
 from provider_base import Provider, ProviderError
 
 # How long a row may sit at status='running' before the watchdog in
@@ -80,11 +81,15 @@ async def _maybe_await(value):
     return value
 
 
-def _link_locations(conn, provider_locations: list, our_locations: list, now: str) -> dict:
+def _link_locations(conn, provider_locations: list, our_locations: list, now: str) -> tuple[dict, list]:
     """Matches every provider-discovered location to -- or creates -- the
-    corresponding internal row. Returns {key: {"id", "name", "location"}},
-    keeping the original ProviderLocation alongside so the per-location
-    review-fetch loop below doesn't need to reconstruct one.
+    corresponding internal row. Returns (linked, collisions):
+      - linked: {key: {"id", "name", "location"}}, keeping the original
+        ProviderLocation alongside so the per-location review-fetch loop
+        below doesn't need to reconstruct one.
+      - collisions: a list of dicts describing every discovered location
+        that could NOT be safely auto-linked this run (see below). Never
+        empty by default -- [] when nothing collided.
 
     Moved from gbp_sync.py (Phase 3 Milestone 1's _link_locations) --
     already fully generic for the matching logic itself: a provider location
@@ -108,22 +113,91 @@ def _link_locations(conn, provider_locations: list, our_locations: list, now: st
          out gbp_location_name) on a location that may already be
          legitimately linked to Google by a real GBP sync. For GBPProvider,
          external_id is always truthy, so this guard is always taken and
-         behavior is identical to before."""
+         behavior is identical to before.
+
+    Recovery Milestone 3 gap (found via gbp_location_diagnostic.py, 2026-08-22:
+    two live GBP listings named "Casa Tequila Prime" at the same address,
+    distinct resource IDs, one already linked): the fuzzy-name fallback
+    below used to silently overwrite gbp_location_name whenever a SECOND,
+    different external_id also matched an already-linked local row --
+    "last write wins," with no record that a conflict ever happened, and
+    (worse) every location's linked entry got its reviews fetched, so a
+    genuine second Google listing could have its reviews attached to the
+    wrong local identity. Two defensive rules now apply, both scoped to the
+    fuzzy-match path ONLY -- an exact gbp_location_name match (a provider
+    location whose external_id already equals what's stored) is always
+    authoritative and completely unaffected by either rule:
+      1. If the fuzzy match resolves to a local row whose gbp_location_name
+         is already set to a DIFFERENT external_id, this is a blocked
+         collision -- the existing link is left completely untouched, and
+         this provider location is excluded from `linked` entirely (so
+         fetch_reviews() is never called for it this run -- see sync_all()).
+         A local row with no gbp_location_name yet (never linked) is NOT a
+         collision -- that's an ordinary first-time link.
+      2. If the fuzzy match itself is ambiguous -- the normalized name
+         matches MORE THAN ONE local row -- this is also a blocked
+         collision. The previous code picked next()'s first result
+         arbitrarily; it now never guesses."""
     by_name = {_norm_name(l["name"]): l for l in our_locations}
+    # Keyed by id, sharing the SAME dict objects as our_locations/by_name (not
+    # copies) -- updated in place below whenever a gbp_location_name write
+    # happens, so the collision check a few iterations later in THIS SAME
+    # loop sees it too. Without this, two brand-new (never-before-linked)
+    # colliding external_ids discovered in the same run would each see the
+    # OTHER's write as "still unlinked" (the pre-loop snapshot never
+    # refreshes), and the second would incorrectly be allowed to also link --
+    # the exact silent-overwrite this whole change exists to prevent. Only
+    # matters for this in-run ordering; a location already linked from a
+    # PRIOR run is caught immediately by the exact-match branch above
+    # regardless (that's how the real Casa Tequila Prime case is caught).
+    by_id = {l["id"]: l for l in our_locations}
     linked = {}
+    collisions = []
 
     for i, ploc in enumerate(provider_locations):
         existing_row = db.get_location_by_gbp_name(conn, ploc.external_id)
         if existing_row:
+            # Exact resource-ID match is always authoritative -- unchanged.
             loc_id, loc_name = existing_row["id"], existing_row["name"]
         else:
             gname = _norm_name(ploc.name)
-            match = by_name.get(gname) or next(
-                (l for l in our_locations
-                 if gname and (gname in _norm_name(l["name"]) or _norm_name(l["name"]) in gname)),
-                None,
-            )
+            exact_name_match = by_name.get(gname)
+            substring_matches = [
+                l for l in our_locations
+                if gname and (gname in _norm_name(l["name"]) or _norm_name(l["name"]) in gname)
+            ] if not exact_name_match else []
+
+            if exact_name_match:
+                match = exact_name_match
+            elif len(substring_matches) > 1:
+                collisions.append({
+                    "kind": "ambiguous_fuzzy_match",
+                    "location_id": None, "location_name": None,
+                    "existing_gbp_id": None, "conflicting_gbp_id": ploc.external_id,
+                    "gbp_name": ploc.name, "city": ploc.city, "address": ploc.address,
+                    "candidate_local_names": [l["name"] for l in substring_matches],
+                })
+                print(f"GBP_LOCATION_COLLISION kind=ambiguous_fuzzy_match "
+                      f"gbp_name={ploc.name!r} gbp_id={ploc.external_id} "
+                      f"candidates={[l['name'] for l in substring_matches]}")
+                continue
+            else:
+                match = substring_matches[0] if substring_matches else None
+
             if match:
+                existing_gbp_id = match["gbp_location_name"]
+                if existing_gbp_id and existing_gbp_id != ploc.external_id:
+                    collisions.append({
+                        "kind": "duplicate_gbp_listing",
+                        "location_id": match["id"], "location_name": match["name"],
+                        "existing_gbp_id": existing_gbp_id, "conflicting_gbp_id": ploc.external_id,
+                        "gbp_name": ploc.name, "city": ploc.city, "address": ploc.address,
+                        "candidate_local_names": None,
+                    })
+                    print(f"GBP_LOCATION_COLLISION kind=duplicate_gbp_listing "
+                          f"location_id={match['id']} location_name={match['name']!r} "
+                          f"retained={existing_gbp_id} conflicting={ploc.external_id}")
+                    continue
                 loc_id, loc_name = match["id"], match["name"]
             else:
                 # Genuinely new to us -- create it. Brand/city are
@@ -136,11 +210,70 @@ def _link_locations(conn, provider_locations: list, our_locations: list, now: st
             account_name = ploc.provider_metadata.get("account_name")
             db.set_location_gbp_info(conn, loc_id, account_name, ploc.external_id,
                                       ploc.verification_status, now)
+            if loc_id in by_id:
+                by_id[loc_id]["gbp_location_name"] = ploc.external_id
 
         key = ploc.external_id or f"__unlinked_{i}__"
         linked[key] = {"id": loc_id, "name": loc_name, "location": ploc}
 
-    return linked
+    return linked, collisions
+
+
+def _reconcile_collision_flags(conn, collisions: list, now: str) -> None:
+    """Mirrors validate.py's own open/detect/resolve pattern (see that
+    module's docstring) exactly, scoped to just the 'duplicate_gbp_listing'
+    flag_type: a location colliding THIS run gets exactly one open flag --
+    no new row if one is already open, so a collision that persists across
+    every sync (the expected case until the duplicate Google listing is
+    merged or excluded) never grows duplicate rows. A location that WAS
+    colliding but isn't detected as colliding this run (the duplicate was
+    merged/removed on Google's side) gets its open flag resolved
+    automatically, the same way validate.py resolves a cleared condition.
+
+    Only 'duplicate_gbp_listing' (a real local location_id, from a fuzzy
+    match landing on an already-differently-linked row) becomes a
+    validation_flags row -- 'ambiguous_fuzzy_match' collisions (see
+    _link_locations) have no location_id to anchor a flag to (nothing
+    resolved at all) and are surfaced via the GBP_LOCATION_COLLISION log
+    line only."""
+    by_location = {
+        c["location_id"]: c for c in collisions if c["kind"] == "duplicate_gbp_listing"
+    }
+
+    open_rows = conn.execute(
+        "SELECT id, location_id FROM validation_flags "
+        "WHERE resolved_at IS NULL AND flag_type = 'duplicate_gbp_listing'"
+    ).fetchall()
+    open_by_location: dict = {}
+    for r in open_rows:
+        open_by_location.setdefault(r["location_id"], []).append(r["id"])
+
+    for location_id, c in by_location.items():
+        if location_id in open_by_location:
+            continue  # already open -- leave it in place, matches validate.py's own invariant
+        detail = (
+            f"gbp_name={c['gbp_name']!r} existing_gbp_id={c['existing_gbp_id']!r} "
+            f"conflicting_gbp_id={c['conflicting_gbp_id']!r} city={c['city']!r} "
+            "reason='two Google Business Profile listings with the same normalized "
+            "name resolve to this one local location'"
+        )
+        validate.insert_flag(conn, None, location_id, "duplicate_gbp_listing", detail, now)
+
+    ids_to_resolve = []
+    for location_id, ids in open_by_location.items():
+        ids_sorted = sorted(ids)
+        still_colliding = location_id in by_location
+        for i, flag_id in enumerate(ids_sorted):
+            if still_colliding and i == 0:
+                continue  # the one row kept open for an ongoing collision
+            ids_to_resolve.append(flag_id)  # resolved, or a self-healed duplicate-open row
+
+    if ids_to_resolve:
+        placeholders = ",".join("?" * len(ids_to_resolve))
+        conn.execute(
+            f"UPDATE validation_flags SET resolved_at = ? WHERE id IN ({placeholders})",
+            (now, *ids_to_resolve),
+        )
 
 
 def _record_early_failure(conn, now: str, reason: str, provider_name: str, mode: str) -> None:
@@ -217,7 +350,8 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
         }
 
     our_locations = [dict(r) for r in conn.execute("SELECT * FROM locations WHERE is_active = 1").fetchall()]
-    linked = _link_locations(conn, provider_locations, our_locations, now)
+    linked, collisions = _link_locations(conn, provider_locations, our_locations, now)
+    _reconcile_collision_flags(conn, collisions, now)
     conn.commit()
 
     run_id = conn.execute(
@@ -351,6 +485,13 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
         "locations_succeeded": locations_succeeded, "locations_failed": locations_failed,
         "new": total_new, "edited": total_edited, "deleted": total_deleted, "errors": errors,
         "new_reviews": new_reviews_detail,
+        # Recovery Milestone 3: locations discovered but excluded from `linked`
+        # (and therefore never fetch_reviews()'d this run) because linking them
+        # would have overwritten a different existing gbp_location_name, or
+        # because their normalized name matched more than one local row. See
+        # _link_locations()/_reconcile_collision_flags(). Purely additive --
+        # every existing key above is unchanged.
+        "location_collisions": collisions,
     }
 
 
