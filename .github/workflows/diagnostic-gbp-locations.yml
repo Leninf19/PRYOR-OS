@@ -1,0 +1,50 @@
+name: Diagnostic - GBP Location Reconciliation
+
+# ONE-TIME, read-only diagnostic (Recovery Milestone 3, Phase 4): resolves
+# why GBP Test Connection discovers 23 Google Business Profile locations
+# while dashboard/reviews.db's `locations` table only has 22 linked rows.
+# Runs gbp_location_diagnostic.py, which calls only
+# GBPProvider().discover_locations() (list accounts, list locations -- no
+# review fetch, no reply) and reads dashboard/reviews.db through a SQLite
+# mode=ro connection. No commit step exists in this workflow -- it is
+# structurally incapable of writing to reviews.db, unlike every other
+# workflow in this repo. Deliberately NOT in the reviews-db-writer
+# concurrency group (it writes nothing, so it must never queue behind or
+# block a real sync).
+#
+# workflow_dispatch only -- no schedule. Intended to be run once.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      # cryptography is required for google_api.py's AESGCM decrypt of the
+      # Redis-stored refresh token (see google_api.py's
+      # _fetch_refresh_token_from_redis()) -- the same dependency every
+      # other GBP-calling workflow installs.
+      - name: Install Python dependencies
+        run: pip install cryptography
+
+      - name: Run GBP location reconciliation diagnostic
+        run: python gbp_location_diagnostic.py
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
