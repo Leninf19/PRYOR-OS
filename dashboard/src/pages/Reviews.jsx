@@ -82,6 +82,13 @@ const FAIL_REASONS = {
   network_error:     'Network error. Check your connection and try again.',
   location_mismatch: 'Could not match this review to a verified Google location.',
   already_replied:   'This review already has an owner response on Google.',
+  // Recovery Milestone 5: distinct from network_error -- this means OUR
+  // OWN watchdog gave up waiting, not that the request definitely failed.
+  // Google's reply endpoint is a PUT (an idempotent upsert), so retrying
+  // the same text is always safe -- it can never create a duplicate reply,
+  // even if the first attempt actually went through before we stopped
+  // waiting for it.
+  timeout: 'This took longer than expected — it may have already gone through on Google\'s side. Retrying is safe and will never create a duplicate reply; check Confirmed/Externally Replied first if you\'d like to be sure before retrying.',
 }
 
 function fmtWhen(iso) {
@@ -182,7 +189,17 @@ function GBPBanner() {
 
 function WorkspaceStats({ reviews, ws, draftByReviewId }) {
   const total     = reviews.length
-  const withDraft = reviews.filter(r => draftByReviewId[r.review_id || r.review_url || '']).length
+  // Recovery Milestone 5, Problem 3: this only counted the scheduled batch
+  // export (draftByReviewId), so once on-demand/prewarmed generation started
+  // persisting drafts straight into the workspace instead, this metric
+  // under-reported (often showing 0 even with drafts genuinely ready) --
+  // exactly the "broken pipeline" the metric needs to reflect accurately
+  // rather than be removed. A review counts once it has a draft from either
+  // source, unedited by a human (status 'draft_ready') or the original
+  // scheduled export.
+  const withDraft = reviews.filter(r =>
+    Boolean(draftByReviewId[r.review_id || r.review_url || '']) || ws[reviewId(r)]?.status === 'draft_ready'
+  ).length
   const urgent    = reviews.filter(r => (r.star_rating ?? 5) <= 1).length
   const done      = reviews.filter(r => STATUS_META[ws[reviewId(r)]?.status]?.done).length
 
@@ -478,7 +495,14 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
   const [lastTone,   setLastTone]     = useState(null)
   const [rewriting,  setRewriting]    = useState(false)
   const [rewriteErr, setRewriteErr]   = useState(null)
-  const [publishing, setPublishing]   = useState(false)
+  // Recovery Milestone 5: explicit publish state machine
+  // (idle -> publishing -> success | failed) instead of a single boolean --
+  // 'success' is transient (this instance unmounts via onPublishSuccess()'s
+  // review switch, or the queue empties, before it would ever need to
+  // render), but making publishing/failed distinct from "never attempted"
+  // is what lets a failure carry its own message without a stale boolean.
+  const [publishState, setPublishState] = useState('idle') // 'idle' | 'publishing' | 'failed'
+  const publishing = publishState === 'publishing'
   const [copied,     setCopied]       = useState(false)
   const [moreOpen,   setMoreOpen]     = useState(false)
   const [acknowledged, setAcknowledged] = useState(false)
@@ -490,6 +514,54 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
   const publishInFlight = useRef(false)
 
   const wasEdited = wsEntry?.status === 'edited'
+  // AI-prepared covers both sources: the scheduled batch export (`draft`)
+  // and an on-demand-generated one persisted into the workspace below --
+  // both are "prepared, not yet touched by a manager."
+  const isAiPrepared = (Boolean(draft) || wsEntry?.status === 'draft_ready') && !wasEdited
+
+  // Recovery Milestone 5, Problem 2: if this actionable review has no
+  // draft anywhere (no scheduled batch export, no persisted workspace
+  // edit/generation), generate one automatically, once, the moment it's
+  // opened -- reuses the same /api/rewrite endpoint and Phase-3 safety
+  // guard the manual "AI Rewrite Tone" buttons already call, just
+  // triggered automatically instead of by a click. Persisted into the
+  // SAME localStorage-backed workspace editedDraft field a manual rewrite
+  // already uses (status: 'draft_ready', not 'edited' -- this is prepared
+  // text, not something the manager wrote), so reopening this review later
+  // never re-generates: `hasAnyDraft` below becomes true and the effect's
+  // own guard condition no longer matches. Explicit Regenerate is the only
+  // other path back through this endpoint.
+  const hasAnyDraft = Boolean(draft?.draft) || Boolean(wsEntry?.editedDraft)
+  const [autoGenerating, setAutoGenerating] = useState(false)
+  const [autoGenerateErr, setAutoGenerateErr] = useState(null)
+  const autoGenerateAttempted = useRef(false)
+
+  useEffect(() => {
+    if (hasAnyDraft || isDone || autoGenerateAttempted.current) return
+    autoGenerateAttempted.current = true
+    setAutoGenerating(true)
+    setAutoGenerateErr(null)
+    callRewrite({
+      tone: 'friendly',
+      reviewText:   r.review_text  || '',
+      currentDraft: '',
+      reviewerName: r.reviewer_name || 'Guest',
+      location:     r.location_name || 'our restaurant',
+      stars:        r.star_rating   ?? 1,
+    }).then(generated => {
+      setLocalDraft(generated)
+      onUpdate(rid, { editedDraft: generated, status: 'draft_ready' })
+    }).catch(e => {
+      setAutoGenerateErr(
+        e.message?.includes('ANTHROPIC_API_KEY') || e.message?.includes('401') || /credit/i.test(e.message || '')
+          ? 'AI is currently unavailable — you can still write your own response below.'
+          : 'Could not prepare a response automatically. You can still write your own below.'
+      )
+    }).finally(() => setAutoGenerating(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once per
+    // mounted review (this component is now keyed by review id), guarded by
+    // autoGenerateAttempted against StrictMode's dev-only double-invoke.
+  }, [])
 
   function onTextChange(val) {
     setLocalDraft(val)
@@ -534,10 +606,28 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
 
   const publishBlocked = !localDraft || publishing || (serious && !acknowledged)
 
+  // Recovery Milestone 5 root cause: the previous version had no bound on
+  // how long a publish request could take before the UI gave up -- proven
+  // by reproduction (a route that never resolves leaves the button
+  // permanently disabled on "Publishing…" with zero recovery). The
+  // concrete real-world trigger is /api/google/publish's own fallback
+  // lookup path (used whenever a review has no gbp_review_name yet --
+  // still true for a meaningful share of the actionable backlog): it makes
+  // several sequential, paginated Google API calls with no per-call
+  // timeout, only Vercel's platform-level function limit as an eventual
+  // (and much longer) backstop. This watchdog is a bounded, generous
+  // safety net for that -- NOT a substitute for the fallback path itself
+  // eventually being unnecessary once more reviews are GBP-linked.
+  const PUBLISH_TIMEOUT_MS = 45000
+
   async function handlePublish() {
     if (publishBlocked || publishInFlight.current) return
     publishInFlight.current = true
-    setPublishing(true) // disabled immediately -- prevents double submission
+    setPublishState('publishing') // disabled immediately -- prevents double submission
+
+    const controller = new AbortController()
+    const watchdog = setTimeout(() => controller.abort(), PUBLISH_TIMEOUT_MS)
+
     try {
       const res = await fetch('/api/google/publish', {
         method:  'POST',
@@ -547,27 +637,41 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
             ? { reviewName: r.gbp_review_name, replyText: localDraft }
             : { locationName: r.location_name, reviewerName: r.reviewer_name, replyText: localDraft }
         ),
+        signal: controller.signal,
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
         onUpdate(rid, { status: 'published', publishedAt: new Date().toISOString(), failReason: null }, 'Published to Google')
         showToast('Response published to Google')
         onPublishSuccess?.() // auto-advance to the next actionable review
+        // No setPublishState('idle') here: this instance either unmounts
+        // (queue empties) or a fresh instance mounts for the next review
+        // (keyed by review id -- see ReviewDetailContent's callers), each
+        // starting at 'idle' on its own. Resetting here too would just be
+        // a redundant state update racing that transition.
       } else {
         onUpdate(rid, { status: 'failed', failReason: data.error || 'api_error' }, 'Publish failed')
-        setPublishing(false) // stays in the active queue, editable, retryable -- do NOT auto-advance
-        publishInFlight.current = false
+        setPublishState('failed') // stays in the active queue, editable, retryable -- do NOT auto-advance
       }
-    } catch {
-      onUpdate(rid, { status: 'failed', failReason: 'network_error' }, 'Publish failed')
-      setPublishing(false)
+    } catch (err) {
+      // AbortError = our own watchdog fired, not a real network failure --
+      // the request may well have reached Google and succeeded server-side
+      // before the client gave up waiting (this is exactly the "stuck"
+      // symptom's likely real-world mechanism). GBP's reply endpoint is a
+      // PUT to a fixed .../reviews/{review}/reply resource (an idempotent
+      // upsert by REST convention and by Google's own API design -- it SETS
+      // the reply text, it does not append), so retrying with the same
+      // text is safe either way: at worst it re-confirms the same value,
+      // it can never create a duplicate reply. 'timeout' gets its own
+      // FAIL_REASONS message saying exactly that, rather than the generic
+      // network_error text.
+      const timedOut = err?.name === 'AbortError'
+      onUpdate(rid, { status: 'failed', failReason: timedOut ? 'timeout' : 'network_error' }, 'Publish failed')
+      setPublishState('failed')
+    } finally {
+      clearTimeout(watchdog)
       publishInFlight.current = false
     }
-    // NOTE: no `finally` resetting `publishing`/`publishInFlight` on success
-    // -- this component unmounts (onPublishSuccess selects a different
-    // review) before it would matter, and leaving the button disabled
-    // through that transition is exactly what prevents a double-click
-    // double-publish.
   }
 
   function handleKeyDown(e) {
@@ -630,9 +734,10 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <label className="text-[10px] font-medium tracking-wide flex items-center gap-1.5" style={{ color: 'var(--color-text-3)' }}>
-                {draft && !wasEdited && <span style={{ color: 'var(--color-accent)' }}>✦ AI-prepared</span>}
+                {isAiPrepared && <span style={{ color: 'var(--color-accent)' }}>✦ AI Prepared</span>}
                 {wasEdited && <span>Edited</span>}
-                {!draft && !wasEdited && <span>Your response</span>}
+                {!isAiPrepared && !wasEdited && !autoGenerating && <span>Your response</span>}
+                {autoGenerating && <span style={{ color: 'var(--color-text-3)' }}>Preparing response…</span>}
               </label>
               <span className="text-[10px]" style={{ color: charOver ? 'var(--color-danger)' : 'var(--color-text-3)' }}>
                 {charCount} / 4096
@@ -643,19 +748,29 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
               value={localDraft}
               onChange={e => onTextChange(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Write a response to this review…"
+              placeholder={autoGenerating ? 'Preparing a response…' : 'Write a response to this review…'}
               rows={4}
+              disabled={autoGenerating}
               className="w-full rounded-xl px-3 py-2.5 text-xs resize-y focus:outline-none transition-colors"
               style={{
-                background: 'var(--ai-draft-bg)', color: 'var(--ai-draft-text)',
-                border: `1px solid ${charOver ? 'var(--color-danger)' : 'var(--ai-draft-border)'}`,
+                // Recovery Milestone 5, Problem 3: this used to be the
+                // near-black --ai-draft-* palette (an intentionally
+                // theme-independent dark panel, still used elsewhere for the
+                // "AI reasoning" card) -- for the actual reply text a manager
+                // edits and publishes, that read as heavy/out of place next
+                // to the rest of this light UI. Reuses the same light
+                // accent-tint tokens the Owner Response box below already
+                // uses, so "AI-prepared" and "already replied on Google"
+                // read as one consistent light palette instead of two.
+                background: isAiPrepared ? 'var(--color-accent-lt)' : 'var(--color-surface)',
+                color: 'var(--color-text-1)',
+                border: `1px solid ${charOver ? 'var(--color-danger)' : (isAiPrepared ? 'var(--color-accent-md)' : 'var(--color-border)')}`,
                 lineHeight: 1.6, fontFamily: 'inherit', minHeight: 84,
+                opacity: autoGenerating ? 0.6 : 1,
               }}
             />
-            {!draft && !localDraft && (
-              <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-3)' }}>
-                No AI draft available yet for this review — write your own response above.
-              </p>
+            {autoGenerateErr && (
+              <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-3)' }}>{autoGenerateErr}</p>
             )}
           </div>
 
@@ -1066,13 +1181,16 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate, onPublis
 
       <SendToRestaurantSection r={r} />
 
-      {/* Similar reviews */}
+      {/* Similar reviews -- moved into a collapsed disclosure (Recovery
+          Milestone 5, Problem 3): useful context, but competed with the
+          review/response/publish flow for attention in the first viewport
+          when shown open by default. */}
       {similar.length > 0 && (
-        <div>
-          <p className="text-[10px] font-bold uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-3)' }}>
-            Similar Reviews at This Location
-          </p>
-          <div className="space-y-2">
+        <details className="pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>
+          <summary className="text-[10px] font-bold uppercase tracking-wider cursor-pointer" style={{ color: 'var(--color-text-3)' }}>
+            Related context · {similar.length} similar review{similar.length === 1 ? '' : 's'} at this location
+          </summary>
+          <div className="space-y-2 mt-2">
             {similar.map((s, i) => (
               <div key={i} className="p-2.5 rounded-lg text-xs" style={{ background: 'var(--color-surface-2)' }}>
                 <div className="flex items-center justify-between mb-1">
@@ -1083,7 +1201,7 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate, onPublis
               </div>
             ))}
           </div>
-        </div>
+        </details>
       )}
 
       {!r.owner_response && (
@@ -1114,7 +1232,12 @@ function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, onUpdate, onPub
         <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>{r.reviewer_name || 'Anonymous'}</p>
         <p className="text-xs" style={{ color: 'var(--color-text-3)' }}>{r.location_name} · {r.review_date}</p>
       </div>
-      <ReviewDetailContent r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
+      {/* Keyed by review identity (Recovery Milestone 5, defense-in-depth):
+          guarantees ResponseWorkspace's local state (publishState, localDraft,
+          etc.) always starts fresh for a newly-selected review rather than
+          depending on React's own reconciliation heuristics happening to
+          treat this as a remount every time. */}
+      <ReviewDetailContent key={reviewId(r)} r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
     </Card>
   )
 }
@@ -1154,7 +1277,7 @@ function ReviewDetailOverlay({ r, draft, allReviews, onClose, wsEntry, onUpdate,
           </button>
         </div>
         <div className="flex-1 p-5">
-          <ReviewDetailContent r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
+          <ReviewDetailContent key={reviewId(r)} r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
         </div>
       </motion.aside>
     </>
@@ -1266,7 +1389,14 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
 
   const totalPages = Math.max(1, Math.ceil(processed.length / PAGE_SIZE))
   const safePage   = Math.min(page, totalPages - 1)
-  const visible    = processed.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE)
+  // Memoized (not a plain .slice()) so its identity is stable across renders
+  // that don't actually change the page/list -- the prewarm effect below
+  // depends on it, and an unstable reference here made it restart (and fire
+  // an extra overlapping /api/rewrite call) on every unrelated re-render.
+  const visible    = useMemo(
+    () => processed.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE),
+    [processed, safePage]
+  )
 
   // Recovery Milestone 4, Phase 9: after a successful publish, the just-
   // handled review will disappear from `visible` on the next render (its
@@ -1300,6 +1430,68 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
     })
     return out
   }, [drafts])
+
+  // Recovery Milestone 5, Problem 2/13: bounded background prewarm -- once a
+  // review is selected, generate drafts for the next PREWARM_COUNT
+  // actionable reviews that don't have one anywhere yet, so opening them
+  // feels instant instead of triggering ResponseWorkspace's own on-open
+  // generation each time.
+  //
+  // This is a single persistent worker loop (mount-once effect, empty dep
+  // array) rather than an effect keyed on [selectedKey, visible]. An
+  // earlier version restarted on every dependency change; because several
+  // queries (meta/reviews/drafts/actions) resolve in quick succession on
+  // load, that caused several back-to-back restarts within milliseconds of
+  // each other -- each one synchronously claimed the next unclaimed
+  // candidate (so no review was ever double-generated) but its fetch was
+  // dispatched before the PREVIOUS restart's fetch had resolved, so several
+  // /api/rewrite calls ran concurrently instead of one at a time. Reading
+  // live state through a ref inside one long-lived loop guarantees true
+  // concurrency=1 for the component's whole lifetime, independent of how
+  // often the surrounding component re-renders. A prewarm failure (e.g.
+  // Anthropic unavailable) is silent here; that review just falls back to
+  // ResponseWorkspace's own on-open generation (with its own visible error
+  // state) whenever it's actually opened.
+  const PREWARM_COUNT = 5
+  const PREWARM_IDLE_POLL_MS = 1000
+  const prewarmedRef = useRef(new Set())
+  const prewarmLiveRef = useRef(null)
+  prewarmLiveRef.current = { selectedKey, visible, ws, draftByReviewId }
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      while (!cancelled) {
+        const { selectedKey: sk, visible: vis, ws: wsNow, draftByReviewId: dbid } = prewarmLiveRef.current
+        const idx = vis.findIndex((r, i) => `${r.review_id || r.review_url || i}` === sk)
+        const start = idx === -1 ? 0 : idx + 1
+        const next = vis.slice(start, start + PREWARM_COUNT).find(r => {
+          const id = reviewId(r)
+          if (prewarmedRef.current.has(id)) return false
+          if ((r.owner_response || '').trim()) return false
+          if (wsNow[id]?.editedDraft) return false
+          if (dbid[r.review_id || r.review_url || '']?.draft) return false
+          return true
+        })
+        if (!next) {
+          await new Promise(res => setTimeout(res, PREWARM_IDLE_POLL_MS))
+          continue
+        }
+        const id = reviewId(next)
+        prewarmedRef.current.add(id)
+        try {
+          const generated = await callRewrite({
+            tone: 'friendly', reviewText: next.review_text || '', currentDraft: '',
+            reviewerName: next.reviewer_name || 'Guest', location: next.location_name || 'our restaurant',
+            stars: next.star_rating ?? 1,
+          })
+          if (!cancelled) setRecord(id, { editedDraft: generated, status: 'draft_ready' })
+        } catch {
+          // best-effort -- see comment above
+        }
+      }
+    })()
+    return () => { cancelled = true }
+  }, [])
 
   const selected = useMemo(
     () => visible.find((r, i) => `${r.review_id || r.review_url || i}` === selectedKey) ?? null,

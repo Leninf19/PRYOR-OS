@@ -188,6 +188,63 @@ async function testMissingReplyTextReturns400() {
   assert(res.statusCode === 400, `expected 400, got ${res.statusCode}`)
 }
 
+// --- Response contract (Recovery Milestone 5: Reviews.jsx's handlePublish()
+// only ever reads `res.ok` on success and `data.error`/`data.message` on
+// failure -- it never inspects any other field. This locks that exact
+// shape down so a backend response-shape change can never again silently
+// leave the frontend's fetch() resolved-but-misread, or (the actual
+// production incident this milestone fixes) waiting indefinitely on a
+// request that already completed. ---------------------------------------
+
+async function testSuccessResponseShapeIsExactlySuccessTrue() {
+  const res = await invoke(
+    { reviewName: 'accounts/1/locations/2/reviews/3', replyText: 'Thanks!' },
+    async (url) => {
+      if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
+      if (url.endsWith('/reply')) return { ok: true, status: 200, json: async () => ({}) }
+      throw new Error(`unexpected fetch: ${url}`)
+    }
+  )
+  assert(res.statusCode === 200, `success must be HTTP 200, got ${res.statusCode}`)
+  assert(Object.keys(res.body).length === 1 && res.body.success === true,
+    `success body must be exactly { success: true }, got ${JSON.stringify(res.body)}`)
+}
+
+async function testEveryFailureResponseHasErrorAndMessageStrings() {
+  const scenarios = [
+    ['missing replyText (400)', { reviewName: 'accounts/1/locations/2/reviews/3' }, async () => { throw new Error('no fetch expected') }],
+    ['permission denied (403)', { reviewName: 'accounts/1/locations/2/reviews/3', replyText: 'x' }, async (url) => {
+      if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
+      return { ok: false, status: 403, json: async () => ({ error: { message: 'denied' } }) }
+    }],
+    ['review gone (404)', { reviewName: 'accounts/1/locations/2/reviews/3', replyText: 'x' }, async (url) => {
+      if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
+      return { ok: false, status: 404, json: async () => ({ error: { message: 'gone' } }) }
+    }],
+    ['unexpected 5xx from GBP (502)', { reviewName: 'accounts/1/locations/2/reviews/3', replyText: 'x' }, async (url) => {
+      if (url.includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok' }) }
+      // fetchWithRetry retries 5xx up to 3 times -- always return 500 so it exhausts retries and returns the last response.
+      return { ok: false, status: 500, json: async () => ({ error: { message: 'boom' } }) }
+    }],
+  ]
+  for (const [label, body, fetchImpl] of scenarios) {
+    const res = await invoke(body, fetchImpl)
+    assert(res.statusCode >= 400, `${label}: expected an error status, got ${res.statusCode}`)
+    assert(typeof res.body.error === 'string' && res.body.error.length > 0,
+      `${label}: body.error must be a non-empty string, got ${JSON.stringify(res.body)}`)
+    assert(typeof res.body.message === 'string' && res.body.message.length > 0,
+      `${label}: body.message must be a non-empty string, got ${JSON.stringify(res.body)}`)
+  }
+}
+
+async function testWrongHttpMethodReturns405WithConsistentShape() {
+  const res = fakeRes()
+  await handler({ method: 'GET', body: {}, headers: { cookie: `lta_session=${AUTH_COOKIE}` } }, res)
+  assert(res.statusCode === 405, `expected 405, got ${res.statusCode}`)
+  assert(res.body.error === 'method_not_allowed', `expected error code 'method_not_allowed', got ${JSON.stringify(res.body)}`)
+  assert(typeof res.body.message === 'string' && res.body.message.length > 0, 'a 405 must also carry a message string')
+}
+
 async function main() {
   await run('direct reviewName path: successful reply', testDirectReviewNameSuccess)
   await run('direct reviewName path: 403 maps to missing_permission', testDirectReviewNamePermissionDenied)
@@ -195,6 +252,9 @@ async function main() {
   await run('legacy locationName+reviewerName fallback resolves via the correct current API hosts', testLegacyFallbackPathResolvesCorrectHosts)
   await run('missing Google credentials returns 503 not_connected without any fetch', testMissingCredentialsReturns503)
   await run('missing replyText returns 400 without any fetch', testMissingReplyTextReturns400)
+  await run('success response shape is exactly { success: true }', testSuccessResponseShapeIsExactlySuccessTrue)
+  await run('every failure response carries non-empty error + message strings', testEveryFailureResponseHasErrorAndMessageStrings)
+  await run('a non-POST request returns 405 with the same error+message shape as every other failure', testWrongHttpMethodReturns405WithConsistentShape)
 
   console.log()
   if (results.every(Boolean)) {

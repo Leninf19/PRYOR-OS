@@ -784,7 +784,7 @@ async function replyViaReviewName(reviewName, replyText, token) {
 }
 
 async function publish(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed', message: 'Method not allowed' })
 
   const account = await requireAuth(req, res, PUBLISH_ALLOWED_ROLES)
   if (!account) return
@@ -891,9 +891,13 @@ async function publish(req, res) {
     return res.status(200).json({ success: true })
 
   } catch (err) {
-    const status = err.status || (err.status === 403 ? 403 : 500)
+    // err.status/err.code come from replyViaReviewName's own thrown errors
+    // (403/missing_permission, 404/review_gone, or 502/api_error) -- the
+    // `|| 500`/`|| 'api_error'` fallbacks only matter for a genuinely
+    // unexpected exception this function never itself throws deliberately.
+    const status = err.status || 500
     return res.status(status).json({
-      error:   err.code || (err.status === 403 ? 'missing_permission' : 'api_error'),
+      error:   err.code || 'api_error',
       message: err.message,
     })
   }
