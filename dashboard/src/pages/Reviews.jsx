@@ -16,7 +16,7 @@ import { useRestaurantContacts } from '../hooks/useRestaurantContacts.js'
 import ContactEditorModal from './settings/ContactEditorModal.jsx'
 import { useAccount } from '../components/AuthGate.jsx'
 import { EMAIL_STATUS_META, DUPLICATE_EMAIL_STATUSES } from '../utils/actionWorkspaceUtils.js'
-import { REPLY_STATE_META, computeReplyState } from '../utils/replyState.js'
+import { REPLY_STATE_META, computeReplyState, isActionableReplyState, isSeriousReview } from '../utils/replyState.js'
 
 const PAGE_SIZE = 40
 
@@ -189,7 +189,7 @@ function WorkspaceStats({ reviews, ws, draftByReviewId }) {
   return (
     <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
       {[
-        { label: 'Awaiting Response', value: total,     color: 'var(--color-danger)'  },
+        { label: 'Needs Reply',       value: total,     color: 'var(--color-danger)'  },
         { label: 'AI Draft Ready',    value: withDraft, color: 'var(--color-accent)'  },
         { label: '1★ Urgent',         value: urgent,    color: 'var(--color-grade-c)' },
         { label: 'Completed',         value: done,      color: 'var(--color-success)' },
@@ -440,20 +440,56 @@ function ReviewRow({ r, selected, onSelect, wsEntry }) {
 
 // ─── Response workspace section (inside the detail panel) ─────────────────────
 
-function ResponseWorkspace({ r, draft, wsEntry, onUpdate }) {
-  const rid            = reviewId(r)
-  const initialStatus  = draft ? 'draft_ready' : 'needs_review'
-  const status         = wsEntry?.status ?? initialStatus
-  const statusMeta     = STATUS_META[status] ?? STATUS_META.needs_review
-  const isDone         = statusMeta.done
-  const failReason     = wsEntry?.failReason ?? null
+// Recovery Milestone 4, Phase 14: a serious_escalation-classified review
+// must not be a routine one-click publish. Gated by a single explicit
+// acknowledgment (not a second confirmation on every normal publish -- only
+// this one class) before Confirm & Publish becomes clickable. Resets
+// per-review (keyed by rid via the parent unmounting/remounting this
+// component on selection change -- see Reviews.jsx's master-detail panel).
+function SeriousReviewWarning({ acknowledged, onAcknowledge }) {
+  return (
+    <div className="mb-3 p-3 rounded-xl text-xs leading-relaxed"
+         style={{ background: 'var(--color-danger-bg)', border: '1px solid var(--color-danger-border)', color: 'var(--color-danger)' }}>
+      <p className="font-bold mb-1">⚠ Needs Management Review</p>
+      <p className="mb-2" style={{ color: 'var(--color-text-2)' }}>
+        This review mentions something serious (a safety, legal, or conduct concern). Read it carefully before
+        responding — a contact invitation may be appropriate here, unlike a routine review.
+      </p>
+      <label className="flex items-center gap-2 cursor-pointer" style={{ color: 'var(--color-text-1)' }}>
+        <input type="checkbox" checked={acknowledged} onChange={e => onAcknowledge(e.target.checked)} />
+        I've reviewed this and I'm ready to respond
+      </label>
+    </div>
+  )
+}
 
-  const [localDraft, setLocalDraft] = useState(wsEntry?.editedDraft ?? draft?.draft ?? '')
-  const [activeTone, setActiveTone] = useState(null)
-  const [rewriting,  setRewriting]  = useState(false)
-  const [rewriteErr, setRewriteErr] = useState(null)
-  const [publishing, setPublishing] = useState(false)
-  const [copied,     setCopied]     = useState(false)
+function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
+  const showToast       = useToast()
+  const rid              = reviewId(r)
+  const initialStatus    = draft ? 'draft_ready' : 'needs_review'
+  const status           = wsEntry?.status ?? initialStatus
+  const statusMeta       = STATUS_META[status] ?? STATUS_META.needs_review
+  const isDone            = statusMeta.done
+  const failReason       = wsEntry?.failReason ?? null
+  const serious          = useMemo(() => isSeriousReview(r), [r])
+
+  const [localDraft, setLocalDraft]   = useState(wsEntry?.editedDraft ?? draft?.draft ?? '')
+  const [activeTone, setActiveTone]   = useState(null)
+  const [lastTone,   setLastTone]     = useState(null)
+  const [rewriting,  setRewriting]    = useState(false)
+  const [rewriteErr, setRewriteErr]   = useState(null)
+  const [publishing, setPublishing]   = useState(false)
+  const [copied,     setCopied]       = useState(false)
+  const [moreOpen,   setMoreOpen]     = useState(false)
+  const [acknowledged, setAcknowledged] = useState(false)
+  const textareaRef = useRef(null)
+  // A ref, not state -- guards the actual double-submit race a fast double-
+  // click/double-Enter can win against React's own render cycle (the
+  // `disabled` attribute only reflects `publishing` state after the next
+  // render; this is checked synchronously, before that render happens).
+  const publishInFlight = useRef(false)
+
+  const wasEdited = wsEntry?.status === 'edited'
 
   function onTextChange(val) {
     setLocalDraft(val)
@@ -470,6 +506,7 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate }) {
   async function handleRewrite(tone) {
     if (rewriting) return
     setActiveTone(tone)
+    setLastTone(tone)
     setRewriting(true)
     setRewriteErr(null)
     try {
@@ -495,9 +532,12 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate }) {
     }
   }
 
+  const publishBlocked = !localDraft || publishing || (serious && !acknowledged)
+
   async function handlePublish() {
-    if (!localDraft || publishing) return
-    setPublishing(true)
+    if (publishBlocked || publishInFlight.current) return
+    publishInFlight.current = true
+    setPublishing(true) // disabled immediately -- prevents double submission
     try {
       const res = await fetch('/api/google/publish', {
         method:  'POST',
@@ -511,22 +551,41 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate }) {
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
         onUpdate(rid, { status: 'published', publishedAt: new Date().toISOString(), failReason: null }, 'Published to Google')
+        showToast('Response published to Google')
+        onPublishSuccess?.() // auto-advance to the next actionable review
       } else {
         onUpdate(rid, { status: 'failed', failReason: data.error || 'api_error' }, 'Publish failed')
+        setPublishing(false) // stays in the active queue, editable, retryable -- do NOT auto-advance
+        publishInFlight.current = false
       }
     } catch {
       onUpdate(rid, { status: 'failed', failReason: 'network_error' }, 'Publish failed')
-    } finally {
       setPublishing(false)
+      publishInFlight.current = false
+    }
+    // NOTE: no `finally` resetting `publishing`/`publishInFlight` on success
+    // -- this component unmounts (onPublishSuccess selects a different
+    // review) before it would matter, and leaving the button disabled
+    // through that transition is exactly what prevents a double-click
+    // double-publish.
+  }
+
+  function handleKeyDown(e) {
+    const cmdEnter = (e.metaKey || e.ctrlKey) && e.key === 'Enter'
+    if (cmdEnter && !publishBlocked) {
+      e.preventDefault()
+      handlePublish()
     }
   }
 
   function handleMarkPublished() {
     onUpdate(rid, { status: 'published', publishedAt: new Date().toISOString(), failReason: null }, 'Marked published')
+    onPublishSuccess?.()
   }
 
   function handleTakenCareOf() {
     onUpdate(rid, { status: 'taken_care_of', publishedAt: new Date().toISOString(), failReason: null }, 'Marked done')
+    onPublishSuccess?.()
   }
 
   function handleUndo() {
@@ -541,7 +600,7 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate }) {
     <div>
       <div className="flex items-center justify-between mb-2">
         <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>
-          Response Workspace
+          Response
         </p>
         <Badge variant={statusMeta.variant}>{statusMeta.label}</Badge>
       </div>
@@ -549,7 +608,7 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate }) {
       {failReason && (
         <div className="mb-3 px-3 py-2.5 rounded-lg text-xs leading-relaxed"
              style={{ background: 'var(--color-danger-bg)', color: 'var(--color-danger)', border: '1px solid var(--color-danger-border)' }}>
-          <strong>Publish failed:</strong> {FAIL_REASONS[failReason] ?? failReason}
+          <strong>Publish failed:</strong> {FAIL_REASONS[failReason] ?? failReason} Your response text is unchanged — try again.
         </div>
       )}
 
@@ -566,18 +625,24 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate }) {
         </div>
       ) : (
         <div className="space-y-3">
+          {serious && <SeriousReviewWarning acknowledged={acknowledged} onAcknowledge={setAcknowledged} />}
+
           <div>
             <div className="flex items-center justify-between mb-1.5">
-              <label className="text-[10px] font-bold uppercase tracking-[0.15em]" style={{ color: 'var(--color-text-3)' }}>
-                {draft ? '✦ AI Response Draft' : 'Your Response'}
+              <label className="text-[10px] font-medium tracking-wide flex items-center gap-1.5" style={{ color: 'var(--color-text-3)' }}>
+                {draft && !wasEdited && <span style={{ color: 'var(--color-accent)' }}>✦ AI-prepared</span>}
+                {wasEdited && <span>Edited</span>}
+                {!draft && !wasEdited && <span>Your response</span>}
               </label>
               <span className="text-[10px]" style={{ color: charOver ? 'var(--color-danger)' : 'var(--color-text-3)' }}>
                 {charCount} / 4096
               </span>
             </div>
             <textarea
+              ref={textareaRef}
               value={localDraft}
               onChange={e => onTextChange(e.target.value)}
+              onKeyDown={handleKeyDown}
               placeholder="Write a response to this review…"
               rows={4}
               className="w-full rounded-xl px-3 py-2.5 text-xs resize-y focus:outline-none transition-colors"
@@ -587,44 +652,68 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate }) {
                 lineHeight: 1.6, fontFamily: 'inherit', minHeight: 84,
               }}
             />
+            {!draft && !localDraft && (
+              <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-3)' }}>
+                No AI draft available yet for this review — write your own response above.
+              </p>
+            )}
           </div>
 
-          <div>
-            <p className="text-[10px] font-bold uppercase tracking-[0.15em] mb-1.5" style={{ color: 'var(--color-text-3)' }}>
-              AI Rewrite Tone
-            </p>
-            <div className="flex flex-wrap gap-1.5">
-              {TONES.map(t => {
-                const isActive = activeTone === t.id
-                return (
-                  <button key={t.id} disabled={rewriting} onClick={() => handleRewrite(t.id)}
-                          className="px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-all"
-                          style={isActive
-                            ? { background: 'var(--color-accent)', color: 'white', borderColor: 'var(--color-accent)', opacity: 0.85 }
-                            : { background: 'var(--color-surface-2)', color: 'var(--color-text-2)', borderColor: 'var(--color-border)', opacity: rewriting ? 0.5 : 1 }}>
-                    {isActive && rewriting ? '…' : t.label}
-                  </button>
-                )
-              })}
-            </div>
-            {rewriteErr && <p className="text-xs mt-2" style={{ color: 'var(--color-danger)' }}>{rewriteErr}</p>}
-          </div>
-
+          {/* Primary + secondary actions -- Confirm & Publish is the one
+              visually dominant control (Phase 10); Regenerate stays a
+              step down; everything else moves into "More actions". */}
           <div className="flex items-center gap-2 flex-wrap pt-1">
-            <Button variant="primary" onClick={handlePublish} disabled={!localDraft || publishing}>
-              {publishing ? 'Publishing…' : 'Publish to Google'}
+            <Button variant="primary" onClick={handlePublish} disabled={publishBlocked}>
+              {publishing ? 'Publishing…' : 'Confirm & Publish'}
             </Button>
-            <Button variant={copied ? 'accent' : 'secondary'} onClick={handleCopy} disabled={!localDraft}>
-              {copied ? '✓ Copied!' : 'Copy Response'}
+            <Button variant="secondary" disabled={rewriting} onClick={() => handleRewrite(lastTone || 'friendly')}>
+              {rewriting && !activeTone ? 'Regenerating…' : 'Regenerate'}
             </Button>
-            <a href={link.href} target="_blank" rel="noopener noreferrer">
-              <Button variant="secondary">Open Google ↗</Button>
-            </a>
+            <button
+              type="button"
+              onClick={() => setMoreOpen(o => !o)}
+              className="text-xs font-medium px-2 py-1.5"
+              style={{ color: 'var(--color-text-3)' }}
+              aria-expanded={moreOpen}
+            >
+              More actions {moreOpen ? '▲' : '▼'}
+            </button>
           </div>
-          <div className="flex items-center gap-2 flex-wrap">
-            <Button variant="ghost" onClick={handleMarkPublished}>Mark Published</Button>
-            <Button variant="ghost" onClick={handleTakenCareOf}>Already Done</Button>
-          </div>
+          {rewriteErr && <p className="text-xs" style={{ color: 'var(--color-danger)' }}>{rewriteErr}</p>}
+
+          {moreOpen && (
+            <div className="space-y-3 p-3 rounded-xl" style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)' }}>
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-[0.15em] mb-1.5" style={{ color: 'var(--color-text-3)' }}>
+                  AI Rewrite Tone
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {TONES.map(t => {
+                    const isActive = activeTone === t.id
+                    return (
+                      <button key={t.id} disabled={rewriting} onClick={() => handleRewrite(t.id)}
+                              className="px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-all"
+                              style={isActive
+                                ? { background: 'var(--color-accent)', color: 'white', borderColor: 'var(--color-accent)', opacity: 0.85 }
+                                : { background: 'var(--color-surface)', color: 'var(--color-text-2)', borderColor: 'var(--color-border)', opacity: rewriting ? 0.5 : 1 }}>
+                        {isActive && rewriting ? '…' : t.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <Button variant={copied ? 'accent' : 'secondary'} onClick={handleCopy} disabled={!localDraft}>
+                  {copied ? '✓ Copied!' : 'Copy Response'}
+                </Button>
+                <a href={link.href} target="_blank" rel="noopener noreferrer">
+                  <Button variant="secondary">Open Google ↗</Button>
+                </a>
+                <Button variant="ghost" onClick={handleMarkPublished}>Mark Published</Button>
+                <Button variant="ghost" onClick={handleTakenCareOf}>Already Done</Button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -884,7 +973,7 @@ function ResponseHistory({ history }) {
 // ─── Detail content (shared by the desktop persistent panel and the mobile
 // overlay panel -- inbox layout shell, M5.1) ───────────────────────────────
 
-function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate }) {
+function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate, onPublishSuccess }) {
   const link = buildReviewLink(r)
   const sentiment = sentimentBucket(r)
   const sentMeta = SENTIMENT_META[sentiment]
@@ -958,14 +1047,20 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate }) {
       ) : (
         /* Not yet replied -- full response workspace (draft/edit/rewrite/publish) */
         <div className="pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>
-          <ResponseWorkspace r={r} draft={draft} wsEntry={wsEntry} onUpdate={onUpdate} />
+          <ResponseWorkspace r={r} draft={draft} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
         </div>
       )}
 
-      {/* Internal notes + assignment -- available regardless of reply status */}
-      <div className="pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>
-        <NotesAndAssignment r={r} wsEntry={wsEntry} onUpdate={onUpdate} />
-      </div>
+      {/* Internal notes + assignment -- available regardless of reply status,
+          but de-emphasized (Phase 10): most reviews need neither. */}
+      <details className="pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>
+        <summary className="text-[10px] font-bold uppercase tracking-wider cursor-pointer" style={{ color: 'var(--color-text-3)' }}>
+          Notes &amp; Assignment
+        </summary>
+        <div className="mt-2">
+          <NotesAndAssignment r={r} wsEntry={wsEntry} onUpdate={onUpdate} />
+        </div>
+      </details>
 
       <ResponseHistory history={wsEntry?.history} />
 
@@ -1003,7 +1098,7 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, onUpdate }) {
 
 // ─── Desktop persistent detail panel (lg+, inbox layout shell) ────────────────
 
-function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, onUpdate }) {
+function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, onUpdate, onPublishSuccess }) {
   if (!r) {
     return (
       <Card className="p-8 h-full flex items-center justify-center text-center">
@@ -1019,7 +1114,7 @@ function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, onUpdate }) {
         <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>{r.reviewer_name || 'Anonymous'}</p>
         <p className="text-xs" style={{ color: 'var(--color-text-3)' }}>{r.location_name} · {r.review_date}</p>
       </div>
-      <ReviewDetailContent r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} onUpdate={onUpdate} />
+      <ReviewDetailContent r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
     </Card>
   )
 }
@@ -1028,7 +1123,7 @@ function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, onUpdate }) {
 // prior ReviewExplorer.jsx, a fixed 460px panel doesn't fit a phone/tablet
 // viewport the way it does on desktop) ─────────────────────────────────────
 
-function ReviewDetailOverlay({ r, draft, allReviews, onClose, wsEntry, onUpdate }) {
+function ReviewDetailOverlay({ r, draft, allReviews, onClose, wsEntry, onUpdate, onPublishSuccess }) {
   return (
     <>
       <motion.div
@@ -1059,7 +1154,7 @@ function ReviewDetailOverlay({ r, draft, allReviews, onClose, wsEntry, onUpdate 
           </button>
         </div>
         <div className="flex-1 p-5">
-          <ReviewDetailContent r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} onUpdate={onUpdate} />
+          <ReviewDetailContent r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
         </div>
       </motion.aside>
     </>
@@ -1103,7 +1198,14 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
   const [locFilter, setLocFilter] = useState('')
   const [page,    setPage]        = useState(0)
   const [selectedKey, setSelectedKey] = useState(null)
-  const [needsResponseOnly, setNeedsResponseOnly] = useState(() => searchParams.get('filter') === 'needs-response')
+  // Recovery Milestone 4, Phase 5: the Reviews inbox now defaults to the
+  // actionable queue (needs_reply/draft/failed -- see
+  // replyState.js's isActionableReplyState) rather than opening on the full
+  // unfiltered list. The name is unchanged from M5 (still "needsResponseOnly")
+  // to keep this diff scoped -- its MEANING widened from "star<=2 and
+  // unanswered" to "not yet resolved", and its default flipped from off to
+  // on. ?filter=all opts out to the full list on load; toggling flips both.
+  const [needsResponseOnly, setNeedsResponseOnly] = useState(() => searchParams.get('filter') !== 'all')
 
   const resetPage = useCallback(() => setPage(0), [])
 
@@ -1128,7 +1230,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
   function toggleNeedsResponse() {
     const next = !needsResponseOnly
     setNeedsResponseOnly(next)
-    setSearchParams(next ? { filter: 'needs-response' } : {}, { replace: true })
+    setSearchParams(next ? {} : { filter: 'all' }, { replace: true })
     resetPage()
   }
 
@@ -1138,7 +1240,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
 
   const processed = useMemo(() => {
     let rows = filtered
-    if (needsResponseOnly) rows = rows.filter(r => (Number(r.star_rating) || 5) <= 2 && !(r.owner_response || '').trim())
+    if (needsResponseOnly) rows = rows.filter(r => isActionableReplyState(computeReplyState(r, ws[reviewId(r)])))
     if (replyStates.length) rows = rows.filter(r => replyStates.includes(computeReplyState(r, ws[reviewId(r)])))
     if (stars)     rows = rows.filter(r => r.star_rating === Number(stars))
     if (locFilter) rows = rows.filter(r => r.location_name === locFilter)
@@ -1165,6 +1267,22 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
   const totalPages = Math.max(1, Math.ceil(processed.length / PAGE_SIZE))
   const safePage   = Math.min(page, totalPages - 1)
   const visible    = processed.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE)
+
+  // Recovery Milestone 4, Phase 9: after a successful publish, the just-
+  // handled review will disappear from `visible` on the next render (its
+  // reply state no longer matches the actionable filter) -- this selects
+  // whichever review will take its place in the queue, using the CURRENT
+  // (pre-removal) ordering so the manager lands on the next real item
+  // rather than momentarily on nothing. No page reload, no refetch --
+  // entirely local selection state, exactly like clicking a row.
+  const advanceToNext = useCallback(() => {
+    const idx = visible.findIndex((r, i) => `${r.review_id || r.review_url || i}` === selectedKey)
+    if (idx === -1) { setSelectedKey(null); return }
+    const next = visible[idx + 1] ?? visible[idx - 1] ?? null
+    if (!next) { setSelectedKey(null); return }
+    const nextIdx = visible[idx + 1] ? idx + 1 : idx - 1
+    setSelectedKey(`${next.review_id || next.review_url || nextIdx}`)
+  }, [visible, selectedKey])
 
   function toggleSort(key) {
     if (needsResponseOnly) return // sorted by priority while this quick filter is active
@@ -1215,14 +1333,16 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
       <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_420px] lg:gap-5 lg:items-start">
         {/* ── List column ── */}
         <div className="space-y-4 min-w-0">
-          {/* Needs Response quick filter */}
+          {/* Actionable-inbox toggle (Phase 5) -- Needs Reply is the default
+              view; toggling shows the full list, including Published/
+              Externally Replied history. */}
           <button
             onClick={toggleNeedsResponse}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors"
             style={needsResponseOnly
               ? { background: 'var(--color-danger)', color: 'white', borderColor: 'var(--color-danger)' }
               : { background: 'var(--color-surface)', color: 'var(--color-text-2)', borderColor: 'var(--color-border)' }}>
-            {needsResponseOnly ? '✓ Needs Response only' : 'Show only reviews needing a response'}
+            {needsResponseOnly ? '✓ Needs Reply' : 'Show all reviews'}
           </button>
 
           {needsResponseOnly && (
@@ -1276,8 +1396,19 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
 
             <div>
               {visible.length === 0 ? (
-                <EmptyState icon="🔍" title="No reviews match your filters"
-                            body="Try adjusting your keyword, sentiment, star filter, or date range." />
+                needsResponseOnly && !keyword && !stars && !sentiment && !length && !locFilter && !replyStates.length ? (
+                  <EmptyState icon="🎉" title="You're all caught up"
+                              body="Every review has been replied to, published, or is otherwise resolved."
+                              action={
+                                <button onClick={toggleNeedsResponse} className="text-xs font-medium underline"
+                                        style={{ color: 'var(--color-accent)' }}>
+                                  View all reviews / history →
+                                </button>
+                              } />
+                ) : (
+                  <EmptyState icon="🔍" title="No reviews match your filters"
+                              body="Try adjusting your keyword, sentiment, star filter, or date range." />
+                )
               ) : visible.map((r, i) => {
                 const rid = r.review_id || r.review_url || ''
                 const key = `${rid || i}`
@@ -1352,6 +1483,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
               allReviews={filtered}
               wsEntry={selectedWsEntry}
               onUpdate={setRecord}
+              onPublishSuccess={advanceToNext}
             />
           </div>
         )}
@@ -1369,6 +1501,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
               onClose={() => setSelectedKey(null)}
               wsEntry={selectedWsEntry}
               onUpdate={setRecord}
+              onPublishSuccess={advanceToNext}
             />
           )}
         </AnimatePresence>

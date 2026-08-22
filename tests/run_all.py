@@ -38,6 +38,7 @@ TESTS = [
     "test_auto_update_local_mode.py",
     "test_location_contacts.py",
     "test_health_check.py",
+    "test_response_policy.py",
 ]
 
 

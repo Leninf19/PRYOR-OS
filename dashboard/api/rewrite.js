@@ -8,21 +8,67 @@ import { enforceRateLimit } from './_lib/rateLimit.js'
 
 const CONTACT_EMAIL = 'advertising@l3amigos.com'
 
+// Recovery Milestone 4 (Review Reply Inbox + AI Response Quality): mirrors
+// ai_engine.py's _SERIOUS_KEYWORDS/_SERIOUS_RE fix exactly (kept as two
+// independent implementations, Python backend vs. this Vercel function, the
+// same way this file's keyword list was already a duplicate of ai_engine.py's
+// before this change -- see that file's own comment). The previous list
+// matched as a naive substring (`lower.includes(kw)`), which fires on
+// innocent words containing a keyword -- 'sue' matches inside "no ISSUEs at
+// all", 'ill' matches inside "the tacos were griILLed perfectly". Every
+// entry is now matched with \b...\b word boundaries.
 const SERIOUS_KEYWORDS = [
-  'sick', 'ill', 'vomit', 'threw up', 'food poison', 'diarrhea', 'stomach',
-  'hospital', 'doctor', 'health department', 'health code',
-  'cockroach', 'roach', 'rat', 'mouse', 'rodent', 'insect', 'bug', 'pest',
-  'injury', 'injured', 'hurt', 'unsafe', 'accident',
-  'discrimination', 'racist', 'racism', 'harassment', 'rude', 'hostile', 'threatening',
-  'lawsuit', 'lawyer', 'attorney', 'sue', 'legal',
-  'police', 'fight', 'assault', 'stole', 'stolen', 'theft',
-  'never coming back', 'health violation', 'shut down', 'report',
+  'sick', 'ill', 'vomit', 'vomiting', 'food poisoning', 'diarrhea',
+  'hospital', 'hospitalized', 'doctor', 'health department', 'health code',
+  'cockroach', 'roach', 'rat', 'rats', 'mouse', 'mice', 'rodent', 'rodents',
+  'insect', 'insects', 'pest', 'pests',
+  'injury', 'injured', 'unsafe', 'accident',
+  'discrimination', 'discriminated', 'racist', 'racism', 'harassment', 'harassed',
+  'hostile', 'threatening', 'threatened',
+  'lawsuit', 'lawyer', 'attorney', 'sue', 'sued', 'legal action',
+  'police', 'assault', 'assaulted', 'stole', 'stolen', 'theft',
+  'never coming back', 'health violation', 'shut down',
+]
+const SERIOUS_RE = new RegExp(
+  '\\b(' + SERIOUS_KEYWORDS.map(kw => kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')\\b',
+  'i'
+)
+
+// Deliberately NOT gated on star rating -- see ai_engine.py's
+// _is_serious_escalation for the same reasoning (a 5-star review can still
+// describe a serious unresolved incident; plenty of 1-star reviews are just
+// "slow service", not a serious incident).
+export function isSeriousIssue(reviewText) {
+  if (!reviewText) return false
+  return SERIOUS_RE.test(reviewText)
+}
+
+// Phase 3 hard safety guard, mirrors ai_engine.py's enforce_response_policy()
+// exactly: for any non-serious response, strip any sentence containing
+// forbidden recovery/escalation language rather than trusting the model not
+// to have generated it. Applied to EVERY /api/rewrite response before it's
+// returned, regardless of tone requested.
+const FORBIDDEN_RECOVERY_PATTERNS = [
+  /contact us[^.!?]*so we can make this right/i,
+  /make this right/i,
+  /please contact us/i,
+  /reach out to us/i,
+  /reach out directly/i,
+  /contact us at/i,
+  new RegExp(CONTACT_EMAIL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'),
+  /\b[\w.+-]+@[\w-]+\.[\w.-]+\b/,      // any email address
+  /\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b/, // any US-style phone number
+  /sincerely apologi[sz]e/i,
+  /deeply apologi[sz]e/i,
+  /give us another chance/i,
 ]
 
-function isSeriousIssue(reviewText, stars) {
-  if (!reviewText) return false
-  const lower = reviewText.toLowerCase()
-  return SERIOUS_KEYWORDS.some(kw => lower.includes(kw)) || Number(stars) === 1
+export function enforceResponsePolicy(draftText, serious) {
+  if (serious || !draftText) return draftText
+  const sentences = draftText.trim().split(/(?<=[.!?])\s+/)
+  const kept = sentences.filter(s => !FORBIDDEN_RECOVERY_PATTERNS.some(p => p.test(s)))
+  const cleaned = kept.join(' ').trim()
+  return cleaned || draftText.split('—')[0].trim() // never return empty; fall back to the pre-sign-off text
 }
 
 const TONE_GUIDES = {
@@ -62,7 +108,7 @@ export default async function handler(req, res) {
 
   const toneGuide    = TONE_GUIDES[tone] ?? TONE_GUIDES.friendly
   const locationName = location || 'our restaurant'
-  const serious      = isSeriousIssue(reviewText, stars)
+  const serious      = isSeriousIssue(reviewText)
   const numStars     = Number(stars) || 3
 
   const langNote = tone === 'spanish'
@@ -81,14 +127,14 @@ export default async function handler(req, res) {
 
   const contactNote = serious
     ? `At the end (before the sign-off), invite them to reach out directly: "Please contact us at ${CONTACT_EMAIL} so we can make this right." Do not add anything after the sign-off.`
-    : ''
+    : `Do not include any contact email, phone number, or "contact us" invitation — that language is reserved for serious unresolved incidents only, which this is not.`
 
   const prompt = `You are the manager of ${locationName}, a Mexican restaurant. Write a response to this Google review on behalf of ${locationName} only — do not reference or name any other restaurant or chain.
 
 TONE: ${toneGuide}
 ${langNote}
 ${lengthGuide}
-${contactNote ? contactNote + '\n' : ''}
+${contactNote}
 REVIEWER: ${reviewerName || 'A guest'}
 STAR RATING: ${numStars} out of 5
 REVIEW TEXT: ${reviewText || '(Rating only — no written review)'}
@@ -125,7 +171,9 @@ Write ONLY the response text. No quotes, no labels, no preamble. Sign off as '�
       return res.status(502).json({ error: 'Anthropic returned an empty response. Try again.' })
     }
 
-    return res.status(200).json({ rewritten })
+    // Phase 3 hard safety guard -- applied regardless of what the model
+    // actually returned, not just relied on via the prompt above.
+    return res.status(200).json({ rewritten: enforceResponsePolicy(rewritten, serious) })
   } catch (err) {
     return res.status(500).json({ error: err?.message ?? 'Unexpected server error' })
   }

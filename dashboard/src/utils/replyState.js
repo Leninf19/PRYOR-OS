@@ -49,3 +49,43 @@ export function computeReplyState(r, wsEntry) {
   if (wsEntry?.status === 'draft_ready' || wsEntry?.status === 'edited') return 'draft'
   return 'needs_reply'
 }
+
+// Recovery Milestone 4 (Review Reply Inbox + AI Response Quality): the
+// Reviews inbox's default queue. "Actionable" = still needs a manager's
+// attention -- unanswered (needs_reply), has a prepared-but-not-yet-sent
+// draft (draft), or previously failed to publish and needs a retry
+// (failed). confirmed/externally_replied are already resolved and belong
+// in history/search, not the default working queue.
+const ACTIONABLE_STATES = new Set(['needs_reply', 'draft', 'failed'])
+export function isActionableReplyState(state) {
+  return ACTIONABLE_STATES.has(state)
+}
+
+// Mirrors ai_engine.py's _SERIOUS_KEYWORDS/_SERIOUS_RE and
+// dashboard/api/rewrite.js's SERIOUS_KEYWORDS/SERIOUS_RE exactly -- the
+// THIRD independent copy of this word-boundary keyword check, kept in sync
+// by comment reference the same way the other two already were before this
+// milestone. Used only for the Reviews inbox's own "Needs Management
+// Review" warning gate (Phase 14) -- never used to generate or alter
+// response text, and never a substitute for the deterministic guard those
+// two modules already apply to whatever draft text actually gets used.
+const SERIOUS_KEYWORDS = [
+  'sick', 'ill', 'vomit', 'vomiting', 'food poisoning', 'diarrhea',
+  'hospital', 'hospitalized', 'doctor', 'health department', 'health code',
+  'cockroach', 'roach', 'rat', 'rats', 'mouse', 'mice', 'rodent', 'rodents',
+  'insect', 'insects', 'pest', 'pests',
+  'injury', 'injured', 'unsafe', 'accident',
+  'discrimination', 'discriminated', 'racist', 'racism', 'harassment', 'harassed',
+  'hostile', 'threatening', 'threatened',
+  'lawsuit', 'lawyer', 'attorney', 'sue', 'sued', 'legal action',
+  'police', 'assault', 'assaulted', 'stole', 'stolen', 'theft',
+  'never coming back', 'health violation', 'shut down',
+]
+const SERIOUS_RE = new RegExp(
+  '\\b(' + SERIOUS_KEYWORDS.map(kw => kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')\\b',
+  'i'
+)
+
+export function isSeriousReview(r) {
+  return SERIOUS_RE.test(r?.review_text || '')
+}
