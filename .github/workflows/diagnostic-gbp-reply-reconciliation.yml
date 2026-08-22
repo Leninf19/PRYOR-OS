@@ -1,0 +1,75 @@
+name: Diagnostic - GBP Reply Reconciliation
+
+# ONE-TIME, read-only diagnostic (Recovery Milestone 6A): compares the
+# reviews reviews.db currently classifies as actionable (owner_response
+# empty) against Google's LIVE, current review state, using their existing
+# gbp_review_name. Exists to answer, with real numbers, how many of the
+# reviews the dashboard shows as "Needs Reply" are actually already
+# answered on Google -- the root cause being that a successful
+# Confirm & Publish only ever updates browser localStorage, never
+# reviews.db, so the authoritative dataset can silently lag behind Google's
+# real state until an unrelated GBP sync happens to re-fetch that review.
+#
+# Runs gbp_reply_reconciliation_diagnostic.py, which calls ONLY
+# google_api.get_review() (a single GET per review -- read-only) and reads
+# dashboard/reviews.db through a SQLite mode=ro connection. It never calls
+# google_api.reply_to_review() (PUT), never runs provider_sync.sync_all(),
+# never generates an AI draft, and never writes to reviews.db, reviews.csv,
+# or Redis/workspace state anywhere.
+#
+# No commit step exists in this workflow -- it is structurally incapable of
+# writing to reviews.db, unlike the real sync workflows. Deliberately NOT in
+# any reviews-db-writer concurrency group (it writes nothing, so it must
+# never queue behind or block a real sync, and a real sync must never queue
+# behind it either).
+#
+# workflow_dispatch only -- no schedule. Intended to be run once per
+# location investigated.
+on:
+  workflow_dispatch:
+    inputs:
+      location:
+        description: 'Exact locations.name to diagnose'
+        required: true
+        default: 'Casa Tequila Prime'
+      window_days:
+        description: 'Days considered the "default dashboard window" (reported separately from older actionable reviews)'
+        required: false
+        default: '7'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      # cryptography is required for google_api.py's AESGCM decrypt of the
+      # Redis-stored refresh token (see google_api.py's
+      # _fetch_refresh_token_from_redis()) -- the same dependency every
+      # other GBP-calling workflow installs. google_api.py's own HTTP calls
+      # use urllib.request (stdlib), so nothing else is needed.
+      - name: Install Python dependencies
+        run: pip install cryptography
+
+      - name: Run GBP reply reconciliation diagnostic (read-only)
+        run: >
+          python gbp_reply_reconciliation_diagnostic.py
+          --location "${{ inputs.location }}"
+          --window-days "${{ inputs.window_days }}"
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
