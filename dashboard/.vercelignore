@@ -1,0 +1,11 @@
+# dashboard/api has no reviews.db access of its own (see actions/[action].js,
+# actionStore.js, contactStore.js, settings/[action].js -- the API layer only
+# ever reads the exported JSON under private-data/, never the raw DB/CSV).
+# Bundling these into the deployment upload is pure waste, and reviews.db
+# alone has repeatedly sat at exactly the 100 MiB GitHub commit ceiling,
+# which is also Vercel's own per-deployment upload limit -- every deploy
+# from M3 through M6 failed with "File size limit exceeded (100 MB)" for
+# this reason (confirmed via the deploy-frontend.yml run logs during the
+# 2026-08-22 recovery merge). No .vercelignore existed before this.
+reviews.db
+reviews.csv
