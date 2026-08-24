@@ -89,7 +89,11 @@ function parseRecord(value) {
 export function deriveUserStatus(record) {
   if (!record) return null
   if (record.disabled) return 'disabled'
-  if (record.passwordSetAt) return 'active'
+  // A static (ACCOUNT_DIRECTORY_JSON) account has none of the Redis-only
+  // invite-tracking fields at all -- the field's ABSENCE (not just a null
+  // value) means "never went through the invite flow", i.e. active by
+  // default, same as passwordSetAt being genuinely set for a Redis user.
+  if (!('passwordSetAt' in record) || record.passwordSetAt) return 'active'
   if (record.inviteRevokedAt) return 'revoked'
   if (record.inviteExpiresAt && new Date(record.inviteExpiresAt).getTime() < Date.now()) return 'expired'
   return 'invited'

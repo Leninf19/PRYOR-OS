@@ -27,6 +27,10 @@
 // POST /api/settings/resend-invite          -- issues a fresh token for a not-yet-activated invite
 // POST /api/settings/revoke-invite          -- revokes a not-yet-activated invite
 // POST /api/settings/generate-reset-link    -- Owner/Admin fallback reset link for an active account
+// GET  /api/settings/users-list             -- richer admin roster (status/lastLogin/invitedAt)
+// POST /api/settings/update-user-role-locations -- change role/locationIds, bumps sessionVersion
+// POST /api/settings/disable-user           -- immediate; blocked for the last active Owner
+// POST /api/settings/enable-user            -- re-enable a disabled account
 
 import { readFile } from 'fs/promises'
 import path from 'path'
@@ -40,11 +44,14 @@ import {
 import { appendAuditEntry, listAuditEntries, clientIp, AuditLogUnavailableError } from '../_lib/auditLog.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
-import { getAccountByEmail } from '../_lib/accountStore.js'
+import { getAccountByEmail, getAccountById, listAccounts } from '../_lib/accountStore.js'
 import { getUserById, upsertUser, updateUser, deriveUserStatus, UserStoreUnavailableError } from '../_lib/userStore.js'
 import { createInviteToken, revokeInviteToken, createResetToken, TokenStoreUnavailableError } from '../_lib/tokenStore.js'
 import { buildInviteEmail, buildInviteEmailSubject, buildResetEmail, buildResetEmailSubject } from '../_lib/accountEmailTemplate.js'
-import { generateUserId, isValidDisplayName, validateRoleAndLocations, canAssignRole, buildInviteUrl, buildResetUrl } from '../_lib/userManagement.js'
+import {
+  generateUserId, isValidDisplayName, validateRoleAndLocations, canAssignRole,
+  buildInviteUrl, buildResetUrl, assertNotLastActiveOwner,
+} from '../_lib/userManagement.js'
 
 function actorFields(account, req) {
   return { actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req) }
@@ -872,6 +879,180 @@ async function generateResetLinkAction(req, res) {
   }
 }
 
+// GET /api/settings/users-list
+// Owner/Admin only. The richer admin roster (status/lastLogin/invitedAt) --
+// distinct from GET /api/session/accounts, which stays the lightweight,
+// any-authenticated-role roster used by assignee pickers. Uses
+// accountStore.js's merged, de-duplicated (Redis-wins) listAccounts(), the
+// same view assertNotLastActiveOwner() counts against, so a promoted
+// identity is never listed twice.
+async function usersListAction(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+  if (!roleHasPermission(account.role, Permission.USERS_MANAGE)) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to view users.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `settings:users-list:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
+
+  const all = await listAccounts()
+  const users = all
+    .map(a => ({
+      userId: a.userId,
+      email: a.email,
+      displayName: a.displayName ?? a.email,
+      role: a.role,
+      locationIds: a.locationIds,
+      status: deriveUserStatus(a),
+      lastLoginAt: a.lastLoginAt ?? null,
+      invitedAt: a.invitedAt ?? null,
+      createdAt: a.createdAt ?? null,
+    }))
+    .sort((x, y) => x.displayName.localeCompare(y.displayName))
+
+  return res.status(200).json({ users })
+}
+
+// POST /api/settings/update-user-role-locations  { userId, role, locationIds }
+// Bumps sessionVersion unconditionally -- Phase 14's explicit requirement
+// that a role or location change take effect immediately, not whenever the
+// target's existing session cookie happens to expire. Transparently
+// promotes a static-directory-only account into Redis on its first edit,
+// same pattern as reset-password's promotion (accountStore.js's Redis-wins
+// precedence makes the Redis copy authoritative from that point on).
+async function updateUserRoleLocationsAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+  if (!roleHasPermission(account.role, Permission.USERS_MANAGE)) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to manage users.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `settings:update-user-role-locations:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { userId, role, locationIds } = req.body ?? {}
+  if (typeof userId !== 'string' || !userId) {
+    return res.status(400).json({ error: 'invalid_request', message: 'userId is required.' })
+  }
+  const roleCheck = validateRoleAndLocations(role, locationIds)
+  if (!roleCheck.valid) {
+    return res.status(400).json({ error: 'invalid_request', message: roleCheck.message })
+  }
+  if (!canAssignRole(account.role, role)) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only an Owner may promote an account to Owner.' })
+  }
+
+  try {
+    const target = await getAccountById(userId)
+    if (!target) return res.status(404).json({ error: 'not_found' })
+
+    if (target.role === 'owner' && role !== 'owner') {
+      const lastOwnerCheck = await assertNotLastActiveOwner(userId)
+      if (!lastOwnerCheck.safe) {
+        return res.status(409).json({ error: 'last_owner', message: lastOwnerCheck.message })
+      }
+    }
+
+    const now = new Date().toISOString()
+    const updated = await upsertUser({
+      createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
+      inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
+      ...target,
+      role, locationIds,
+      sessionVersion: (Number.isInteger(target.sessionVersion) ? target.sessionVersion : 1) + 1,
+      updatedAt: now,
+    })
+
+    await appendAuditEntry({
+      ...actorFields(account, req), entity: 'user', entityId: userId,
+      action: 'user.role_or_locations_changed',
+      changes: [
+        { field: 'role', oldValue: target.role, newValue: role },
+        { field: 'locationIds', oldValue: target.locationIds, newValue: locationIds },
+      ],
+      result: 'success',
+      message: `Updated role/locations for ${target.email}.`,
+    })
+
+    return res.status(200).json({ userId: updated.userId, role: updated.role, locationIds: updated.locationIds })
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError) {
+      console.error(`[settings/update-user-role-locations] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// Shared by disable-user/enable-user -- both promote-on-first-write and
+// bump sessionVersion for disable (an active session must not survive a
+// disable even one request longer than the next auth check; there's no
+// equivalent need for enable, since a disabled account's session was
+// already rejected on `disabled` alone, independent of sessionVersion).
+async function setUserDisabledAction(req, res, { disabled, actionName }) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+  if (!roleHasPermission(account.role, Permission.USERS_MANAGE)) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to manage users.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `settings:${actionName}:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { userId } = req.body ?? {}
+  if (typeof userId !== 'string' || !userId) {
+    return res.status(400).json({ error: 'invalid_request', message: 'userId is required.' })
+  }
+
+  try {
+    const target = await getAccountById(userId)
+    if (!target) return res.status(404).json({ error: 'not_found' })
+
+    if (disabled && target.role === 'owner') {
+      const lastOwnerCheck = await assertNotLastActiveOwner(userId)
+      if (!lastOwnerCheck.safe) {
+        return res.status(409).json({ error: 'last_owner', message: lastOwnerCheck.message })
+      }
+    }
+
+    const now = new Date().toISOString()
+    const updated = await upsertUser({
+      createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
+      inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
+      ...target,
+      disabled,
+      sessionVersion: disabled ? (Number.isInteger(target.sessionVersion) ? target.sessionVersion : 1) + 1 : target.sessionVersion,
+      updatedAt: now,
+    })
+
+    await appendAuditEntry({
+      ...actorFields(account, req), entity: 'user', entityId: userId,
+      action: disabled ? 'user.disabled' : 'user.enabled',
+      changes: [{ field: 'disabled', oldValue: target.disabled, newValue: disabled }],
+      result: 'success',
+      message: `${disabled ? 'Disabled' : 'Re-enabled'} ${target.email}.`,
+    })
+
+    return res.status(200).json({ userId: updated.userId, disabled: updated.disabled })
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError) {
+      console.error(`[settings/${actionName}] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+async function disableUserAction(req, res) { return setUserDisabledAction(req, res, { disabled: true, actionName: 'disable-user' }) }
+async function enableUserAction(req, res) { return setUserDisabledAction(req, res, { disabled: false, actionName: 'enable-user' }) }
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
     case 'contacts':                       return listContacts(req, res)
@@ -886,6 +1067,10 @@ export default async function handler(req, res) {
     case 'resend-invite':                   return resendInviteAction(req, res)
     case 'revoke-invite':                   return revokeInviteAction(req, res)
     case 'generate-reset-link':             return generateResetLinkAction(req, res)
+    case 'users-list':                      return usersListAction(req, res)
+    case 'update-user-role-locations':      return updateUserRoleLocationsAction(req, res)
+    case 'disable-user':                    return disableUserAction(req, res)
+    case 'enable-user':                     return enableUserAction(req, res)
     default:                                return res.status(404).json({ error: 'not_found' })
   }
 }

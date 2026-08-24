@@ -7,7 +7,9 @@
 
 import { settingsSections } from '../dashboard/src/pages/settings/settingsSections.js'
 
-const KNOWN_ROLES = new Set(['owner', 'marketing', 'location_manager', 'read_only'])
+// REVIEWED UPDATE (Multi-Location Authentication & User Access System,
+// Commit 1): 'admin' added to accounts.js's ROLES.
+const KNOWN_ROLES = new Set(['owner', 'admin', 'marketing', 'location_manager', 'read_only'])
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)

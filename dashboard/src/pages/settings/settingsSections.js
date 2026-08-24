@@ -74,4 +74,16 @@ export const settingsSections = [
     // CONTACTS_MANAGE but not AUDIT_VIEW.
     requiredRoles: ['owner'],
   },
+  {
+    id: 'users',
+    path: 'users',
+    label: 'Users & Access',
+    icon: '🧑‍🤝‍🧑',
+    component: lazy(() => import('./UsersAccess.jsx')),
+    // Multi-Location Authentication & User Access System -- USERS_MANAGE
+    // is granted only to owner/admin (permissions.js); Marketing/
+    // location_manager/read_only never see this nav item, matching the
+    // backend gate every action in this section enforces.
+    requiredRoles: ['owner', 'admin'],
+  },
 ]

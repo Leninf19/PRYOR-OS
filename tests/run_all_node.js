@@ -74,6 +74,8 @@ const TESTS = [
   'test_password_reset_ui.js',
   'test_location_authorization.js',
   'test_frontend_location_scoping.js',
+  'test_user_management.js',
+  'test_users_access_ui.js',
 ]
 
 const results = {}

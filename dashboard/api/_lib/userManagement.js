@@ -7,6 +7,7 @@
 
 import { randomUUID } from 'crypto'
 import { ROLES, isValidLocationIds } from './accounts.js'
+import { listAccounts } from './accountStore.js'
 
 export function generateUserId() {
   return `usr_${randomUUID()}`
@@ -41,6 +42,24 @@ export function validateRoleAndLocations(role, locationIds) {
 export function canAssignRole(actingAccountRole, targetRole) {
   if (targetRole === 'owner') return actingAccountRole === 'owner'
   return true
+}
+
+// "It must be impossible through the UI or API to disable the last active
+// Owner, downgrade the last active Owner, or remove all ownership access
+// accidentally." Uses accountStore.js's listAccounts() -- the same merged,
+// de-duplicated (Redis-wins) view used for last-Owner counting and for
+// GET /api/session/accounts -- so a static-directory identity later
+// promoted into Redis (password reset) is never counted twice. Returns
+// { safe: true } or { safe: false, message } rather than throwing, so
+// callers can shape their own 409 response.
+export async function assertNotLastActiveOwner(targetUserId) {
+  const all = await listAccounts()
+  const activeOwners = all.filter(a => a.role === 'owner' && !a.disabled)
+  const targetIsTheOnlyOne = activeOwners.length === 1 && activeOwners[0].userId === targetUserId
+  if (targetIsTheOnlyOne) {
+    return { safe: false, message: 'This is the last active Owner account -- promote another account to Owner first.' }
+  }
+  return { safe: true, message: null }
 }
 
 function buildOrigin(req) {

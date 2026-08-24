@@ -152,6 +152,9 @@ async function testDeriveUserStatus() {
   assert(deriveUserStatus({ disabled: false, passwordSetAt: null, inviteRevokedAt: '2026-01-01T00:00:00.000Z' }) === 'revoked', 'revoked invite (never activated) -> revoked')
   assert(deriveUserStatus({ disabled: false, passwordSetAt: null, inviteExpiresAt: '2000-01-01T00:00:00.000Z' }) === 'expired', 'past inviteExpiresAt, never activated -> expired')
   assert(deriveUserStatus({ disabled: false, passwordSetAt: '2026-01-01T00:00:00.000Z', inviteRevokedAt: '2026-01-01T00:00:00.000Z' }) === 'active', 'an activated account is active even if stale invite metadata lingers')
+  // A static (ACCOUNT_DIRECTORY_JSON) account never has a passwordSetAt
+  // FIELD at all -- its absence, not a null value, must mean active.
+  assert(deriveUserStatus({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false }) === 'active', 'a static account with no passwordSetAt field at all must be treated as active, not invited')
 }
 
 // --- accountStore.js: dual-read precedence ------------------------------

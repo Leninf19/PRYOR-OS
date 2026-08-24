@@ -449,6 +449,38 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Multi-Location Authentication & User Access System, Commit 3. Same USERS_MANAGE gate as invite-user. Rejects an account that has not been activated yet (use resend-invite instead).',
   },
+  {
+    route: 'GET /api/settings/users-list', file: 'api/settings/[action].js', method: 'GET', action: 'users-list',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin'],
+    scope: 'company-wide admin roster (status/lastLogin/invitedAt) -- distinct from GET /api/session/accounts, which any authenticated role may call',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 6. Same USERS_MANAGE gate as invite-user.',
+  },
+  {
+    route: 'POST /api/settings/update-user-role-locations', file: 'api/settings/[action].js', method: 'POST', action: 'update-user-role-locations',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin'],
+    scope: 'company-wide admin action -- changes another account\'s role/locationIds, bumps sessionVersion unconditionally',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 6. Same USERS_MANAGE gate; canAssignRole() additionally blocks Admin from promoting anyone to Owner. assertNotLastActiveOwner() blocks demoting the last active Owner (409).',
+  },
+  {
+    route: 'POST /api/settings/disable-user', file: 'api/settings/[action].js', method: 'POST', action: 'disable-user',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin'],
+    scope: 'company-wide admin action -- immediate (bumps sessionVersion)',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 6. Same USERS_MANAGE gate. assertNotLastActiveOwner() blocks disabling the last active Owner (409).',
+  },
+  {
+    route: 'POST /api/settings/enable-user', file: 'api/settings/[action].js', method: 'POST', action: 'enable-user',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin'],
+    scope: 'company-wide admin action',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 6. Same USERS_MANAGE gate. No last-Owner check needed (re-enabling never removes ownership).',
+  },
 ]
 
 // ---------------------------------------------------------------------------
