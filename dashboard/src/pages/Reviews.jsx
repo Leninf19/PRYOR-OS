@@ -578,6 +578,12 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
       reviewerName: r.reviewer_name || 'Guest',
       location:     r.location_name || 'our restaurant',
       stars:        r.star_rating   ?? 1,
+      // Multi-Location Authentication & User Access System: required for a
+      // location-scoped account (location_manager, or a scoped Marketing
+      // account) to be authorized at all -- see dashboard/api/rewrite.js.
+      // Owner/Admin/company-wide Marketing continue working unchanged
+      // without it.
+      localReviewId: rid,
     }).then(generated => {
       setLocalDraft(generated)
       onUpdate(rid, { editedDraft: generated, status: 'draft_ready' })
@@ -619,6 +625,7 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
         reviewerName: r.reviewer_name || 'Guest',
         location:     r.location_name || 'our restaurant',
         stars:        r.star_rating   ?? 1,
+        localReviewId: rid,
       })
       setLocalDraft(rewritten)
       onUpdate(rid, { editedDraft: rewritten, status: 'edited' })
@@ -1585,6 +1592,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
             tone: 'friendly', reviewText: next.review_text || '', currentDraft: '',
             reviewerName: next.reviewer_name || 'Guest', location: next.location_name || 'our restaurant',
             stars: next.star_rating ?? 1,
+            localReviewId: id,
           })
           if (!cancelled) setRecord(id, { editedDraft: generated, status: 'draft_ready' })
         } catch {

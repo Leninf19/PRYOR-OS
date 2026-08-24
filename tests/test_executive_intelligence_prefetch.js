@@ -62,9 +62,17 @@ function testQueryKeysMatchTheirCorrespondingHooks() {
   // useActionCenter()/useOperationsImpact() use queryKey 'action-center'/
   // 'operations-impact' -- the prefetch entries must use the identical
   // keys, or the prefetched cache entry would never be hit by the hook.
-  assert(/export function useActionCenter\(\)\s*\{\s*return useQuery\(\{\s*queryKey:\s*\['action-center'\]/.test(content),
+  //
+  // REVIEWED UPDATE (Multi-Location Authentication & User Access System,
+  // Commit 5): both hooks now route through useCompanyWideQuery(queryKey,
+  // path) (enabled: !isLocationScoped(account), so a scoped account's
+  // browser never even issues these company-wide requests) instead of an
+  // inline useQuery({queryKey, ...}) call -- the queryKey itself, and the
+  // real invariant this test checks (it must match the prefetch entry's
+  // key), are unchanged.
+  assert(/export function useActionCenter\(\)\s*\{\s*return useCompanyWideQuery\(\['action-center'\]/.test(content),
     "useActionCenter()'s queryKey must be 'action-center', matching the prefetch entry")
-  assert(/export function useOperationsImpact\(\)\s*\{\s*return useQuery\(\{\s*queryKey:\s*\['operations-impact'\]/.test(content),
+  assert(/export function useOperationsImpact\(\)\s*\{\s*return useCompanyWideQuery\(\['operations-impact'\]/.test(content),
     "useOperationsImpact()'s queryKey must be 'operations-impact', matching the prefetch entry")
 }
 

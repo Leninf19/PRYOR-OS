@@ -12,7 +12,8 @@ import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
 import CXIndexGrid from '../components/ui/CXIndexGrid.jsx'
 import ExplainableScore from '../components/ui/ExplainableScore.jsx'
-import { useLocationStats, useLocationDetail, usePrefetchLocationDetails } from '../hooks/useIntelligence.js'
+import { useLocationStats, useLocationDetail, usePrefetchLocationDetails, useMeta, isLocationScoped } from '../hooks/useIntelligence.js'
+import { useAccount } from '../components/AuthGate.jsx'
 import { explainHealthScore } from '../utils/dataUtils.js'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -348,13 +349,29 @@ function LocationDashboard({ loc, detail, loading, locationReviews = [], locatio
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export default function LocationDetail({ allReviews = [], filtered = [], prevFiltered = [], filters = {} }) {
+  // Multi-Location Authentication & User Access System (Phase 9, flagged
+  // "especially important"): a scoped account must never see the row of
+  // every location's button, and analytics/location-stats.json (the
+  // company-wide file this page used to source EVERY location's rich stats
+  // from) is now permanently blocked for them -- meta.json's own
+  // (server-filtered) locations list is the only location source that
+  // still works, giving name/city/slug but not the richer lifetime-stats
+  // fields (periodSentiment/starBreakdown/lifetimeRating below fall back
+  // to "--"/0 for a scoped account until a scoped per-location analytics
+  // export exists -- everything sourced from useLocationDetail(slug), i.e.
+  // health score/trend/CX index/complaints/praise/staff/forecast/AI
+  // summary, is already fully available since that file IS per-location).
+  const account = useAccount()
+  const scoped = isLocationScoped(account)
+  const { data: meta } = useMeta()
   const { data: stats, isLoading: lStats, isError: eStats, refetch: refetchStats } = useLocationStats()
-  usePrefetchLocationDetails(stats)
+  const availableLocations = scoped ? (meta?.locations ?? []) : stats
+  usePrefetchLocationDetails(scoped ? null : stats)
   const [selected, setSelected] = useState(null)
 
   const selectedLoc = useMemo(
-    () => stats?.find(s => s.name === selected) ?? stats?.[0] ?? null,
-    [stats, selected]
+    () => availableLocations?.find(s => s.name === selected) ?? availableLocations?.[0] ?? null,
+    [availableLocations, selected]
   )
   const slug = selectedLoc ? slugify(selectedLoc.name) : null
   const { data: detail, isLoading: lDetail } = useLocationDetail(slug)
@@ -374,8 +391,8 @@ export default function LocationDetail({ allReviews = [], filtered = [], prevFil
 
   // Auto-select first on load
   useMemo(() => {
-    if (!selected && stats?.length) setSelected(stats[0].name)
-  }, [stats, selected])
+    if (!selected && availableLocations?.length) setSelected(availableLocations[0].name)
+  }, [availableLocations, selected])
 
   return (
     <div className="space-y-6 max-w-[1100px]">
@@ -386,7 +403,18 @@ export default function LocationDetail({ allReviews = [], filtered = [], prevFil
         </p>
       </div>
 
-      {eStats ? (
+      {scoped ? (
+        // Phase 9: a scoped account (one location or a handful) never sees
+        // the full company's location-picker row -- a single-location
+        // account skips the picker entirely (its dashboard opens directly
+        // to that location, per the milestone's explicit example); a
+        // multi-location manager still gets a picker, but constrained to
+        // only their own assigned locations (meta.json is already
+        // server-filtered to exactly that set).
+        availableLocations?.length > 1 && (
+          <LocationPicker stats={availableLocations} selected={selected ?? availableLocations?.[0]?.name} onSelect={setSelected} />
+        )
+      ) : eStats ? (
         <ErrorState body="Couldn't load location data." onRetry={refetchStats} />
       ) : lStats ? (
         <div className="skeleton h-10 w-full max-w-2xl" />

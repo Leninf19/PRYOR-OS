@@ -8,10 +8,11 @@ import { useAccount }        from './components/AuthGate.jsx'
 import { useReviewsData }    from './hooks/useReviewsData.js'
 import { useGlobalPrefetch } from './hooks/useIntelligence.js'
 import { useUnansweredCount } from './hooks/useReviewWorkspace.js'
-import { filterReviews, getDefaultDateRange } from './utils/dataUtils.js'
+import { filterReviews, getDefaultDateRange, getUniqueLocations } from './utils/dataUtils.js'
+import { isLocationScoped } from './hooks/useIntelligence.js'
 import {
   parseFiltersFromSearchParams, loadStoredFilters, saveStoredFilters, clearStoredFilters,
-  withFreshDefaults, buildSearchParamsFromFilters, stripFilterParams,
+  withFreshDefaults, buildSearchParamsFromFilters, stripFilterParams, restrictLocationsToAllowed,
 } from './utils/filterPersistence.js'
 import { settingsSections } from './pages/settings/settingsSections.js'
 
@@ -134,9 +135,27 @@ function ErrorScreen() {
 // address bar is always an accurate, shareable snapshot of what's actually
 // showing -- including right after a plain <Link> navigation to a page
 // that never had filter params of its own.
-function useFilterPersistence(allReviews) {
+function useFilterPersistence(allReviews, account) {
   const [searchParams, setSearchParams] = useSearchParams()
   const [filters, setFilters] = useState(null)
+  // Multi-Location Authentication & User Access System (Phase 10): never
+  // trust a URL query parameter or localStorage for authorization -- the
+  // server/session's allowed locations are authoritative. `allReviews`
+  // itself is already server-side scoped (dashboard/api/data.js filters
+  // meta.json/reviews.by-location for a scoped account), so the set of
+  // location names actually present in it can never contain an
+  // unauthorized name; intersecting a stored/URL `locations` value against
+  // it is a pure narrowing, never a widening, of what a scoped account can
+  // select. null (company-wide account) means "no restriction."
+  const scoped = isLocationScoped(account)
+  // Memoized -- getUniqueLocations() would otherwise return a new array
+  // reference every render, which as a useEffect dependency below would
+  // re-run that effect (and its setSearchParams call) on every single
+  // render instead of only when the underlying review data actually changes.
+  const allowedLocationNames = useMemo(
+    () => (scoped ? getUniqueLocations(allReviews ?? []) : null),
+    [scoped, allReviews]
+  )
   // Set for exactly one effect pass right after handleResetFilters strips
   // the URL, so that pass resolves `filters` to fresh computed defaults
   // WITHOUT also writing them back into the URL as explicit params -- the
@@ -152,13 +171,13 @@ function useFilterPersistence(allReviews) {
     const dr = getDefaultDateRange(allReviews)
     const fromUrl = parseFiltersFromSearchParams(searchParams)
     if (fromUrl) {
-      const resolved = withFreshDefaults(fromUrl, dr)
+      const resolved = restrictLocationsToAllowed(withFreshDefaults(fromUrl, dr), allowedLocationNames)
       setFilters(resolved)
       saveStoredFilters(fromUrl) // mirror to localStorage so a later bare visit reflects this
       return
     }
     const stored = loadStoredFilters()
-    const resolved = withFreshDefaults(stored, dr)
+    const resolved = restrictLocationsToAllowed(withFreshDefaults(stored, dr), allowedLocationNames)
     setFilters(resolved)
     if (justReset.current) {
       justReset.current = false
@@ -175,7 +194,7 @@ function useFilterPersistence(allReviews) {
     // same effect an extra, harmless-but-pointless time; it's still
     // correctly re-run on every REAL searchParams change because useSearchParams
     // itself causes this component to re-render with a new searchParams value.
-  }, [allReviews, searchParams])
+  }, [allReviews, searchParams, allowedLocationNames])
 
   // A normal filter edit (date input, pill toggle, preset click) -- writes
   // the change into the URL; the effect above picks up the resulting
@@ -207,7 +226,7 @@ function RootLayout() {
   useGlobalPrefetch()
   const account = useAccount()
   const { data: allReviews, isLoading, isError } = useReviewsData()
-  const { filters, handleFilterChange, handleResetFilters } = useFilterPersistence(allReviews)
+  const { filters, handleFilterChange, handleResetFilters } = useFilterPersistence(allReviews, account)
   const location = useLocation()
 
   const filtered = useMemo(() => {

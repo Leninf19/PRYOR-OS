@@ -232,14 +232,23 @@ export default function GlobalFilters({ allReviews, filters, onChange, onReset }
                 onChange={v => set('brands', v)}
               />
             </div>
-            <div>
-              <p className="text-[10px] font-bold tracking-widest text-[var(--filter-stone-400)] uppercase mb-2 dark:text-[var(--color-text-3)]">Location</p>
-              <Pills
-                options={allLocations}
-                selected={filters.locations}
-                onChange={v => set('locations', v)}
-              />
-            </div>
+            {/* Multi-Location Authentication & User Access System (Phase 7):
+                allLocations is already derived from allReviews, which is
+                already server-side scoped -- a single-location account only
+                ever has one option here, so the picker (a no-op choice
+                between "All" and the one location it's already implicitly
+                filtered to) is hidden entirely rather than shown as a
+                confusing, functionally-empty control. */}
+            {allLocations.length > 1 && (
+              <div>
+                <p className="text-[10px] font-bold tracking-widest text-[var(--filter-stone-400)] uppercase mb-2 dark:text-[var(--color-text-3)]">Location</p>
+                <Pills
+                  options={allLocations}
+                  selected={filters.locations}
+                  onChange={v => set('locations', v)}
+                />
+              </div>
+            )}
             <div>
               <p className="text-[10px] font-bold tracking-widest text-[var(--filter-stone-400)] uppercase mb-2 dark:text-[var(--color-text-3)]">Stars</p>
               <StarPills selected={filters.stars} onChange={v => set('stars', v)} />

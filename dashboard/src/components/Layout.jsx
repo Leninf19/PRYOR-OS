@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 import { NavLink, Link, useLocation } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
-import { useMeta, usePredictiveAlerts, useActionItems } from '../hooks/useIntelligence.js'
+import { useMeta, usePredictiveAlerts, useActionItems, isLocationScoped } from '../hooks/useIntelligence.js'
+import { useReviewsData } from '../hooks/useReviewsData.js'
 import { useGoogleOAuthStatus } from '../hooks/useGoogleOAuthStatus.js'
+import { useAccount } from './AuthGate.jsx'
 import ThemeToggle from './ui/ThemeToggle.jsx'
 import SmartSearch from './SmartSearch.jsx'
 import LogoutButton from './LogoutButton.jsx'
@@ -56,9 +58,19 @@ const NAV_FLAT = NAV_ITEMS
 // ── Compact snapshot bar ──────────────────────────────────────────────────────
 
 function SnapshotBar() {
+  const account = useAccount()
+  const scoped = isLocationScoped(account)
   const { data: meta }    = useMeta()
+  // Company-wide files (usePredictiveAlerts/useActionItems), disabled for a
+  // scoped account (Multi-Location Authentication & User Access System) --
+  // their pills below are derived from the already-scoped review data
+  // instead (useReviewsData() is the same ['all-reviews'] query every page
+  // already uses, so this is a cache hit, not a new fetch). Predictive
+  // alerts have no per-location equivalent surfaced here yet, so a scoped
+  // account simply doesn't see that pill, rather than a misleading "0".
   const { data: alerts, isError: alertsError }   = usePredictiveAlerts()
   const { data: actions, isError: actionsError } = useActionItems()
+  const { data: allReviews } = useReviewsData()
   // Design System Specification v1.0, Phase 7 -- the single canonical
   // Google-connection source. Alerts.jsx and ScraperStatus.jsx each still
   // independently render their own copy of this same signal (out of scope
@@ -75,9 +87,23 @@ function SnapshotBar() {
   const now        = new Date()
   const dateLabel  = now.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
   const totalLocs  = meta?.locations?.length ?? '—'
-  const totalRevs  = meta?.totalReviews != null ? meta.totalReviews.toLocaleString() : '—'
-  const alertCount = Array.isArray(alerts) ? alerts.length : (alerts?.alerts?.length ?? 0)
-  const backlog    = actions?.unanswered?.length ?? 0
+  // Phase 8's explicit example: a single-location account sees its own
+  // restaurant's name ("Casa Tequila Prime"), never a bare count that would
+  // otherwise read as if it had access to more than one location.
+  const locationsLabel = scoped && meta?.locations?.length === 1
+    ? meta.locations[0].name
+    : `${totalLocs} locations`
+  const totalRevs = scoped
+    ? (Array.isArray(allReviews) ? allReviews.length.toLocaleString() : '—')
+    : (meta?.totalReviews != null ? meta.totalReviews.toLocaleString() : '—')
+  const alertCount = scoped ? 0 : (Array.isArray(alerts) ? alerts.length : (alerts?.alerts?.length ?? 0))
+  // Mirrors export_action_items()'s own definition (export_chunks.py):
+  // unanswered, <=2-star reviews -- computed client-side from the
+  // already-scoped review set for a scoped account, since action-items.json
+  // itself is a blocked company-wide file for them.
+  const backlog = scoped
+    ? (Array.isArray(allReviews) ? allReviews.filter(r => r.star_rating != null && r.star_rating <= 2 && !(r.owner_response || '').trim()).length : 0)
+    : (actions?.unanswered?.length ?? 0)
 
   const lastRun = meta?.generatedAt
     ? (() => {
@@ -90,7 +116,7 @@ function SnapshotBar() {
   const pills = [
     { label: dateLabel, dimmed: false },
     lastRun && { label: `Updated ${lastRun}`, dimmed: true },
-    { label: `${totalLocs} locations`, dimmed: true },
+    { label: locationsLabel, dimmed: true },
     { label: `${totalRevs} reviews`, dimmed: true },
     alertCount > 0 && { label: `${alertCount} alerts`, color: 'var(--color-warning)', dot: true },
     backlog > 0 && { label: `${backlog} need reply`, color: 'var(--color-danger)', dot: true },
@@ -228,6 +254,12 @@ function NotificationBell({ alerts, actions, hasError }) {
 // ── Sidebar content ───────────────────────────────────────────────────────────
 
 function SidebarContent({ unansweredCount, onLinkClick }) {
+  const account = useAccount()
+  const scoped = isLocationScoped(account)
+  const { data: meta } = useMeta()
+  const footerLabel = scoped && meta?.locations?.length === 1
+    ? meta.locations[0].name
+    : `Los Tres Amigos · ${meta?.locations?.length ?? account?.locationIds?.length ?? '—'} Location${meta?.locations?.length === 1 ? '' : 's'}`
   return (
     <>
       {/* Brand */}
@@ -275,7 +307,7 @@ function SidebarContent({ unansweredCount, onLinkClick }) {
       <div className="px-5 py-3 flex-shrink-0 flex items-center justify-between gap-2"
            style={{ borderTop: '1px solid var(--color-border)' }}>
         <p className="text-[10px] truncate" style={{ color: 'var(--color-text-3)' }}>
-          Los Tres Amigos · 21 Locations
+          {footerLabel}
         </p>
         <div className="flex items-center gap-1 flex-shrink-0">
           <LogoutButton />

@@ -145,6 +145,26 @@ export function withFreshDefaults(partial, defaultDateRange) {
   }
 }
 
+// Multi-Location Authentication & User Access System (Phase 10): a stored
+// or URL-carried `locations` value must never be trusted as authorization --
+// only the server-derived allowed-locations set is authoritative (never a
+// browser's localStorage or a URL a link could hand anyone). `allowedNames`
+// is null for a company-wide (unscoped) account, meaning "no restriction,
+// return filters unchanged" -- for a scoped account it's the exact set
+// meta.json's own (already server-filtered) locations list names, so this
+// is a pure intersection, never a widening: requested filters ∩
+// session.allowedLocationIds, never the reverse. Applied identically
+// whether `locations` came from the URL, localStorage, or neither (an
+// empty array already intersects down to itself).
+export function restrictLocationsToAllowed(filters, allowedNames) {
+  if (allowedNames === null) return filters
+  const allowed = new Set(allowedNames)
+  return {
+    ...filters,
+    locations: (filters.locations ?? []).filter(name => allowed.has(name)),
+  }
+}
+
 // Builds a NEW URLSearchParams reflecting `filters` -- always constructed
 // fresh from `existingParams` with the 5 filter keys deleted first and only
 // non-empty ones re-added, so this can never accumulate duplicates and
