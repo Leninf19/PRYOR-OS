@@ -43,9 +43,7 @@
 import { readFile } from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { requireAuth } from './_lib/auth.js'
-
-const ALLOWED_ROLES = ['owner', 'marketing']
+import { requireAuth, requireLocationAccess } from './_lib/auth.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PRIVATE_ROOT = path.resolve(__dirname, '..', 'private-data')
@@ -93,6 +91,69 @@ function isAllowed(relPath) {
   return DYNAMIC_ALLOWLIST.some(re => re.test(relPath))
 }
 
+// --- Multi-Location Authentication & User Access System, Commit 4 --------
+// Per-file location authorization for a scoped (locationIds !== '*')
+// account. Three outcomes: 'meta' (meta.json itself -- read, then FILTERED
+// after parsing, never blocked outright), 'per-location' (one of the 3
+// DYNAMIC_ALLOWLIST patterns -- checked against the account's grant via the
+// slug's resolved locationId), 'company-wide' (every other EXACT_ALLOWLIST
+// file -- permanently blocked for a scoped account, per DATA_FILE_REGISTRY;
+// see tests/test_authorization_matrix.js Section 7).
+function categorizeRelPath(relPath) {
+  if (relPath === 'meta.json') return 'meta'
+  if (DYNAMIC_ALLOWLIST.some(re => re.test(relPath))) return 'per-location'
+  return 'company-wide'
+}
+
+// slug is always the LAST path segment minus '.json' for all 3 dynamic
+// patterns (insights/{slug}.json, reviews/by-location/{slug}.json,
+// intelligence/locations/{slug}.json) -- no pattern nests a slug elsewhere.
+function extractSlugFromRelPath(relPath) {
+  const segments = relPath.split('/')
+  const last = segments[segments.length - 1]
+  return last.replace(/\.json$/, '')
+}
+
+let metaLocationsCache = null
+let metaLocationsTestOverride = null
+
+// Test-only seam, same pattern as reviewLocationIndex.js's own
+// _setReviewLocationIndexForTests.
+export function _setMetaLocationsForTests(locations) {
+  metaLocationsTestOverride = locations
+  metaLocationsCache = null
+}
+export function _resetMetaLocationsForTests() {
+  metaLocationsTestOverride = null
+  metaLocationsCache = null
+}
+
+// Returns meta.json's `locations` array (cached per warm instance -- see
+// reviewLocationIndex.js's identical reasoning). Used both to resolve a
+// requested slug's locationId (per-location files) and to filter the
+// locations list itself (meta.json requests). Reads directly off disk,
+// independent of isAllowed()/EXACT_ALLOWLIST -- meta.json is always
+// allowlisted for every role, so this never bypasses anything the
+// allowlist itself wouldn't already permit.
+async function loadMetaLocations() {
+  if (metaLocationsTestOverride !== null) return metaLocationsTestOverride
+  if (metaLocationsCache !== null) return metaLocationsCache
+  try {
+    const raw = await readFile(path.join(PRIVATE_ROOT, 'meta.json'), 'utf-8')
+    metaLocationsCache = JSON.parse(raw).locations ?? []
+  } catch (err) {
+    console.error(`[api/data] could not load meta.json for location resolution: ${err.message}`)
+    metaLocationsCache = []
+  }
+  return metaLocationsCache
+}
+
+async function resolveLocationIdForSlug(slug) {
+  const locations = await loadMetaLocations()
+  const match = locations.find(l => l.slug === slug)
+  return match ? match.locationId : null
+}
+
 // req.query.file is a single, already-decoded string (ordinary query-string
 // parsing, not dynamic-route segment extraction). Still validated
 // defensively here rather than trusted: split on '/' and reject anything
@@ -120,12 +181,34 @@ export default async function handler(req, res) {
   // static asset.
   res.setHeader('Cache-Control', 'private, no-store')
 
-  const account = await requireAuth(req, res, ALLOWED_ROLES)
+  // Any authenticated role may reach this far -- Commit 4 removed the flat
+  // owner/marketing role gate. The real decision below is per-file and
+  // per-location, driven by categorizeRelPath()/account.locationIds.
+  const account = await requireAuth(req, res, null)
   if (!account) return
 
   const relPath = buildRequestedRelPath(req.query.file)
   if (!relPath || !isAllowed(relPath)) {
     return res.status(404).json({ error: 'not_found' })
+  }
+
+  let requestedLocationId = null // only meaningful for the 'per-location' category
+  if (account.locationIds !== '*') {
+    const category = categorizeRelPath(relPath)
+    if (category === 'company-wide') {
+      return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to view company-wide data.' })
+    }
+    if (category === 'per-location') {
+      const slug = extractSlugFromRelPath(relPath)
+      requestedLocationId = await resolveLocationIdForSlug(slug)
+      if (requestedLocationId === null || !requireLocationAccess(account, requestedLocationId)) {
+        // Existence-hiding, matching the frozen §6 error contract every
+        // other location-scope check in this codebase uses -- never 403
+        // for an out-of-scope location.
+        return res.status(404).json({ error: 'not_found' })
+      }
+    }
+    // category === 'meta' falls through -- read + filtered after parsing.
   }
 
   const resolved = path.resolve(PRIVATE_ROOT, relPath)
@@ -164,6 +247,22 @@ export default async function handler(req, res) {
   } catch {
     console.error(`[api/data] ${relPath} exists but is not valid JSON -- refusing to serve it.`)
     return res.status(500).json({ error: 'server_error', message: 'This data file is currently unavailable.' })
+  }
+
+  // meta.json for a scoped account: filter `locations` to only the
+  // account's own grant, and never pass through `totalReviews` -- that
+  // field is a company-wide aggregate (Phase 19's explicit "never leak
+  // corporate totals to a scoped account" requirement) and this endpoint
+  // has no cheap way to recompute a scoped total without reading every
+  // location's own review file. The frontend must derive a scoped
+  // account's review counts from the (already location-scoped) review
+  // data it fetches, never from meta.totalReviews.
+  if (account.locationIds !== '*' && relPath === 'meta.json') {
+    parsed = {
+      ...parsed,
+      locations: (parsed.locations ?? []).filter(l => requireLocationAccess(account, l.locationId)),
+      totalReviews: null,
+    }
   }
 
   res.setHeader('Content-Type', 'application/json; charset=utf-8')

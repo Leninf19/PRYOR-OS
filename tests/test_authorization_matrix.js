@@ -145,11 +145,11 @@ const ROLES = ['owner', 'admin', 'marketing', 'location_manager', 'read_only']
 const ENDPOINT_REGISTRY = [
   {
     route: 'GET /api/data', file: 'api/data.js', method: 'GET',
-    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
-    scope: 'company-wide today; no location filtering exists yet',
-    unauthorizedShape: 'json', wrongRoleStatus: 403,
-    locationMilestone: 6,
-    notes: 'Serves dashboard/private-data/** via a positive allowlist (see data-file registry below). Role gate is a flat allow-list, not permission-based.',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'per-file, per-location (see the data-file registry, Section 7) -- no flat role gate at all',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'LANDED (Multi-Location Authentication & User Access System, Commit 4) -- serves dashboard/private-data/** via a positive allowlist. Any authenticated role reaches this far now; the real decision is per-file/per-location (categorizeRelPath()/requireLocationAccess()), never a role check. There is no "wrong role" case for this endpoint anymore.',
   },
   {
     route: 'GET /api/session/whoami', file: 'api/session/[action].js', method: 'GET', action: 'whoami',
@@ -217,19 +217,27 @@ const ENDPOINT_REGISTRY = [
   },
   {
     route: 'POST /api/google/publish', file: 'api/google/[action].js', method: 'POST', action: 'publish',
-    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
-    scope: 'reply for any location today; no location filtering exists yet',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing', 'location_manager'],
+    scope: 'permission-gated (REPLY or REPLY_ASSIGNED) + per-review location scope via requireScopedAuth/reviewLocationIndex.js',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
-    locationMilestone: 8,
-    notes: 'The "review reply" endpoint referenced throughout the architecture as the target of Milestone 7 (review->location lookup) and Milestone 8 (scoping).',
+    locationMilestone: null,
+    notes: 'LANDED (Multi-Location Authentication & User Access System, Commit 4) -- this is the endpoint the old roadmap\'s Milestone 7 (review->location lookup) and Milestone 8 (publish.js scoping) both targeted. A location-scoped caller (location_manager, or a location-scoped Marketing account) must supply reviewName directly (rejected 400 review_name_required otherwise) -- the legacy locationName/reviewerName fuzzy-match fallback is restricted to company-wide (locationIds === "*") callers only, closing a TOCTOU gap where authorization could check one review while the fallback path\'s fuzzy match resolved a different one. read_only holds neither REPLY nor REPLY_ASSIGNED and remains denied (403), unchanged.',
+  },
+  {
+    route: 'POST /api/google/publish-bridge', file: 'api/google/[action].js', method: 'POST', action: 'publish-bridge',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing', 'location_manager'],
+    scope: 'permission-gated (REPLY or REPLY_ASSIGNED); bulk-read, so each returned record is individually filtered by the caller\'s location grant rather than a single requireScopedAuth resolveLocationId call',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'LANDED (Multi-Location Authentication & User Access System, Commit 4) -- added to the registry now (was previously undocumented here; the file-level scanner did not catch its absence because google/[action].js was already registered via other actions). A location-scoped caller receives only bridge records for reviews within their own locationIds grant; records for other reviews are simply omitted from the response, matching this endpoint\'s existing "absent means no bridge record" contract.',
   },
   {
     route: 'POST /api/rewrite', file: 'api/rewrite.js', method: 'POST',
-    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
-    scope: 'account-wide -- a text-tone rewrite tool, not location data',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing', 'location_manager'],
+    scope: 'permission-gated (REPLY or REPLY_ASSIGNED) + optional per-review location scope via localReviewId',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'No location dimension exists for this endpoint (it rewrites arbitrary caller-supplied text). No milestone in the roadmap scopes it; Owner/Marketing-only is expected to be permanent.',
+    notes: 'REVISED (Multi-Location Authentication & User Access System, Commit 4) -- this endpoint previously had no location dimension at all; it now accepts an OPTIONAL localReviewId, required only for a location-scoped caller (owner/marketing/admin continue working unchanged without it). A scoped caller omitting it is denied (404) rather than silently trusted -- functionally usable by location_manager once the frontend-scoping commit wires Reviews.jsx to send it.',
   },
   {
     route: 'POST /api/executive-brief', file: 'api/executive-brief.js', method: 'POST',
@@ -307,43 +315,43 @@ const ENDPOINT_REGISTRY = [
   },
   {
     route: 'GET /api/actions/list', file: 'api/actions/[action].js', method: 'GET', action: 'list',
-    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
-    scope: 'company-wide task workspace -- not part of the location-authorization roadmap (Milestones 6-9 above); this endpoint reads Redis-backed collaborative state, never reviews.db-derived location data',
-    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'Redis-backed collaborative state, now location-filtered in-handler for a scoped caller (via reviewLocationIndex.js) rather than gated by role at all',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
     locationMilestone: null,
-    notes: 'Action Center Accountability milestone. Same read roles as the AI Action Center already has today (owner, marketing) -- location_manager is deliberately NOT granted here; per README "Location authorization strategy", location-scoped accounts remain unsafe to create until Milestone 6/7\'s location_id propagation lands, and this milestone does not change that.',
+    notes: 'REVISED (Multi-Location Authentication & User Access System, Commit 4) -- previously owner/marketing-only; every role holds at least VIEW_ASSIGNED so requireAuth(req, res, null) now admits any authenticated role, with a scoped account\'s results filtered to items whose review resolves to one of its own locationIds (an item for a foreign location is simply absent, never a 403/404). There is no "wrong role" case for this endpoint anymore.',
   },
   {
     route: 'POST /api/actions/update', file: 'api/actions/[action].js', method: 'POST', action: 'update',
-    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
-    scope: 'company-wide task workspace -- same non-goal as GET /api/actions/list',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing', 'location_manager'],
+    scope: 'permission-gated (REPLY or REPLY_ASSIGNED) + per-review location scope (id resolved via reviewLocationIndex.js)',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'Action Center Accountability milestone. Rate-limited per-caller (test_actions_endpoint.js). Rejects any patch containing a server-owned field (createdBy/At, updatedBy/At, history, id) with 400, before ever reaching actionStore.js.',
+    notes: 'REVISED (Commit 4) -- previously owner/marketing-only via a flat role array; now requireScopedAuth. Rate-limited per-caller (test_actions_endpoint.js). Rejects any patch containing a server-owned field (createdBy/At, updatedBy/At, history, id) with 400, before ever reaching actionStore.js.',
   },
   {
     route: 'GET /api/actions/preview-review-email', file: 'api/actions/[action].js', method: 'GET', action: 'preview-review-email',
-    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
-    scope: 'restaurant bad-review email workflow -- same non-goal as GET /api/actions/list; recipient is resolved server-side, never client-supplied',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing', 'location_manager'],
+    scope: 'restaurant bad-review email workflow -- permission-gated (REPLY or REPLY_ASSIGNED) + location scope via the request\'s own explicit locationId',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'Recovery-audit milestone (restaurant bad-review email workflow). Read-only preview of the recipient/CC/Reply-To a send WOULD use, for the confirmation panel -- never returns the whole location-contacts.json directory, only the one location requested.',
+    notes: 'REVISED (Commit 4) -- previously owner/marketing-only. Read-only preview of the recipient/CC/Reply-To a send WOULD use, for the confirmation panel -- never returns the whole location-contacts.json directory, only the one location requested, now enforced via requireScopedAuth using the request\'s own locationId query param.',
   },
   {
     route: 'POST /api/actions/send-review-email', file: 'api/actions/[action].js', method: 'POST', action: 'send-review-email',
-    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
-    scope: 'restaurant bad-review email workflow -- same non-goal as GET /api/actions/list',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing', 'location_manager'],
+    scope: 'restaurant bad-review email workflow -- permission-gated (REPLY or REPLY_ASSIGNED) + location scope via the request\'s own explicit locationId',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'Recovery-audit milestone. Rate-limited per-caller (test_send_review_email.js). Recipient/CC/Reply-To are always server-resolved (locationContacts.js / reviewEmailConfig.js) -- the request body has no field for any of them. Duplicate-send protection requires confirmResend once an item is sent/replied/follow_up_required/resolved.',
+    notes: 'REVISED (Commit 4) -- previously owner/marketing-only. Rate-limited per-caller (test_send_review_email.js). Recipient/CC/Reply-To are always server-resolved (locationContacts.js / reviewEmailConfig.js) -- the request body has no field for any of them. Duplicate-send protection requires confirmResend once an item is sent/replied/follow_up_required/resolved.',
   },
   {
     route: 'POST /api/actions/update-email-status', file: 'api/actions/[action].js', method: 'POST', action: 'update-email-status',
-    authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
-    scope: 'restaurant bad-review email workflow -- same non-goal as GET /api/actions/list',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing', 'location_manager'],
+    scope: 'restaurant bad-review email workflow -- permission-gated (REPLY or REPLY_ASSIGNED) + per-review location scope (id resolved via reviewLocationIndex.js, no explicit locationId field exists on this action)',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'Recovery-audit milestone. Manual replied/follow_up_required/resolved transitions only -- rejects "sent"/"failed"/"queued"/"not_sent" outright, and rejects any item with no prior outgoing email, so this can never be used to fake a send.',
+    notes: 'REVISED (Commit 4) -- previously owner/marketing-only. Manual replied/follow_up_required/resolved transitions only -- rejects "sent"/"failed"/"queued"/"not_sent" outright, and rejects any item with no prior outgoing email, so this can never be used to fake a send.',
   },
   {
     route: 'GET /api/settings/contacts', file: 'api/settings/[action].js', method: 'GET', action: 'contacts',
@@ -488,9 +496,9 @@ const ERROR_CONTRACT_EXCEPTIONS = [
 const DATA_FILE_REGISTRY = [
   {
     category: 'per-location reviews', files: ['reviews/by-location/'], dynamic: true,
-    owner: 'yes', marketing: 'yes', location_manager: 'assigned-only (pending)', read_only: 'assigned-only (pending)',
-    accessModel: 'unrestricted today for owner/marketing (every slug); assigned-only intended for scoped roles',
-    milestone: 6,
+    owner: 'yes', marketing: 'yes', location_manager: 'assigned-only (LANDED, Commit 4)', read_only: 'assigned-only (LANDED, Commit 4)',
+    accessModel: 'unrestricted for owner/marketing/admin (every slug, wildcard locationIds); assigned-only for scoped roles, enforced by resolving the slug to its locationId via meta.json and checking requireLocationAccess -- 404 for an unassigned location.',
+    milestone: null,
   },
   {
     // RESOLVED (Milestone 5, Option C): dashboard/private-data/analytics/locations/<locationId>.json
@@ -576,16 +584,23 @@ const DATA_FILE_REGISTRY = [
   },
   {
     category: 'per-location intelligence', files: ['intelligence/locations/', 'insights/'], dynamic: true,
-    owner: 'yes', marketing: 'yes', location_manager: 'assigned-only (pending)', read_only: 'assigned-only (pending)',
-    accessModel: 'unrestricted today for owner/marketing; assigned-only intended for scoped roles. This is the exact pattern Milestone 5 (Option C) extends for the two GAP categories above. Same insights/ vs intelligence/locations/ naming debt as the company-wide bucket -- both listed individually below.',
-    milestone: 6,
+    owner: 'yes', marketing: 'yes', location_manager: 'assigned-only (LANDED, Commit 4)', read_only: 'assigned-only (LANDED, Commit 4)',
+    accessModel: 'unrestricted for owner/marketing/admin; assigned-only for scoped roles, same slug->locationId resolution as per-location reviews above. Same insights/ vs intelligence/locations/ naming debt as the company-wide bucket -- both listed individually below.',
+    milestone: null,
   },
   {
     category: 'operational / meta (no location dimension)',
-    files: ['meta.json', 'action-items.json', 'validation.json', 'scraper-status.json', 'gbp-sync.json', 'provider-health.json'],
+    files: ['action-items.json', 'validation.json', 'scraper-status.json', 'gbp-sync.json', 'provider-health.json'],
     owner: 'yes', marketing: 'yes', location_manager: 'blocked (permanent)', read_only: 'blocked (permanent)',
-    accessModel: 'not one of the architecture\'s 11 named categories -- these are operational/meta files (location directory, validation status, scraper/sync state) with no location dimension at all. Documented explicitly here so the registry accounts for every real allowlisted file rather than silently omitting them. provider-health.json (Phase 3 Milestone 5, a completely separate numbering track from this file\'s own "Milestone 5" in SECTION 7B below -- that one is Phase 2\'s per-location analytics work) was added to data.js\'s allowlist with the exact same owner/marketing-only access as its scraper-status.json/gbp-sync.json siblings -- no new access model needed.',
+    accessModel: 'not one of the architecture\'s 11 named categories -- these are operational/meta files (validation status, scraper/sync state) with no location dimension at all. Documented explicitly here so the registry accounts for every real allowlisted file rather than silently omitting them. provider-health.json (Phase 3 Milestone 5, a completely separate numbering track from this file\'s own "Milestone 5" in SECTION 7B below -- that one is Phase 2\'s per-location analytics work) was added to data.js\'s allowlist with the exact same owner/marketing-only access as its scraper-status.json/gbp-sync.json siblings -- no new access model needed.',
     milestone: 6,
+  },
+  {
+    category: 'company directory (meta.json -- special-cased, not blocked)',
+    files: ['meta.json'],
+    owner: 'yes (unfiltered)', marketing: 'yes (unfiltered)', location_manager: 'yes (FILTERED, Commit 4)', read_only: 'yes (FILTERED, Commit 4)',
+    accessModel: 'meta.json was split out of the "operational / meta" bucket above (Multi-Location Authentication & User Access System, Commit 4) because it is NOT blocked outright for a scoped role like its siblings -- it is always readable, but the response is transformed: `locations` is filtered to only the account\'s own locationIds, and `totalReviews` (a company-wide aggregate) is stripped to null rather than ever exposed to a scoped account. The frontend needs the location directory itself (names/slugs) to render at all, even for a single-location account -- unlike the genuinely company-wide files below, there was no safe way to block it outright.',
+    milestone: null,
   },
   {
     category: 'raw-data exports', files: [],
@@ -776,50 +791,58 @@ async function testRoleMatrixDeniesEveryNonAllowedRole() {
   }
 }
 
+// Confirms Milestone 8's landed mechanism statically: publish() is gated by
+// requireScopedAuth (permission + per-review location), not a flat role
+// array, and the fuzzy-match fallback is restricted to company-wide
+// callers. Full functional coverage (a real successful/denied publish call)
+// is in tests/test_location_authorization.js.
+async function testPublishIsPermissionAndLocationGatedNotRoleGated() {
+  const src = readFileSync(path.join(API_DIR, 'google', '[action].js'), 'utf-8')
+  assert(/PUBLISH_PERMISSIONS = \[Permission\.REPLY, Permission\.REPLY_ASSIGNED\]/.test(src), 'publish must be gated by [REPLY, REPLY_ASSIGNED], not a flat role array')
+  assert(/resolveLocationIdForReviewOrDeny/.test(src), 'publish must resolve and enforce the review\'s location via reviewLocationIndex.js')
+  assert(/review_name_required/.test(src), 'a location-scoped caller must be required to use the direct reviewName path, not the fuzzy-match fallback')
+}
+
 // --- Location Manager / Read Only: future (pending) behavior -------------
 // These describe scoped access that literally cannot exist until the
 // endpoint itself becomes location-aware. Recorded, not skipped.
 
 function recordScopedRolePendingTests() {
-  pending('location_manager: read assigned locations succeeds via /api/data', {
-    expectedBehavior: 'GET /api/data?file=reviews/by-location/<assigned-slug>.json returns 200 for a location_manager whose locationIds include that location',
-    milestone: 6,
-    reason: '/api/data has zero location-awareness today -- ALLOWED_ROLES = [owner, marketing] rejects location_manager outright (403) regardless of which file is requested; there is no per-file location check to activate yet.',
-  })
-  pending('location_manager: unassigned location rejected with 404 (never 403)', {
-    expectedBehavior: 'a location outside locationIds returns 404 (existence-hiding), matching the frozen API error contract (§6)',
-    milestone: 6,
-    reason: 'Same as above -- today the rejection is a blanket 403 at the role-gate, before any per-location check runs.',
-  })
-  pending('location_manager: reply only for assigned locations', {
-    expectedBehavior: 'POST /api/google/publish succeeds for a review belonging to an assigned location and is rejected (404) for a review outside locationIds',
-    milestone: 8,
-    reason: 'publish.js has no location dimension today -- it is gated purely by ALLOWED_ROLES = [owner, marketing], which already rejects location_manager entirely (403) before any per-review location check could run. Requires Milestone 7\'s review->location lookup to exist first.',
-  })
-  pending('location_manager: export assigned-location data', {
-    expectedBehavior: 'export (client-side CSV) is derivable only from data the account can view, i.e. assigned-location data once Milestone 6 lands',
-    milestone: 6,
-    reason: 'Export has no independent backend enforcement today (see the raw-data exports entry in the data-file registry) -- it inherits whatever /api/data returns, which is nothing for location_manager until Milestone 6.',
-  })
-  pending('location_manager: company-wide analytics containing other locations rejected', {
-    expectedBehavior: 'any company-wide file (KPIs, rankings, trends, reports, company-wide intelligence) is rejected for location_manager even after Milestone 6 lands assigned-location access -- this is a PERMANENT rule, not a temporary gap',
-    milestone: 6,
-    reason: 'Cannot be distinguished from the blanket "location_manager can access nothing" rejection until Milestone 6 introduces file-category-aware checks; today all such requests already 403, but for the wrong reason (role gate, not category gate).',
-  })
-  pending('read_only: read assigned-location reviews and analytics', {
-    expectedBehavior: 'GET /api/data for an assigned location\'s reviews/intelligence returns 200',
-    milestone: 6,
-    reason: 'Same blanket role-gate limitation as location_manager above.',
-  })
-  pending('read_only: unassigned location rejected with 404', {
-    expectedBehavior: '404, never 403, for a location outside locationIds',
-    milestone: 6,
-    reason: 'Same as location_manager\'s unassigned-location pending case.',
+  // FLIPPED TO ACTIVE, Multi-Location Authentication & User Access System,
+  // Commit 4 (data.js is now genuinely location-aware -- see
+  // testCurrentAllowlistHasPerLocationLogicNotAFlatRoleGate above and, for
+  // full functional coverage against the real private-data directory,
+  // tests/test_data_endpoint.js's testLocationManagerMetaJsonFilteredToOwnLocationOnly/
+  // testLocationManagerCanReadItsOwnLocationReviews/
+  // testLocationManagerCannotReadAForeignLocationReviews/
+  // testLocationManagerBlockedFromCompanyWideAggregates and
+  // testReadOnlyWildcardNowFullyAllowed): what used to be six separate
+  // pending entries here --
+  //   "location_manager: read assigned locations succeeds via /api/data"
+  //   "location_manager: unassigned location rejected with 404"
+  //   "location_manager: company-wide analytics containing other locations rejected"
+  //   "read_only: read assigned-location reviews and analytics"
+  //   "read_only: unassigned location rejected with 404"
+  // are all landed; data.js's mechanism is uniformly locationIds-driven
+  // (not role-specific), so read_only and location_manager share the exact
+  // same enforcement path.
+
+  // Still genuinely pending -- export is client-side CSV repackaging of
+  // already-fetched /api/data JSON (no independent backend enforcement
+  // point, per the raw-data-exports registry entry below), so it inherits
+  // correct scoping automatically now that /api/data itself is scoped, but
+  // that inheritance is only verified by testing the frontend export code
+  // path itself, which belongs to the frontend-scoping commit of this
+  // milestone, not this backend-registry file.
+  pending('location_manager: export assigned-location data (frontend verification)', {
+    expectedBehavior: 'a location_manager\'s client-side CSV export contains only reviews from data already fetched via the now-scoped /api/data -- verified by exercising dashboard/src/utils/exportUtils.js\'s callers with a scoped account, not by this backend registry',
+    milestone: 'frontend-scoping',
+    reason: 'the backend precondition (scoped /api/data) is now satisfied, but the frontend export code path itself is not yet exercised by any test -- that lands with the frontend-scoping commit.',
   })
   pending('read_only: export controls hidden/disabled in the frontend', {
-    expectedBehavior: 'read_only must never be able to export, even for assigned-location data it can otherwise view -- this is a PERMANENT distinction from location_manager (who does get EXPORT_ASSIGNED). RESOLVED ASSIGNMENT (Decision 3): since export is client-side-only with no backend enforcement point, this is owned by Milestone 9 (frontend role-aware UI), which must hide/disable CSV, print, download, or equivalent export controls for read_only specifically.',
-    milestone: 9,
-    reason: 'Cannot be exercised today because read_only cannot reach any data at all yet (blanket role-gate 403), and the frontend export controls (dashboard/src/utils/exportUtils.js callers) are not yet role-aware -- both preconditions land in Milestones 6 and 9 respectively.',
+    expectedBehavior: 'read_only must never be able to export, even for assigned-location data it can otherwise view -- this is a PERMANENT distinction from location_manager (who does get EXPORT_ASSIGNED). RESOLVED ASSIGNMENT (Decision 3): since export is client-side-only with no backend enforcement point, this is owned by the frontend-scoping/Users-&-Access-UI commits, which must hide/disable CSV, print, download, or equivalent export controls for read_only specifically.',
+    milestone: 'frontend-scoping',
+    reason: 'the backend precondition (read_only can now reach scoped data at all) is satisfied as of Commit 4, but the frontend export controls (dashboard/src/utils/exportUtils.js callers) are not yet role-aware.',
   })
 }
 
@@ -1287,22 +1310,43 @@ async function testDataFileRegistryCoversEveryAllowlistedFileExactly() {
   assert(extraDynamicPrefixes.length === 0, `registry claims dynamic prefix(es) that data.js's DYNAMIC_ALLOWLIST does not actually have: ${extraDynamicPrefixes.join(', ')}`)
 }
 
-function pendingReviewToLocationLookupGuard() {
-  pending('review-to-location internal lookup file is never added to the public /api/data allowlist', {
-    expectedBehavior: 'once Milestone 7 creates the review->location lookup file, a test must assert (by its real filename) that it never appears in data.js\'s EXACT_ALLOWLIST or matches any DYNAMIC_ALLOWLIST pattern, for any role including Owner',
-    milestone: 7,
-    reason: 'the file does not exist yet -- there is nothing to name or assert against until Milestone 7 creates it. This entry is the placeholder commitment that the guard test will be written then, not skipped.',
-  })
+// FLIPPED TO ACTIVE (Multi-Location Authentication & User Access System,
+// Commit 4): export_chunks.py's export_review_location_index() now writes
+// dashboard/private-data/_internal/review-location-index.json
+// (reviewLocationIndex.js reads it server-side for publish()/actions()/
+// rewrite.js's authorization). This asserts, by the real filename, that it
+// never appears in data.js's EXACT_ALLOWLIST or matches any
+// DYNAMIC_ALLOWLIST pattern, for any role including Owner -- the guard
+// Milestone 7 committed to building once the file existed.
+async function testReviewToLocationLookupNeverInPublicAllowlist() {
+  const exact = new Set(extractExactAllowlist())
+  assert(!exact.has('_internal/review-location-index.json'), 'the review-location index must NEVER be in data.js\'s EXACT_ALLOWLIST')
+  const dataJsSrc = readFileSync(path.join(API_DIR, 'data.js'), 'utf-8')
+  const match = dataJsSrc.match(/DYNAMIC_ALLOWLIST = \[([\s\S]*?)\n\]/)
+  assert(match, 'could not find DYNAMIC_ALLOWLIST in data.js')
+  assert(!/_internal/.test(match[1]), 'no DYNAMIC_ALLOWLIST pattern may reference _internal/ -- the review-location index must stay server-only')
+
+  // Also confirm the real file, wherever the export pipeline has produced
+  // it, is genuinely unreachable through the real handler -- not just
+  // absent from the static allowlist source.
+  const dataHandlerMod = await import('../dashboard/api/data.js')
+  const fakeRes = () => { const r = { statusCode: null, body: null, headers: {} }; r.status = c => { r.statusCode = c; return r }; r.json = o => { r.body = o; return r }; r.send = s => { r.body = s; return r }; r.setHeader = () => {}; return r }
+  const res = fakeRes()
+  await dataHandlerMod.default({ method: 'GET', query: { file: '_internal/review-location-index.json' }, headers: {} }, res)
+  assert(res.statusCode === 401 || res.statusCode === 404, `an unauthenticated request for the internal index must never succeed, got ${res.statusCode}`)
 }
 
-async function testCurrentAllowlistHasNoPerRoleOrPerLocationLogic() {
-  // Confirms today's actual mechanism: data.js's gate is a single flat
-  // ALLOWED_ROLES check with ZERO per-file, per-role, or per-location
-  // branching -- which is exactly why every scoped-role data-file category
-  // above is "pending" rather than partially active.
+// REVIEWED UPDATE (Multi-Location Authentication & User Access System,
+// Commit 4): data.js's flat ALLOWED_ROLES gate is gone -- this now confirms
+// the OPPOSITE of what it used to: per-file, per-location logic exists, and
+// every scoped-role data-file category the DATA_FILE_REGISTRY above once
+// marked "pending" is now active (see the LANDED notes on those entries and
+// on the ENDPOINT_REGISTRY's GET /api/data entry).
+async function testCurrentAllowlistHasPerLocationLogicNotAFlatRoleGate() {
   const source = readFileSync(path.join(API_DIR, 'data.js'), 'utf-8')
-  assert(/const ALLOWED_ROLES = \['owner', 'marketing'\]/.test(source), 'data.js\'s role gate must still be the flat owner/marketing allow-list this milestone assumes -- if this changed, the data-file registry\'s "pending" statuses need re-review')
-  assert(!/locationIds/.test(source), 'data.js must not yet reference locationIds anywhere -- if it does, location filtering has begun and this registry is stale')
+  assert(!/ALLOWED_ROLES/.test(source), 'data.js must no longer have a flat ALLOWED_ROLES gate -- authorization is now per-file/per-location')
+  assert(/account\.locationIds/.test(source), 'data.js must reference account.locationIds -- location filtering has landed')
+  assert(/requireLocationAccess/.test(source), 'data.js must call requireLocationAccess for per-location files')
 }
 
 // ===========================================================================
@@ -1338,8 +1382,7 @@ async function testAnalyticsLocationsArtifactExistsButNotYetServedByApiData() {
   // any endpoint" wording for per-location analytics/trends is accurate,
   // not stale.
   const dataJsSrc = readFileSync(path.join(API_DIR, 'data.js'), 'utf-8')
-  assert(!/analytics\/locations/.test(dataJsSrc), 'data.js must not yet reference analytics/locations/ -- if it does, Milestone 6 has started and this test/registry needs updating, not this milestone')
-  assert(/const ALLOWED_ROLES = \['owner', 'marketing'\]/.test(dataJsSrc), 'data.js\'s role gate must still be exactly what it was before Milestone 5')
+  assert(!/analytics\/locations/.test(dataJsSrc), 'data.js must not yet reference analytics/locations/ -- the per-location analytics artifact export_location_analytics() produces is still not wired into the public allowlist, unaffected by Commit 4\'s location-scoping of the FILES THAT ARE already allowlisted')
 }
 
 // ===========================================================================
@@ -1362,7 +1405,14 @@ async function testRequireAuthSourceUnchanged() {
 // until now (mirrors the identical update in test_permissions.js). This
 // test's job going forward is narrower: confirm the helpers are used ONLY
 // by the endpoint(s) that are supposed to use them.
-const EXPECTED_SCOPED_AUTH_CALLERS = new Set([path.join(API_DIR, 'settings', '[action].js')])
+const EXPECTED_SCOPED_AUTH_CALLERS = new Set([
+  path.join(API_DIR, 'settings', '[action].js'),
+  // Multi-Location Authentication & User Access System, Commit 4.
+  path.join(API_DIR, 'google', '[action].js'),
+  path.join(API_DIR, 'actions', '[action].js'),
+  path.join(API_DIR, 'rewrite.js'),
+  path.join(API_DIR, 'data.js'), // calls requireLocationAccess directly, not requireScopedAuth
+])
 
 async function testNoProductionEndpointImportsTheNewHelpers() {
   const offenders = []
@@ -1417,6 +1467,7 @@ async function main() {
   console.log('\n--- SECTION 2: Role matrix ---')
   await run('every endpoint denies every role not in its current allow-list (403)', testRoleMatrixDeniesEveryNonAllowedRole)
   await run('[RESOLVED, Milestone 6A] OAuth endpoints (auth.js/callback.js) return 403 for authenticated wrong-role, not 401 -- registry is not stale', testResolvedOAuthExceptionEndpointsReturn403ForWrongRole)
+  await run('[LANDED, Commit 4] publish() is gated by permission + location, not a flat role array', testPublishIsPermissionAndLocationGatedNotRoleGated)
   recordScopedRolePendingTests()
   recordErrorContractPendingTests()
 
@@ -1453,8 +1504,8 @@ async function main() {
 
   console.log('\n--- SECTION 7: Data-file authorization registry ---')
   await run('every allowlisted data file (exact + dynamic) maps to exactly one registry category, with none missing or invented', testDataFileRegistryCoversEveryAllowlistedFileExactly)
-  await run('/api/data\'s current gate has zero per-role or per-location logic (confirms every "pending" status above)', testCurrentAllowlistHasNoPerRoleOrPerLocationLogic)
-  pendingReviewToLocationLookupGuard()
+  await run('[LANDED, Commit 4] /api/data now has real per-file/per-location logic, not a flat role gate', testCurrentAllowlistHasPerLocationLogicNotAFlatRoleGate)
+  await run('[LANDED, Commit 4] the review-to-location internal lookup file is never in the public /api/data allowlist', testReviewToLocationLookupNeverInPublicAllowlist)
 
   console.log('\n--- SECTION 7B: Milestone 5 (per-location analytics export) ---')
   await run('per-location analytics artifact now exists in the export pipeline (export_chunks.py + refresh_analytics.py)', testMilestone5PerLocationAnalyticsArtifactExistsInExportPipeline)

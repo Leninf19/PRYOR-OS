@@ -140,11 +140,22 @@ export function requireOwnership(account, resourceLocationId) {
 // Phase 2 architecture's API error contract (§6): 403 would confirm the
 // resource exists but is off-limits, disclosing its existence to an
 // account that shouldn't even know to ask.
+// `permission` may be a single Permission constant, or an array of them
+// (ANY-of semantics -- the account needs at least one). The array form
+// exists for the unrestricted/`_ASSIGNED` permission pairs (REPLY vs.
+// REPLY_ASSIGNED, EXPORT vs. EXPORT_ASSIGNED): owner/marketing hold the
+// unrestricted variant, location_manager (and a location-scoped marketing
+// account) hold the `_ASSIGNED` variant -- both must be allowed to reach
+// this same endpoint, with requireLocationAccess()'s own wildcard-vs-array
+// handling (below) doing the actual scoping either way. Backward
+// compatible: a single string still behaves exactly as before (a
+// one-element ANY-of is the same check).
 export async function requireScopedAuth(req, res, { permission, resolveLocationId }) {
   const account = await requireAuth(req, res, null)
   if (!account) return null
 
-  if (!roleHasPermission(account.role, permission)) {
+  const permissions = Array.isArray(permission) ? permission : [permission]
+  if (!permissions.some(p => roleHasPermission(account.role, p))) {
     res.status(403).json({ error: 'forbidden', message: 'You do not have permission to perform this action.' })
     return null
   }

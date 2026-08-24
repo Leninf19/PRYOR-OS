@@ -94,10 +94,48 @@ async function testListUnauthenticatedReturns401() {
   assert(res.statusCode === 401, `expected 401, got ${res.statusCode}`)
 }
 
-async function testListReadOnlyForbidden() {
+// REVIEWED UPDATE (Multi-Location Authentication & User Access System,
+// Commit 4): read_only is no longer flatly rejected from list() -- every
+// role holds at least VIEW_ASSIGNED, and a scoped account's results are now
+// filtered by location instead. This fixture's read_only account has
+// locationIds: '*' (company-wide), so it now sees the full, unfiltered
+// workspace once the store is configured -- see
+// testListLocationScopedAccountSeesOnlyItsOwnLocation below for the
+// scoped-filtering behavior itself.
+async function testListReadOnlyNowAllowedAndScopedByLocation() {
   await setDirectory()
+  _setRedisClientForTests(() => fakeRedis({ a1: JSON.stringify({ id: 'a1', status: 'New' }) }))
   const res = await invoke({ action: 'list', token: await readOnlyToken() })
-  assert(res.statusCode === 403, `read_only must not view the workspace yet, got ${res.statusCode}`)
+  assert(res.statusCode === 200, `read_only (company-wide) must now be able to list, got ${res.statusCode}`)
+  assert(res.body.actions.a1, 'the configured action item must be present for a company-wide read_only account')
+}
+
+// New Commit 4 behavior: a location-scoped account only sees action items
+// whose review resolves (via reviewLocationIndex.js) to one of their
+// assigned locations -- an item for a foreign location is silently absent,
+// matching this endpoint's existing "no error, just filtered" read model.
+async function testListLocationScopedAccountSeesOnlyItsOwnLocation() {
+  await setDirectory()
+  _setRedisClientForTests(() => fakeRedis({
+    mine: JSON.stringify({ id: 'mine', status: 'New' }),
+    foreign: JSON.stringify({ id: 'foreign', status: 'New' }),
+  }))
+  const { _setReviewLocationIndexForTests, _resetReviewLocationIndexForTests } = await import('../dashboard/api/_lib/reviewLocationIndex.js')
+  _setReviewLocationIndexForTests({ mine: 7, foreign: 9 })
+  try {
+    const lmToken = await signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7], sessionVersion: 1 })
+    process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
+      accounts: JSON.parse(process.env.ACCOUNT_DIRECTORY_JSON).accounts.concat([
+        { userId: 'usr_lm', email: 'lm@example.com', passwordHash: await bcrypt.hash('x', 12), role: 'location_manager', locationIds: [7], sessionVersion: 1, disabled: false, displayName: 'LM' },
+      ]),
+    })
+    const res = await invoke({ action: 'list', token: lmToken })
+    assert(res.statusCode === 200, `expected 200, got ${res.statusCode}`)
+    assert(res.body.actions.mine, 'the item for the account\'s own location must be present')
+    assert(!res.body.actions.foreign, 'an item for a foreign location must be absent, never leaked')
+  } finally {
+    _resetReviewLocationIndexForTests()
+  }
 }
 
 async function testListWrongMethodReturns405() {
@@ -204,7 +242,8 @@ async function testUpdateIsRateLimited() {
 async function main() {
   await run('unknown action -> 404', testUnknownActionReturns404)
   await run('list: unauthenticated -> 401', testListUnauthenticatedReturns401)
-  await run('list: read_only -> 403 (not yet a viewer role for this workspace)', testListReadOnlyForbidden)
+  await run('list: read_only is now allowed (VIEW_ASSIGNED), scoped by location', testListReadOnlyNowAllowedAndScopedByLocation)
+  await run('list: a location-scoped account sees only its own location\'s items', testListLocationScopedAccountSeesOnlyItsOwnLocation)
   await run('list: wrong method -> 405', testListWrongMethodReturns405)
   await run('list: no records yet -> 200 with empty object', testListReturnsEmptyWhenNoRecords)
   await run('list: unconfigured store -> 503', testListStoreUnavailableReturns503)

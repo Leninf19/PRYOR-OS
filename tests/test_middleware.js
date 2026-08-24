@@ -2,9 +2,17 @@
 // Confirms it (a) always 404s the legacy /data/* prefix (nothing should
 // ever be served from there again -- this is what stops Vercel's SPA
 // rewrite from serving index.html with a 200 for a file that no longer
-// exists), and (b) performs the same session/role pre-check as the Node
-// endpoint for /api/data, without being the only thing standing guard
-// (dashboard/api/data.js re-verifies everything independently).
+// exists), and (b) performs the coarse identity pre-check (signed session +
+// disabled + sessionVersion) for /api/data, without being the only thing
+// standing guard (dashboard/api/data.js re-verifies everything
+// independently, plus the file-path allowlist and per-file location
+// authorization this Edge layer cannot see -- it never reads req.query.file).
+//
+// REVISED (Multi-Location Authentication & User Access System, Commit 4):
+// this layer no longer restricts by role at all -- see
+// testApiDataNonOwnerRoleAlsoContinues below. The role/location decision
+// moved entirely to data.js, which is the only layer that knows which file
+// is actually being requested.
 //
 // Run directly: node tests/test_middleware.js
 
@@ -74,11 +82,25 @@ async function testApiDataAuthenticatedContinues() {
   assert(res && ![401, 403, 404].includes(res.status), `authenticated request must be allowed to continue, got status ${res?.status}`)
 }
 
+async function testApiDataNonOwnerRoleAlsoContinues() {
+  const hash = await bcrypt.hash('x', 12)
+  process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
+    accounts: [
+      { userId: 'usr_owner', email: 'owner@example.com', passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false },
+      { userId: 'usr_lm', email: 'lm@example.com', passwordHash: hash, role: 'location_manager', locationIds: [7], sessionVersion: 1, disabled: false },
+    ],
+  })
+  const token = await signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7], sessionVersion: 1 })
+  const res = await middleware(fakeRequest('/api/data?file=meta.json', token))
+  assert(res && ![401, 403, 404].includes(res.status), `a location_manager (or any authenticated role) must reach the Node layer, which makes the real per-file decision -- got status ${res?.status}`)
+}
+
 async function main() {
   await run('legacy /data/* always 404s (no session)', testLegacyDataPathAlways404)
   await run('legacy /data/* 404s even with a valid session (nothing should ever be served there)', testLegacyDataPath404EvenWithValidSession)
   await run('/api/data unauthenticated -> 401 at the edge', testApiDataUnauthenticatedRejected)
   await run('/api/data authenticated -> continues to the Node handler', testApiDataAuthenticatedContinues)
+  await run('/api/data: a non-owner/marketing role also continues (role gate removed, Commit 4)', testApiDataNonOwnerRoleAlsoContinues)
 
   console.log()
   if (results.every(Boolean)) {

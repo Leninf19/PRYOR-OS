@@ -7,10 +7,16 @@
       "includeFiles": "private-data/**"
     },
     "api/actions/[action].js": {
-      "includeFiles": "private-data/location-contacts.json"
+      "includeFiles": "private-data/{location-contacts.json,meta.json,_internal/review-location-index.json}"
     },
     "api/settings/[action].js": {
       "includeFiles": "private-data/{location-contacts.json,meta.json}"
+    },
+    "api/google/[action].js": {
+      "includeFiles": "private-data/_internal/review-location-index.json"
+    },
+    "api/rewrite.js": {
+      "includeFiles": "private-data/_internal/review-location-index.json"
     }
   },
   "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }]

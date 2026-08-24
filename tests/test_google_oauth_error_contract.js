@@ -275,10 +275,22 @@ async function testStatusForAuthFailureFailsClosedForUnknownReasons() {
 async function testNoOtherEndpointBehaviorChanged() {
   // Static confirmation that this milestone (originally Milestone 6A; the
   // two files it touched were later merged into google/[action].js by
-  // Phase 8's Milestone 8.2) touched only what it claims to: the consolidated
-  // file still calls evaluateSession(req, ['owner']) (Marketing was never
-  // made eligible for either the auth or callback case), and never
-  // references any location-scoping helper anywhere.
+  // Phase 8's Milestone 8.2) touched only what it claims to: the
+  // consolidated file still calls evaluateSession(req, ['owner']) for
+  // exactly the auth/callback cases (Marketing was never made eligible for
+  // either) -- unaffected by any later milestone.
+  //
+  // REVIEWED UPDATE (Multi-Location Authentication & User Access System,
+  // Commit 4): the second half of this assertion used to require that
+  // google/[action].js reference NO location-scoping helper at all. That
+  // was accurate before Commit 4 (the file's own README-referenced
+  // "Location authorization strategy" gap this milestone explicitly closes)
+  // and is now intentionally superseded -- publish()/publishBridge() use
+  // requireScopedAuth/requireLocationAccess to enforce per-review location
+  // ownership (reviewLocationIndex.js). auth.js/callback.js's OWN Owner-only
+  // gates (checked above) are completely unaffected by that change -- this
+  // assertion now confirms the helpers ARE present (Commit 4 landed) while
+  // the auth/callback gate count stays exactly 2, unchanged.
   const { readFileSync } = await import('fs')
   const { fileURLToPath } = await import('url')
   const path = await import('path')
@@ -286,7 +298,7 @@ async function testNoOtherEndpointBehaviorChanged() {
   const src = readFileSync(path.join(dashboardDir, 'api', 'google', '[action].js'), 'utf-8')
   const gateCount = (src.match(/evaluateSession\(req, \['owner'\]\)/g) || []).length
   assert(gateCount === 2, `expected exactly 2 evaluateSession(req, ['owner']) gates (auth + callback cases), found ${gateCount}`)
-  assert(!/requireLocationAccess|requireOwnership|requireScopedAuth/.test(src), 'google/[action].js must not reference any location-scoping helper')
+  assert(/requireScopedAuth/.test(src), 'google/[action].js must reference requireScopedAuth as of Commit 4 (publish/publish-bridge location scoping)')
 }
 
 async function main() {

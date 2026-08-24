@@ -10,12 +10,24 @@
 // reviews.db, analytics_cache, or anything export_chunks.py/
 // refresh_analytics.py produce.
 //
-// Same roles as the AI Action Center's own read access today (owner,
-// marketing) -- this milestone does not introduce location-scoped
-// authorization; see README "Location authorization strategy" for why
-// location_manager accounts aren't safe to grant this yet.
+// Multi-Location Authentication & User Access System, Commit 4: the
+// "location_manager accounts aren't safe to grant this yet" gap this
+// comment used to describe is closed -- reviewLocationIndex.js now resolves
+// a review action's owning location server-side. `list` is readable by any
+// authenticated role (VIEW_ALL/VIEW_ASSIGNED, i.e. every role), filtered by
+// location for a scoped account; `update` and the restaurant-email actions
+// are gated by REPLY/REPLY_ASSIGNED (the same permission pair publish()
+// uses) plus per-item location scope.
+//
+// actionStore.js's `id` is always the review's own reviewId() value (review_id
+// || review_url || `${review_date}-${reviewer_name}`) -- the exact same
+// identity space reviewLocationIndex.js is keyed by (see
+// dashboard/src/hooks/usePriorityDigest.js's own reliance on this), so
+// resolving an action's location is the same lookup publish() uses.
 
-import { requireAuth } from '../_lib/auth.js'
+import { requireAuth, requireScopedAuth, requireLocationAccess } from '../_lib/auth.js'
+import { Permission, roleHasPermission } from '../_lib/permissions.js'
+import { resolveLocationIdForReview, resolveLocationIdForReviewOrDeny } from '../_lib/reviewLocationIndex.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import { getAllActions, getAction, upsertAction, ActionStoreUnavailableError } from '../_lib/actionStore.js'
 import { getLocationContact } from '../_lib/locationContacts.js'
@@ -23,7 +35,7 @@ import { getEscalationCcEmails, getReplyToEmail } from '../_lib/reviewEmailConfi
 import { sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildDefaultSubject, buildReviewEmail } from '../_lib/reviewEmailTemplate.js'
 
-const ALLOWED_ROLES = ['owner', 'marketing']
+const REPLY_PERMISSIONS = [Permission.REPLY, Permission.REPLY_ASSIGNED]
 
 // Mirrors ActionCenter.jsx's STATUSES exactly (dashboard/src/pages/ActionCenter.jsx).
 // Intentionally duplicated rather than shared across the frontend/backend
@@ -167,8 +179,12 @@ function validateReviewSnapshot(review) {
 async function previewReviewEmail(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
 
-  const account = await requireAuth(req, res, ALLOWED_ROLES)
-  if (!account) return
+  const scope = await requireScopedAuth(req, res, {
+    permission: REPLY_PERMISSIONS,
+    resolveLocationId: async (req) => Number(req.query?.locationId),
+  })
+  if (!scope) return
+  const { account } = scope
 
   const { id, locationId: locationIdRaw } = req.query ?? {}
   const locationId = Number(locationIdRaw)
@@ -215,8 +231,12 @@ async function previewReviewEmail(req, res) {
 async function sendReviewEmailAction(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
 
-  const account = await requireAuth(req, res, ALLOWED_ROLES)
-  if (!account) return
+  const scope = await requireScopedAuth(req, res, {
+    permission: REPLY_PERMISSIONS,
+    resolveLocationId: async (req) => Number(req.body?.locationId),
+  })
+  if (!scope) return
+  const { account } = scope
 
   const allowed = await enforceRateLimit(req, res, `actions:send-review-email:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
   if (!allowed) return
@@ -340,8 +360,15 @@ async function sendReviewEmailAction(req, res) {
 async function updateEmailStatus(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
 
-  const account = await requireAuth(req, res, ALLOWED_ROLES)
-  if (!account) return
+  // No explicit locationId in this action's payload (unlike preview/send-
+  // review-email) -- resolved from `id` (the review) via reviewLocationIndex.js,
+  // same as update() below.
+  const scope = await requireScopedAuth(req, res, {
+    permission: REPLY_PERMISSIONS,
+    resolveLocationId: async (req, account) => resolveLocationIdForReviewOrDeny(req.body?.id, account),
+  })
+  if (!scope) return
+  const { account } = scope
 
   const allowed = await enforceRateLimit(req, res, `actions:update-email-status:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
@@ -381,12 +408,25 @@ async function updateEmailStatus(req, res) {
 async function list(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
 
-  const account = await requireAuth(req, res, ALLOWED_ROLES)
+  // Any authenticated role may read (every role holds at least
+  // VIEW_ASSIGNED) -- a location-scoped account is filtered to its own
+  // location's items below, never the flat role gate this used to be.
+  const account = await requireAuth(req, res, null)
   if (!account) return
 
   try {
-    const actions = await getAllActions()
-    return res.status(200).json({ actions })
+    const all = await getAllActions()
+    if (account.locationIds === '*') {
+      return res.status(200).json({ actions: all })
+    }
+    const scoped = {}
+    for (const [id, record] of Object.entries(all)) {
+      const locationId = await resolveLocationIdForReview(id)
+      if (locationId !== null && requireLocationAccess(account, locationId)) {
+        scoped[id] = record
+      }
+    }
+    return res.status(200).json({ actions: scoped })
   } catch (err) {
     if (err instanceof ActionStoreUnavailableError) {
       console.error(`[actions/list] ${err.message}`)
@@ -403,8 +443,12 @@ async function list(req, res) {
 async function update(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
 
-  const account = await requireAuth(req, res, ALLOWED_ROLES)
-  if (!account) return
+  const scope = await requireScopedAuth(req, res, {
+    permission: REPLY_PERMISSIONS,
+    resolveLocationId: async (req, account) => resolveLocationIdForReviewOrDeny(req.body?.id, account),
+  })
+  if (!scope) return
+  const { account } = scope
 
   const allowed = await enforceRateLimit(req, res, `actions:update:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return

@@ -3,8 +3,23 @@
 // POST /api/rewrite  { tone, reviewText, currentDraft, reviewerName, location, stars }
 // Returns           { rewritten: string }
 
-import { requireAuth } from './_lib/auth.js'
+import { requireScopedAuth } from './_lib/auth.js'
+import { Permission } from './_lib/permissions.js'
+import { resolveLocationIdForReviewOrDeny } from './_lib/reviewLocationIndex.js'
 import { enforceRateLimit } from './_lib/rateLimit.js'
+
+// Multi-Location Authentication & User Access System, Commit 4: gated by
+// permission + per-review location (same REPLY/REPLY_ASSIGNED pair as
+// publish()/actions' update()), not a flat role array. This endpoint's
+// request body has no review identifier today -- `localReviewId` below is
+// a new OPTIONAL field; owner/marketing/admin (company-wide) continue
+// working unchanged without it, exactly as before. A location-scoped
+// caller (location_manager, or a scoped Marketing account) REQUIRES it --
+// functionally usable by them once the frontend starts sending it
+// (dashboard/src/pages/Reviews.jsx's rewrite call, wired in the
+// frontend-scoping commit of this same milestone); until then a scoped
+// caller correctly gets 404 rather than an insecure default.
+const REWRITE_PERMISSIONS = [Permission.REPLY, Permission.REPLY_ASSIGNED]
 
 const CONTACT_EMAIL = 'advertising@l3amigos.com'
 
@@ -87,8 +102,12 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  const account = await requireAuth(req, res, ['owner', 'marketing'])
-  if (!account) return
+  const scope = await requireScopedAuth(req, res, {
+    permission: REWRITE_PERMISSIONS,
+    resolveLocationId: async (req, account) => resolveLocationIdForReviewOrDeny(req.body?.localReviewId, account),
+  })
+  if (!scope) return
+  const { account } = scope
 
   const allowed = await enforceRateLimit(req, res, `rewrite:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return

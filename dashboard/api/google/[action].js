@@ -25,7 +25,9 @@ import { randomBytes } from 'crypto'
 import { setCookie, parseCookies, clearCookie } from './_lib/cookies.js'
 import { fetchWithRetry } from './_lib/http.js'
 import { exchangeRefreshToken, getAccessToken } from './_lib/googleAuth.js'
-import { requireAuth, evaluateSession, statusForAuthFailure } from '../_lib/auth.js'
+import { requireAuth, requireScopedAuth, requireLocationAccess, evaluateSession, statusForAuthFailure } from '../_lib/auth.js'
+import { Permission, roleHasPermission } from '../_lib/permissions.js'
+import { resolveLocationIdForReview, resolveLocationIdForReviewOrDeny } from '../_lib/reviewLocationIndex.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import {
   getStoredCredential, setStoredCredential, recordSyncOutcome, recordOAuthRefresh,
@@ -724,13 +726,16 @@ async function triggerImport(req, res) {
 // (unavoidable without a persisted id for that review).
 // ---------------------------------------------------------------------------
 
-// Location Manager is part of the permission model but is NOT included
-// below yet: this endpoint's fallback path only has a client-supplied
-// locationName string to go on, with no server-side way to resolve it to
-// the review's actual location_id (see README "Location authorization
-// strategy" gap). Enabling Location Manager here requires that resolution
-// to exist first -- do not add 'location_manager' to this list until then.
-const PUBLISH_ALLOWED_ROLES = ['owner', 'marketing']
+// Multi-Location Authentication & User Access System, Commit 4: Location
+// Manager (and a location-scoped Marketing account) can now reach this
+// endpoint -- the review->location resolution the earlier comment here
+// called out as missing now exists (reviewLocationIndex.js, built from
+// export_chunks.py's export_review_location_index()). Gated by permission
+// (REPLY for owner/marketing's unrestricted access, REPLY_ASSIGNED for a
+// scoped location_manager/marketing account), not a flat role array --
+// see requireScopedAuth() below, which also enforces per-review location
+// ownership via resolveLocationIdForReviewOrDeny().
+const PUBLISH_PERMISSIONS = [Permission.REPLY, Permission.REPLY_ASSIGNED]
 
 async function gbpGet(url, token) {
   const r = await fetchWithRetry(url, {
@@ -789,8 +794,28 @@ async function replyViaReviewName(reviewName, replyText, token) {
 async function publish(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed', message: 'Method not allowed' })
 
-  const account = await requireAuth(req, res, PUBLISH_ALLOWED_ROLES)
-  if (!account) return
+  // requireScopedAuth resolves the review's location BEFORE any further
+  // validation, so an unauthorized caller never learns whether their
+  // payload was otherwise well-formed.
+  //
+  // SECURITY: authorization is resolved against `reviewName` when present,
+  // NOT `localReviewId` -- reviewName is the EXACT identifier
+  // replyViaReviewName() below actually writes to, so checking against it
+  // closes a TOCTOU gap a naive localReviewId-only check would have (a
+  // scoped caller could otherwise pass a legitimate localReviewId for
+  // their own location alongside a locationName/reviewerName pair that
+  // fuzzy-matches a DIFFERENT location's review -- the authorization check
+  // and the actual write would then be checking two different reviews).
+  // resolveLocationIdForReviewOrDeny returns null (skip the location
+  // check) only for a company-wide (locationIds === '*') caller -- a
+  // location-scoped caller with no resolvable identifier is denied (404),
+  // never silently treated as company-wide.
+  const scope = await requireScopedAuth(req, res, {
+    permission: PUBLISH_PERMISSIONS,
+    resolveLocationId: async (req, account) => resolveLocationIdForReviewOrDeny(req.body?.reviewName || req.body?.localReviewId, account),
+  })
+  if (!scope) return
+  const { account } = scope
 
   const allowed = await enforceRateLimit(req, res, `publish:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
   if (!allowed) return
@@ -819,6 +844,21 @@ async function publish(req, res) {
 
   if (!replyText || (!reviewName && !locationName)) {
     return res.status(400).json({ error: 'api_error', message: 'Missing replyText, and either reviewName or locationName.' })
+  }
+
+  // A location-scoped account (location_manager, or a location-scoped
+  // Marketing account) may not use the fuzzy locationName/reviewerName
+  // fallback path -- the authorization check above verified `reviewName`'s
+  // own resolved location, not whatever a name-match might land on. This
+  // is what actually closes the TOCTOU gap described above, not just the
+  // resolveLocationId call: without this, a scoped account could still
+  // pass an unrelated (but self-owned) reviewName merely to satisfy the
+  // authorization check while replying via the untrusted fallback path.
+  if (account.locationIds !== '*' && !reviewName) {
+    return res.status(400).json({
+      error: 'review_name_required',
+      message: 'This account can only reply using the linked review. Ask an Owner or Admin if this review needs the legacy name-matching fallback.',
+    })
   }
 
   // Recovery Milestone 6B, Part 2: called ONLY after replyViaReviewName()
@@ -959,8 +999,15 @@ const PUBLISH_BRIDGE_MAX_IDS = 200
 async function publishBridge(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed', message: 'Method not allowed' })
 
-  const account = await requireAuth(req, res, PUBLISH_ALLOWED_ROLES)
+  // A bulk read across many ids doesn't map to requireScopedAuth's
+  // single-resolveLocationId shape -- gate on permission only here
+  // (roleHasPermission below), then filter each returned record by the
+  // caller's own location grant before it reaches the response.
+  const account = await requireAuth(req, res, null)
   if (!account) return
+  if (!PUBLISH_PERMISSIONS.some(p => roleHasPermission(account.role, p))) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to perform this action.' })
+  }
 
   const allowed = await enforceRateLimit(req, res, `publish-bridge:${account.userId}`, { requestsPerWindow: 60, windowSeconds: 60 })
   if (!allowed) return
@@ -989,6 +1036,17 @@ async function publishBridge(req, res) {
 
   const bridges = {}
   for (const [id, record] of Object.entries(records)) {
+    // Location-scoped caller: only include a bridge record for a review
+    // this account actually has access to -- resolved the same way
+    // publish() authorizes a single review (localReviewId, since that's
+    // what these bridge records are keyed by). A record for an
+    // unresolvable/foreign review is simply omitted, matching this
+    // endpoint's existing "absent means no bridge record" contract rather
+    // than surfacing a 403/404 for one id among many.
+    if (account.locationIds !== '*') {
+      const locationId = await resolveLocationIdForReview(id)
+      if (locationId === null || !requireLocationAccess(account, locationId)) continue
+    }
     bridges[id] = {
       status: record.status,
       responseText: record.responseText,

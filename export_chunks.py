@@ -629,6 +629,48 @@ def export_location_detail_reviews(conn, locations: dict) -> None:
         write_json(f"reviews/by-location/{slugify(loc['name'])}.json", reviews_out)
 
 
+def export_review_location_index(conn, locations: dict) -> None:
+    """Multi-Location Authentication & User Access System, Commit 4: a
+    SERVER-ONLY review -> canonical numeric locationId lookup, used by
+    dashboard/api/_lib/reviewLocationIndex.js to authorize per-review
+    actions (GBP publish, AI rewrite, Action Center) against the caller's
+    account.locationIds. Deliberately written OUTSIDE dashboard/api/data.js's
+    public allowlist -- data.js reads only from PRIVATE_DATA_DIR paths on its
+    EXACT_ALLOWLIST/DYNAMIC_ALLOWLIST, and "_internal/" is not, and must
+    never become, one of them, for any role including Owner. Guarded by
+    tests/test_authorization_matrix.js's dedicated assertion.
+
+    Keyed by TWO independent identity spaces, both mapping to the same
+    locationId, so a caller can be authorized against whichever identifier
+    the actual write operation will use (closing a TOCTOU gap where
+    authorization checks one identifier but the write acts on another):
+      - the SAME identity dashboard/src/utils/dataUtils.js's reviewId()
+        computes client-side -- review_id (db.canonical_review_id) if
+        present, else review_url, else f"{review_date}-{reviewer_name}";
+      - gbp_review_name, the Google Business Profile API's own resource
+        path (accounts/*/locations/*/reviews/*) -- present once a review has
+        been linked via gbp_sync.py/gbp_import.py, and the EXACT identifier
+        dashboard/api/google/[action].js's publish() uses to actually write
+        the reply once linked. These two id spaces never collide (one is a
+        URL/date-name string, the other always starts with "accounts/").
+    """
+    rows = conn.execute(
+        """SELECT r.*, l.id AS loc_id FROM reviews r
+           JOIN locations l ON l.id = r.location_id
+           WHERE r.is_deleted = 0"""
+    ).fetchall()
+    index = {}
+    for r in rows:
+        review_id = db.canonical_review_id(r["review_url"] or "") or ""
+        key = review_id or (r["review_url"] or "") or f"{r['review_date']}-{r['reviewer_name']}"
+        if key:
+            index[key] = r["loc_id"]
+        gbp_review_name = r["gbp_review_name"] if "gbp_review_name" in r.keys() else None
+        if gbp_review_name:
+            index[gbp_review_name] = r["loc_id"]
+    write_json("_internal/review-location-index.json", index)
+
+
 def main():
     conn = db.get_connection()
     db.init_schema(conn)
@@ -640,6 +682,7 @@ def main():
     export_analytics_cache(conn)
     export_location_analytics(conn, locations)  # Phase 2 Milestone 5 (Option C)
     export_location_detail_reviews(conn, locations)  # replaces export_reviews_by_location
+    export_review_location_index(conn, locations)  # Multi-Location Auth Commit 4 -- never in data.js's public allowlist
     export_action_items(conn, locations)
     export_validation(conn)
     export_scraper_status(conn)

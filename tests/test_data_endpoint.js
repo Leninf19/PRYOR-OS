@@ -95,15 +95,52 @@ async function testMarketingCanReadMeta() {
   assert(res.statusCode === 200, `expected 200, got ${res.statusCode}`)
 }
 
-async function testReadOnlyAndLocationManagerBlocked() {
+// REVISED (Multi-Location Authentication & User Access System, Commit 4):
+// the flat role-block this test used to assert is exactly what Commit 4
+// closes -- replaced by real per-file/per-location authorization tests
+// below, run against the real private-data directory. Fixture facts used
+// throughout: locationId 3 = "Los Tres Amigos Owosso" (slug
+// los-tres-amigos-owosso), locationId 20 = "Casa Tequila Brighton" (slug
+// casa-tequila-brighton) -- usr_locmgr above is scoped to [3] only.
+async function testReadOnlyWildcardNowFullyAllowed() {
   await setDirectory()
   const roToken = await signSession({ userId: 'usr_readonly', email: 'readonly@example.com', role: 'read_only', locationIds: '*', sessionVersion: 1 })
   const roRes = await invoke(['meta.json'], roToken)
-  assert(roRes.statusCode === 403, `read_only must be blocked until location filtering exists, got ${roRes.statusCode}`)
+  assert(roRes.statusCode === 200, `a company-wide (locationIds: '*') read_only account must now be fully allowed, got ${roRes.statusCode}`)
+  assert(Number.isInteger(JSON.parse(roRes.body).totalReviews), 'a wildcard account must still see the real, unfiltered totalReviews')
+}
 
+async function testLocationManagerMetaJsonFilteredToOwnLocationOnly() {
+  await setDirectory()
   const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], sessionVersion: 1 })
-  const lmRes = await invoke(['meta.json'], lmToken)
-  assert(lmRes.statusCode === 403, `location_manager must be blocked until location filtering exists, got ${lmRes.statusCode}`)
+  const res = await invoke(['meta.json'], lmToken)
+  assert(res.statusCode === 200, `meta.json itself must never be blocked outright for a scoped account, got ${res.statusCode}`)
+  const body = JSON.parse(res.body)
+  assert(body.locations.length === 1 && body.locations[0].locationId === 3, `expected exactly location 3, got ${JSON.stringify(body.locations.map(l => l.locationId))}`)
+  assert(body.totalReviews === null, 'totalReviews (a company-wide aggregate) must never be exposed to a scoped account')
+}
+
+async function testLocationManagerCanReadItsOwnLocationReviews() {
+  await setDirectory()
+  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], sessionVersion: 1 })
+  const res = await invoke(['reviews', 'by-location', 'los-tres-amigos-owosso.json'], lmToken)
+  assert(res.statusCode === 200, `expected 200 for the account's own location, got ${res.statusCode}`)
+}
+
+async function testLocationManagerCannotReadAForeignLocationReviews() {
+  await setDirectory()
+  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], sessionVersion: 1 })
+  const res = await invoke(['reviews', 'by-location', 'casa-tequila-brighton.json'], lmToken)
+  assert(res.statusCode === 404, `expected 404 (never 403, existence-hiding) for a foreign location, got ${res.statusCode}`)
+}
+
+async function testLocationManagerBlockedFromCompanyWideAggregates() {
+  await setDirectory()
+  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], sessionVersion: 1 })
+  for (const file of ['analytics/kpis.json', 'action-items.json', 'intelligence/company-summary.json']) {
+    const res = await invoke(file.split('/'), lmToken)
+    assert(res.statusCode === 403, `${file}: a company-wide aggregate must be permanently blocked (403) for a scoped account, got ${res.statusCode}`)
+  }
 }
 
 async function testUnknownFileReturns404() {
@@ -325,7 +362,11 @@ async function main() {
   await run('unauthenticated request -> 401', testUnauthenticatedReturns401)
   await run('authenticated Owner request -> expected payload', testOwnerCanReadMeta)
   await run('authenticated Marketing request -> expected payload', testMarketingCanReadMeta)
-  await run('Read Only and Location Manager are blocked until location filtering exists', testReadOnlyAndLocationManagerBlocked)
+  await run('a company-wide (wildcard) read_only account is now fully allowed', testReadOnlyWildcardNowFullyAllowed)
+  await run('location_manager: meta.json is filtered to its own location, totalReviews stripped', testLocationManagerMetaJsonFilteredToOwnLocationOnly)
+  await run('location_manager: can read its own location\'s reviews', testLocationManagerCanReadItsOwnLocationReviews)
+  await run('location_manager: cannot read a foreign location\'s reviews (404)', testLocationManagerCannotReadAForeignLocationReviews)
+  await run('location_manager: blocked (403) from company-wide aggregate files', testLocationManagerBlockedFromCompanyWideAggregates)
   await run('unknown file -> 404', testUnknownFileReturns404)
   await run('disallowed (non-allowlisted) file -> 404', testDisallowedFileReturns404)
   await run('.. traversal -> rejected', testDotDotTraversalRejected)

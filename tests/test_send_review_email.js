@@ -16,6 +16,7 @@ import { _setRedisClientForTests, _resetRedisClientForTests } from '../dashboard
 import { _setContactsForTests, _resetContactsForTests } from '../dashboard/api/_lib/locationContacts.js'
 import { _setTransportForTests, _resetTransportForTests } from '../dashboard/api/_lib/emailSender.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import { _setReviewLocationIndexForTests, _resetReviewLocationIndexForTests } from '../dashboard/api/_lib/reviewLocationIndex.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -35,6 +36,7 @@ async function run(name, fn) {
     _resetContactsForTests()
     _resetTransportForTests()
     _resetLimiterFactoryForTests()
+    _resetReviewLocationIndexForTests()
     delete process.env.VERCEL_ENV
     delete process.env.REVIEW_ESCALATION_CC_EMAILS
     delete process.env.REVIEW_REPLY_TO_EMAIL
@@ -142,10 +144,28 @@ async function testSendMarketingAllowed() {
   assert(res.statusCode === 200, `marketing: expected 200, got ${res.statusCode}`)
 }
 
-async function testSendLocationManagerRejected() {
+// REVIEWED UPDATE (Multi-Location Authentication & User Access System,
+// Commit 4): location_manager is no longer flatly rejected -- it holds
+// REPLY_ASSIGNED and this fixture's usr_locmgr is scoped to locationIds:[3],
+// the same location sendBody() targets, so this is now a POSITIVE case.
+// The rejection behavior itself is still real and tested below, just for a
+// location OUTSIDE the account's grant (404, per the frozen error contract
+// -- never 403 for an out-of-scope location).
+async function testSendLocationManagerAllowedForOwnLocation() {
   await setDirectory()
+  _setRedisClientForTests(() => fakeRedis())
+  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setTransportForTests(fakeMailer())
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_locmgr', 'locmgr@example.com', 'location_manager'), body: sendBody() })
-  assert(res.statusCode === 403, `location_manager must be rejected, got ${res.statusCode}`)
+  assert(res.statusCode === 200, `location_manager must be able to send for its own location (3), got ${res.statusCode}, body=${JSON.stringify(res.body)}`)
+}
+
+async function testSendLocationManagerDeniedForForeignLocation() {
+  await setDirectory()
+  _setRedisClientForTests(() => fakeRedis())
+  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_locmgr', 'locmgr@example.com', 'location_manager'), body: sendBody({ locationId: 99 }) })
+  assert(res.statusCode === 404, `location_manager must be denied (404, not 403) for a location outside its grant, got ${res.statusCode}`)
 }
 
 async function testSendReadOnlyRejected() {
@@ -498,17 +518,39 @@ async function testUpdateEmailStatusRejectsAfterFailedSend() {
   assert(res.statusCode === 400, `a FAILED send must never be manually transitionable to replied, got ${res.statusCode}`)
 }
 
-async function testUpdateEmailStatusLocationManagerRejected() {
+// REVIEWED UPDATE (Multi-Location Authentication & User Access System,
+// Commit 4): location_manager holds REPLY_ASSIGNED; this action resolves
+// location from `id` (the review) via reviewLocationIndex.js, not an
+// explicit locationId field -- test-inject the index so 'review-1' resolves
+// to this account's own location (3, matching usr_locmgr's grant above).
+async function testUpdateEmailStatusLocationManagerAllowedForOwnLocation() {
   await setDirectory()
+  const client = fakeRedis()
+  _setRedisClientForTests(() => client)
+  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setTransportForTests(fakeMailer())
+  _setReviewLocationIndexForTests({ 'review-1': 3 })
+  const ownerT = await tokenFor('usr_owner', 'owner@example.com', 'owner')
+  await invoke({ action: 'send-review-email', method: 'POST', token: ownerT, body: sendBody() })
+
   const res = await invoke({ action: 'update-email-status', method: 'POST', token: await tokenFor('usr_locmgr', 'locmgr@example.com', 'location_manager'), body: { id: 'review-1', emailStatus: 'resolved' } })
-  assert(res.statusCode === 403, `location_manager must be rejected, got ${res.statusCode}`)
+  assert(res.statusCode === 200, `location_manager must be able to update the email status for its own location's review, got ${res.statusCode}`)
+}
+
+async function testUpdateEmailStatusLocationManagerDeniedForForeignLocation() {
+  await setDirectory()
+  _setRedisClientForTests(() => fakeRedis())
+  _setReviewLocationIndexForTests({ 'review-1': 99 }) // not in usr_locmgr's [3] grant
+  const res = await invoke({ action: 'update-email-status', method: 'POST', token: await tokenFor('usr_locmgr', 'locmgr@example.com', 'location_manager'), body: { id: 'review-1', emailStatus: 'resolved' } })
+  assert(res.statusCode === 404, `location_manager must be denied (404, not 403) for a review outside its grant, got ${res.statusCode}`)
 }
 
 async function main() {
   await run('send-review-email: unauthenticated -> 401', testSendUnauthenticatedRejected)
   await run('send-review-email: owner allowed', testSendOwnerAllowed)
   await run('send-review-email: marketing allowed', testSendMarketingAllowed)
-  await run('send-review-email: location_manager rejected -> 403', testSendLocationManagerRejected)
+  await run('send-review-email: location_manager allowed for its own location', testSendLocationManagerAllowedForOwnLocation)
+  await run('send-review-email: location_manager denied (404) for a foreign location', testSendLocationManagerDeniedForForeignLocation)
   await run('send-review-email: read_only rejected -> 403', testSendReadOnlyRejected)
   await run('recipient is always resolved server-side from locationId, never the client', testRecipientResolvedFromLocationIdNotClient)
   await run('CC cannot be overridden by the client -- always REVIEW_ESCALATION_CC_EMAILS', testCcCannotBeOverriddenByClient)
@@ -534,7 +576,8 @@ async function main() {
   await run('update-email-status rejects an item with no prior send', testUpdateEmailStatusRejectsWhenNoPriorSend)
   await run('update-email-status happy path (replied)', testUpdateEmailStatusHappyPath)
   await run('update-email-status rejects a transition after a FAILED send', testUpdateEmailStatusRejectsAfterFailedSend)
-  await run('update-email-status: location_manager rejected -> 403', testUpdateEmailStatusLocationManagerRejected)
+  await run('update-email-status: location_manager allowed for its own location\'s review', testUpdateEmailStatusLocationManagerAllowedForOwnLocation)
+  await run('update-email-status: location_manager denied (404) for a foreign location\'s review', testUpdateEmailStatusLocationManagerDeniedForForeignLocation)
 
   console.log()
   if (results.every(Boolean)) {

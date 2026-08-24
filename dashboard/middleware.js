@@ -13,13 +13,27 @@
 //
 // What this file verifies vs. what the Node endpoint verifies:
 //   - Middleware (/api/data): signature + expiry (via _lib/session.js)
-//     and current sessionVersion/disabled/role (via _lib/accountStore.js) --
-//     everything that's Edge-runtime safe (no bcrypt, no fs, no Redis).
-//   - Node endpoint (dashboard/api/data.js): the SAME checks again,
-//     independently, PLUS the file-path allowlist and the actual file
-//     read. It does not trust that middleware already approved the
-//     request.
-//   - Neither layer does rate limiting here -- Upstash is Node-only.
+//     and current sessionVersion/disabled account status (via
+//     _lib/accountStore.js) -- everything that's Edge-runtime safe (no
+//     bcrypt, no fs, no Redis for the account lookup itself, though
+//     accountStore.js's dual-read may consult Upstash's Edge-safe REST
+//     client).
+//   - Node endpoint (dashboard/api/data.js): the SAME identity checks
+//     again, independently, PLUS the file-path allowlist, PER-FILE
+//     location-of-request authorization (Multi-Location Authentication &
+//     User Access System, Commit 4), and the actual file read. It does not
+//     trust that middleware already approved the request.
+//   - Neither layer does rate limiting here -- Upstash rate-limiting is
+//     Node-only.
+//
+// ROLE GATE, Commit 4: this layer no longer restricts by role at all --
+// every authenticated, non-disabled, current-sessionVersion account passes
+// through to the Node layer, which is the ONLY place that can know which
+// specific file/location a request concerns (this Edge check never reads
+// req.query.file) and therefore the only place that can make the real
+// per-file/per-location decision. A role/location-scoped account reaching
+// past this coarse check is not yet "authorized" -- data.js's own allowlist
+// and location check are still fully independent and authoritative.
 //
 // /data/* (legacy): no files exist there after this phase's migration, so
 // there's nothing to gate -- this simply always 404s, matching requirement
@@ -35,8 +49,6 @@
 import { next } from '@vercel/functions'
 import { verifySession, SESSION_COOKIE } from './api/_lib/session.js'
 import { getAccountById } from './api/_lib/accountStore.js'
-
-const ALLOWED_ROLES = ['owner', 'marketing']
 
 function parseCookieHeader(header) {
   const out = {}
@@ -72,9 +84,6 @@ export default async function middleware(request) {
   if (!account || account.disabled) return json(401, { error: 'unauthenticated', message: 'Sign in required.' })
   if (account.sessionVersion !== claims.sessionVersion) {
     return json(401, { error: 'session_expired', message: 'Your session is no longer valid. Please sign in again.' })
-  }
-  if (!ALLOWED_ROLES.includes(account.role)) {
-    return json(403, { error: 'forbidden', message: 'You do not have permission to view this.' })
   }
 
   // Passed the edge pre-check -- continue to the Node function, which

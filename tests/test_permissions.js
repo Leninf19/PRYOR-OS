@@ -253,6 +253,30 @@ async function testRequireScopedAuthSucceedsWithNoLocationScope() {
   assert(result.locationId === null, 'locationId passes through as null')
 }
 
+// requireScopedAuth's `permission` param accepts an array (ANY-of) as well
+// as a single constant -- added for the unrestricted/_ASSIGNED permission
+// pairs (owner/marketing hold REPLY, location_manager holds REPLY_ASSIGNED,
+// both must reach the same endpoint).
+async function testRequireScopedAuthAcceptsAnArrayOfPermissions() {
+  process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify(await buildDirectory())
+
+  const lmToken = await tokenFor('usr_lm', 'location_manager', [3, 7, 12])
+  const { req: lmReq, res: lmRes } = fakeReqRes(lmToken)
+  const lmResult = await requireScopedAuth(lmReq, lmRes, {
+    permission: [Permission.REPLY, Permission.REPLY_ASSIGNED],
+    resolveLocationId: async () => 7,
+  })
+  assert(lmResult !== null, 'location_manager (holds only REPLY_ASSIGNED) must pass an ANY-of [REPLY, REPLY_ASSIGNED] check')
+
+  const roToken = await tokenFor('usr_ro', 'read_only', [7])
+  const { req: roReq, res: roRes } = fakeReqRes(roToken)
+  const roResult = await requireScopedAuth(roReq, roRes, {
+    permission: [Permission.REPLY, Permission.REPLY_ASSIGNED],
+    resolveLocationId: async () => 7,
+  })
+  assert(roResult === null && roRes.statusCode === 403, `read_only holds neither REPLY nor REPLY_ASSIGNED, expected 403, got ${roRes.statusCode}`)
+}
+
 // Phase 2 Milestone 2: static source checks confirming the new helpers
 // remain unused by production code and requireAuth() itself is untouched.
 async function testRequireAuthSourceUnchanged() {
@@ -274,6 +298,12 @@ async function testRequireAuthSourceUnchanged() {
 // elsewhere.
 const EXPECTED_SCOPED_AUTH_CALLERS = new Set([
   path.join(DASHBOARD_DIR, 'api', 'settings', '[action].js'),
+  // Multi-Location Authentication & User Access System, Commit 4:
+  // publish()/publishBridge() location-scope every per-review action.
+  path.join(DASHBOARD_DIR, 'api', 'google', '[action].js'),
+  path.join(DASHBOARD_DIR, 'api', 'actions', '[action].js'),
+  path.join(DASHBOARD_DIR, 'api', 'rewrite.js'),
+  path.join(DASHBOARD_DIR, 'api', 'data.js'), // calls requireLocationAccess directly, not requireScopedAuth
 ])
 
 async function testNewHelpersAreUsedOnlyByExpectedEndpoints() {
@@ -312,6 +342,7 @@ async function main() {
   await run('requireScopedAuth: location out of scope -> 404 not_found (never 403)', testRequireScopedAuthLocationOutOfScopeReturns404)
   await run('requireScopedAuth: in-scope location + granted permission -> succeeds', testRequireScopedAuthSucceedsInScope)
   await run('requireScopedAuth: no location scope (company-wide) -> succeeds', testRequireScopedAuthSucceedsWithNoLocationScope)
+  await run('requireScopedAuth: permission param accepts an array (ANY-of)', testRequireScopedAuthAcceptsAnArrayOfPermissions)
   await run('requireAuth() source is byte-level unchanged from before Milestone 2', testRequireAuthSourceUnchanged)
   await run('requireScopedAuth/requireOwnership/requireLocationAccess are used only by the expected endpoint(s)', testNewHelpersAreUsedOnlyByExpectedEndpoints)
 
