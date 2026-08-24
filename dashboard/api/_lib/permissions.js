@@ -35,6 +35,12 @@ export const Permission = Object.freeze({
   EMAIL_VIEW:      'email_view',
   SETTINGS_ADMIN:  'settings_admin', // Google Business Profile connect/disconnect
   AUDIT_VIEW:      'audit_view',
+  // Multi-Location Authentication & User Access System: invite/disable/
+  // role-and-location-reassign other users. Deliberately separate from
+  // SETTINGS_ADMIN -- user management is an operational capability Owner
+  // and Admin both hold; GBP OAuth is an infrastructure-credential
+  // capability that stays Owner-only. See the role table below.
+  USERS_MANAGE:    'users_manage',
 })
 
 // The role table: references Permission.* constants, never raw strings.
@@ -49,6 +55,23 @@ export const ROLE_PERMISSIONS = Object.freeze({
     Permission.CAMPAIGNS, Permission.EXPORT, Permission.ADMIN,
     Permission.CONTACTS_VIEW, Permission.CONTACTS_MANAGE,
     Permission.EMAIL_VIEW, Permission.SETTINGS_ADMIN, Permission.AUDIT_VIEW,
+    Permission.USERS_MANAGE,
+  ]),
+  // 'admin': core operational tier (same VIEW_ALL/REPLY/EXPORT/CAMPAIGNS as
+  // owner/marketing) plus USERS_MANAGE -- deliberately introduced in the
+  // Commit 1 (user model + roles) scope only. CONTACTS_VIEW/CONTACTS_MANAGE/
+  // EMAIL_VIEW/AUDIT_VIEW are intentionally NOT granted yet: those gate
+  // settings/[action].js endpoints this milestone hasn't reviewed for admin
+  // access yet (Restaurant Contacts/Email/Audit Log), and granting them here
+  // first would let admin reach those endpoints before their own commit
+  // adds admin to ENDPOINT_REGISTRY/tests for them. Widened in that later,
+  // reviewed commit -- see the milestone's implementation sequence. Never
+  // granted: SETTINGS_ADMIN (GBP OAuth connect/disconnect) or the ADMIN
+  // capability itself -- both stay Owner-only by design.
+  admin: new Set([
+    Permission.VIEW_ALL, Permission.VIEW_ASSIGNED, Permission.REPLY,
+    Permission.CAMPAIGNS, Permission.EXPORT,
+    Permission.USERS_MANAGE,
   ]),
   marketing: new Set([
     Permission.VIEW_ALL, Permission.VIEW_ASSIGNED, Permission.REPLY,

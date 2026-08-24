@@ -47,7 +47,7 @@ export async function evaluateSession(req, allowedRoles) {
   const claims = await verifySession(cookies[SESSION_COOKIE])
   if (!claims) return { account: null, reason: 'unauthenticated' }
 
-  const account = getAccountById(claims.userId)
+  const account = await getAccountById(claims.userId)
   if (!account || account.disabled) return { account: null, reason: 'unauthenticated' }
 
   if (account.sessionVersion !== claims.sessionVersion) {

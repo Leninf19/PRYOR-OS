@@ -89,6 +89,7 @@ async function setDirectory(overrides = {}) {
   const hash = await bcrypt.hash('correct-horse-battery-staple', 12)
   const base = {
     owner:            { userId: 'usr_owner',    email: 'owner@example.com',    passwordHash: hash, role: 'owner',            locationIds: '*',        sessionVersion: 1, disabled: false, displayName: 'Owner' },
+    admin:            { userId: 'usr_admin',    email: 'admin@example.com',    passwordHash: hash, role: 'admin',            locationIds: '*',        sessionVersion: 1, disabled: false, displayName: 'Admin' },
     marketing:        { userId: 'usr_marketing', email: 'marketing@example.com', passwordHash: hash, role: 'marketing',       locationIds: '*',        sessionVersion: 1, disabled: false, displayName: 'Marketing' },
     location_manager: { userId: 'usr_lm',        email: 'lm@example.com',      passwordHash: hash, role: 'location_manager', locationIds: [3, 7, 12], sessionVersion: 1, disabled: false, displayName: 'Location Manager' },
     read_only:        { userId: 'usr_ro',        email: 'ro@example.com',      passwordHash: hash, role: 'read_only',        locationIds: [7],        sessionVersion: 1, disabled: false, displayName: 'Read Only' },
@@ -119,7 +120,14 @@ function fakeRes() {
   return res
 }
 
-const ROLES = ['owner', 'marketing', 'location_manager', 'read_only']
+// 'admin' added by the Multi-Location Authentication & User Access System
+// milestone. Adding it here means testRoleMatrixDeniesEveryNonAllowedRole
+// (below) automatically asserts admin is rejected (403) from every
+// ENDPOINT_REGISTRY entry that doesn't yet list it in currentAllowedRoles --
+// correct for this commit, since no endpoint's role gate has been widened
+// to include admin yet (that begins in the location-authorization commit,
+// which touches data.js/google/[action].js/actions/[action].js/rewrite.js).
+const ROLES = ['owner', 'admin', 'marketing', 'location_manager', 'read_only']
 
 // ---------------------------------------------------------------------------
 // SECTION 6 (defined early so SECTION 2's role matrix can be generated from
@@ -867,6 +875,22 @@ async function testOwnerAndMarketingRetainApprovedUnrestrictedCapabilities() {
   assert(roleHasPermission('marketing', Permission.ADMIN) === false, 'marketing must never hold ADMIN')
 }
 
+// admin: same operational tier as owner/marketing (VIEW_ALL/REPLY/EXPORT/
+// CAMPAIGNS unrestricted) but must NEVER hold the two infrastructure-tier
+// capabilities (Permission.ADMIN and SETTINGS_ADMIN, i.e. GBP OAuth
+// connect/disconnect) that stay Owner-only by design -- and, unlike
+// marketing, admin DOES hold the new USERS_MANAGE capability, same as owner.
+async function testAdminRetainsOperationalCapabilitiesButNotInfrastructureAdmin() {
+  for (const p of [Permission.VIEW_ALL, Permission.VIEW_ASSIGNED, Permission.REPLY, Permission.EXPORT, Permission.CAMPAIGNS]) {
+    assert(roleHasPermission('admin', p) === true, `admin must retain ${p}`)
+  }
+  assert(roleHasPermission('admin', Permission.USERS_MANAGE) === true, 'admin must hold USERS_MANAGE')
+  assert(roleHasPermission('owner', Permission.USERS_MANAGE) === true, 'owner must hold USERS_MANAGE')
+  assert(roleHasPermission('marketing', Permission.USERS_MANAGE) === false, 'marketing must never hold USERS_MANAGE')
+  assert(roleHasPermission('admin', Permission.ADMIN) === false, 'admin must never hold the ADMIN capability (Owner-only, infrastructure-tier)')
+  assert(roleHasPermission('admin', Permission.SETTINGS_ADMIN) === false, 'admin must never hold SETTINGS_ADMIN (GBP OAuth stays Owner-only)')
+}
+
 // ===========================================================================
 // SECTION 4 -- LOCATION-SCOPE INVARIANTS
 // ===========================================================================
@@ -1333,6 +1357,7 @@ async function main() {
   await run('read_only never receives reply or export (unrestricted or assigned)', testReadOnlyNeverReplyOrExport)
   await run('location_manager never receives view_all, reply, export, campaigns, or admin', testLocationManagerNeverHasCompanyWideCapabilities)
   await run('owner and marketing retain their approved unrestricted capabilities', testOwnerAndMarketingRetainApprovedUnrestrictedCapabilities)
+  await run('admin retains operational capabilities (incl. USERS_MANAGE) but never ADMIN/SETTINGS_ADMIN', testAdminRetainsOperationalCapabilitiesButNotInfrastructureAdmin)
 
   console.log('\n--- SECTION 4: Location-scope invariants ---')
   await run('wildcard locationIds grants all valid location ids', testWildcardGrantsAllValidLocationIds)

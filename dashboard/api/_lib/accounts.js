@@ -22,7 +22,12 @@
 // hash, a typo'd role, a locationIds array with a stray string in it) that
 // should be caught loudly at load time, not silently ignored.
 
-export const ROLES = ['owner', 'marketing', 'location_manager', 'read_only']
+// 'admin' added by the Multi-Location Authentication & User Access System
+// milestone -- same grant tier as 'owner' except SETTINGS_ADMIN (GBP OAuth
+// connect/disconnect stays Owner-only; see permissions.js). Every existing
+// static ACCOUNT_DIRECTORY_JSON entry is unaffected -- this only widens the
+// set of values `role` may validly hold.
+export const ROLES = ['owner', 'admin', 'marketing', 'location_manager', 'read_only']
 
 const ACCOUNT_FIELDS = new Set([
   'userId', 'email', 'passwordHash', 'role', 'locationIds', 'sessionVersion', 'disabled', 'displayName',
@@ -33,7 +38,11 @@ const ACCOUNT_FIELDS = new Set([
 // any other malformed value) sitting in passwordHash instead of a real hash.
 const BCRYPT_HASH_RE = /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/
 
-function isValidLocationIds(locationIds) {
+// Exported so userStore.js (the Redis-backed dynamic directory) can validate
+// locationIds with the exact same rule as the static directory below,
+// without duplicating it -- '*' or a non-empty array of distinct positive
+// integers, nothing else.
+export function isValidLocationIds(locationIds) {
   if (locationIds === '*') return true
   if (!Array.isArray(locationIds) || locationIds.length === 0) return false
   const seen = new Set()

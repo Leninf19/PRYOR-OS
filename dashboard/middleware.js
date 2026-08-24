@@ -68,7 +68,7 @@ export default async function middleware(request) {
   const claims = await verifySession(cookies[SESSION_COOKIE])
   if (!claims) return json(401, { error: 'unauthenticated', message: 'Sign in required.' })
 
-  const account = getAccountById(claims.userId)
+  const account = await getAccountById(claims.userId)
   if (!account || account.disabled) return json(401, { error: 'unauthenticated', message: 'Sign in required.' })
   if (account.sessionVersion !== claims.sessionVersion) {
     return json(401, { error: 'session_expired', message: 'Your session is no longer valid. Please sign in again.' })

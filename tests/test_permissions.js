@@ -52,6 +52,7 @@ async function buildDirectory() {
   return {
     accounts: [
       { userId: 'usr_owner', email: 'owner@example.com', passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false, displayName: 'Owner' },
+      { userId: 'usr_admin', email: 'admin@example.com', passwordHash: hash, role: 'admin', locationIds: '*', sessionVersion: 1, disabled: false, displayName: 'Admin' },
       { userId: 'usr_marketing', email: 'marketing@example.com', passwordHash: hash, role: 'marketing', locationIds: '*', sessionVersion: 1, disabled: false, displayName: 'Marketing' },
       { userId: 'usr_lm', email: 'lm@example.com', passwordHash: hash, role: 'location_manager', locationIds: [3, 7, 12], sessionVersion: 1, disabled: false, displayName: 'Location Manager' },
       { userId: 'usr_ro', email: 'ro@example.com', passwordHash: hash, role: 'read_only', locationIds: [7], sessionVersion: 1, disabled: false, displayName: 'Read Only' },
@@ -67,6 +68,8 @@ async function testPermissionRegistryIsFrozenAndComplete() {
     'VIEW_ALL', 'VIEW_ASSIGNED', 'REPLY', 'REPLY_ASSIGNED', 'EXPORT', 'EXPORT_ASSIGNED', 'CAMPAIGNS', 'ADMIN',
     // Phase 8 (Operational Settings Platform)
     'CONTACTS_VIEW', 'CONTACTS_MANAGE', 'EMAIL_VIEW', 'SETTINGS_ADMIN', 'AUDIT_VIEW',
+    // Multi-Location Authentication & User Access System
+    'USERS_MANAGE',
   ]
   for (const key of expected) {
     assert(typeof Permission[key] === 'string' && Permission[key].length > 0, `Permission.${key} must be a non-empty string`)
@@ -76,36 +79,51 @@ async function testPermissionRegistryIsFrozenAndComplete() {
 
 async function testRolePermissionsIsFrozen() {
   assert(Object.isFrozen(ROLE_PERMISSIONS), 'ROLE_PERMISSIONS must be frozen')
-  for (const role of ['owner', 'marketing', 'location_manager', 'read_only']) {
+  for (const role of ['owner', 'admin', 'marketing', 'location_manager', 'read_only']) {
     assert(ROLE_PERMISSIONS[role] instanceof Set, `ROLE_PERMISSIONS.${role} must be a Set`)
   }
 }
 
-// Every role x every permission, matching the approved Phase 2 Revision 3
-// capability matrix exactly. Written as an explicit table (not derived) so
-// the expected grants are legible here without cross-referencing the
-// architecture doc, and so any accidental drift in permissions.js shows up
-// as a specific, named failure.
+// Every role x every permission, matching the approved capability matrix
+// exactly -- 'admin' added by the Multi-Location Authentication & User
+// Access System milestone (same tier as owner except SETTINGS_ADMIN/ADMIN,
+// which stay Owner-only-by-design; both roles get the new USERS_MANAGE).
+// Written as an explicit table (not derived) so the expected grants are
+// legible here without cross-referencing the architecture doc, and so any
+// accidental drift in permissions.js shows up as a specific, named failure.
 const EXPECTED_GRANTS = {
   owner: {
     VIEW_ALL: true, VIEW_ASSIGNED: true, REPLY: true, REPLY_ASSIGNED: false,
     EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: true,
     CONTACTS_VIEW: true, CONTACTS_MANAGE: true, EMAIL_VIEW: true, SETTINGS_ADMIN: true, AUDIT_VIEW: true,
+    USERS_MANAGE: true,
+  },
+  admin: {
+    // Commit 1 scope only -- Contacts/Email/Audit grants land in the later
+    // commit that reviews admin access for those endpoints. See
+    // permissions.js's own comment on the admin role.
+    VIEW_ALL: true, VIEW_ASSIGNED: true, REPLY: true, REPLY_ASSIGNED: false,
+    EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: false,
+    CONTACTS_VIEW: false, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
+    USERS_MANAGE: true,
   },
   marketing: {
     VIEW_ALL: true, VIEW_ASSIGNED: true, REPLY: true, REPLY_ASSIGNED: false,
     EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: false,
     CONTACTS_VIEW: true, CONTACTS_MANAGE: true, EMAIL_VIEW: true, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
+    USERS_MANAGE: false,
   },
   location_manager: {
     VIEW_ALL: false, VIEW_ASSIGNED: true, REPLY: false, REPLY_ASSIGNED: true,
     EXPORT: false, EXPORT_ASSIGNED: true, CAMPAIGNS: false, ADMIN: false,
     CONTACTS_VIEW: true, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
+    USERS_MANAGE: false,
   },
   read_only: {
     VIEW_ALL: false, VIEW_ASSIGNED: true, REPLY: false, REPLY_ASSIGNED: false,
     EXPORT: false, EXPORT_ASSIGNED: false, CAMPAIGNS: false, ADMIN: false,
     CONTACTS_VIEW: false, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
+    USERS_MANAGE: false,
   },
 }
 

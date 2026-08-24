@@ -263,8 +263,12 @@ async function testAccountStoreIsSingleSourceOfAccountLookups() {
   const accountStoreSrc = readFileSync(path.join(DASHBOARD_DIR, 'api', '_lib', 'accountStore.js'), 'utf-8')
   assert(/from\s+['"][^'"]*\baccounts\.js['"]/.test(accountStoreSrc),
     'accountStore.js should be the module delegating to accounts.js')
-  assert(/export function getAccountById/.test(accountStoreSrc), 'accountStore.js must export getAccountById')
-  assert(/export function getAccountByEmail/.test(accountStoreSrc), 'accountStore.js must export getAccountByEmail')
+  // REVIEWED UPDATE (Multi-Location Authentication & User Access System,
+  // Commit 1): these are now genuinely async -- accountStore.js dual-reads
+  // against the Redis-backed userStore.js before falling back to the static
+  // directory, so `async` is now part of the expected exported signature.
+  assert(/export async function getAccountById/.test(accountStoreSrc), 'accountStore.js must export async getAccountById')
+  assert(/export async function getAccountByEmail/.test(accountStoreSrc), 'accountStore.js must export async getAccountByEmail')
 
   const middlewareSrc = readFileSync(path.join(DASHBOARD_DIR, 'middleware.js'), 'utf-8')
   const loginSrc = readFileSync(path.join(DASHBOARD_DIR, 'api', 'session', '[action].js'), 'utf-8')

@@ -15,6 +15,8 @@ import { verifyPassword } from '../_lib/password.js'
 import { requireAuth } from '../_lib/auth.js'
 import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
+import { touchLastLogin } from '../_lib/userStore.js'
+import { appendAuditEntry } from '../_lib/auditLog.js'
 
 const SESSION_TTL_SECONDS = 12 * 60 * 60 // 12h fixed session (Phase 1)
 
@@ -55,11 +57,22 @@ async function login(req, res) {
 
   const genericFailure = () => res.status(401).json({ error: 'invalid_credentials', message: 'Invalid email or password.' })
 
-  const account = getAccountByEmail(email)
+  const account = await getAccountByEmail(email)
   const hashToCheck = account?.passwordHash || DUMMY_HASH
   const passwordOk = await verifyPassword(password, hashToCheck)
 
   if (!account || account.disabled || !passwordOk) {
+    // Audit-logged by outcome, never by which specific check failed (unknown
+    // email vs. wrong password vs. disabled account) -- the caller-facing
+    // response is already identical for all three (no-enumeration, above);
+    // logging the distinction internally would just move the same
+    // information into a second, easier-to-overlook surface. Never logs the
+    // attempted password itself.
+    await appendAuditEntry({
+      actorId: account?.userId ?? null, actorEmail: email, ip: clientIp(req),
+      action: 'user.login_failed', entity: 'user', entityId: account?.userId ?? null,
+      result: 'failure', message: 'Sign-in attempt failed.',
+    })
     return genericFailure()
   }
 
@@ -81,6 +94,17 @@ async function login(req, res) {
   }
 
   setCookie(res, SESSION_COOKIE, token, { maxAgeSeconds: SESSION_TTL_SECONDS })
+
+  // Best-effort, never blocking/failing the response: touchLastLogin() is a
+  // no-op for static-directory-only accounts (no Redis record to update),
+  // and swallows its own Redis errors -- a bookkeeping-field write must
+  // never turn a successful login into a failed one.
+  await touchLastLogin(account.userId)
+  await appendAuditEntry({
+    actorId: account.userId, actorEmail: account.email, ip: clientIp(req),
+    action: 'user.login', entity: 'user', entityId: account.userId,
+    result: 'success', message: 'Signed in.',
+  })
 
   return res.status(200).json({
     account: {
@@ -128,7 +152,7 @@ async function accounts(req, res) {
   const account = await requireAuth(req, res, null) // null = any authenticated role
   if (!account) return
 
-  const safeAccounts = listAccounts()
+  const safeAccounts = (await listAccounts())
     .filter(a => !a.disabled)
     .map(a => ({
       userId: a.userId,
