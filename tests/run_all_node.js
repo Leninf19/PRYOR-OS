@@ -70,6 +70,8 @@ const TESTS = [
   'test_user_store.js',
   'test_invitations.js',
   'test_accept_invite_ui.js',
+  'test_password_reset.js',
+  'test_password_reset_ui.js',
 ]
 
 const results = {}

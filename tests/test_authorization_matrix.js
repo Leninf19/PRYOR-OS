@@ -192,6 +192,30 @@ const ENDPOINT_REGISTRY = [
     notes: 'Multi-Location Authentication & User Access System. Deliberately open -- the invitation token itself is the credential (single-use, atomically consumed via GETDEL, tokenStore.js). Sets the invitee\'s own password (never seen by the inviting Owner/Admin), activates the account, and auto-logs in.',
   },
   {
+    route: 'POST /api/session/forgot-password', file: 'api/session/[action].js', method: 'POST', action: 'forgot-password',
+    authRequired: false, currentAllowedRoles: 'NONE',
+    scope: 'none (entry point, like login)',
+    unauthorizedShape: null, wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 3. Deliberately open -- always returns the exact same response regardless of whether the email exists, is disabled, or the token store is briefly unreachable (no-enumeration, mirroring login.js\'s own genericFailure() convention).',
+  },
+  {
+    route: 'GET /api/session/reset-status', file: 'api/session/[action].js', method: 'GET', action: 'reset-status',
+    authRequired: false, currentAllowedRoles: 'NONE',
+    scope: 'none (entry point)',
+    unauthorizedShape: null, wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 3. Non-consuming preview (tokenStore.js peekResetToken) -- deliberately reveals only valid/invalid, never the account\'s email/role (more conservative than invite-status, since a reset link is more plausible to have been intercepted).',
+  },
+  {
+    route: 'POST /api/session/reset-password', file: 'api/session/[action].js', method: 'POST', action: 'reset-password',
+    authRequired: false, currentAllowedRoles: 'NONE',
+    scope: 'none (entry point, like login)',
+    unauthorizedShape: null, wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 3. Deliberately open -- the reset token itself is the credential. Bumps sessionVersion (invalidates every prior session immediately) and transparently promotes a static-ACCOUNT_DIRECTORY_JSON-only account into the Redis store on its first reset.',
+  },
+  {
     route: 'POST /api/google/publish', file: 'api/google/[action].js', method: 'POST', action: 'publish',
     authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
     scope: 'reply for any location today; no location filtering exists yet',
@@ -408,6 +432,14 @@ const ENDPOINT_REGISTRY = [
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
     notes: 'Multi-Location Authentication & User Access System, Commit 2. Same USERS_MANAGE gate as invite-user. Idempotent -- revoking an already-consumed/already-revoked invite is a harmless no-op.',
+  },
+  {
+    route: 'POST /api/settings/generate-reset-link', file: 'api/settings/[action].js', method: 'POST', action: 'generate-reset-link',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin'],
+    scope: 'company-wide admin action -- Owner/Admin fallback reset link for an already-active account',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 3. Same USERS_MANAGE gate as invite-user. Rejects an account that has not been activated yet (use resend-invite instead).',
   },
 ]
 

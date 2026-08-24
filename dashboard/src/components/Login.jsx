@@ -1,10 +1,13 @@
 import { useState } from 'react'
 
-// Deliberately minimal: no self-service signup, no password reset link, no
-// "remember me" -- Phase 1's account directory is 3 Owner accounts added by
-// hand (see README). Failure message is always the same generic text
-// regardless of whether the email doesn't exist or the password is wrong,
-// matching the server's no-enumeration behavior.
+// Deliberately minimal: no self-service signup, no "remember me" -- Phase 1's
+// account directory started as 3 Owner accounts added by hand (see README);
+// new accounts now come through invitations (Settings -> Users & Access),
+// not this screen. A "Forgot password?" link routes to the public
+// /forgot-password page (Multi-Location Authentication & User Access
+// System). Failure message is always the same generic text regardless of
+// whether the email doesn't exist or the password is wrong, matching the
+// server's no-enumeration behavior.
 export default function Login({ onSuccess }) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -90,6 +93,10 @@ export default function Login({ onSuccess }) {
           style={{ background: 'var(--color-accent)', borderColor: 'var(--color-accent)', color: 'white', opacity: submitting ? 0.6 : 1 }}>
           {submitting ? 'Signing in…' : 'Sign in'}
         </button>
+
+        <a href="/forgot-password" className="text-xs font-semibold block text-center" style={{ color: 'var(--color-text-2)' }}>
+          Forgot password?
+        </a>
       </form>
     </div>
   )

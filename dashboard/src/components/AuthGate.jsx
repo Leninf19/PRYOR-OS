@@ -3,14 +3,19 @@ import { useLocation } from 'react-router-dom'
 import { useSession } from '../hooks/useSession.js'
 import Login from './Login.jsx'
 import AcceptInvite from './AcceptInvite.jsx'
+import ForgotPassword from './ForgotPassword.jsx'
+import ResetPassword from './ResetPassword.jsx'
 
 // Paths reachable WITHOUT a session, checked before any loading/
-// authenticated/unauthenticated branching below -- an invitee has no
-// account yet and must never see the sign-in form. useSession()'s whoami
-// check still fires in the background on these paths (harmless, ignored;
-// not worth threading a skip-flag through the hook for one wasted 401).
+// authenticated/unauthenticated branching below -- an invitee/locked-out
+// user has no valid session yet and must never see the sign-in form.
+// useSession()'s whoami check still fires in the background on these paths
+// (harmless, ignored; not worth threading a skip-flag through the hook for
+// one wasted 401).
 const PUBLIC_PATHS = {
   '/accept-invite': AcceptInvite,
+  '/forgot-password': ForgotPassword,
+  '/reset-password': ResetPassword,
 }
 
 // The authenticated account (userId/email/role/locationIds/displayName from

@@ -26,6 +26,7 @@
 // POST /api/settings/invite-user            -- Multi-Location Auth: Owner/Admin invites a new user (USERS_MANAGE)
 // POST /api/settings/resend-invite          -- issues a fresh token for a not-yet-activated invite
 // POST /api/settings/revoke-invite          -- revokes a not-yet-activated invite
+// POST /api/settings/generate-reset-link    -- Owner/Admin fallback reset link for an active account
 
 import { readFile } from 'fs/promises'
 import path from 'path'
@@ -41,9 +42,9 @@ import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
 import { getAccountByEmail } from '../_lib/accountStore.js'
 import { getUserById, upsertUser, updateUser, deriveUserStatus, UserStoreUnavailableError } from '../_lib/userStore.js'
-import { createInviteToken, revokeInviteToken, TokenStoreUnavailableError } from '../_lib/tokenStore.js'
-import { buildInviteEmail, buildInviteEmailSubject } from '../_lib/accountEmailTemplate.js'
-import { generateUserId, isValidDisplayName, validateRoleAndLocations, canAssignRole, buildInviteUrl } from '../_lib/userManagement.js'
+import { createInviteToken, revokeInviteToken, createResetToken, TokenStoreUnavailableError } from '../_lib/tokenStore.js'
+import { buildInviteEmail, buildInviteEmailSubject, buildResetEmail, buildResetEmailSubject } from '../_lib/accountEmailTemplate.js'
+import { generateUserId, isValidDisplayName, validateRoleAndLocations, canAssignRole, buildInviteUrl, buildResetUrl } from '../_lib/userManagement.js'
 
 function actorFields(account, req) {
   return { actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req) }
@@ -808,6 +809,69 @@ async function revokeInviteAction(req, res) {
   }
 }
 
+// POST /api/settings/generate-reset-link  { userId }
+// Owner/Admin-only fallback for Phase 5/16's "usable before Microsoft SMTP
+// is repaired" requirement -- lets an Owner/Admin hand an already-active
+// user a working reset link directly, without depending on outbound email
+// at all (still attempts a best-effort email too, same emailWarning
+// pattern as invite-user). Rejects an account that hasn't been activated
+// yet -- that's resend-invite's job, not this one's, since an un-activated
+// account has no password to "reset" in the first place.
+async function generateResetLinkAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+  if (!roleHasPermission(account.role, Permission.USERS_MANAGE)) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to manage users.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `settings:generate-reset-link:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { userId } = req.body ?? {}
+  if (typeof userId !== 'string' || !userId) {
+    return res.status(400).json({ error: 'invalid_request', message: 'userId is required.' })
+  }
+
+  try {
+    const target = await getUserById(userId)
+    if (!target) return res.status(404).json({ error: 'not_found' })
+    if (!target.passwordSetAt) {
+      return res.status(409).json({ error: 'not_yet_active', message: 'This account has not been activated yet -- resend the invitation instead.' })
+    }
+
+    const { rawToken, expiresAt } = await createResetToken({ userId })
+    const resetUrl = buildResetUrl(req, rawToken)
+
+    let emailWarning = null
+    try {
+      const subject = buildResetEmailSubject()
+      const { html, text } = buildResetEmail({ name: target.displayName, resetUrl, expiresAt })
+      await sendReviewEmail({ to: target.email, cc: [], replyTo: undefined, subject, html, text })
+    } catch (err) {
+      emailWarning = err instanceof EmailSenderUnavailableError
+        ? 'Email is not configured -- share the reset link manually.'
+        : 'The reset email could not be sent -- share the reset link manually.'
+      console.error(`[settings/generate-reset-link] reset email failed: ${sanitizeErrorMessage(err.message)}`)
+    }
+
+    await appendAuditEntry({
+      ...actorFields(account, req), entity: 'user', entityId: userId,
+      action: 'password_reset.link_generated', changes: null, result: 'success',
+      message: `Generated a password reset link for ${target.email}.`,
+    })
+
+    return res.status(200).json({ userId, resetUrl, expiresAt, emailWarning })
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError || err instanceof TokenStoreUnavailableError) {
+      console.error(`[settings/generate-reset-link] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
     case 'contacts':                       return listContacts(req, res)
@@ -821,6 +885,7 @@ export default async function handler(req, res) {
     case 'invite-user':                     return inviteUserAction(req, res)
     case 'resend-invite':                   return resendInviteAction(req, res)
     case 'revoke-invite':                   return revokeInviteAction(req, res)
+    case 'generate-reset-link':             return generateResetLinkAction(req, res)
     default:                                return res.status(404).json({ error: 'not_found' })
   }
 }
