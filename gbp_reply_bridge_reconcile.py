@@ -46,6 +46,7 @@ import argparse
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -77,15 +78,39 @@ def _redis_get(path: str, token: str):
 def list_bridge_keys() -> list[str]:
     """KEYS publish_bridge:v1:* -- see module docstring for why a KEYS scan
     is an accepted, reasoned choice for this specific, small, TTL-bounded
-    keyspace rather than the general anti-pattern it usually is."""
+    keyspace rather than the general anti-pattern it usually is.
+
+    NOT url-encoded, deliberately: BRIDGE_KEY_PREFIX + '*' is a fixed glob
+    PATTERN, not an exact dynamic key -- unlike get_bridge_record()/
+    delete_bridge_record() below, there is no per-record arbitrary content
+    here to escape, and quoting the literal '*' would send Upstash '%2A'
+    instead of the wildcard, breaking the scan entirely. The prefix itself
+    (letters, digits, ':') never needs encoding either -- ':' is a valid
+    unreserved path character per RFC 3986.
+    """
     base_url, token = _redis_base_url()
     result = _redis_get(f"{base_url}/keys/{BRIDGE_KEY_PREFIX}*", token)
     return result.get("result") or []
 
 
+# Every OTHER Redis call in this module addresses one exact, dynamic key
+# returned by list_bridge_keys() -- built from Google's actual review data
+# (reviewer name, review date, or a scraped review URL; see
+# publishBridgeStore.js/dataUtils.js's reviewId() fallback chain), so it can
+# contain spaces, punctuation, or non-ASCII characters. Unlike the KEYS
+# pattern above, this is never a wildcard -- the full key must survive
+# round-trip exactly, so it is safe (and required) to percent-encode
+# every non-unreserved byte. safe='' additionally encodes '/' itself,
+# since a key derived from a URL can legitimately contain one, and an
+# un-encoded '/' would otherwise be read as an extra path segment by the
+# HTTP layer, not as part of the key.
+def _quote_key(key: str) -> str:
+    return urllib.parse.quote(key, safe="")
+
+
 def get_bridge_record(key: str) -> dict | None:
     base_url, token = _redis_base_url()
-    result = _redis_get(f"{base_url}/get/{key}", token)
+    result = _redis_get(f"{base_url}/get/{_quote_key(key)}", token)
     raw = result.get("result")
     if not raw:
         return None
@@ -97,7 +122,7 @@ def get_bridge_record(key: str) -> dict | None:
 
 def delete_bridge_record(key: str) -> None:
     base_url, token = _redis_base_url()
-    _redis_get(f"{base_url}/del/{key}", token)
+    _redis_get(f"{base_url}/del/{_quote_key(key)}", token)
 
 
 def find_local_review(conn, gbp_review_name: str):
