@@ -11,6 +11,7 @@ import AIBriefingCard from '../components/ui/AIBriefingCard.jsx'
 import ExecutiveScoreCard from '../components/ui/ExecutiveScoreCard.jsx'
 import CompanyGoalsSection from '../components/ui/CompanyGoalsSection.jsx'
 import KPIGrid from '../components/ui/KPIGrid.jsx'
+import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
 import { useTodayDigest } from '../hooks/useTodayDigest.js'
 import { useActivityFeed } from '../hooks/useActivityFeed.js'
 import { useMonthlyTrend, useLocationStats, useExecutiveScores } from '../hooks/useIntelligence.js'
@@ -324,6 +325,15 @@ export default function Today() {
       </div>
 
       <KPIGrid kpis={kpis} loading={kpisLoading} />
+
+      {/* Recovery Milestone (Reviews Analytics KPI): unlike KPIGrid above
+          (kpis comes from useKPIs()'s fixed trailing-30-day pipeline
+          snapshot -- see useTodayDigest.js), this is driven live by the
+          same `filtered` array that produces the plain "N reviews" badge in
+          the global filter bar (App.jsx) -- so this card's own total always
+          reconciles exactly with that badge for the active date/location/
+          brand selection, with no separate filtering logic of its own. */}
+      <SentimentBreakdown reviews={filtered} periodLabel={periodLabel} showSummaryLine />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className="lg:col-span-2">

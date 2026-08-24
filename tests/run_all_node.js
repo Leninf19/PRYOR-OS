@@ -63,6 +63,8 @@ const TESTS = [
   'test_audit_log_ui.js',
   'test_google_business_profile_ui.js',
   'test_google_oauth_quota_blocked.js',
+  'test_data_utils.js',
+  'test_sentiment_breakdown_ui.js',
 ]
 
 const results = {}
