@@ -79,13 +79,20 @@ function parseRecord(value) {
   }
 }
 
-// 'invited' | 'active' | 'disabled', derived so it can never drift from the
-// fields that actually gate login/authorization -- see the header comment.
+// 'invited' | 'active' | 'disabled' | 'revoked' | 'expired', derived so it
+// can never drift from the fields that actually gate login/authorization --
+// see the header comment. Order is deliberate: disabled always wins (an
+// account explicitly turned off, regardless of how it got there); an
+// account that has genuinely set a password is 'active' even if it still
+// carries stale invite metadata; only then do the not-yet-accepted invite
+// states (revoked/expired/invited) apply.
 export function deriveUserStatus(record) {
   if (!record) return null
   if (record.disabled) return 'disabled'
-  if (!record.passwordSetAt) return 'invited'
-  return 'active'
+  if (record.passwordSetAt) return 'active'
+  if (record.inviteRevokedAt) return 'revoked'
+  if (record.inviteExpiresAt && new Date(record.inviteExpiresAt).getTime() < Date.now()) return 'expired'
+  return 'invited'
 }
 
 export async function getUserById(userId) {

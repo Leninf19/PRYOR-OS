@@ -11,12 +11,17 @@
 
 import { setCookie, clearCookie } from '../google/_lib/cookies.js'
 import { getAccountByEmail, listAccounts } from '../_lib/accountStore.js'
-import { verifyPassword } from '../_lib/password.js'
+import { verifyPassword, hashPassword, validatePasswordStrength } from '../_lib/password.js'
 import { requireAuth } from '../_lib/auth.js'
 import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
-import { touchLastLogin } from '../_lib/userStore.js'
+import { touchLastLogin, updateUser, UserStoreUnavailableError } from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
+import {
+  consumeInviteToken, markInviteConsumedPending, clearInviteConsumedPending, peekInviteToken,
+  TokenStoreUnavailableError,
+} from '../_lib/tokenStore.js'
+import { isValidDisplayName } from '../_lib/userManagement.js'
 
 const SESSION_TTL_SECONDS = 12 * 60 * 60 // 12h fixed session (Phase 1)
 
@@ -166,12 +171,128 @@ async function accounts(req, res) {
   return res.status(200).json({ accounts: safeAccounts })
 }
 
+// GET /api/session/invite-status?token=  -- unauthenticated, non-consuming.
+// Lets the /accept-invite frontend page show "You've been invited..."
+// before the user has typed anything, without burning the token's single
+// use (see tokenStore.js's peekInviteToken). Never reveals more than the
+// invitee themselves will already see once they open the link.
+async function inviteStatus(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+  const token = req.query?.token
+  if (typeof token !== 'string' || !token) {
+    return res.status(400).json({ error: 'invalid_request', message: 'A token is required.' })
+  }
+  try {
+    const result = await peekInviteToken(token)
+    if (!result) return res.status(200).json({ valid: false })
+    const { email, role, locationIds } = result.payload
+    return res.status(200).json({ valid: true, email, role, locationIds })
+  } catch (err) {
+    if (err instanceof TokenStoreUnavailableError) {
+      console.error(`[session/invite-status] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// POST /api/session/accept-invite  { token, name?, password }
+// Unauthenticated by design (the token itself is the credential at this
+// point) -- validates the invitation, sets the invitee's own password
+// (never seen by the Owner/Admin who invited them), activates the account,
+// and auto-logs them in. See tokenStore.js's header comment for the full
+// single-use + no-unrecoverable-partial-failure contract this relies on:
+// consumeInviteToken() is atomic (GETDEL), and a failure AFTER consuming
+// but before the account is fully set up is recoverable by the client
+// resubmitting the identical token -- it will be found via the pending
+// safety-net record rather than rejected as invalid.
+async function acceptInvite(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const allowed = await enforceRateLimit(req, res, `accept-invite:${clientIp(req)}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { token, name, password } = req.body ?? {}
+  if (typeof token !== 'string' || !token) {
+    return res.status(400).json({ error: 'invalid_request', message: 'A valid invitation link is required.' })
+  }
+  const strength = validatePasswordStrength(password)
+  if (!strength.valid) {
+    return res.status(400).json({ error: 'invalid_request', message: strength.message })
+  }
+
+  let consumed
+  try {
+    consumed = await consumeInviteToken(token)
+  } catch (err) {
+    if (err instanceof TokenStoreUnavailableError) {
+      console.error(`[session/accept-invite] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Account setup is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+  if (!consumed) {
+    return res.status(400).json({ error: 'invalid_or_expired_token', message: 'This invitation link is invalid, expired, or has already been used.' })
+  }
+  const { payload, tokenHash, fromPending } = consumed
+  const { userId } = payload
+
+  if (!fromPending) {
+    // Fresh consume -- write the retry safety net BEFORE attempting any of
+    // the writes below, per tokenStore.js's contract.
+    await markInviteConsumedPending(tokenHash, payload)
+  }
+
+  try {
+    const passwordHash = await hashPassword(password)
+    const now = new Date().toISOString()
+    const updated = await updateUser(userId, {
+      passwordHash, passwordSetAt: now,
+      ...(isValidDisplayName(name) ? { displayName: name.trim() } : {}),
+    })
+    if (!updated) {
+      // The user record itself is gone -- not a token problem (already
+      // validated above), something else removed the account between
+      // invite-creation and acceptance. Not retryable.
+      return res.status(404).json({ error: 'not_found', message: 'This account no longer exists.' })
+    }
+
+    const sessionToken = await signSession({
+      userId: updated.userId, email: updated.email, role: updated.role,
+      locationIds: updated.locationIds, sessionVersion: updated.sessionVersion,
+    }, { expiresInSeconds: SESSION_TTL_SECONDS })
+    setCookie(res, SESSION_COOKIE, sessionToken, { maxAgeSeconds: SESSION_TTL_SECONDS })
+
+    await clearInviteConsumedPending(tokenHash)
+    await appendAuditEntry({
+      actorId: userId, actorEmail: updated.email, ip: clientIp(req),
+      action: 'invitation.accepted', entity: 'user', entityId: userId,
+      result: 'success', message: 'Invitation accepted, account activated.',
+    })
+
+    return res.status(200).json({
+      account: { userId: updated.userId, email: updated.email, role: updated.role, locationIds: updated.locationIds, displayName: updated.displayName ?? updated.email },
+    })
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError) {
+      // The pending safety-net record is untouched -- the client can
+      // resubmit the identical token+password once the store recovers and
+      // this will retry idempotently via the fromPending fallback above.
+      console.error(`[session/accept-invite] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not finish setting up your account. Please try this link again in a moment.' })
+    }
+    throw err
+  }
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
-    case 'login':    return login(req, res)
-    case 'logout':   return logout(req, res)
-    case 'whoami':   return whoami(req, res)
-    case 'accounts': return accounts(req, res)
-    default:         return res.status(404).json({ error: 'not_found' })
+    case 'login':          return login(req, res)
+    case 'logout':         return logout(req, res)
+    case 'whoami':         return whoami(req, res)
+    case 'accounts':       return accounts(req, res)
+    case 'invite-status':  return inviteStatus(req, res)
+    case 'accept-invite':  return acceptInvite(req, res)
+    default:                return res.status(404).json({ error: 'not_found' })
   }
 }

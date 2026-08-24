@@ -176,6 +176,22 @@ const ENDPOINT_REGISTRY = [
     notes: 'Idempotent cookie clear; no session required to call it, matching Phase 1 design (no server-side revocation list).',
   },
   {
+    route: 'GET /api/session/invite-status', file: 'api/session/[action].js', method: 'GET', action: 'invite-status',
+    authRequired: false, currentAllowedRoles: 'NONE',
+    scope: 'none (entry point)',
+    unauthorizedShape: null, wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System. Deliberately open/unauthenticated -- a non-consuming preview of an invite token (tokenStore.js peekInviteToken) so /accept-invite can render "You\'ve been invited" before the invitee submits anything. Never reveals more than the invitee, who already holds the link, would see anyway.',
+  },
+  {
+    route: 'POST /api/session/accept-invite', file: 'api/session/[action].js', method: 'POST', action: 'accept-invite',
+    authRequired: false, currentAllowedRoles: 'NONE',
+    scope: 'none (entry point, like login)',
+    unauthorizedShape: null, wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System. Deliberately open -- the invitation token itself is the credential (single-use, atomically consumed via GETDEL, tokenStore.js). Sets the invitee\'s own password (never seen by the inviting Owner/Admin), activates the account, and auto-logs in.',
+  },
+  {
     route: 'POST /api/google/publish', file: 'api/google/[action].js', method: 'POST', action: 'publish',
     authRequired: true, currentAllowedRoles: ['owner', 'marketing'],
     scope: 'reply for any location today; no location filtering exists yet',
@@ -368,6 +384,30 @@ const ENDPOINT_REGISTRY = [
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
     notes: 'Phase 8 Milestone 8.9. Second production caller of requireScopedAuth() in this file -- resolveLocationId reads body.locationId, same ordering as contacts-upsert (permission checked before location scope).',
+  },
+  {
+    route: 'POST /api/settings/invite-user', file: 'api/settings/[action].js', method: 'POST', action: 'invite-user',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin'],
+    scope: 'company-wide admin action -- creates a new (invited, not-yet-active) account',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 2. requireAuth(req,res,null) + roleHasPermission(USERS_MANAGE), same pattern as GET /api/settings/contacts -- only owner/admin hold USERS_MANAGE. Additionally enforces canAssignRole(): only an Owner may invite a new Owner account (Admin cannot self-elevate via inviting one).',
+  },
+  {
+    route: 'POST /api/settings/resend-invite', file: 'api/settings/[action].js', method: 'POST', action: 'resend-invite',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin'],
+    scope: 'company-wide admin action -- reissues a token for a not-yet-activated invite',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 2. Same USERS_MANAGE gate as invite-user.',
+  },
+  {
+    route: 'POST /api/settings/revoke-invite', file: 'api/settings/[action].js', method: 'POST', action: 'revoke-invite',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin'],
+    scope: 'company-wide admin action -- revokes a not-yet-activated invite',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Multi-Location Authentication & User Access System, Commit 2. Same USERS_MANAGE gate as invite-user. Idempotent -- revoking an already-consumed/already-revoked invite is a harmless no-op.',
   },
 ]
 

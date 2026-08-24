@@ -1,6 +1,17 @@
 import { createContext, useContext } from 'react'
+import { useLocation } from 'react-router-dom'
 import { useSession } from '../hooks/useSession.js'
 import Login from './Login.jsx'
+import AcceptInvite from './AcceptInvite.jsx'
+
+// Paths reachable WITHOUT a session, checked before any loading/
+// authenticated/unauthenticated branching below -- an invitee has no
+// account yet and must never see the sign-in form. useSession()'s whoami
+// check still fires in the background on these paths (harmless, ignored;
+// not worth threading a skip-flag through the hook for one wasted 401).
+const PUBLIC_PATHS = {
+  '/accept-invite': AcceptInvite,
+}
 
 // The authenticated account (userId/email/role/locationIds/displayName from
 // GET /api/session/whoami), available to any component below AuthGate --
@@ -22,6 +33,12 @@ export function useAccount() {
 // 'unauthenticated', which unmounts App and remounts the login screen here.
 export default function AuthGate({ children }) {
   const { status, account, login } = useSession()
+  const location = useLocation()
+
+  const PublicPage = PUBLIC_PATHS[location.pathname]
+  if (PublicPage) {
+    return <PublicPage />
+  }
 
   if (status === 'loading') {
     return (

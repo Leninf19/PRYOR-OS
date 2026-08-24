@@ -68,6 +68,8 @@ const TESTS = [
   'test_filter_persistence.js',
   'test_filter_persistence_wiring.js',
   'test_user_store.js',
+  'test_invitations.js',
+  'test_accept_invite_ui.js',
 ]
 
 const results = {}

@@ -23,6 +23,9 @@
 // GET  /api/settings/audit-log              -- Milestone 8.6
 // GET  /api/settings/email-status           -- Milestone 8.9
 // POST /api/settings/contacts-send-test-email -- Milestone 8.9
+// POST /api/settings/invite-user            -- Multi-Location Auth: Owner/Admin invites a new user (USERS_MANAGE)
+// POST /api/settings/resend-invite          -- issues a fresh token for a not-yet-activated invite
+// POST /api/settings/revoke-invite          -- revokes a not-yet-activated invite
 
 import { readFile } from 'fs/promises'
 import path from 'path'
@@ -36,6 +39,11 @@ import {
 import { appendAuditEntry, listAuditEntries, clientIp, AuditLogUnavailableError } from '../_lib/auditLog.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
+import { getAccountByEmail } from '../_lib/accountStore.js'
+import { getUserById, upsertUser, updateUser, deriveUserStatus, UserStoreUnavailableError } from '../_lib/userStore.js'
+import { createInviteToken, revokeInviteToken, TokenStoreUnavailableError } from '../_lib/tokenStore.js'
+import { buildInviteEmail, buildInviteEmailSubject } from '../_lib/accountEmailTemplate.js'
+import { generateUserId, isValidDisplayName, validateRoleAndLocations, canAssignRole, buildInviteUrl } from '../_lib/userManagement.js'
 
 function actorFields(account, req) {
   return { actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req) }
@@ -84,6 +92,23 @@ function isPositiveInteger(n) {
 
 function isPlainObject(v) {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+// Best-effort, cosmetic-only: resolves location ids to display names for
+// the invitation email's copy (never for authorization -- reuses the same
+// META_PATH/metaOverride seam the contacts-backfill action already has).
+// Returns [] on any failure or for '*' -- callers already handle an empty
+// list as "names unavailable, use a generic scoped phrase" (see
+// accountEmailTemplate.js's buildInviteEmail).
+async function resolveLocationNames(locationIds) {
+  if (locationIds === '*' || !Array.isArray(locationIds)) return []
+  try {
+    const meta = metaOverride ?? JSON.parse(await readFile(META_PATH, 'utf-8'))
+    const byId = new Map((meta.locations ?? []).map(l => [l.locationId, l.name]))
+    return locationIds.map(id => byId.get(id)).filter(Boolean)
+  } catch {
+    return []
+  }
 }
 
 // Fields a caller may patch. locationId/createdBy/createdAt/updatedBy/
@@ -571,6 +596,218 @@ async function sendTestEmailAction(req, res) {
   }
 }
 
+// POST /api/settings/invite-user  { name, email, role, locationIds }
+// Owner/Admin only (USERS_MANAGE). Only an Owner may invite a new Owner
+// (canAssignRole()) -- Admin cannot self-service its way to Owner via
+// inviting another Owner account. Always returns the raw invite link in the
+// response (Phase 16's "usable before Microsoft SMTP is repaired"
+// requirement) -- an email-send failure is reported as a non-fatal
+// `emailWarning`, never a hard failure, since the link itself is already
+// valid and copyable regardless of delivery.
+async function inviteUserAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+  if (!roleHasPermission(account.role, Permission.USERS_MANAGE)) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to manage users.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `settings:invite-user:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { name, email: rawEmail, role, locationIds } = req.body ?? {}
+  if (!isValidDisplayName(name)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'name is required (1-100 characters).' })
+  }
+  const email = typeof rawEmail === 'string' ? rawEmail.trim() : rawEmail
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'A valid email is required.' })
+  }
+  const roleCheck = validateRoleAndLocations(role, locationIds)
+  if (!roleCheck.valid) {
+    return res.status(400).json({ error: 'invalid_request', message: roleCheck.message })
+  }
+  if (!canAssignRole(account.role, role)) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only an Owner may invite a new Owner account.' })
+  }
+
+  const existing = await getAccountByEmail(email)
+  if (existing) {
+    return res.status(409).json({ error: 'account_exists', message: 'An account with this email already exists.' })
+  }
+
+  const userId = generateUserId()
+  const now = new Date().toISOString()
+  const trimmedName = name.trim()
+
+  try {
+    const { rawToken, tokenHash, expiresAt } = await createInviteToken({
+      userId, email: email.toLowerCase(), role, locationIds, invitedBy: account.userId,
+    })
+
+    await upsertUser({
+      userId, email, passwordHash: null, role, locationIds,
+      sessionVersion: 1, disabled: false, displayName: trimmedName,
+      createdAt: now, updatedAt: now, lastLoginAt: null,
+      invitedAt: now, invitedBy: account.userId, lastInviteSentAt: now,
+      inviteTokenHash: tokenHash, inviteExpiresAt: expiresAt, inviteRevokedAt: null,
+      passwordSetAt: null,
+    })
+
+    const inviteUrl = buildInviteUrl(req, rawToken)
+    let emailWarning = null
+    try {
+      const locationNames = await resolveLocationNames(locationIds)
+      const subject = buildInviteEmailSubject()
+      const { html, text } = buildInviteEmail({ name: trimmedName, role, locationIds, locationNames, inviteUrl, expiresAt })
+      await sendReviewEmail({ to: email, cc: [], replyTo: undefined, subject, html, text })
+    } catch (err) {
+      emailWarning = err instanceof EmailSenderUnavailableError
+        ? 'Email is not configured -- share the invitation link manually.'
+        : 'The invitation email could not be sent -- share the invitation link manually.'
+      console.error(`[settings/invite-user] invite email failed: ${sanitizeErrorMessage(err.message)}`)
+    }
+
+    await appendAuditEntry({
+      ...actorFields(account, req),
+      entity: 'user', entityId: userId,
+      action: 'invitation.created',
+      changes: [{ field: 'role', oldValue: null, newValue: role }, { field: 'locationIds', oldValue: null, newValue: locationIds }],
+      result: 'success',
+      message: `Invited ${email} as ${role}.`,
+    })
+
+    return res.status(200).json({ userId, email, role, locationIds, inviteUrl, expiresAt, emailWarning })
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError || err instanceof TokenStoreUnavailableError) {
+      console.error(`[settings/invite-user] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// POST /api/settings/resend-invite  { userId }
+// Issues a brand-new token (the old one, if any, is best-effort revoked
+// first) and updates the user record's invite metadata -- never touches
+// invitedAt (the original invite timestamp), only lastInviteSentAt.
+async function resendInviteAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+  if (!roleHasPermission(account.role, Permission.USERS_MANAGE)) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to manage users.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `settings:resend-invite:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { userId } = req.body ?? {}
+  if (typeof userId !== 'string' || !userId) {
+    return res.status(400).json({ error: 'invalid_request', message: 'userId is required.' })
+  }
+
+  try {
+    const target = await getUserById(userId)
+    if (!target) return res.status(404).json({ error: 'not_found' })
+    if (target.passwordSetAt) {
+      return res.status(409).json({ error: 'already_active', message: 'This account has already been activated -- use password reset instead.' })
+    }
+
+    if (target.inviteTokenHash) {
+      try { await revokeInviteToken(target.inviteTokenHash) } catch (err) { console.error(`[settings/resend-invite] failed to revoke prior token: ${err.message}`) }
+    }
+
+    const { rawToken, tokenHash, expiresAt } = await createInviteToken({
+      userId, email: target.email, role: target.role, locationIds: target.locationIds, invitedBy: account.userId,
+    })
+    const now = new Date().toISOString()
+    await updateUser(userId, {
+      inviteTokenHash: tokenHash, inviteExpiresAt: expiresAt, inviteRevokedAt: null, lastInviteSentAt: now,
+    })
+
+    const inviteUrl = buildInviteUrl(req, rawToken)
+    let emailWarning = null
+    try {
+      const locationNames = await resolveLocationNames(target.locationIds)
+      const subject = buildInviteEmailSubject()
+      const { html, text } = buildInviteEmail({ name: target.displayName, role: target.role, locationIds: target.locationIds, locationNames, inviteUrl, expiresAt })
+      await sendReviewEmail({ to: target.email, cc: [], replyTo: undefined, subject, html, text })
+    } catch (err) {
+      emailWarning = err instanceof EmailSenderUnavailableError
+        ? 'Email is not configured -- share the invitation link manually.'
+        : 'The invitation email could not be sent -- share the invitation link manually.'
+      console.error(`[settings/resend-invite] invite email failed: ${sanitizeErrorMessage(err.message)}`)
+    }
+
+    await appendAuditEntry({
+      ...actorFields(account, req), entity: 'user', entityId: userId,
+      action: 'invitation.resent', changes: null, result: 'success',
+      message: `Resent invitation to ${target.email}.`,
+    })
+
+    return res.status(200).json({ userId, inviteUrl, expiresAt, emailWarning })
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError || err instanceof TokenStoreUnavailableError) {
+      console.error(`[settings/resend-invite] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// POST /api/settings/revoke-invite  { userId }
+// Idempotent: revoking an already-revoked or already-consumed invite is a
+// harmless no-op (tokenStore.revokeInviteToken deletes a possibly-nonexistent
+// key without error). Rejects outright for an already-activated account --
+// that's disable-user's job, not this one's.
+async function revokeInviteAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+  if (!roleHasPermission(account.role, Permission.USERS_MANAGE)) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to manage users.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `settings:revoke-invite:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { userId } = req.body ?? {}
+  if (typeof userId !== 'string' || !userId) {
+    return res.status(400).json({ error: 'invalid_request', message: 'userId is required.' })
+  }
+
+  try {
+    const target = await getUserById(userId)
+    if (!target) return res.status(404).json({ error: 'not_found' })
+    if (target.passwordSetAt) {
+      return res.status(409).json({ error: 'already_active', message: 'This account has already been activated -- disable it instead.' })
+    }
+
+    if (target.inviteTokenHash) {
+      await revokeInviteToken(target.inviteTokenHash)
+    }
+    await updateUser(userId, { inviteRevokedAt: new Date().toISOString() })
+
+    await appendAuditEntry({
+      ...actorFields(account, req), entity: 'user', entityId: userId,
+      action: 'invitation.revoked', changes: null, result: 'success',
+      message: `Revoked invitation for ${target.email}.`,
+    })
+
+    return res.status(200).json({ userId, revoked: true })
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError || err instanceof TokenStoreUnavailableError) {
+      console.error(`[settings/revoke-invite] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
     case 'contacts':                       return listContacts(req, res)
@@ -581,6 +818,9 @@ export default async function handler(req, res) {
     case 'contacts-send-test-email':        return sendTestEmailAction(req, res)
     case 'audit-log':                       return auditLogAction(req, res)
     case 'email-status':                    return emailStatusAction(req, res)
+    case 'invite-user':                     return inviteUserAction(req, res)
+    case 'resend-invite':                   return resendInviteAction(req, res)
+    case 'revoke-invite':                   return revokeInviteAction(req, res)
     default:                                return res.status(404).json({ error: 'not_found' })
   }
 }

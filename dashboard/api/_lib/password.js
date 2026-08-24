@@ -19,3 +19,20 @@ export async function verifyPassword(plainPassword, hash) {
   if (!plainPassword || !hash) return false
   return bcrypt.compare(plainPassword, hash)
 }
+
+// A single, reasonable, clearly-displayable rule -- minimum length only, no
+// forced character-class complexity (a long passphrase is stronger and
+// friendlier than "P@ssw0rd1", and the invite/reset milestone's own
+// requirement is explicitly "without creating unnecessarily hostile
+// complexity"). Used by accept-invite and reset-password; never by login
+// (an existing password's own historical requirements aren't re-validated
+// at sign-in time).
+export const MIN_PASSWORD_LENGTH = 10
+
+export function validatePasswordStrength(password) {
+  if (typeof password !== 'string') return { valid: false, message: 'Password is required.' }
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    return { valid: false, message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters.` }
+  }
+  return { valid: true, message: null }
+}

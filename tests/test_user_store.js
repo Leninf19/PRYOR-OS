@@ -149,6 +149,9 @@ async function testDeriveUserStatus() {
   assert(deriveUserStatus({ disabled: true, passwordSetAt: '2026-01-01T00:00:00.000Z' }) === 'disabled', 'disabled always wins regardless of passwordSetAt')
   assert(deriveUserStatus({ disabled: false, passwordSetAt: null }) === 'invited', 'no passwordSetAt yet -> invited')
   assert(deriveUserStatus({ disabled: false, passwordSetAt: '2026-01-01T00:00:00.000Z' }) === 'active', 'disabled false + passwordSetAt -> active')
+  assert(deriveUserStatus({ disabled: false, passwordSetAt: null, inviteRevokedAt: '2026-01-01T00:00:00.000Z' }) === 'revoked', 'revoked invite (never activated) -> revoked')
+  assert(deriveUserStatus({ disabled: false, passwordSetAt: null, inviteExpiresAt: '2000-01-01T00:00:00.000Z' }) === 'expired', 'past inviteExpiresAt, never activated -> expired')
+  assert(deriveUserStatus({ disabled: false, passwordSetAt: '2026-01-01T00:00:00.000Z', inviteRevokedAt: '2026-01-01T00:00:00.000Z' }) === 'active', 'an activated account is active even if stale invite metadata lingers')
 }
 
 // --- accountStore.js: dual-read precedence ------------------------------
