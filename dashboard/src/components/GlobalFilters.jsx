@@ -101,7 +101,7 @@ function StarPills({ selected, onChange }) {
 }
 
 // ── Main component ──────────────────────────────────────────────────────────
-export default function GlobalFilters({ allReviews, filters, onChange }) {
+export default function GlobalFilters({ allReviews, filters, onChange, onReset }) {
   const [advOpen, setAdvOpen] = useState(false)
   const { resolved } = useTheme()
 
@@ -117,16 +117,27 @@ export default function GlobalFilters({ allReviews, filters, onChange }) {
     onChange({ ...filters, start, end })
   }
 
+  // Recovery Milestone (Global Filter Persistence): goes through the
+  // dedicated onReset (App.jsx's handleResetFilters -- strips URL filter
+  // params entirely and clears localStorage) rather than onChange with
+  // today's computed default dates, which would freeze them as explicit
+  // URL params instead of genuinely returning to "no params, fresh
+  // defaults apply". Falls back to the old onChange-based behavior if a
+  // caller doesn't provide onReset, so this stays a non-breaking addition.
   function reset() {
-    onChange({
-      brands:    [],
-      locations: [],
-      start:     filters._defaultStart,
-      end:       filters._defaultEnd,
-      stars:     [],
-      _defaultStart: filters._defaultStart,
-      _defaultEnd:   filters._defaultEnd,
-    })
+    if (onReset) {
+      onReset()
+    } else {
+      onChange({
+        brands:    [],
+        locations: [],
+        start:     filters._defaultStart,
+        end:       filters._defaultEnd,
+        stars:     [],
+        _defaultStart: filters._defaultStart,
+        _defaultEnd:   filters._defaultEnd,
+      })
+    }
     setAdvOpen(false)
   }
 

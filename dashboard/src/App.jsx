@@ -1,5 +1,5 @@
-import { useMemo, useEffect, useState, lazy, Suspense } from 'react'
-import { Routes, Route, Navigate, Outlet, useLocation, useOutletContext } from 'react-router-dom'
+import { useMemo, useEffect, useState, useRef, lazy, Suspense } from 'react'
+import { Routes, Route, Navigate, Outlet, useLocation, useOutletContext, useSearchParams } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import Layout               from './components/Layout.jsx'
 import GlobalFilters        from './components/GlobalFilters.jsx'
@@ -9,6 +9,10 @@ import { useReviewsData }    from './hooks/useReviewsData.js'
 import { useGlobalPrefetch } from './hooks/useIntelligence.js'
 import { useUnansweredCount } from './hooks/useReviewWorkspace.js'
 import { filterReviews, getDefaultDateRange } from './utils/dataUtils.js'
+import {
+  parseFiltersFromSearchParams, loadStoredFilters, saveStoredFilters, clearStoredFilters,
+  withFreshDefaults, buildSearchParamsFromFilters, stripFilterParams,
+} from './utils/filterPersistence.js'
 import { settingsSections } from './pages/settings/settingsSections.js'
 
 // Route-level code-splitting -- each page ships in its own chunk, fetched
@@ -65,9 +69,7 @@ const NO_FILTER_PATHS = [
 ]
 
 function buildDefaultFilters(reviews) {
-  const dr = getDefaultDateRange(reviews)
-  return { brands: [], locations: [], start: dr.start, end: dr.end, stars: [],
-           _defaultStart: dr.start, _defaultEnd: dr.end }
+  return withFreshDefaults(null, getDefaultDateRange(reviews))
 }
 
 function LoadingScreen() {
@@ -119,16 +121,94 @@ function ErrorScreen() {
   )
 }
 
+// Recovery Milestone (Global Filter Persistence): the URL is the reactive
+// source of truth once mounted -- both a user-driven filter change AND a
+// browser back/forward navigation land here the same way (searchParams
+// changing), and both are resolved through the exact same priority chain
+// (URL -> localStorage -> computed defaults), so there is only ever one
+// code path deciding what `filters` should be, never two that could
+// disagree. Writes flow OUT through setSearchParams (see handleFilterChange
+// below); this effect never itself calls setSearchParams except in the
+// "URL had no filter params at all" branch, where it reflects whatever it
+// resolved (localStorage or defaults) back into the CURRENT url so the
+// address bar is always an accurate, shareable snapshot of what's actually
+// showing -- including right after a plain <Link> navigation to a page
+// that never had filter params of its own.
+function useFilterPersistence(allReviews) {
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [filters, setFilters] = useState(null)
+  // Set for exactly one effect pass right after handleResetFilters strips
+  // the URL, so that pass resolves `filters` to fresh computed defaults
+  // WITHOUT also writing them back into the URL as explicit params -- the
+  // whole point of Reset is that the address bar visibly goes back to
+  // having no filter params at all, not "no params for an instant, then
+  // immediately refilled with today's computed dates." Every other "URL
+  // has no filter params" case (a genuinely bare bookmark/first visit)
+  // still gets its resolved state reflected back for shareability.
+  const justReset = useRef(false)
+
+  useEffect(() => {
+    if (!allReviews) return
+    const dr = getDefaultDateRange(allReviews)
+    const fromUrl = parseFiltersFromSearchParams(searchParams)
+    if (fromUrl) {
+      const resolved = withFreshDefaults(fromUrl, dr)
+      setFilters(resolved)
+      saveStoredFilters(fromUrl) // mirror to localStorage so a later bare visit reflects this
+      return
+    }
+    const stored = loadStoredFilters()
+    const resolved = withFreshDefaults(stored, dr)
+    setFilters(resolved)
+    if (justReset.current) {
+      justReset.current = false
+      return
+    }
+    // No filter params were in the URL -- reflect the resolved state (from
+    // localStorage, or fresh defaults) into it now, without adding a
+    // history entry, so the address bar is immediately accurate/shareable.
+    setSearchParams(buildSearchParamsFromFilters(resolved, searchParams), { replace: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- searchParams
+    // is intentionally read fresh each run, not a reactive dependency in
+    // the usual sense (see module docstring above) -- adding it here would
+    // make the "write resolved defaults back" branch above re-trigger this
+    // same effect an extra, harmless-but-pointless time; it's still
+    // correctly re-run on every REAL searchParams change because useSearchParams
+    // itself causes this component to re-render with a new searchParams value.
+  }, [allReviews, searchParams])
+
+  // A normal filter edit (date input, pill toggle, preset click) -- writes
+  // the change into the URL; the effect above picks up the resulting
+  // searchParams change and updates `filters` state as a consequence. Uses
+  // `replace` so tweaking filters doesn't spam browser history -- back/
+  // forward still works correctly at the granularity of actual page
+  // navigations, each of which carries its own filter snapshot in its URL.
+  function handleFilterChange(next) {
+    setSearchParams(buildSearchParamsFromFilters(next, searchParams), { replace: true })
+  }
+
+  // Reset Filters: strips the 5 filter keys from the URL entirely (rather
+  // than writing today's computed defaults back in as explicit params, which
+  // would freeze them and defeat the point of a "no params = fresh defaults"
+  // reset) and clears localStorage, so both persistence layers agree there is
+  // nothing saved and the very next resolution recomputes a genuinely fresh
+  // default from current data -- see justReset above for why that one
+  // resolution pass doesn't re-populate the URL it was just asked to clear.
+  function handleResetFilters() {
+    clearStoredFilters()
+    justReset.current = true
+    setSearchParams(stripFilterParams(searchParams), { replace: true })
+  }
+
+  return { filters, handleFilterChange, handleResetFilters }
+}
+
 function RootLayout() {
   useGlobalPrefetch()
   const account = useAccount()
   const { data: allReviews, isLoading, isError } = useReviewsData()
-  const [filters, setFilters] = useState(null)
+  const { filters, handleFilterChange, handleResetFilters } = useFilterPersistence(allReviews)
   const location = useLocation()
-
-  useEffect(() => {
-    if (allReviews && !filters) setFilters(buildDefaultFilters(allReviews))
-  }, [allReviews, filters])
 
   const filtered = useMemo(() => {
     if (!allReviews || !filters) return []
@@ -163,7 +243,7 @@ function RootLayout() {
     <Layout unansweredCount={unansweredCount}>
       {showFilterBar && (
         <div className="mb-6 space-y-3">
-          <GlobalFilters allReviews={allReviews} filters={filters} onChange={setFilters} />
+          <GlobalFilters allReviews={allReviews} filters={filters} onChange={handleFilterChange} onReset={handleResetFilters} />
           <div className="flex items-center gap-2.5">
             <span className="badge badge-neutral">
               <span className="w-1.5 h-1.5 rounded-full flex-shrink-0"

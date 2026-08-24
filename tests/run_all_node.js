@@ -65,6 +65,8 @@ const TESTS = [
   'test_google_oauth_quota_blocked.js',
   'test_data_utils.js',
   'test_sentiment_breakdown_ui.js',
+  'test_filter_persistence.js',
+  'test_filter_persistence_wiring.js',
 ]
 
 const results = {}
