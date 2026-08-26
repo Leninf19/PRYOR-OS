@@ -13,6 +13,7 @@ import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const LAYOUT_JSX = path.resolve(__dirname, '..', 'dashboard', 'src', 'components', 'Layout.jsx')
+const USE_NOTIFICATIONS_JS = path.resolve(__dirname, '..', 'dashboard', 'src', 'hooks', 'useNotifications.js')
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -89,8 +90,25 @@ function testMobilePanelUsesAResponsiveSheetLayoutNotAFixedDesktopWidth() {
   assert(/max-h-\[70vh\]/.test(fnMatch[0]), 'the panel must cap its own height on small viewports rather than overflowing')
 }
 
+// Regression guard for a real production bug caught during rollout: the
+// hook originally built `/api/notifications?action=${action}` (a query
+// string), but Vercel's [action].js dynamic-route convention maps the URL
+// PATH SEGMENT to req.query.action (e.g. /api/actions/list, /api/settings/
+// contacts-upsert -- see actionWorkspaceService.js/contactsService.js) --
+// a query string never matches that route pattern and 404s before the
+// function is even invoked. Every Node-level test for this endpoint calls
+// the handler directly with a manually-constructed req.query.action, so
+// none of them could have caught this; only a source-scan of the actual
+// fetch URL construction (or a live deployment) can.
+function testCallsTheRealApiUsingThePathSegmentConventionNotAQueryString() {
+  const hookSrc = readFileSync(USE_NOTIFICATIONS_JS, 'utf-8')
+  assert(hookSrc.includes('`/api/notifications/${action}`'), 'useNotifications.js must build the URL as /api/notifications/<action> (path segment), matching every other [action].js endpoint\'s real routing convention')
+  assert(!/\/api\/notifications\?action=/.test(hookSrc), 'useNotifications.js must never use a ?action= query string -- that URL shape never matches Vercel\'s dynamic [action].js route and 404s in production')
+}
+
 function main() {
   run('NotificationBell is self-contained via useNotifications()', testNotificationBellIsSelfContainedViaTheHook)
+  run('useNotifications.js calls the real API using the path-segment convention, not a query string', testCallsTheRealApiUsingThePathSegmentConventionNotAQueryString)
   run('the bell is mounted in both the desktop SnapshotBar and the mobile topbar', testBellIsMountedInBothDesktopSnapshotBarAndMobileTopbar)
   run('the badge reflects unreadCount, not a raw item count', testBadgeShowsUnreadCountNotRawItemCount)
   run('the empty state uses the required copy', testEmptyStateUsesTheRequiredCopy)

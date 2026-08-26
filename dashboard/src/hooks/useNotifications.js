@@ -17,7 +17,13 @@ import { SESSION_EXPIRED_EVENT } from '../lib/dataClient.js'
 const QUERY_KEY = ['notifications']
 
 async function callNotificationsApi(action, { method = 'GET', body } = {}) {
-  const url = `/api/notifications?action=${action}`
+  // Vercel's [action].js dynamic-route convention maps the URL PATH
+  // SEGMENT to req.query.action (e.g. /api/actions/list, /api/settings/
+  // contacts-upsert) -- a query string (`?action=`) never matches this
+  // route pattern at all and 404s before the function is even invoked.
+  // Every other consolidated endpoint in this app already calls its
+  // actions this way (see actionWorkspaceService.js/contactsService.js).
+  const url = `/api/notifications/${action}`
   const res = await fetch(url, {
     method,
     headers: body ? { 'content-type': 'application/json' } : undefined,
