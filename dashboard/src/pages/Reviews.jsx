@@ -1493,9 +1493,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
   const totalPages = Math.max(1, Math.ceil(processed.length / PAGE_SIZE))
   const safePage   = Math.min(page, totalPages - 1)
   // Memoized (not a plain .slice()) so its identity is stable across renders
-  // that don't actually change the page/list -- the prewarm effect below
-  // depends on it, and an unstable reference here made it restart (and fire
-  // an extra overlapping /api/rewrite call) on every unrelated re-render.
+  // that don't actually change the page/list.
   const visible    = useMemo(
     () => processed.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE),
     [processed, safePage]
@@ -1534,74 +1532,18 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
     return out
   }, [drafts])
 
-  // Recovery Milestone 5, Problem 2/13: bounded background prewarm -- once a
-  // review is selected, generate drafts for the next PREWARM_COUNT
-  // actionable reviews that don't have one anywhere yet, so opening them
-  // feels instant instead of triggering ResponseWorkspace's own on-open
-  // generation each time.
-  //
-  // This is a single persistent worker loop (mount-once effect, empty dep
-  // array) rather than an effect keyed on [selectedKey, visible]. An
-  // earlier version restarted on every dependency change; because several
-  // queries (meta/reviews/drafts/actions) resolve in quick succession on
-  // load, that caused several back-to-back restarts within milliseconds of
-  // each other -- each one synchronously claimed the next unclaimed
-  // candidate (so no review was ever double-generated) but its fetch was
-  // dispatched before the PREVIOUS restart's fetch had resolved, so several
-  // /api/rewrite calls ran concurrently instead of one at a time. Reading
-  // live state through a ref inside one long-lived loop guarantees true
-  // concurrency=1 for the component's whole lifetime, independent of how
-  // often the surrounding component re-renders. A prewarm failure (e.g.
-  // Anthropic unavailable) is silent here; that review just falls back to
-  // ResponseWorkspace's own on-open generation (with its own visible error
-  // state) whenever it's actually opened.
-  const PREWARM_COUNT = 5
-  const PREWARM_IDLE_POLL_MS = 1000
-  const prewarmedRef = useRef(new Set())
-  const prewarmLiveRef = useRef(null)
-  prewarmLiveRef.current = { selectedKey, visible, ws, draftByReviewId, bridges: bridgesData }
-  useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      while (!cancelled) {
-        const { selectedKey: sk, visible: vis, ws: wsNow, draftByReviewId: dbid, bridges: br } = prewarmLiveRef.current
-        const idx = vis.findIndex((r, i) => `${r.review_id || r.review_url || i}` === sk)
-        const start = idx === -1 ? 0 : idx + 1
-        const next = vis.slice(start, start + PREWARM_COUNT).find(r => {
-          const id = reviewId(r)
-          if (prewarmedRef.current.has(id)) return false
-          // Recovery Milestone 6B, Part 9: a review answered via Google's
-          // owner_response, the durable publish bridge, or a same-browser
-          // 'published' workspace record must never consume Anthropic
-          // credits preparing another response -- checked here in addition
-          // to (not instead of) the needsResponseOnly filter upstream,
-          // since prewarm also runs over `visible` when that filter is off.
-          if (isAnsweredReplyState(r, wsNow[id], br[id])) return false
-          if (wsNow[id]?.editedDraft) return false
-          if (dbid[r.review_id || r.review_url || '']?.draft) return false
-          return true
-        })
-        if (!next) {
-          await new Promise(res => setTimeout(res, PREWARM_IDLE_POLL_MS))
-          continue
-        }
-        const id = reviewId(next)
-        prewarmedRef.current.add(id)
-        try {
-          const generated = await callRewrite({
-            tone: 'friendly', reviewText: next.review_text || '', currentDraft: '',
-            reviewerName: next.reviewer_name || 'Guest', location: next.location_name || 'our restaurant',
-            stars: next.star_rating ?? 1,
-            localReviewId: id,
-          })
-          if (!cancelled) setRecord(id, { editedDraft: generated, status: 'draft_ready' })
-        } catch {
-          // best-effort -- see comment above
-        }
-      }
-    })()
-    return () => { cancelled = true }
-  }, [])
+  // UX fix (post-Milestone-5): the background prewarm worker that used to
+  // live here generated AI drafts for up to the next 5 actionable reviews
+  // the instant ANY review was selected -- including reviews the manager
+  // never clicked or opened, which silently moved them from Needs Reply to
+  // Draft just by virtue of being nearby in the list/queue. That violated
+  // the required lifecycle (a review must stay Needs Reply until
+  // intentionally opened) and burned Anthropic credits on reviews no one
+  // asked about. Removed outright, not replaced with another background/
+  // batch mechanism -- ResponseWorkspace's own on-open effect (see its
+  // `autoGenerateAttempted` guard above) is the only remaining place that
+  // triggers automatic generation, and it already runs exactly once per
+  // review, only when that specific review is actually opened.
 
   const selected = useMemo(
     () => visible.find((r, i) => `${r.review_id || r.review_url || i}` === selectedKey) ?? null,

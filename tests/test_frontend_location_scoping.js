@@ -127,8 +127,14 @@ function testReviewsPageSendsLocalReviewIdOnEveryRewriteCall() {
   // matching close) rather than a flat whole-file count, so this can't be
   // fooled by an unrelated `id:`/`localReviewId:` occurrence elsewhere in
   // this large file matching a loose regex.
+  // REVIEWED UPDATE: was 3 (auto-generate-on-open, manual Regenerate, and
+  // the background prewarm worker). The prewarm call site was deliberately
+  // removed -- it generated drafts for reviews the user never opened,
+  // silently moving them from Needs Reply to Draft on page load. The
+  // remaining 2 call sites are exactly the two lifecycle-approved triggers:
+  // open an undrafted review, or click Regenerate.
   const calls = [...s.matchAll(/callRewrite\(\{([\s\S]*?)\n\s*\}\)/g)]
-  assert(calls.length === 3, `expected exactly 3 callRewrite() call sites, found ${calls.length} -- update this test if the page's rewrite call sites changed`)
+  assert(calls.length === 2, `expected exactly 2 callRewrite() call sites, found ${calls.length} -- update this test if the page's rewrite call sites changed`)
   calls.forEach((call, i) => {
     assert(/localReviewId:\s*(rid|id)\b/.test(call[1]), `callRewrite() call #${i + 1} is missing localReviewId -- a location-scoped account would be denied (404) using this call site`)
   })
