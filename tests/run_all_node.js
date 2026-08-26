@@ -79,6 +79,7 @@ const TESTS = [
   'test_users_access_ui.js',
   'test_security_hardening.js',
   'test_reviews_no_background_draft_generation.js',
+  'test_reviews_auto_advance.js',
 ]
 
 const results = {}

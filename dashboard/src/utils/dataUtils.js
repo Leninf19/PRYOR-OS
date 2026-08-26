@@ -347,6 +347,28 @@ export function reviewId(r) {
   return r.review_id || r.review_url || `${r.review_date}-${r.reviewer_name}`
 }
 
+// Reviews.jsx auto-advance fix: given the CURRENT actionable queue (already
+// filtered/sorted -- Needs Reply, Draft, location/star/date/search, exactly
+// as the caller is showing it) and the currently-selected review's stable
+// reviewId(), returns the stable reviewId() of whichever review should be
+// selected next -- the item immediately after the current one, falling
+// back to the item immediately before it if the current one was last, or
+// null if the queue only ever had this one item (caller shows "all caught
+// up"). Pure and array-position-agnostic: the caller is expected to call
+// this BEFORE mutating/removing the current review from its own state, so
+// the returned id can be handed to a plain identity-based setSelectedKey()
+// afterward -- it is never re-derived from a numeric index against an
+// array that may have already changed shape by the time selection actually
+// happens. Extracted here (rather than left inline in Reviews.jsx) so the
+// exact ordering guarantees (A->B->C->D->caught up, publishing from the
+// middle, an already-filtered queue) are unit-testable without a DOM.
+export function computeNextReviewId(visibleQueue, selectedKey) {
+  const idx = visibleQueue.findIndex(r => reviewId(r) === selectedKey)
+  if (idx === -1) return null
+  const next = visibleQueue[idx + 1] ?? visibleQueue[idx - 1] ?? null
+  return next ? reviewId(next) : null
+}
+
 export function getCategoryChanges(filtered, prevFiltered, minCount = 2) {
   return {
     complaints: _diffTags(_tallyTags(filtered, 'complaint_tags'), _tallyTags(prevFiltered, 'complaint_tags'), minCount),

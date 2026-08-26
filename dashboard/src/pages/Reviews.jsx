@@ -7,7 +7,7 @@ import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Button from '../components/ui/Button.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
-import { sentimentBucket, reviewId } from '../utils/dataUtils.js'
+import { sentimentBucket, reviewId, computeNextReviewId } from '../utils/dataUtils.js'
 import { exportCSV } from '../utils/exportUtils.js'
 import { useResponseDrafts } from '../hooks/useIntelligence.js'
 import { useReviewWorkspace } from '../hooks/useReviewWorkspace.js'
@@ -510,7 +510,7 @@ function SeriousReviewWarning({ acknowledged, onAcknowledge }) {
   )
 }
 
-function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
+function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess, nextReviewId }) {
   const showToast       = useToast()
   const rid              = reviewId(r)
   const initialStatus    = draft ? 'draft_ready' : 'needs_review'
@@ -698,7 +698,11 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
             ? "Published to Google, but local confirmation couldn't be saved. It will reconcile automatically."
             : 'Response published to Google'
         )
-        onPublishSuccess?.() // auto-advance to the next actionable review
+        // Auto-advance to the next actionable review -- `nextReviewId` was
+        // captured by the parent BEFORE this review was marked complete
+        // (see Reviews.jsx's own nextReviewId memo for why), so this is a
+        // direct selection by stable identity, never a re-derived index.
+        onPublishSuccess?.(nextReviewId)
         // No setPublishState('idle') here: this instance either unmounts
         // (queue empties) or a fresh instance mounts for the next review
         // (keyed by review id -- see ReviewDetailContent's callers), each
@@ -739,12 +743,12 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess }) {
 
   function handleMarkPublished() {
     onUpdate(rid, { status: 'published', publishedAt: new Date().toISOString(), failReason: null }, 'Marked published')
-    onPublishSuccess?.()
+    onPublishSuccess?.(nextReviewId)
   }
 
   function handleTakenCareOf() {
     onUpdate(rid, { status: 'taken_care_of', publishedAt: new Date().toISOString(), failReason: null }, 'Marked done')
-    onPublishSuccess?.()
+    onPublishSuccess?.(nextReviewId)
   }
 
   function handleUndo() {
@@ -1143,7 +1147,7 @@ function ResponseHistory({ history }) {
 // ─── Detail content (shared by the desktop persistent panel and the mobile
 // overlay panel -- inbox layout shell, M5.1) ───────────────────────────────
 
-function ReviewDetailContent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpdate, onPublishSuccess }) {
+function ReviewDetailContent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpdate, onPublishSuccess, nextReviewId }) {
   const link = buildReviewLink(r)
   const sentiment = sentimentBucket(r)
   const sentMeta = SENTIMENT_META[sentiment]
@@ -1236,7 +1240,7 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpd
       ) : (
         /* Not yet replied -- full response workspace (draft/edit/rewrite/publish) */
         <div className="pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>
-          <ResponseWorkspace r={r} draft={draft} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
+          <ResponseWorkspace r={r} draft={draft} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} nextReviewId={nextReviewId} />
         </div>
       )}
 
@@ -1290,7 +1294,7 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpd
 
 // ─── Desktop persistent detail panel (lg+, inbox layout shell) ────────────────
 
-function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpdate, onPublishSuccess }) {
+function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpdate, onPublishSuccess, nextReviewId }) {
   if (!r) {
     return (
       <Card className="p-8 h-full flex items-center justify-center text-center">
@@ -1311,7 +1315,7 @@ function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, bridgeEntry, on
           etc.) always starts fresh for a newly-selected review rather than
           depending on React's own reconciliation heuristics happening to
           treat this as a remount every time. */}
-      <ReviewDetailContent key={reviewId(r)} r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} bridgeEntry={bridgeEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
+      <ReviewDetailContent key={reviewId(r)} r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} bridgeEntry={bridgeEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} nextReviewId={nextReviewId} />
     </Card>
   )
 }
@@ -1320,7 +1324,7 @@ function ReviewDetailPersistent({ r, draft, allReviews, wsEntry, bridgeEntry, on
 // prior ReviewExplorer.jsx, a fixed 460px panel doesn't fit a phone/tablet
 // viewport the way it does on desktop) ─────────────────────────────────────
 
-function ReviewDetailOverlay({ r, draft, allReviews, onClose, wsEntry, bridgeEntry, onUpdate, onPublishSuccess }) {
+function ReviewDetailOverlay({ r, draft, allReviews, onClose, wsEntry, bridgeEntry, onUpdate, onPublishSuccess, nextReviewId }) {
   return (
     <>
       <motion.div
@@ -1351,7 +1355,7 @@ function ReviewDetailOverlay({ r, draft, allReviews, onClose, wsEntry, bridgeEnt
           </button>
         </div>
         <div className="flex-1 p-5">
-          <ReviewDetailContent key={reviewId(r)} r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} bridgeEntry={bridgeEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} />
+          <ReviewDetailContent key={reviewId(r)} r={r} draft={draft} allReviews={allReviews} wsEntry={wsEntry} bridgeEntry={bridgeEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} nextReviewId={nextReviewId} />
         </div>
       </motion.aside>
     </>
@@ -1499,21 +1503,53 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
     [processed, safePage]
   )
 
-  // Recovery Milestone 4, Phase 9: after a successful publish, the just-
-  // handled review will disappear from `visible` on the next render (its
-  // reply state no longer matches the actionable filter) -- this selects
-  // whichever review will take its place in the queue, using the CURRENT
-  // (pre-removal) ordering so the manager lands on the next real item
-  // rather than momentarily on nothing. No page reload, no refetch --
-  // entirely local selection state, exactly like clicking a row.
-  const advanceToNext = useCallback(() => {
-    const idx = visible.findIndex((r, i) => `${r.review_id || r.review_url || i}` === selectedKey)
-    if (idx === -1) { setSelectedKey(null); return }
-    const next = visible[idx + 1] ?? visible[idx - 1] ?? null
-    if (!next) { setSelectedKey(null); return }
-    const nextIdx = visible[idx + 1] ? idx + 1 : idx - 1
-    setSelectedKey(`${next.review_id || next.review_url || nextIdx}`)
-  }, [visible, selectedKey])
+  // Recovery Milestone 4, Phase 9 / bugfix (auto-advance skip): after a
+  // successful publish, the just-handled review will disappear from
+  // `visible` on the next render (its reply state no longer matches the
+  // actionable filter) -- this determines whichever review will take its
+  // place in the queue, using the CURRENT (pre-removal) ordering, so the
+  // manager lands on the next real item rather than momentarily on nothing.
+  //
+  // ROOT CAUSE of the "publish A -> opens C instead of B" bug this replaces:
+  // the old version identified both the current AND the next review by
+  // `${r.review_id || r.review_url || i}` -- for any review lacking BOTH a
+  // real review_id and review_url (the location+reviewer fuzzy-match
+  // fallback path -- a real, non-trivial share of the actionable backlog),
+  // that identity fell back to `i`, the review's POSITION in `visible` at
+  // the moment it was computed. `selectedKey` was then stored as that
+  // positional string (e.g. "1" for B). Once A was removed from `visible`
+  // on the next render (its status flipped to 'published', so it no longer
+  // passes the actionable filter), every remaining review's position shifted
+  // down by one -- B moved from index 1 to index 0, and whatever review
+  // used to be at index 1 (C) was now the one matching the STALE stored key
+  // "1". The bug was never about *when* the next review was computed (it
+  // already correctly ran against the pre-removal array, since the
+  // workspace mutation's onMutate -- see useReviewWorkspace.js -- awaits
+  // cancelQueries() first, deferring the actual cache write to a later
+  // microtask) -- it was that the selection was being remembered by a
+  // POSITION that a mutating array does not keep stable, not by a genuine
+  // identity.
+  //
+  // Fix: `nextReviewId` below is computed with the exact same canonical
+  // reviewId(r) this file already uses everywhere else (ws/bridgesData
+  // lookups, ReviewDetailContent's mount key) -- a content-derived identity
+  // (review_id, review_url, or a review_date+reviewer_name fallback) that
+  // never depends on array position, so it keeps pointing at the SAME
+  // review no matter how many places ahead of it get removed first. It is
+  // computed eagerly here (memoized on the current, still-unmutated
+  // `visible`/`selectedKey`) -- i.e. genuinely BEFORE the current review is
+  // marked complete/removed -- and handed to ResponseWorkspace as a plain
+  // prop, which passes it straight back on success without recomputing
+  // anything itself. No index, no re-derivation after the mutating array
+  // has already changed shape.
+  const nextReviewId = useMemo(
+    () => computeNextReviewId(visible, selectedKey),
+    [visible, selectedKey]
+  )
+
+  const advanceToNext = useCallback((targetReviewId) => {
+    setSelectedKey(targetReviewId ?? null)
+  }, [])
 
   function toggleSort(key) {
     if (needsResponseOnly) return // sorted by priority while this quick filter is active
@@ -1546,7 +1582,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
   // review, only when that specific review is actually opened.
 
   const selected = useMemo(
-    () => visible.find((r, i) => `${r.review_id || r.review_url || i}` === selectedKey) ?? null,
+    () => visible.find(r => reviewId(r) === selectedKey) ?? null,
     [visible, selectedKey]
   )
   const selectedDraft = selected ? draftByReviewId[selected.review_id || selected.review_url || ''] : null
@@ -1654,9 +1690,8 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
                   <EmptyState icon="🔍" title="No reviews match your filters"
                               body="Try adjusting your keyword, sentiment, star filter, or date range." />
                 )
-              ) : visible.map((r, i) => {
-                const rid = r.review_id || r.review_url || ''
-                const key = `${rid || i}`
+              ) : visible.map(r => {
+                const key = reviewId(r)
                 return (
                   <ReviewRow
                     key={key}
@@ -1731,6 +1766,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
               bridgeEntry={selectedBridgeEntry}
               onUpdate={setRecord}
               onPublishSuccess={advanceToNext}
+              nextReviewId={nextReviewId}
             />
           </div>
         )}
@@ -1750,6 +1786,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
               bridgeEntry={selectedBridgeEntry}
               onUpdate={setRecord}
               onPublishSuccess={advanceToNext}
+              nextReviewId={nextReviewId}
             />
           )}
         </AnimatePresence>
