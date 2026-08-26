@@ -106,8 +106,36 @@ function testCallsTheRealApiUsingThePathSegmentConventionNotAQueryString() {
   assert(!/\/api\/notifications\?action=/.test(hookSrc), 'useNotifications.js must never use a ?action= query string -- that URL shape never matches Vercel\'s dynamic [action].js route and 404s in production')
 }
 
+// Regression guard for a real production bug: "the bell is visible in
+// production, but clicking it shows nothing." Root cause (confirmed via
+// Playwright against the exact production bundle): the desktop SnapshotBar
+// row had `overflow-x-auto` with no explicit overflow-y, and per the CSS
+// overflow spec, setting overflow-x to any non-"visible" value forces the
+// computed overflow-y to "auto" too (an explicit `overflow-y-visible`
+// override does NOT undo this -- the spec keys off the value "visible"
+// itself, not how it got there). SnapshotBar's box is only ~44px tall, so
+// its computed overflow:auto silently clipped the notification panel (an
+// absolutely-positioned child extending ~170px below) down to a ~1px
+// sliver -- invisible, but still technically "visible" per naive CSS
+// visibility checks, which is why it shipped unnoticed. Fix: only the pill
+// row itself scrolls horizontally now; NotificationBell (and its panel) sit
+// outside that scrolling container entirely.
+function testSnapshotBarDoesNotClipTheBellPanelViaOverflowXAuto() {
+  const barMatch = SRC.match(/function SnapshotBar\(\) \{([\s\S]*?)\n\}/)
+  assert(barMatch, 'could not find SnapshotBar')
+  const body = barMatch[1]
+  const outerDivMatch = body.match(/return \(\s*\n\s*<div className="([^"]*)"/)
+  assert(outerDivMatch, 'could not find SnapshotBar\'s outer returned div')
+  assert(!/overflow-x-auto/.test(outerDivMatch[1]), 'SnapshotBar\'s OUTER container (an ancestor of <NotificationBell />) must never have overflow-x-auto -- it forces overflow-y to compute as auto too, clipping the bell\'s dropdown panel to a ~1px sliver')
+  assert(/overflow-x-auto/.test(body), 'the pill row must still scroll horizontally when it overflows -- just scoped to its own inner div, not the ancestor shared with NotificationBell')
+  const bellIndex = body.indexOf('<NotificationBell />')
+  const innerScrollIndex = body.search(/overflow-x-auto/)
+  assert(bellIndex > -1 && innerScrollIndex > -1 && bellIndex > innerScrollIndex + 20, 'NotificationBell must be rendered as a sibling AFTER the inner overflow-x-auto pill wrapper closes, not inside it')
+}
+
 function main() {
   run('NotificationBell is self-contained via useNotifications()', testNotificationBellIsSelfContainedViaTheHook)
+  run('SnapshotBar does not clip the bell panel via overflow-x-auto on a shared ancestor', testSnapshotBarDoesNotClipTheBellPanelViaOverflowXAuto)
   run('useNotifications.js calls the real API using the path-segment convention, not a query string', testCallsTheRealApiUsingThePathSegmentConventionNotAQueryString)
   run('the bell is mounted in both the desktop SnapshotBar and the mobile topbar', testBellIsMountedInBothDesktopSnapshotBarAndMobileTopbar)
   run('the badge reflects unreadCount, not a raw item count', testBadgeShowsUnreadCountNotRawItemCount)

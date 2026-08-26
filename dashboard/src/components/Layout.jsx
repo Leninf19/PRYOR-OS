@@ -124,23 +124,35 @@ function SnapshotBar() {
   ].filter(Boolean)
 
   return (
-    <div className="no-print hidden lg:flex items-center gap-4 px-8 py-2 flex-shrink-0 overflow-x-auto"
+    <div className="no-print hidden lg:flex items-center gap-4 px-8 py-2 flex-shrink-0"
          style={{ background: 'var(--color-surface)', borderBottom: '1px solid var(--color-border)' }}>
-      {pills.map((p, i) => (
-        <div key={i} className="flex items-center gap-1.5 flex-shrink-0">
-          {p.dot && (
-            <span className="w-1.5 h-1.5 rounded-full flex-shrink-0"
-                  style={{ background: p.color }} />
-          )}
-          <span className="text-[10px] font-medium"
-                style={{ color: p.color ?? (p.dimmed ? 'var(--color-text-3)' : 'var(--color-text-2)') }}>
-            {p.label}
-          </span>
-          {i < pills.length - 1 && (
-            <span className="ml-2 text-[10px]" style={{ color: 'var(--color-border)' }}>·</span>
-          )}
-        </div>
-      ))}
+      {/* Only the pill row itself scrolls horizontally when it overflows --
+          NotificationBell's dropdown panel (an absolutely-positioned child
+          extending well below this bar) must NOT live inside an
+          overflow-x-auto box: per the CSS overflow spec, setting overflow-x
+          to any non-"visible" value forces the computed overflow-y to "auto"
+          too (a plain overflow-y-visible override does not undo this -- the
+          spec keys off the value "visible" itself, not how it got there), so
+          the whole bar would silently clip the panel to a ~1px sliver. Fixed
+          in production ("bell visible, but clicking it shows nothing"): move
+          the scrolling to a nested div scoped to just the pills. */}
+      <div className="flex items-center gap-4 overflow-x-auto min-w-0">
+        {pills.map((p, i) => (
+          <div key={i} className="flex items-center gap-1.5 flex-shrink-0">
+            {p.dot && (
+              <span className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+                    style={{ background: p.color }} />
+            )}
+            <span className="text-[10px] font-medium"
+                  style={{ color: p.color ?? (p.dimmed ? 'var(--color-text-3)' : 'var(--color-text-2)') }}>
+              {p.label}
+            </span>
+            {i < pills.length - 1 && (
+              <span className="ml-2 text-[10px]" style={{ color: 'var(--color-border)' }}>·</span>
+            )}
+          </div>
+        ))}
+      </div>
 
       {/* Connection status -- persistent, always shown (unlike the alert/
           backlog pills above, which only appear when non-zero) */}
