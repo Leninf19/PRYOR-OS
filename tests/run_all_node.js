@@ -67,6 +67,7 @@ const TESTS = [
   'test_sentiment_breakdown_ui.js',
   'test_filter_persistence.js',
   'test_filter_persistence_wiring.js',
+  'test_filter_expiration.js',
   'test_user_store.js',
   'test_invitations.js',
   'test_accept_invite_ui.js',

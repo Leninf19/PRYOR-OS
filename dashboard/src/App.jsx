@@ -13,6 +13,7 @@ import { isLocationScoped } from './hooks/useIntelligence.js'
 import {
   parseFiltersFromSearchParams, loadStoredFilters, saveStoredFilters, clearStoredFilters,
   withFreshDefaults, buildSearchParamsFromFilters, stripFilterParams, restrictLocationsToAllowed,
+  resolveDateRangeWithExpiration,
 } from './utils/filterPersistence.js'
 import { settingsSections } from './pages/settings/settingsSections.js'
 
@@ -166,23 +167,66 @@ function useFilterPersistence(allReviews, account) {
   // still gets its resolved state reflected back for shareability.
   const justReset = useRef(false)
 
+  // Global Filter Expiration / Rolling Date Default: a custom date range
+  // only lives for DATE_RANGE_EXPIRY_MS past when it was last deliberately
+  // accepted (see resolveDateRangeWithExpiration's own header for the full
+  // acceptance/reflection/expiry rules) -- locations/brands/stars are
+  // untouched by any of this and keep persisting exactly as before.
+  // `expiryTick` exists solely so the dashboard can self-correct while a
+  // tab stays open across the hour mark, without polling: a single
+  // setTimeout scheduled to the known expiration (see the effect below)
+  // bumps this, which re-runs the resolution effect with a fresh
+  // Date.now() -- the persisted `dateExpiresAt` remains the actual source
+  // of truth either way, so this is a convenience, not a requirement (every
+  // refresh/navigation/filter-state resolution already re-checks it).
+  const [expiryTick, setExpiryTick] = useState(0)
+
   useEffect(() => {
     if (!allReviews) return
     const dr = getDefaultDateRange(allReviews)
+    const now = Date.now()
     const fromUrl = parseFiltersFromSearchParams(searchParams)
+    const stored = loadStoredFilters()
+
     if (fromUrl) {
-      const resolved = restrictLocationsToAllowed(withFreshDefaults(fromUrl, dr), allowedLocationNames)
-      setFilters(resolved)
-      saveStoredFilters(fromUrl) // mirror to localStorage so a later bare visit reflects this
+      const dateResult = resolveDateRangeWithExpiration({
+        urlPresent: true, urlStart: fromUrl.start, urlEnd: fromUrl.end, stored, now, defaultDateRange: dr,
+      })
+      const merged = { ...fromUrl, start: dateResult.start, end: dateResult.end }
+      const resolved = restrictLocationsToAllowed(withFreshDefaults(merged, dr), allowedLocationNames)
+      setFilters({ ...resolved, _dateExpiresAt: dateResult.dateExpiresAt })
+      // Persists the AUTHORIZATION-NARROWED `resolved.locations`, never
+      // `merged.locations` -- a URL a scoped account was handed (or typed)
+      // can carry another restaurant's name, and that must never survive
+      // into localStorage/a later bare-visit resolution even inertly.
+      // mirror to localStorage so a later bare visit reflects this
+      saveStoredFilters({ start: resolved.start, end: resolved.end, locations: resolved.locations, brands: resolved.brands, stars: resolved.stars, dateExpiresAt: dateResult.dateExpiresAt })
+      if (dateResult.expired) {
+        // The address bar still carries the now-lapsed start/end -- rewrite
+        // it to the just-recomputed rolling default rather than letting a
+        // stale query string keep resolving to an old frozen range forever.
+        setSearchParams(buildSearchParamsFromFilters(resolved, searchParams), { replace: true })
+      }
       return
     }
-    const stored = loadStoredFilters()
-    const resolved = restrictLocationsToAllowed(withFreshDefaults(stored, dr), allowedLocationNames)
-    setFilters(resolved)
+
+    const dateResult = resolveDateRangeWithExpiration({
+      urlPresent: false, urlStart: null, urlEnd: null, stored, now, defaultDateRange: dr,
+    })
+    const merged = { ...stored, start: dateResult.start, end: dateResult.end }
+    const resolved = restrictLocationsToAllowed(withFreshDefaults(merged, dr), allowedLocationNames)
+    setFilters({ ...resolved, _dateExpiresAt: dateResult.dateExpiresAt })
     if (justReset.current) {
+      // Reset just cleared localStorage and stripped the URL -- this pass
+      // must leave both genuinely empty (not immediately repopulate them
+      // with today's freshly-computed defaults), matching handleResetFilters'
+      // own contract below.
       justReset.current = false
       return
     }
+    // See the fromUrl branch above for why this persists resolved.locations
+    // (authorization-narrowed), never merged.locations (raw storage/URL).
+    saveStoredFilters({ start: resolved.start, end: resolved.end, locations: resolved.locations, brands: resolved.brands, stars: resolved.stars, dateExpiresAt: dateResult.dateExpiresAt })
     // No filter params were in the URL -- reflect the resolved state (from
     // localStorage, or fresh defaults) into it now, without adding a
     // history entry, so the address bar is immediately accurate/shareable.
@@ -194,7 +238,23 @@ function useFilterPersistence(allReviews, account) {
     // same effect an extra, harmless-but-pointless time; it's still
     // correctly re-run on every REAL searchParams change because useSearchParams
     // itself causes this component to re-render with a new searchParams value.
-  }, [allReviews, searchParams, allowedLocationNames])
+    // `expiryTick` is a deliberate extra trigger (see its own comment above) --
+    // bumping it re-runs this exact same resolution logic with a fresh `now`.
+  }, [allReviews, searchParams, allowedLocationNames, expiryTick])
+
+  // Single scheduled timeout to the known expiration -- not a recurring
+  // countdown/poll, and cleaned up (cleared) whenever the expiration moves
+  // or this unmounts. Purely a live-tab convenience; see expiryTick's own
+  // comment above for why the persisted timestamp remains authoritative
+  // regardless of whether this timer ever fires.
+  useEffect(() => {
+    const expiresAt = filters?._dateExpiresAt
+    if (!Number.isFinite(expiresAt)) return
+    const msRemaining = expiresAt - Date.now()
+    if (msRemaining <= 0) { setExpiryTick(t => t + 1); return }
+    const id = setTimeout(() => setExpiryTick(t => t + 1), msRemaining)
+    return () => clearTimeout(id)
+  }, [filters?._dateExpiresAt])
 
   // A normal filter edit (date input, pill toggle, preset click) -- writes
   // the change into the URL; the effect above picks up the resulting

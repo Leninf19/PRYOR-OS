@@ -112,8 +112,14 @@ function testGlobalFiltersHidesLocationPickerWithOneOption() {
 
 function testFilterPersistenceRestrictsLocationsOnBothResolutionPaths() {
   const s = src('App.jsx')
-  assert(/restrictLocationsToAllowed\(withFreshDefaults\(fromUrl, dr\), allowedLocationNames\)/.test(s), 'the URL-sourced filter resolution path must restrict locations to the allowed set')
-  assert(/restrictLocationsToAllowed\(withFreshDefaults\(stored, dr\), allowedLocationNames\)/.test(s), 'the localStorage-sourced filter resolution path must restrict locations to the allowed set')
+  // REVIEWED UPDATE (Global Filter Expiration / Rolling Date Default): both
+  // resolution paths now pass `merged` (fromUrl/stored with start/end
+  // replaced by resolveDateRangeWithExpiration's expiration-aware result),
+  // not the raw fromUrl/stored object, into withFreshDefaults --
+  // restrictLocationsToAllowed still wraps the result identically on both
+  // paths, so the authorization guarantee this test protects is unchanged.
+  assert(/restrictLocationsToAllowed\(withFreshDefaults\(merged, dr\), allowedLocationNames\)/g.test(s), 'both the URL-sourced and localStorage-sourced filter resolution paths must restrict locations to the allowed set')
+  assert([...s.matchAll(/restrictLocationsToAllowed\(withFreshDefaults\(merged, dr\), allowedLocationNames\)/g)].length === 2, 'expected exactly 2 call sites (URL-sourced path + localStorage-sourced path), each still authorization-checked')
   assert(/getUniqueLocations\(allReviews \?\? \[\]\)/.test(s), 'allowedLocationNames must be derived from the already-server-scoped allReviews, never trusted from elsewhere')
   assert(/useMemo\(\s*\n?\s*\(\) => \(scoped \? getUniqueLocations/.test(s), 'allowedLocationNames must be memoized -- an unmemoized array would re-run the resolution effect on every render')
 }

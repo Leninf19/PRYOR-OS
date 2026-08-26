@@ -98,6 +98,48 @@ function testDefaultDateFieldsNeverReadFromUrlOrStorage() {
   assert(!keysMatch[1].includes('_default'), 'FILTER_PARAM_KEYS must never include _defaultStart/_defaultEnd')
 }
 
+// ── Global Filter Expiration / Rolling Date Default ─────────────────────
+
+function testAppUsesResolveDateRangeWithExpiration() {
+  const content = app()
+  assert(content.includes('resolveDateRangeWithExpiration'), 'App.jsx must import and use resolveDateRangeWithExpiration -- a bare withFreshDefaults(fromUrl, dr) can no longer be the whole story once custom dates expire')
+  const importMatch = content.match(/import\s*\{([^}]*)\}\s*from\s*['"]\.\/utils\/filterPersistence\.js['"]/s)
+  assert(importMatch && /\bresolveDateRangeWithExpiration\b/.test(importMatch[1]), 'resolveDateRangeWithExpiration must be imported from filterPersistence.js, not reimplemented inline in App.jsx')
+}
+
+function testExpiredCustomRangeTriggersAUrlRewrite() {
+  const content = app()
+  assert(/dateResult\.expired/.test(content), 'App.jsx must branch on the expired flag resolveDateRangeWithExpiration returns')
+  // The expired branch must call setSearchParams to strip/replace the now-
+  // stale start/end sitting in the address bar -- not merely update local
+  // state while leaving the stale query string in place forever.
+  const expiredBlock = content.match(/if \(dateResult\.expired\) \{([\s\S]*?)\n\s*\}/)
+  assert(expiredBlock, 'could not find the "if (dateResult.expired)" block')
+  assert(/setSearchParams/.test(expiredBlock[1]), 'an expired custom range must trigger a setSearchParams call to clean the stale URL params')
+}
+
+function testSaveStoredFiltersIsCalledWithDateExpiresAt() {
+  const content = app()
+  const saveCalls = [...content.matchAll(/saveStoredFilters\(\{([\s\S]*?)\}\)/g)]
+  assert(saveCalls.length > 0, 'expected at least one saveStoredFilters({...}) call site')
+  assert(saveCalls.every(m => /dateExpiresAt:\s*dateResult\.dateExpiresAt/.test(m[1])), 'every saveStoredFilters call in App.jsx must pass dateResult.dateExpiresAt, so the persisted record always carries the correct expiration')
+}
+
+function testALiveTabSelfCorrectsViaASingleScheduledTimeoutNotAPollingLoop() {
+  const content = app()
+  assert(/setTimeout\(/.test(content), 'App.jsx must schedule a timeout to the known expiration so an open tab can self-correct once the hour passes')
+  assert(!/setInterval\(/.test(content), 'this must be a single scheduled timeout to a known instant, never a recurring setInterval/polling loop')
+  assert(/clearTimeout\(/.test(content), 'the scheduled timeout must be cleaned up (cleared) -- e.g. in a useEffect cleanup function -- not left dangling')
+  assert(/_dateExpiresAt/.test(content), 'the scheduling effect must key off the resolved _dateExpiresAt bookkeeping field')
+}
+
+function testDateExpirationNeverAppliesToLocationsBrandsStars() {
+  const fp = read('utils/filterPersistence.js')
+  const fnMatch = fp.match(/export function resolveDateRangeWithExpiration\([^)]*\)\s*\{([\s\S]*?)\n\}/)
+  assert(fnMatch, 'could not locate resolveDateRangeWithExpiration')
+  assert(!/locations|brands|stars/.test(fnMatch[1]), 'resolveDateRangeWithExpiration must only ever compute start/end/dateExpiresAt -- location/brand/star persistence must stay entirely outside its concern')
+}
+
 function main() {
   run('App.jsx uses useSearchParams (URL-driven, not local-state-only)', testAppUsesSearchParamsNotOnlyLocalState)
   run('App.jsx imports every filterPersistence.js helper it needs', testAppImportsFilterPersistenceHelpers)
@@ -107,6 +149,11 @@ function main() {
   run('GlobalFilters.jsx accepts and calls an onReset prop', testGlobalFiltersAcceptsOnResetProp)
   run('App.jsx wires onReset={handleResetFilters} into GlobalFilters', testGlobalFiltersReceivesOnResetFromApp)
   run('_defaultStart/_defaultEnd are never part of the URL vocabulary', testDefaultDateFieldsNeverReadFromUrlOrStorage)
+  run('App.jsx imports and uses resolveDateRangeWithExpiration', testAppUsesResolveDateRangeWithExpiration)
+  run('an expired custom range triggers a URL rewrite to clean the stale params', testExpiredCustomRangeTriggersAUrlRewrite)
+  run('every saveStoredFilters call persists the resolved dateExpiresAt', testSaveStoredFiltersIsCalledWithDateExpiresAt)
+  run('a live tab self-corrects via a single scheduled+cleaned-up timeout, never a polling loop', testALiveTabSelfCorrectsViaASingleScheduledTimeoutNotAPollingLoop)
+  run('resolveDateRangeWithExpiration never touches location/brand/star persistence', testDateExpirationNeverAppliesToLocationsBrandsStars)
 
   console.log()
   if (results.every(Boolean)) {
