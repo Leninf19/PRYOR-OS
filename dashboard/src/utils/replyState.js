@@ -1,3 +1,5 @@
+import { reviewId } from './dataUtils.js'
+
 // M5's reply-state model (Navigation/Design System/Execution Master Plan
 // v1.0) -- a presentation-layer mapping over the existing workspace `status`
 // + `owner_response` fields, NOT a new data source or a change to how those
@@ -100,6 +102,25 @@ export function isAnsweredReplyState(r, wsEntry, bridgeEntry) {
 const ACTIONABLE_STATES = new Set(['needs_reply', 'draft', 'failed'])
 export function isActionableReplyState(state) {
   return ACTIONABLE_STATES.has(state)
+}
+
+// Filtering UX Cleanup: per-state counts (Needs Reply/Draft/Confirmed/
+// Failed/Externally Replied) for Reviews.jsx's status pill row. Takes
+// `reviews` as whatever the caller considers "in scope" -- Reviews.jsx
+// passes the GLOBALLY-filtered dataset (App.jsx's date/location/brand/star
+// filters already applied), never its own further-narrowed local view, so
+// these counts answer "how many of each status exist in the current global
+// scope," independent of which status pill(s) happen to be selected right
+// now. Extracted as a pure function (no React) so it's directly
+// unit-testable, mirroring dataUtils.js's computeNextReviewId().
+export function computeReplyStateCounts(reviews, ws, bridges) {
+  const counts = { needs_reply: 0, draft: 0, confirmed: 0, failed: 0, externally_replied: 0 }
+  reviews.forEach(r => {
+    const id = reviewId(r)
+    const state = computeReplyState(r, ws?.[id], bridges?.[id])
+    if (state in counts) counts[state]++
+  })
+  return counts
 }
 
 // Mirrors ai_engine.py's _SERIOUS_KEYWORDS/_SERIOUS_RE and

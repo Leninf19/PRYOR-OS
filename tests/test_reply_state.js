@@ -8,7 +8,7 @@
 //
 // Run directly: node tests/test_reply_state.js
 
-import { computeReplyState, isAnsweredReplyState, isActionableReplyState } from '../dashboard/src/utils/replyState.js'
+import { computeReplyState, isAnsweredReplyState, isActionableReplyState, computeReplyStateCounts } from '../dashboard/src/utils/replyState.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -118,6 +118,53 @@ function testNeedsReplyDraftFailedAreActionable() {
   assert(isActionableReplyState('failed') === true)
 }
 
+// computeReplyStateCounts -- Filtering UX Cleanup: per-status counts for
+// Reviews.jsx's pill row, computed over whatever "in scope" set the caller
+// passes in (Reviews.jsx passes the globally-filtered dataset).
+function testComputeReplyStateCountsBasicBreakdown() {
+  const reviews = [
+    { review_id: 'r1', owner_response: '' },
+    { review_id: 'r2', owner_response: '' },
+    { review_id: 'r3', owner_response: 'Thanks!' },
+  ]
+  const ws = { r2: { status: 'draft_ready' } }
+  const counts = computeReplyStateCounts(reviews, ws, {})
+  assert(counts.needs_reply === 1)
+  assert(counts.draft === 1)
+  assert(counts.externally_replied === 1)
+  assert(counts.confirmed === 0 && counts.failed === 0)
+}
+
+function testComputeReplyStateCountsNeverLosesOrDuplicatesAReview() {
+  const reviews = [
+    { review_id: 'a', owner_response: '' },
+    { review_id: 'b', owner_response: '', },
+  ]
+  const ws = { b: { status: 'failed' } }
+  const counts = computeReplyStateCounts(reviews, ws, {})
+  const total = counts.needs_reply + counts.draft + counts.confirmed + counts.failed + counts.externally_replied
+  assert(total === reviews.length, `every review must be counted exactly once, expected ${reviews.length} got ${total}`)
+}
+
+function testComputeReplyStateCountsHandlesMissingWsAndBridgesGracefully() {
+  const reviews = [{ review_id: 'a', owner_response: '' }]
+  assert(computeReplyStateCounts(reviews, undefined, undefined).needs_reply === 1, 'must not throw when ws/bridges are undefined')
+}
+
+function testComputeReplyStateCountsOnEmptyInputReturnsAllZeros() {
+  const counts = computeReplyStateCounts([], {}, {})
+  assert(Object.values(counts).every(n => n === 0))
+}
+
+function testComputeReplyStateCountsUsesCanonicalReviewIdForLookup() {
+  // A review with no review_id/review_url must still resolve its ws/bridge
+  // entry via the same date+reviewer-name fallback reviewId() uses
+  // elsewhere -- not silently miss its workspace state.
+  const reviews = [{ review_date: '2026-08-20', reviewer_name: 'Alpha', owner_response: '' }]
+  const ws = { '2026-08-20-Alpha': { status: 'draft_ready' } }
+  assert(computeReplyStateCounts(reviews, ws, {}).draft === 1)
+}
+
 function main() {
   run('no owner_response, no bridge, no workspace -> needs_reply', testNoOwnerResponseNoBridgeNoWsIsNeedsReply)
   run('owner_response alone -> externally_replied', testOwnerResponseAloneIsExternallyReplied)
@@ -136,6 +183,11 @@ function main() {
   run('isAnsweredReplyState: false for draft/failed/nothing', testIsNotAnsweredWhenOnlyDraftOrFailed)
   run('confirmed/externally_replied are never actionable', testConfirmedAndExternallyRepliedAreNotActionable)
   run('needs_reply/draft/failed are actionable', testNeedsReplyDraftFailedAreActionable)
+  run('computeReplyStateCounts: basic breakdown across needs_reply/draft/externally_replied', testComputeReplyStateCountsBasicBreakdown)
+  run('computeReplyStateCounts: never loses or duplicates a review', testComputeReplyStateCountsNeverLosesOrDuplicatesAReview)
+  run('computeReplyStateCounts: handles missing ws/bridges gracefully', testComputeReplyStateCountsHandlesMissingWsAndBridgesGracefully)
+  run('computeReplyStateCounts: empty input returns all zeros', testComputeReplyStateCountsOnEmptyInputReturnsAllZeros)
+  run('computeReplyStateCounts: uses the canonical reviewId() fallback for lookup', testComputeReplyStateCountsUsesCanonicalReviewIdForLookup)
 
   console.log()
   if (results.every(Boolean)) {

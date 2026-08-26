@@ -17,7 +17,7 @@ import { useRestaurantContacts } from '../hooks/useRestaurantContacts.js'
 import ContactEditorModal from './settings/ContactEditorModal.jsx'
 import { useAccount } from '../components/AuthGate.jsx'
 import { EMAIL_STATUS_META, DUPLICATE_EMAIL_STATUSES } from '../utils/actionWorkspaceUtils.js'
-import { REPLY_STATE_META, computeReplyState, isActionableReplyState, isAnsweredReplyState, isSeriousReview } from '../utils/replyState.js'
+import { REPLY_STATE_META, computeReplyState, isActionableReplyState, isAnsweredReplyState, isSeriousReview, computeReplyStateCounts } from '../utils/replyState.js'
 
 const PAGE_SIZE = 40
 
@@ -326,7 +326,12 @@ function ReplyStateBadge({ r, wsEntry, bridgeEntry }) {
 
 const REPLY_STATE_FILTERS = ['needs_reply', 'draft', 'confirmed', 'failed', 'externally_replied']
 
-function ReplyStatePills({ selected, onChange }) {
+// Filtering UX Cleanup: `counts` (optional) shows, per state, how many
+// reviews in the CURRENT GLOBAL scope (App.jsx's date/location/brand/star
+// filters -- see Reviews()'s replyStateCounts memo) have that reply state --
+// independent of whichever of these pills is currently active, so a manager
+// can see "4 Drafts exist" even while "Needs Reply" is the selected view.
+function ReplyStatePills({ selected, onChange, counts }) {
   function toggle(state) {
     onChange(selected.includes(state) ? selected.filter(s => s !== state) : [...selected, state])
   }
@@ -345,7 +350,7 @@ function ReplyStatePills({ selected, onChange }) {
             style={active
               ? { background: 'var(--color-accent)', color: 'white', borderColor: 'var(--color-accent)' }
               : { background: 'transparent', color: 'var(--color-text-2)', borderColor: 'var(--color-border)' }}>
-            {meta.label}
+            {meta.label}{counts != null && ` (${counts[state] ?? 0})`}
           </button>
         )
       })}
@@ -353,8 +358,18 @@ function ReplyStatePills({ selected, onChange }) {
   )
 }
 
+// Filtering UX Cleanup: date range, locations, brands, and stars are now
+// EXCLUSIVELY the global filter bar's responsibility (App.jsx/
+// GlobalFilters.jsx) -- this page receives the already-globally-filtered
+// `filtered` dataset as a prop and only ever applies workflow/status
+// filters on top of it (reply state, sentiment, review length, free-text
+// search). The star and location selects that used to live here were a
+// second, weaker, disagreeing copy of two of the four global dimensions
+// (single-select vs. the global bar's multi-select, no visibility into the
+// full authorized location set, no shared persistence) -- removed outright,
+// not synchronized, so there is exactly one place to set them.
 function FilterBar({
-  keyword, onKeyword, replyStates, onReplyStates, stars, onStars, locations, location, onLocation,
+  keyword, onKeyword, replyStates, onReplyStates, replyStateCounts,
   sentiment, onSentiment, length, onLength, count,
 }) {
   return (
@@ -368,7 +383,7 @@ function FilterBar({
           </svg>
           <input
             type="search"
-            placeholder="Search reviews, reviewer, location…"
+            placeholder="Search reviews…"
             value={keyword}
             onChange={e => onKeyword(e.target.value)}
             className="w-full text-sm pl-9 pr-3 py-2 rounded-lg border focus:outline-none focus:ring-2"
@@ -382,19 +397,9 @@ function FilterBar({
           />
         </div>
 
-        {/* Star filter */}
-        <select
-          value={stars}
-          onChange={e => onStars(e.target.value)}
-          className="text-sm px-3 py-2 rounded-lg border focus:outline-none"
-          style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
-          aria-label="Filter by stars"
-        >
-          <option value="">All stars</option>
-          {[1,2,3,4,5].map(s => <option key={s} value={s}>{s}★</option>)}
-        </select>
-
-        {/* AI Sentiment filter */}
+        {/* AI Sentiment filter -- a review-workflow lens, not a global
+            filtering dimension (App.jsx/GlobalFilters.jsx has no sentiment
+            axis), so it stays local. */}
         <select
           value={sentiment}
           onChange={e => onSentiment(e.target.value)}
@@ -408,7 +413,7 @@ function FilterBar({
           <option value="negative">❌ Negative</option>
         </select>
 
-        {/* Review length filter */}
+        {/* Review length filter -- also not a global dimension, stays local. */}
         <select
           value={length}
           onChange={e => onLength(e.target.value)}
@@ -422,26 +427,12 @@ function FilterBar({
           <option value="long">Long (300+)</option>
         </select>
 
-        {/* Location */}
-        {locations.length > 0 && (
-          <select
-            value={location}
-            onChange={e => onLocation(e.target.value)}
-            className="text-sm px-3 py-2 rounded-lg border focus:outline-none max-w-[200px]"
-            style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
-            aria-label="Filter by location"
-          >
-            <option value="">All locations</option>
-            {locations.map(l => <option key={l} value={l}>{l}</option>)}
-          </select>
-        )}
-
         <span className="text-xs ml-auto" style={{ color: 'var(--color-text-3)' }}>
           {count.toLocaleString()} results
         </span>
       </div>
 
-      <ReplyStatePills selected={replyStates} onChange={onReplyStates} />
+      <ReplyStatePills selected={replyStates} onChange={onReplyStates} counts={replyStateCounts} />
     </div>
   )
 }
@@ -1422,10 +1413,8 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
   const [sortDir, setSortDir]     = useState('desc')
   const [keyword, setKeyword]     = useState('')
   const [replyStates, setReplyStates] = useState([])
-  const [stars,   setStars]       = useState('')
   const [sentiment, setSentiment] = useState('')
   const [length,  setLength]      = useState('')
-  const [locFilter, setLocFilter] = useState('')
   const [page,    setPage]        = useState(0)
   const [selectedKey, setSelectedKey] = useState(null)
   // Recovery Milestone 4, Phase 5: the Reviews inbox now defaults to the
@@ -1443,15 +1432,17 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
   // reference" URL / an Action Center email-thread card ("Open review"):
   // /reviews?reviewId=<review_id-or-review_url>. Only handles the common
   // case (a review with a real review_id/review_url, the overwhelming
-  // majority) -- clears this page's own local filters so the target review
-  // isn't hidden by a stale filter, but does NOT touch the parent's global
-  // date-range filter, so a review outside that range still won't be found.
+  // majority) -- clears this page's own local (workflow) filters so the
+  // target review isn't hidden by a stale one, but does NOT touch the
+  // parent's global date/location/brand/star filters (Filtering UX
+  // Cleanup: those are no longer this page's to clear -- a review outside
+  // the current global scope still won't be found, same as before).
   useEffect(() => {
     const targetId = searchParams.get('reviewId')
     if (!targetId) return
     const match = allReviews.find(r => (r.review_id || r.review_url) === targetId)
     if (!match) return
-    setReplyStates([]); setStars(''); setSentiment(''); setLength(''); setLocFilter(''); setKeyword(''); setNeedsResponseOnly(false)
+    setReplyStates([]); setSentiment(''); setLength(''); setKeyword(''); setNeedsResponseOnly(false)
     resetPage()
     setSelectedKey(targetId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1464,16 +1455,28 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
     resetPage()
   }
 
-  const locations = useMemo(() => [...new Set(filtered.map(r => r.location_name).filter(Boolean))].sort(), [filtered])
-
   const trendAlerts = useMemo(() => computeTrendAlerts(filtered, prevFiltered), [filtered, prevFiltered])
+
+  // Filtering UX Cleanup: reply-state (Needs Reply/Draft/Confirmed/Failed/
+  // Externally Replied) counts for the pill row below, computed directly
+  // from `filtered` -- the GLOBALLY-scoped dataset (App.jsx's date/
+  // location/brand/star filters already applied, server-side authorization
+  // already applied upstream of that) -- never renarrowed by this page's
+  // own workflow filters (needsResponseOnly/replyStates/sentiment/length/
+  // keyword). This is what makes the counts answer "how many of each
+  // status exist in my current global scope," independent of whatever
+  // local view the manager currently has selected, and why they
+  // immediately recalculate when the global location/date/star selection
+  // changes (filtered changes) but never when a local filter changes.
+  const replyStateCounts = useMemo(
+    () => computeReplyStateCounts(filtered, ws, bridgesData),
+    [filtered, ws, bridgesData]
+  )
 
   const processed = useMemo(() => {
     let rows = filtered
     if (needsResponseOnly) rows = rows.filter(r => isActionableReplyState(computeReplyState(r, ws[reviewId(r)], bridgesData[reviewId(r)])))
     if (replyStates.length) rows = rows.filter(r => replyStates.includes(computeReplyState(r, ws[reviewId(r)], bridgesData[reviewId(r)])))
-    if (stars)     rows = rows.filter(r => r.star_rating === Number(stars))
-    if (locFilter) rows = rows.filter(r => r.location_name === locFilter)
     if (sentiment) rows = rows.filter(r => sentimentBucket(r) === sentiment)
     if (length)    rows = rows.filter(r => reviewLength(r.review_text) === length)
     if (keyword) {
@@ -1492,7 +1495,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
       if (av > bv) return sortDir === 'asc' ?  1 : -1
       return 0
     })
-  }, [filtered, needsResponseOnly, replyStates, ws, bridgesData, stars, locFilter, sentiment, length, keyword, sortKey, sortDir])
+  }, [filtered, needsResponseOnly, replyStates, ws, bridgesData, sentiment, length, keyword, sortKey, sortDir])
 
   const totalPages = Math.max(1, Math.ceil(processed.length / PAGE_SIZE))
   const safePage   = Math.min(page, totalPages - 1)
@@ -1637,10 +1640,9 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
             <FilterBar
               keyword={keyword}    onKeyword={v => { setKeyword(v); resetPage() }}
               replyStates={replyStates} onReplyStates={v => { setReplyStates(v); resetPage() }}
-              stars={stars}        onStars={v => { setStars(v); resetPage() }}
+              replyStateCounts={replyStateCounts}
               sentiment={sentiment} onSentiment={v => { setSentiment(v); resetPage() }}
               length={length}      onLength={v => { setLength(v); resetPage() }}
-              locations={locations} location={locFilter} onLocation={v => { setLocFilter(v); resetPage() }}
               count={processed.length}
             />
           </Card>
@@ -1677,7 +1679,7 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
 
             <div>
               {visible.length === 0 ? (
-                needsResponseOnly && !keyword && !stars && !sentiment && !length && !locFilter && !replyStates.length ? (
+                needsResponseOnly && !keyword && !sentiment && !length && !replyStates.length ? (
                   <EmptyState icon="🎉" title="You're all caught up"
                               body="Every review has been replied to, published, or is otherwise resolved."
                               action={

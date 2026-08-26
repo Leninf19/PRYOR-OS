@@ -80,6 +80,7 @@ const TESTS = [
   'test_security_hardening.js',
   'test_reviews_no_background_draft_generation.js',
   'test_reviews_auto_advance.js',
+  'test_reviews_filter_cleanup.js',
 ]
 
 const results = {}
