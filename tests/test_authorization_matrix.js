@@ -45,6 +45,7 @@ import sessionHandler from '../dashboard/api/session/[action].js'
 import actionsHandler from '../dashboard/api/actions/[action].js'
 import googleHandler from '../dashboard/api/google/[action].js'
 import settingsHandler from '../dashboard/api/settings/[action].js'
+import notificationsHandler from '../dashboard/api/notifications/[action].js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -481,6 +482,30 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Multi-Location Authentication & User Access System, Commit 6. Same USERS_MANAGE gate. No last-Owner check needed (re-enabling never removes ownership).',
   },
+  {
+    route: 'GET /api/notifications/list', file: 'api/notifications/[action].js', method: 'GET', action: 'list',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'per-item location-filtered in-handler (via notificationEvents.js -> requireLocationAccess), same pattern as GET /api/actions/list -- no flat role gate at all',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Notification Center Audit & Fix. Every role holds at least VIEW_ASSIGNED so requireAuth(req, res, null) admits any authenticated role; a scoped account only ever sees notifications for its own locationIds grant (critical/low-star reviews, reply failures) plus its own assigned actions -- an item for a foreign location is simply absent, never a 403/404. There is no "wrong role" case for this endpoint.',
+  },
+  {
+    route: 'POST /api/notifications/mark-read', file: 'api/notifications/[action].js', method: 'POST', action: 'mark-read',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'single-notification location/ownership scope, resolved from the key\'s own type prefix via requireLocationAccess/reviewLocationIndex.js or an assignedTo/role check',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Notification Center Audit & Fix. Fails closed (404) for any notification key the caller cannot resolve to their own location/assignment/role -- direct API tampering for another location\'s notification key is rejected before any read-state write happens.',
+  },
+  {
+    route: 'POST /api/notifications/mark-all-read', file: 'api/notifications/[action].js', method: 'POST', action: 'mark-all-read',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'recomputes the caller\'s own authorized candidate list server-side and marks exactly that -- never accepts a client-supplied key list',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Notification Center Audit & Fix. Safe by construction: the set of keys marked read is always server-derived from getNotificationCandidates(account), so it can never include a notification outside the caller\'s own authorized scope.',
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -787,6 +812,7 @@ const HANDLERS = {
   'api/actions/[action].js': actionsHandler,
   'api/google/[action].js': googleHandler,
   'api/settings/[action].js': settingsHandler,
+  'api/notifications/[action].js': notificationsHandler,
 }
 
 function minimalReqFor(entry, token) {
@@ -1444,6 +1470,9 @@ const EXPECTED_SCOPED_AUTH_CALLERS = new Set([
   path.join(API_DIR, 'actions', '[action].js'),
   path.join(API_DIR, 'rewrite.js'),
   path.join(API_DIR, 'data.js'), // calls requireLocationAccess directly, not requireScopedAuth
+  // Notification Center Audit & Fix: calls requireLocationAccess directly
+  // (per-review-and-per-notification-key checks), same pattern as data.js.
+  path.join(API_DIR, 'notifications', '[action].js'),
 ])
 
 async function testNoProductionEndpointImportsTheNewHelpers() {

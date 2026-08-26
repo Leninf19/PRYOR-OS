@@ -38,6 +38,7 @@ import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
 import {
   writePublishBridge, getPublishBridges, PublishBridgeUnavailableError,
 } from '../_lib/publishBridgeStore.js'
+import { recordReplyFailure, clearReplyFailure } from '../_lib/notificationStore.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -871,6 +872,13 @@ async function publish(req, res) {
   // saved" instead of silently claiming full durability it doesn't have.
   async function respondPublishSuccess(resolvedGbpReviewName) {
     await recordSyncOutcome({ success: true })
+    // Notification Center Audit & Fix: a subsequent successful publish
+    // resolves any previously-recorded "reply failed" notification for
+    // this review -- best-effort, never allowed to affect the actual
+    // publish response (matches the bridge-write tolerance immediately
+    // below, and the publish bridge's own success path is entirely
+    // unaffected by this).
+    if (localReviewId) await clearReplyFailure(localReviewId)
     if (!localReviewId) {
       // Frontend didn't send its own review id (older client, or a caller
       // hitting this endpoint directly) -- Google still succeeded, there's
@@ -972,6 +980,22 @@ async function publish(req, res) {
     // `|| 500`/`|| 'api_error'` fallbacks only matter for a genuinely
     // unexpected exception this function never itself throws deliberately.
     const status = err.status || 500
+    // Notification Center Audit & Fix: records a "reply failed" event so it
+    // surfaces in the Notification Center rather than existing only in
+    // this response and whatever the caller's own UI does with it. Never
+    // allowed to change the actual error response -- if localReviewId is
+    // missing (an older client, or a direct caller with no id to key by),
+    // or the notification write itself fails, the original error response
+    // below is returned exactly as it always was.
+    if (localReviewId) {
+      const failedLocationId = await resolveLocationIdForReview(localReviewId).catch(() => null)
+      await recordReplyFailure(localReviewId, {
+        locationId: failedLocationId,
+        locationName: locationName ?? null,
+        reviewerName: reviewerName ?? null,
+        failReason: err.message || 'Google did not accept the reply.',
+      })
+    }
     return res.status(status).json({
       error:   err.code || 'api_error',
       message: err.message,

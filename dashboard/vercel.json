@@ -17,6 +17,9 @@
     },
     "api/rewrite.js": {
       "includeFiles": "private-data/_internal/review-location-index.json"
+    },
+    "api/notifications/[action].js": {
+      "includeFiles": "private-data/{meta.json,_internal/review-location-index.json,reviews/by-location/*.json}"
     }
   },
   "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }]

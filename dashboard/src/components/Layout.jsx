@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { useMeta, usePredictiveAlerts, useActionItems, isLocationScoped } from '../hooks/useIntelligence.js'
 import { useReviewsData } from '../hooks/useReviewsData.js'
 import { useGoogleOAuthStatus } from '../hooks/useGoogleOAuthStatus.js'
+import { useNotifications } from '../hooks/useNotifications.js'
 import { useAccount } from './AuthGate.jsx'
 import ThemeToggle from './ui/ThemeToggle.jsx'
 import SmartSearch from './SmartSearch.jsx'
@@ -152,20 +153,110 @@ function SnapshotBar() {
         </span>
       </Link>
 
-      <NotificationBell alerts={alerts} actions={actions} hasError={alertsError || actionsError} />
+      <NotificationBell />
     </div>
   )
 }
 
 // ── Notification bell ────────────────────────────────────────────────────────
+//
+// Notification Center Audit & Fix: self-contained (calls useNotifications()
+// itself) so it can be mounted in both the desktop SnapshotBar and the
+// mobile topbar identically -- previously this only existed inside
+// SnapshotBar, which is desktop-only (`hidden lg:flex`), so a mobile user
+// had no bell at all. Server-side authorization (dashboard/api/
+// notifications/[action].js) already scoped `notifications` to whatever
+// this account is allowed to see; nothing here re-filters by location.
 
-function NotificationBell({ alerts, actions, hasError }) {
+const NOTIFICATION_TYPE_META = {
+  critical_review:   { icon: '⚠️', dot: 'var(--color-danger)' },
+  low_star_review:   { icon: '★',  dot: 'var(--color-grade-c)' },
+  reply_failed:      { icon: '⚠️', dot: 'var(--color-danger)' },
+  assigned_action:   { icon: '📋', dot: 'var(--color-accent)' },
+  gbp_disconnected:  { icon: '🔌', dot: 'var(--color-danger)' },
+}
+
+function relativeTime(iso) {
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return ''
+  const diffMs = Date.now() - then
+  const minutes = Math.round(diffMs / 60000)
+  if (minutes < 1) return 'Just now'
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`
+  const days = Math.round(hours / 24)
+  if (days === 1) return 'Yesterday'
+  if (days < 7) return `${days} days ago`
+  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+}
+
+function notificationLinkTo(n) {
+  if (!n.link) return null
+  if (n.link.type === 'review') return `/reviews?reviewId=${encodeURIComponent(n.link.id)}`
+  if (n.link.type === 'action') return '/actions'
+  if (n.link.type === 'settings') return '/settings/google'
+  return null
+}
+
+function notificationLinkLabel(n) {
+  if (n.type === 'reply_failed') return 'Retry / View Review'
+  if (n.link?.type === 'review') return 'View Review'
+  if (n.link?.type === 'action') return 'View Action'
+  if (n.link?.type === 'settings') return 'View Settings'
+  return null
+}
+
+function NotificationRow({ n, onNavigate, markRead }) {
+  const meta = NOTIFICATION_TYPE_META[n.type] ?? { icon: '•', dot: 'var(--color-text-3)' }
+  const to = notificationLinkTo(n)
+  const label = notificationLinkLabel(n)
+
+  function handleClick() {
+    if (!n.read) markRead(n.key)
+    onNavigate()
+  }
+
+  return (
+    <div className="px-4 py-2.5 flex items-start gap-2.5" style={{ background: n.read ? 'transparent' : 'var(--color-accent-lt)' }}>
+      <span aria-hidden="true" className="flex-shrink-0 mt-0.5 text-sm leading-none">
+        {n.type === 'low_star_review' && typeof n.starRating === 'number'
+          ? <span style={{ color: meta.dot }}>{'★'.repeat(n.starRating)}{'☆'.repeat(5 - n.starRating)}</span>
+          : meta.icon}
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-semibold truncate" style={{ color: 'var(--color-text-1)' }}>{n.title}</p>
+        {n.location && (
+          <p className="text-[10px] truncate" style={{ color: 'var(--color-text-3)' }}>{n.location}</p>
+        )}
+        {n.context && (
+          <p className="text-[10px] mt-0.5 line-clamp-2" style={{ color: 'var(--color-text-2)' }}>“{n.context}”</p>
+        )}
+        <div className="flex items-center gap-2 mt-1">
+          <span className="text-[9px]" style={{ color: 'var(--color-text-3)' }}>{relativeTime(n.timestamp)}</span>
+          {to && (
+            <Link to={to} onClick={handleClick} className="text-[10px] font-semibold underline"
+                  style={{ color: 'var(--color-accent)' }}>
+              {label}
+            </Link>
+          )}
+        </div>
+      </div>
+      {!n.read && (
+        <span aria-hidden="true" className="flex-shrink-0 w-1.5 h-1.5 rounded-full mt-1.5" style={{ background: 'var(--color-accent)' }} />
+      )}
+    </div>
+  )
+}
+
+function NotificationBell() {
   const [open, setOpen] = useState(false)
   const buttonRef = useRef(null)
-  const alertList  = Array.isArray(alerts) ? alerts : (alerts?.alerts ?? [])
-  const unanswered = actions?.unanswered ?? []
-  const count = alertList.length + unanswered.length
-  const label = `Notifications${count > 0 ? `, ${count} item${count === 1 ? '' : 's'}` : ''}`
+  const { notifications, unreadCount, isLoading, isError, markRead, markAllRead } = useNotifications()
+
+  const unread = notifications.filter(n => !n.read)
+  const read = notifications.filter(n => n.read)
+  const label = `Notifications${unreadCount > 0 ? `, ${unreadCount} unread` : ''}`
 
   useEffect(() => {
     if (!open) return
@@ -178,6 +269,8 @@ function NotificationBell({ alerts, actions, hasError }) {
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [open])
+
+  function close() { setOpen(false) }
 
   return (
     <div className="relative ml-auto flex-shrink-0">
@@ -192,56 +285,74 @@ function NotificationBell({ alerts, actions, hasError }) {
         style={{ color: 'var(--color-text-2)' }}
       >
         <span aria-hidden="true">{I.alerts}</span>
-        {count > 0 && (
+        {unreadCount > 0 && (
           <span aria-hidden="true"
                 className="absolute -top-0.5 -right-0.5 text-white text-[9px] font-bold rounded-full min-w-[14px] h-[14px] flex items-center justify-center px-0.5"
                 style={{ background: 'var(--color-danger)' }}>
-            {count > 99 ? '99+' : count}
+            {unreadCount > 99 ? '99+' : unreadCount}
           </span>
         )}
       </button>
 
       {open && (
         <>
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} aria-hidden="true" />
+          <div className="fixed inset-0 z-40" onClick={close} aria-hidden="true" />
           <div id="notification-bell-panel"
-               className="absolute right-0 top-full mt-2 w-80 max-h-96 overflow-y-auto rounded-xl z-50"
+               role="dialog" aria-label="Notifications"
+               className="fixed sm:absolute left-3 right-3 sm:left-auto sm:right-0 top-16 sm:top-full sm:mt-2 sm:w-96 max-h-[70vh] overflow-y-auto rounded-xl z-50"
                style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', boxShadow: 'var(--shadow-lg)' }}>
-            <div className="px-4 py-3" style={{ borderBottom: '1px solid var(--color-border)' }}>
-              <p className="text-xs font-bold" style={{ color: 'var(--color-text-1)' }}>Notifications</p>
+            <div className="px-4 py-3 flex items-center justify-between gap-2 sticky top-0" style={{ background: 'var(--color-surface)', borderBottom: '1px solid var(--color-border)' }}>
+              <div>
+                <p className="text-xs font-bold" style={{ color: 'var(--color-text-1)' }}>Notifications</p>
+                {unreadCount > 0 && (
+                  <p className="text-[10px]" style={{ color: 'var(--color-text-3)' }}>{unreadCount} unread</p>
+                )}
+              </div>
+              {unreadCount > 0 && (
+                <button type="button" onClick={markAllRead}
+                        className="text-[10px] font-semibold underline flex-shrink-0"
+                        style={{ color: 'var(--color-accent)' }}>
+                  Mark all read
+                </button>
+              )}
             </div>
-            {hasError ? (
+
+            {isError ? (
               <div className="px-4 py-6 text-center">
                 <p className="text-xs" style={{ color: 'var(--color-danger)' }}>Couldn't load notifications</p>
               </div>
-            ) : count === 0 ? (
+            ) : isLoading ? (
               <div className="px-4 py-6 text-center">
-                <p className="text-xs" style={{ color: 'var(--color-text-3)' }}>Nothing needs attention right now</p>
+                <p className="text-xs" style={{ color: 'var(--color-text-3)' }}>Loading…</p>
+              </div>
+            ) : notifications.length === 0 ? (
+              <div className="px-4 py-8 text-center">
+                <p className="text-lg mb-1" aria-hidden="true">🎉</p>
+                <p className="text-xs font-semibold" style={{ color: 'var(--color-text-1)' }}>You're all caught up</p>
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-3)' }}>No alerts need your attention right now.</p>
               </div>
             ) : (
-              <div className="py-1">
-                {alertList.slice(0, 5).map((a, i) => (
-                  <Link key={`alert-${i}`} to="/alerts" onClick={() => setOpen(false)}
-                        className="block px-4 py-2.5 hover:bg-[var(--color-surface-2)]">
-                    <p className="text-xs font-semibold truncate" style={{ color: 'var(--color-text-1)' }}>
-                      {a.title ?? a.message ?? 'Predictive signal detected'}
+              <div>
+                {unread.length > 0 && (
+                  <>
+                    <p className="px-4 pt-2.5 pb-1 text-[9px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>
+                      Needs attention
                     </p>
-                    <p className="text-[10px] truncate" style={{ color: 'var(--color-text-3)' }}>
-                      {a.location ?? a.locationName ?? 'All locations'}
+                    <div className="divide-y" style={{ borderColor: 'var(--color-border)' }}>
+                      {unread.map(n => <NotificationRow key={n.key} n={n} onNavigate={close} markRead={markRead} />)}
+                    </div>
+                  </>
+                )}
+                {read.length > 0 && (
+                  <>
+                    <p className="px-4 pt-2.5 pb-1 text-[9px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>
+                      Earlier
                     </p>
-                  </Link>
-                ))}
-                {unanswered.slice(0, 5).map((r, i) => (
-                  <Link key={`unanswered-${i}`} to="/explorer" onClick={() => setOpen(false)}
-                        className="block px-4 py-2.5 hover:bg-[var(--color-surface-2)]">
-                    <p className="text-xs font-semibold truncate" style={{ color: 'var(--color-text-1)' }}>
-                      {r.star_rating ?? '?'}★ from {r.reviewer_name || 'Anonymous'}
-                    </p>
-                    <p className="text-[10px] truncate" style={{ color: 'var(--color-text-3)' }}>
-                      {r.location_name}
-                    </p>
-                  </Link>
-                ))}
+                    <div className="divide-y" style={{ borderColor: 'var(--color-border)' }}>
+                      {read.map(n => <NotificationRow key={n.key} n={n} onNavigate={close} markRead={markRead} />)}
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>
@@ -398,8 +509,13 @@ export default function Layout({ unansweredCount = 0, children }) {
             {current?.label ?? 'Future Insights'}
           </span>
           {current?.id === 'actions' && unansweredCount > 0 && (
-            <span className="ml-auto badge badge-danger">{unansweredCount} pending</span>
+            <span className="badge badge-danger">{unansweredCount} pending</span>
           )}
+          {/* Notification Center Audit & Fix: the bell previously only
+              existed in the desktop-only SnapshotBar below -- a mobile user
+              had no bell at all. NotificationBell is self-contained
+              (useNotifications()), so mounting it here needs no extra props. */}
+          <NotificationBell />
         </header>
 
         {/* Desktop snapshot bar */}

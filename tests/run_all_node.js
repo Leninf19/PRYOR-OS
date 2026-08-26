@@ -81,6 +81,10 @@ const TESTS = [
   'test_reviews_no_background_draft_generation.js',
   'test_reviews_auto_advance.js',
   'test_reviews_filter_cleanup.js',
+  'test_notification_store.js',
+  'test_notification_events.js',
+  'test_notifications_endpoint.js',
+  'test_notification_bell_ui.js',
 ]
 
 const results = {}

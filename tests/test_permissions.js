@@ -304,6 +304,9 @@ const EXPECTED_SCOPED_AUTH_CALLERS = new Set([
   path.join(DASHBOARD_DIR, 'api', 'actions', '[action].js'),
   path.join(DASHBOARD_DIR, 'api', 'rewrite.js'),
   path.join(DASHBOARD_DIR, 'api', 'data.js'), // calls requireLocationAccess directly, not requireScopedAuth
+  // Notification Center Audit & Fix: calls requireLocationAccess directly
+  // (per-review-and-per-notification-key checks), same pattern as data.js.
+  path.join(DASHBOARD_DIR, 'api', 'notifications', '[action].js'),
 ])
 
 async function testNewHelpersAreUsedOnlyByExpectedEndpoints() {
