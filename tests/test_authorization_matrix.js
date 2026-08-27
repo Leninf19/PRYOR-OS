@@ -606,6 +606,14 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'location_manager/read_only never hold CONTENT_MANAGE via the role table.',
   },
+  {
+    route: 'POST /api/content/delete-campaign', file: 'api/content/[action].js', method: 'POST', action: 'delete-campaign',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing'],
+    scope: 'CAMPAIGN_MANAGE + the campaign\'s own location grant (accountCoversLocations)',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Campaign CRUD bugfix: cascades to every asset\'s Blob object + metadata and unlinks (never deletes) any Calendar task referencing this campaignId. location_manager/read_only never hold CAMPAIGN_MANAGE via the role table; a direct-id attempt outside the caller\'s location grant returns 404, never 403.',
+  },
 ]
 
 // ---------------------------------------------------------------------------

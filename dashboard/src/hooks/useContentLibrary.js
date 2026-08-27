@@ -40,6 +40,14 @@ export function useCampaigns({ includeArchived = false } = {}) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['content-campaigns'] }),
   })
 
+  const deleteMutation = useMutation({
+    mutationFn: (id) => callContentApi('delete-campaign', { method: 'POST', body: { id } }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['content-campaigns'] })
+      qc.invalidateQueries({ queryKey: ['content-assets'] })
+    },
+  })
+
   return {
     campaigns: query.data?.campaigns ?? [],
     isLoading: query.isLoading,
@@ -49,6 +57,9 @@ export function useCampaigns({ includeArchived = false } = {}) {
     updateCampaign: (id, patch) => upsertMutation.mutateAsync({ id, ...patch }),
     isSaving: upsertMutation.isPending,
     saveError: upsertMutation.error?.message ?? null,
+    deleteCampaign: (id) => deleteMutation.mutateAsync(id),
+    isDeleting: deleteMutation.isPending,
+    deleteError: deleteMutation.error?.message ?? null,
   }
 }
 

@@ -59,8 +59,17 @@ function CampaignFormModal({ open, onClose, initial, onSubmit, metaLocations, ca
   if (!form) return null
   const set = (patch) => setForm(f => ({ ...f, ...patch }))
   function toggleLocation(id) {
-    const current = Array.isArray(form.locationIds) ? form.locationIds : []
+    // form.locationIds === '*' ("all locations") isn't an array -- expand it
+    // to the full explicit list first so toggling one location off narrows
+    // the set instead of silently starting from empty (which would have
+    // dropped every OTHER location the campaign was actually authorized for).
+    const current = form.locationIds === '*'
+      ? (metaLocations ?? []).map(l => l.locationId)
+      : (Array.isArray(form.locationIds) ? form.locationIds : [])
     set({ locationIds: current.includes(id) ? current.filter(x => x !== id) : [...current, id] })
+  }
+  function isLocationSelected(id) {
+    return form.locationIds === '*' || (Array.isArray(form.locationIds) && form.locationIds.includes(id))
   }
   function submit(e) { e.preventDefault(); onSubmit(form) }
 
@@ -105,7 +114,7 @@ function CampaignFormModal({ open, onClose, initial, onSubmit, metaLocations, ca
             {(metaLocations ?? []).map(l => (
               <button key={l.locationId} type="button" onClick={() => toggleLocation(l.locationId)}
                       className="text-xs px-2.5 py-1 rounded-full border"
-                      style={Array.isArray(form.locationIds) && form.locationIds.includes(l.locationId)
+                      style={isLocationSelected(l.locationId)
                         ? { background: 'var(--color-accent-lt)', color: 'var(--color-accent)', borderColor: 'var(--color-accent-md)' }
                         : { color: 'var(--color-text-2)', borderColor: 'var(--color-border)' }}>
                 {l.name}
@@ -253,11 +262,38 @@ function AssetCard({ asset, onDelete, canManage }) {
   )
 }
 
+// ── Delete campaign confirmation ─────────────────────────────────────────
+
+function DeleteCampaignModal({ open, onClose, onConfirm, deleting, error }) {
+  return (
+    <Modal open={open} onClose={deleting ? () => {} : onClose} title="Delete campaign?" size="sm"
+           footer={(
+             <div className="flex justify-end gap-2">
+               <button type="button" onClick={onClose} disabled={deleting} className="text-sm px-4 py-2 rounded-lg" style={{ color: 'var(--color-text-2)' }}>
+                 Cancel
+               </button>
+               <button type="button" onClick={onConfirm} disabled={deleting}
+                       className="text-sm font-semibold px-4 py-2 rounded-lg text-white" style={{ background: 'var(--color-danger)', opacity: deleting ? 0.6 : 1 }}>
+                 {deleting ? 'Deleting…' : 'Delete Campaign'}
+               </button>
+             </div>
+           )}>
+      <div className="space-y-3">
+        {error && <div className="text-xs p-2 rounded-lg" style={{ background: 'var(--color-danger-bg)', color: 'var(--color-danger)' }}>{error}</div>}
+        <p className="text-sm" style={{ color: 'var(--color-text-2)' }}>
+          This will permanently remove the campaign and its associated Content Library assets.
+        </p>
+      </div>
+    </Modal>
+  )
+}
+
 // ── Campaign detail ───────────────────────────────────────────────────────
 
-function CampaignDetail({ campaign, onBack, metaLocations, canManage, canApprove, onEditCampaign }) {
+function CampaignDetail({ campaign, onBack, metaLocations, canManage, canApprove, onEditCampaign, onDeleteCampaign, isDeleting, deleteError }) {
   const { assets, isLoading, isError, uploadAsset, addCaption, deleteAsset, isUploading, uploadError } = useContentAssets(campaign.id)
   const [uploadOpen, setUploadOpen] = useState(false)
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false)
   const timing = campaignTiming(campaign)
 
   async function handleDownloadAll() {
@@ -292,6 +328,12 @@ function CampaignDetail({ campaign, onBack, metaLocations, canManage, canApprove
               Edit
             </button>
           )}
+          {canManage && (
+            <button type="button" onClick={() => setConfirmDeleteOpen(true)}
+                    className="text-xs font-semibold px-3 py-1.5 rounded-lg" style={{ background: 'var(--color-danger-bg)', color: 'var(--color-danger)' }}>
+              Delete
+            </button>
+          )}
           {assets.length > 0 && (
             <button type="button" onClick={handleDownloadAll}
                     className="text-xs font-semibold px-3 py-1.5 rounded-lg text-white" style={{ background: 'var(--color-accent)' }}>
@@ -321,6 +363,9 @@ function CampaignDetail({ campaign, onBack, metaLocations, canManage, canApprove
                    onUpload={async (f) => { await uploadAsset(f); setUploadOpen(false) }}
                    onAddCaption={async (f) => { await addCaption(f); setUploadOpen(false) }}
                    uploading={isUploading} error={uploadError} />
+
+      <DeleteCampaignModal open={confirmDeleteOpen} onClose={() => setConfirmDeleteOpen(false)}
+                            onConfirm={() => onDeleteCampaign(campaign)} deleting={isDeleting} error={deleteError} />
     </div>
   )
 }
@@ -349,8 +394,11 @@ function CampaignCard({ campaign, onOpen, metaLocations }) {
 export default function Content() {
   const account = useAccount()
   const { data: meta } = useMeta()
-  const [searchParams] = useSearchParams()
-  const { campaigns, isLoading, isError, createCampaign, updateCampaign, isSaving, saveError } = useCampaigns({ includeArchived: true })
+  const [searchParams, setSearchParams] = useSearchParams()
+  const {
+    campaigns, isLoading, isError, createCampaign, updateCampaign, isSaving, saveError,
+    deleteCampaign, isDeleting, deleteError,
+  } = useCampaigns({ includeArchived: true })
 
   const canManage = ['owner', 'admin', 'marketing'].includes(account?.role)
   const canApprove = canManage
@@ -361,6 +409,7 @@ export default function Content() {
   const [formSeed, setFormSeed] = useState(null)
   const [search, setSearch] = useState('')
   const [showArchived, setShowArchived] = useState(false)
+  const [deleteBanner, setDeleteBanner] = useState(null)
 
   const deepLinkCampaignId = searchParams.get('campaignId')
   useEffect(() => {
@@ -379,12 +428,34 @@ export default function Content() {
   }, [campaigns, showArchived, search])
 
   function openCreate() { setFormSeed({ __seed: Math.random(), name: '', description: '', startDate: '', endDate: '', locationIds: [] }); setFormOpen(true) }
-  function openEdit(c) { setFormSeed({ __seed: Math.random(), ...c }); setFormOpen(true); setSelectedCampaign(null) }
+  // Deliberately does NOT clear selectedCampaign -- the campaign detail view
+  // stays open behind the modal, so saving returns the user to where they
+  // were instead of dropping them back on the campaigns grid (requirement:
+  // "campaign remains selected" after Edit).
+  function openEdit(c) { setFormSeed({ __seed: Math.random(), ...c }); setFormOpen(true) }
 
   async function handleSubmit(form) {
-    if (form.id) await updateCampaign(form.id, form)
-    else await createCampaign(form)
+    if (form.id) {
+      const { campaign } = await updateCampaign(form.id, form)
+      // Refresh the open detail view with the server's own record (never a
+      // client-side merge) so an edit is visible immediately without
+      // waiting on the list query's own refetch.
+      setSelectedCampaign(campaign)
+    } else {
+      await createCampaign(form)
+    }
     setFormOpen(false)
+  }
+
+  async function handleDeleteCampaign(campaign) {
+    const result = await deleteCampaign(campaign.id)
+    setSelectedCampaign(null)
+    if (searchParams.get('campaignId')) {
+      const next = new URLSearchParams(searchParams)
+      next.delete('campaignId')
+      setSearchParams(next, { replace: true })
+    }
+    setDeleteBanner(result?.partial ? result.message : null)
   }
 
   if (isError) return <ErrorState body="Couldn't load the content library." />
@@ -393,7 +464,8 @@ export default function Content() {
     return (
       <div className="max-w-[1200px]">
         <CampaignDetail campaign={selectedCampaign} onBack={() => setSelectedCampaign(null)} metaLocations={meta?.locations}
-                         canManage={canManage} canApprove={canApprove} onEditCampaign={openEdit} />
+                         canManage={canManage} canApprove={canApprove} onEditCampaign={openEdit}
+                         onDeleteCampaign={handleDeleteCampaign} isDeleting={isDeleting} deleteError={deleteError} />
         <CampaignFormModal key={formSeed?.__seed ?? 'empty'} open={formOpen} onClose={() => setFormOpen(false)} initial={formSeed} onSubmit={handleSubmit}
                             metaLocations={meta?.locations} canApprove={canApprove} saving={isSaving} error={saveError} />
       </div>
@@ -402,6 +474,12 @@ export default function Content() {
 
   return (
     <div className="space-y-5 max-w-[1200px]">
+      {deleteBanner && (
+        <div className="text-xs p-3 rounded-lg flex items-start justify-between gap-3" style={{ background: 'var(--color-danger-bg)', color: 'var(--color-danger)' }}>
+          <span>{deleteBanner}</span>
+          <button type="button" onClick={() => setDeleteBanner(null)} className="font-semibold shrink-0">Dismiss</button>
+        </div>
+      )}
       <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Content</h1>

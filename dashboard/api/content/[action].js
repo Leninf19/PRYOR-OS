@@ -2,8 +2,9 @@
 // Library endpoint (same Hobby-plan-conscious consolidation as
 // tasks/[action].js). External routes: GET /api/content/list-campaigns,
 // GET /api/content/list-assets, POST /api/content/upsert-campaign,
-// POST /api/content/create-text-asset, POST /api/content/upload,
-// GET /api/content/download, POST /api/content/delete-asset.
+// POST /api/content/delete-campaign, POST /api/content/create-text-asset,
+// POST /api/content/upload, GET /api/content/download,
+// POST /api/content/delete-asset.
 //
 // UPLOAD ARCHITECTURE NOTE (deviation from the original client-direct-token
 // plan, documented per "stop and explain before improvising" -- this
@@ -45,11 +46,14 @@ import { Permission, roleHasPermission } from '../_lib/permissions.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
 import {
-  getAllCampaigns, getCampaign, createCampaign, updateCampaign, CampaignStoreUnavailableError,
+  getAllCampaigns, getCampaign, createCampaign, updateCampaign, deleteCampaign, CampaignStoreUnavailableError,
 } from '../_lib/campaignStore.js'
 import {
   getAllAssets, getAsset, createAsset, deleteAsset, ContentAssetStoreUnavailableError,
 } from '../_lib/contentAssetStore.js'
+import {
+  getAllTasks, updateTask, TaskStoreUnavailableError,
+} from '../_lib/taskStore.js'
 
 const CAMPAIGN_STATUSES = new Set(['Draft', 'Approved', 'Archived'])
 const ASSET_TYPES = new Set([
@@ -257,6 +261,90 @@ async function upsertCampaign(req, res) {
   } catch (err) {
     if (err instanceof CampaignStoreUnavailableError) {
       console.error(`[content/upsert-campaign] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'The content library is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// --- delete-campaign ---------------------------------------------------------
+// POST /api/content/delete-campaign { id } -- CAMPAIGN_MANAGE only (same
+// gate as the edit path in upsertCampaign() above), scoped to the
+// campaign's own locations via accountCoversLocations(). Cascades to every
+// asset under the campaign (private Blob object + metadata) and unlinks
+// (never deletes) every Calendar task that references this campaignId --
+// see taskStore.js's updateTask(), whose `logAction` param appends an
+// audited history entry while leaving the task itself, its assignee, and
+// its schedule untouched.
+async function deleteCampaignAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+  if (!roleHasPermission(account.role, Permission.CAMPAIGN_MANAGE)) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to delete campaigns.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `content:delete-campaign:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { id } = req.body ?? {}
+  if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'invalid_request', message: 'id is required.' })
+
+  try {
+    const campaign = await getCampaign(id)
+    if (!campaign || !accountCoversLocations(account, campaign.locationIds)) return res.status(404).json({ error: 'not_found' })
+
+    const allAssets = await getAllAssets()
+    const campaignAssets = Object.values(allAssets).filter(a => a.campaignId === id)
+
+    // An asset's blobPathname is always a fresh randomUUID minted at upload
+    // time (see upload() below) -- never shared with another asset -- so
+    // deleting it here can never orphan a blob some OTHER asset still
+    // needs. If the blob delete itself fails, the asset's metadata is
+    // deliberately left in place rather than deleted: a dangling metadata
+    // record pointing at a leftover blob is a discoverable, auditable loose
+    // end; deleting the only pointer to that blob would make it
+    // permanently unreachable and unbillable-to-notice instead.
+    let blobFailures = 0
+    for (const asset of campaignAssets) {
+      if (asset.blobPathname) {
+        try {
+          await deleteBlob(asset.blobPathname)
+        } catch (err) {
+          blobFailures += 1
+          console.error(`[content/delete-campaign] blob delete failed for asset ${asset.id}: ${err.message}`)
+          continue
+        }
+      }
+      await deleteAsset(asset.id)
+    }
+
+    const allTasks = await getAllTasks()
+    const linkedTasks = Object.values(allTasks).filter(t => t.campaignId === id)
+    for (const task of linkedTasks) {
+      await updateTask(task.id, { campaignId: null }, account, `Unlinked from deleted campaign "${campaign.name}".`)
+    }
+
+    await deleteCampaign(id)
+
+    await appendAuditEntry({
+      ...actorFields(account, req), entity: 'campaign', entityId: id,
+      action: 'campaign.deleted', result: blobFailures > 0 ? 'partial' : 'success',
+      message: `Deleted campaign "${campaign.name}" (${campaignAssets.length} asset(s), ${linkedTasks.length} task(s) unlinked)`
+        + (blobFailures > 0 ? `, ${blobFailures} asset file(s) failed to remove from storage.` : '.'),
+    })
+
+    if (blobFailures > 0) {
+      return res.status(207).json({
+        success: true, partial: true, unlinkedTaskCount: linkedTasks.length,
+        message: `Campaign deleted, but ${blobFailures} asset file(s) could not be removed from storage.`,
+      })
+    }
+    return res.status(200).json({ success: true, unlinkedTaskCount: linkedTasks.length })
+  } catch (err) {
+    if (err instanceof CampaignStoreUnavailableError || err instanceof ContentAssetStoreUnavailableError || err instanceof TaskStoreUnavailableError) {
+      console.error(`[content/delete-campaign] ${err.message}`)
       return res.status(503).json({ error: 'service_unavailable', message: 'The content library is temporarily unavailable. Please try again shortly.' })
     }
     throw err
@@ -502,6 +590,7 @@ export default async function handler(req, res) {
   switch (req.query?.action) {
     case 'list-campaigns':    return listCampaigns(req, res)
     case 'upsert-campaign':   return upsertCampaign(req, res)
+    case 'delete-campaign':   return deleteCampaignAction(req, res)
     case 'list-assets':       return listAssets(req, res)
     case 'create-text-asset': return createTextAsset(req, res)
     case 'upload':            return upload(req, res)
