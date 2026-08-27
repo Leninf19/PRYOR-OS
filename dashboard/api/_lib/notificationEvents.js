@@ -24,6 +24,8 @@ import { requireLocationAccess } from './auth.js'
 import { getAllActions, ActionStoreUnavailableError } from './actionStore.js'
 import { getStoredCredential } from './credentialStore.js'
 import { listReplyFailures } from './notificationStore.js'
+import { getAllTasks, TaskStoreUnavailableError } from './taskStore.js'
+import { getAllCampaigns, CampaignStoreUnavailableError } from './campaignStore.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PRIVATE_ROOT = path.resolve(__dirname, '..', '..', 'private-data')
@@ -216,6 +218,113 @@ async function gbpDisconnectedCandidate(account) {
   }
 }
 
+// Operations Calendar + Content Library milestone. Terminal task statuses
+// (taskStore.js's own STATUSES enum) -- a completed/cancelled task never
+// needs a due/overdue notification, and a task moving to Completed makes
+// its existing notification (if any) disappear on the very next request,
+// the same "no tracked state, just re-derive from current data" mechanism
+// reviewNotificationCandidates() already relies on.
+const TERMINAL_TASK_STATUSES = new Set(['Completed', 'Cancelled'])
+
+function isVisibleToAccount(account, locationIds) {
+  if (locationIds === '*') return true
+  if (account.locationIds === '*') return true
+  if (!Array.isArray(account.locationIds) || !Array.isArray(locationIds)) return false
+  return locationIds.some(id => account.locationIds.includes(id))
+}
+
+// UTC-explicit, not the local-timezone Date constructor -- task.startAt/
+// endAt and campaign.startDate are all stored/compared as UTC ISO strings
+// throughout this codebase (see export_chunks.py/dataUtils.js), so "today"/
+// "tomorrow" must be computed in UTC too. Using the local-timezone
+// constructor here would silently shift the day boundary by the server's
+// UTC offset -- harmless when the server happens to run in UTC (Vercel's
+// Node runtime default), but wrong (and untested-looking) anywhere else,
+// including this test suite's own local machine.
+function startOfDay(d) { return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())) }
+
+// Due-today / overdue -- mutually exclusive per task (an overdue task is
+// never ALSO reported as merely "due today"), matching the existing
+// critical_review/low_star_review "exactly one candidate per subject"
+// convention. Deliberately excludes recurring tasks (recurrence !== null)
+// from "overdue" -- a recurring task's past occurrences repeating is not
+// what "overdue" means, and per the approved plan, per-occurrence
+// due/overdue tracking is a V2 concern. A recurring task can still surface
+// as "due today" for whichever occurrence (if any) falls on today.
+function taskDueCandidates(tasks, account) {
+  const out = []
+  const now = new Date()
+  const todayStart = startOfDay(now)
+  const todayEnd = new Date(todayStart.getTime() + 86_400_000 - 1)
+
+  for (const t of tasks) {
+    if (TERMINAL_TASK_STATUSES.has(t.status)) continue
+    if (!isVisibleToAccount(account, t.locationIds)) continue
+
+    if (!t.recurrence) {
+      const dueAt = new Date(t.endAt || t.startAt)
+      if (Number.isNaN(dueAt.getTime())) continue
+      if (dueAt < todayStart) {
+        out.push({
+          key: `task_overdue:${t.id}`, type: 'task_overdue', severity: 'critical',
+          title: `Overdue: ${t.title}`, location: null,
+          context: `Was due ${dueAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}.`,
+          timestamp: t.updatedAt ?? t.createdAt, link: { type: 'task', id: t.id },
+        })
+      } else if (dueAt >= todayStart && dueAt <= todayEnd) {
+        out.push({
+          key: `task_due:${t.id}`, type: 'task_due', severity: 'warning',
+          title: `Due today: ${t.title}`, location: null,
+          context: t.description ? truncate(t.description) : 'Due today.',
+          timestamp: t.updatedAt ?? t.createdAt, link: { type: 'task', id: t.id },
+        })
+      }
+    } else {
+      const startAtDate = new Date(t.startAt)
+      if (Number.isNaN(startAtDate.getTime())) continue
+      const sameDayAsStart = startAtDate >= todayStart && startAtDate <= todayEnd
+      // Cheap same-weekday check covers 'weekly' (the common recurring-
+      // promotion case, e.g. "every Wednesday") without importing the full
+      // expandOccurrences() machinery into the notification path.
+      const recurringToday = t.recurrence.freq === 'weekly' && startAtDate.getDay() === now.getDay() &&
+        !(t.recurrence.until && new Date(t.recurrence.until) < todayStart)
+      if (sameDayAsStart || recurringToday) {
+        out.push({
+          key: `task_due:${t.id}`, type: 'task_due', severity: 'warning',
+          title: `Due today: ${t.title}`, location: null,
+          context: t.description ? truncate(t.description) : 'Due today.',
+          timestamp: t.updatedAt ?? t.createdAt, link: { type: 'task', id: t.id },
+        })
+      }
+    }
+  }
+  return out
+}
+
+// Promotion starting tomorrow -- scoped to Approved campaigns only (a Draft
+// promotion isn't real yet; nobody should be nudged about it), keyed by
+// campaignId (not by whichever task references it) so one campaign never
+// produces more than one notification even if several tasks reference it.
+function promotionStartingCandidates(campaigns, account) {
+  const out = []
+  const tomorrowStart = startOfDay(new Date(Date.now() + 86_400_000))
+  const tomorrowEnd = new Date(tomorrowStart.getTime() + 86_400_000 - 1)
+
+  for (const c of campaigns) {
+    if (c.status !== 'Approved' || !c.startDate) continue
+    if (!isVisibleToAccount(account, c.locationIds)) continue
+    const start = new Date(c.startDate)
+    if (Number.isNaN(start.getTime()) || start < tomorrowStart || start > tomorrowEnd) continue
+    out.push({
+      key: `promotion_starting:${c.id}`, type: 'promotion_starting', severity: 'info',
+      title: `Starting tomorrow: ${c.name}`, location: null,
+      context: c.description ? truncate(c.description) : 'Promotion starts tomorrow.',
+      timestamp: c.updatedAt ?? c.createdAt, link: { type: 'campaign', id: c.id },
+    })
+  }
+  return out
+}
+
 const SEVERITY_ORDER = { critical: 0, warning: 1, info: 2 }
 const MAX_NOTIFICATIONS = 50
 
@@ -225,12 +334,32 @@ const MAX_NOTIFICATIONS = 50
 // notifications/[action].js), not here, since read state is per-user and
 // this function's output must stay identical for every user sharing the
 // same authorized scope.
+async function tasksForNotifications() {
+  try {
+    return Object.values(await getAllTasks())
+  } catch (err) {
+    if (err instanceof TaskStoreUnavailableError) return []
+    throw err
+  }
+}
+
+async function campaignsForNotifications() {
+  try {
+    return Object.values(await getAllCampaigns())
+  } catch (err) {
+    if (err instanceof CampaignStoreUnavailableError) return []
+    throw err
+  }
+}
+
 export async function getNotificationCandidates(account) {
-  const [reviews, failures, assignedActions, gbpDisconnected] = await Promise.all([
+  const [reviews, failures, assignedActions, gbpDisconnected, tasks, campaigns] = await Promise.all([
     loadAuthorizedReviews(account),
     listReplyFailures(),
     assignedActionCandidates(account),
     gbpDisconnectedCandidate(account),
+    tasksForNotifications(),
+    campaignsForNotifications(),
   ])
 
   const candidates = [
@@ -238,6 +367,8 @@ export async function getNotificationCandidates(account) {
     ...replyFailureCandidates(failures, account),
     ...assignedActions,
     ...(gbpDisconnected ? [gbpDisconnected] : []),
+    ...taskDueCandidates(tasks, account),
+    ...promotionStartingCandidates(campaigns, account),
   ]
 
   candidates.sort((a, b) =>

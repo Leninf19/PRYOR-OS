@@ -29,8 +29,14 @@
 // set of values `role` may validly hold.
 export const ROLES = ['owner', 'admin', 'marketing', 'location_manager', 'read_only']
 
+// 'canCreateTasks' added by the Operations Calendar + Content Library
+// milestone -- optional, defaults to false when absent (see isValidAccount
+// below). Only meaningful for role: 'location_manager' (see
+// api/_lib/auth.js's canCreateTask()); harmless-but-ignored on every other
+// role, same tolerance displayName already has.
 const ACCOUNT_FIELDS = new Set([
   'userId', 'email', 'passwordHash', 'role', 'locationIds', 'sessionVersion', 'disabled', 'displayName',
+  'canCreateTasks',
 ])
 
 // Standard bcrypt hash shape: $2a$/$2b$/$2y$, 2-digit cost, 53 base64-ish
@@ -71,7 +77,8 @@ function isValidAccount(a) {
     isValidLocationIds(a.locationIds) &&
     Number.isInteger(a.sessionVersion) && a.sessionVersion >= 1 &&
     typeof a.disabled === 'boolean' &&
-    (a.displayName === undefined || typeof a.displayName === 'string')
+    (a.displayName === undefined || typeof a.displayName === 'string') &&
+    (a.canCreateTasks === undefined || typeof a.canCreateTasks === 'boolean')
   )
 }
 
@@ -136,5 +143,6 @@ export function toSafeAccount(account) {
     role: account.role,
     locationIds: account.locationIds,
     displayName: account.displayName ?? account.email,
+    canCreateTasks: Boolean(account.canCreateTasks),
   }
 }

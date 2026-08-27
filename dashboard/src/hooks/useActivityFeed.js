@@ -74,7 +74,9 @@ export function useActivityFeed(allReviews, filtered, prevFiltered, periodLabel)
           id: `action-${id}-${i}`, at: h.at, icon: '🛠',
           title: h.action,
           sub: actionTitleById[id] ?? 'Action Center recommendation',
-          path: '/actions',
+          // Operations Calendar + Content Library milestone: AI Suggestions
+          // now live inside Calendar, not the deprecated /actions-legacy page.
+          path: '/calendar',
         })
       })
     })

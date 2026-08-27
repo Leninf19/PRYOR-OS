@@ -29,3 +29,4 @@ export function useGenerateResetLink()      { return useUsersMutation(usersServi
 export function useUpdateUserRoleLocations() { return useUsersMutation(usersService.updateUserRoleLocations) }
 export function useDisableUser()            { return useUsersMutation(usersService.disableUser) }
 export function useEnableUser()             { return useUsersMutation(usersService.enableUser) }
+export function useUpdateUserCanCreateTasks() { return useUsersMutation(usersService.updateUserCanCreateTasks) }

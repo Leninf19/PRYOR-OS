@@ -52,3 +52,7 @@ export function updateUserRoleLocations({ userId, role, locationIds }) {
 }
 export function disableUser(userId) { return postJSON('disable-user', { userId }) }
 export function enableUser(userId) { return postJSON('enable-user', { userId }) }
+// Operations Calendar + Content Library milestone.
+export function updateUserCanCreateTasks({ userId, canCreateTasks }) {
+  return postJSON('update-user-can-create-tasks', { userId, canCreateTasks })
+}

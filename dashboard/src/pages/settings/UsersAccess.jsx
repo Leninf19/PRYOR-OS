@@ -10,7 +10,7 @@ import { useAccount } from '../../components/AuthGate.jsx'
 import { useMeta } from '../../hooks/useIntelligence.js'
 import {
   useUsersList, useInviteUser, useResendInvite, useRevokeInvite, useGenerateResetLink,
-  useUpdateUserRoleLocations, useDisableUser, useEnableUser,
+  useUpdateUserRoleLocations, useDisableUser, useEnableUser, useUpdateUserCanCreateTasks,
 } from '../../hooks/useUsers.js'
 
 const ROLE_LABELS = { owner: 'Owner', admin: 'Admin', marketing: 'Marketing', location_manager: 'Location Manager', read_only: 'Viewer' }
@@ -187,6 +187,7 @@ export default function UsersAccess() {
   const generateReset = useGenerateResetLink()
   const disable = useDisableUser()
   const enable = useEnableUser()
+  const updateCanCreateTasks = useUpdateUserCanCreateTasks()
 
   const activeOwnerCount = useMemo(
     () => (users ?? []).filter(u => u.role === 'owner' && u.status !== 'disabled').length,
@@ -227,6 +228,16 @@ export default function UsersAccess() {
       toast('Account re-enabled.', { variant: 'success' })
     } catch (err) { toast(err.message, { variant: 'error' }) }
   }
+  // Operations Calendar + Content Library milestone: only meaningful for a
+  // Location Manager -- server-side (update-user-can-create-tasks, USERS_
+  // MANAGE-gated) is the real authorization boundary; this toggle is a
+  // convenience, not the enforcement.
+  async function handleToggleCanCreateTasks(user) {
+    try {
+      await updateCanCreateTasks.mutateAsync({ userId: user.userId, canCreateTasks: !user.canCreateTasks })
+      toast(user.canCreateTasks ? 'Task creation revoked.' : 'Task creation granted.', { variant: 'success' })
+    } catch (err) { toast(err.message, { variant: 'error' }) }
+  }
 
   return (
     <div className="space-y-4">
@@ -252,7 +263,7 @@ export default function UsersAccess() {
             <table className="w-full text-xs">
               <thead>
                 <tr>
-                  {['Name', 'Email', 'Role', 'Locations', 'Status', 'Last Login', ''].map(label => (
+                  {['Name', 'Email', 'Role', 'Locations', 'Can Create Tasks', 'Status', 'Last Login', ''].map(label => (
                     <th key={label} className="px-4 py-2.5 text-left"
                         style={{ background: 'var(--color-surface-2)', borderBottom: '1px solid var(--color-border)',
                                  color: 'var(--color-text-2)', fontSize: '0.6875rem', fontWeight: 600, letterSpacing: '0.05em',
@@ -271,6 +282,18 @@ export default function UsersAccess() {
                       <td className="px-4 py-3" style={{ color: 'var(--color-text-2)' }}>{u.email}</td>
                       <td className="px-4 py-3" style={{ color: 'var(--color-text-2)' }}>{ROLE_LABELS[u.role] ?? u.role}</td>
                       <td className="px-4 py-3 max-w-xs" style={{ color: 'var(--color-text-2)' }}>{locationsLabel(u.locationIds, meta?.locations)}</td>
+                      <td className="px-4 py-3">
+                        {u.role === 'location_manager' ? (
+                          <label className="flex items-center gap-1.5 cursor-pointer">
+                            <input type="checkbox" checked={Boolean(u.canCreateTasks)}
+                                   onChange={() => handleToggleCanCreateTasks(u)}
+                                   disabled={updateCanCreateTasks.isPending} />
+                            <span style={{ color: 'var(--color-text-3)' }}>{u.canCreateTasks ? 'Yes' : 'No'}</span>
+                          </label>
+                        ) : (
+                          <span style={{ color: 'var(--color-text-3)' }}>—</span>
+                        )}
+                      </td>
                       <td className="px-4 py-3"><Badge variant={STATUS_VARIANT[u.status] ?? 'neutral'}>{STATUS_LABEL[u.status] ?? u.status}</Badge></td>
                       <td className="px-4 py-3 whitespace-nowrap" style={{ color: 'var(--color-text-3)' }}>{fmtWhen(u.lastLoginAt)}</td>
                       <td className="px-4 py-3">
@@ -315,6 +338,12 @@ export default function UsersAccess() {
                 </div>
                 <p style={{ color: 'var(--color-text-2)' }}>{u.email}</p>
                 <p style={{ color: 'var(--color-text-2)' }}>{ROLE_LABELS[u.role] ?? u.role} · {locationsLabel(u.locationIds, meta?.locations)}</p>
+                {u.role === 'location_manager' && (
+                  <label className="flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--color-text-3)' }}>
+                    <input type="checkbox" checked={Boolean(u.canCreateTasks)} onChange={() => handleToggleCanCreateTasks(u)} disabled={updateCanCreateTasks.isPending} />
+                    Can create tasks
+                  </label>
+                )}
                 <p className="text-[11px]" style={{ color: 'var(--color-text-3)' }}>Last login: {fmtWhen(u.lastLoginAt)}</p>
               </div>
             ))}

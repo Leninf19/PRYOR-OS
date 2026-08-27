@@ -15,6 +15,8 @@ import { reviewId } from '../dashboard/src/utils/dataUtils.js'
 import { _setRedisClientForTests as setActionRedis, _resetRedisClientForTests as resetActionRedis } from '../dashboard/api/_lib/actionStore.js'
 import { _setRedisClientForTests as setCredentialRedis, _resetRedisClientForTests as resetCredentialRedis } from '../dashboard/api/_lib/credentialStore.js'
 import { _setRedisClientForTests as setNotifRedis, _resetRedisClientForTests as resetNotifRedis } from '../dashboard/api/_lib/notificationStore.js'
+import { _setRedisClientForTests as setTaskRedis, _resetRedisClientForTests as resetTaskRedis } from '../dashboard/api/_lib/taskStore.js'
+import { _setRedisClientForTests as setCampaignRedis, _resetRedisClientForTests as resetCampaignRedis } from '../dashboard/api/_lib/campaignStore.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -34,7 +36,14 @@ async function run(name, fn) {
     resetActionRedis()
     resetCredentialRedis()
     resetNotifRedis()
+    resetTaskRedis()
+    resetCampaignRedis()
   }
+}
+
+function fakeHashStore(initial = {}) {
+  const store = { ...initial }
+  return { hgetall: async () => ({ ...store }) }
 }
 
 const OWNER = { userId: 'usr_owner', role: 'owner', locationIds: '*' }
@@ -266,6 +275,156 @@ async function testGbpConnectedOrNeverConnectedNeverNotifies() {
   }
 }
 
+// --- Operations Calendar + Content Library: task/promotion notifications ---
+
+function taskRecord(overrides) {
+  return {
+    id: 'task_1', title: 'Fix the ice machine', type: 'operations', locationIds: [1],
+    startAt: new Date().toISOString(), endAt: new Date().toISOString(), allDay: false,
+    priority: 'Medium', status: 'Scheduled', recurrence: null, notes: '', relatedReviewIds: [],
+    campaignId: null, sourceActionId: null, createdBy: 'usr_owner', createdAt: new Date().toISOString(),
+    updatedBy: 'usr_owner', updatedAt: new Date().toISOString(), history: [],
+    ...overrides,
+  }
+}
+
+function isoAt(hoursFromNow) {
+  return new Date(Date.now() + hoursFromNow * 3_600_000).toISOString()
+}
+
+async function testTaskDueTodayProducesATaskDueNotification() {
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore({ t1: JSON.stringify(taskRecord({ id: 't1', endAt: isoAt(2) })) }))
+  setCampaignRedis(() => fakeHashStore())
+  const candidates = await getNotificationCandidates(OWNER)
+  const due = candidates.filter(c => c.type === 'task_due')
+  assert(due.length === 1, `a task due later today must produce exactly one task_due candidate, got ${due.length}`)
+  assert(due[0].key === 'task_due:t1', 'the dedup key must be task_due:<taskId>')
+}
+
+async function testTaskOverdueProducesATaskOverdueNotificationNotBoth() {
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore({ t1: JSON.stringify(taskRecord({ id: 't1', endAt: isoAt(-48) })) }))
+  setCampaignRedis(() => fakeHashStore())
+  const candidates = await getNotificationCandidates(OWNER)
+  const overdue = candidates.filter(c => c.type === 'task_overdue')
+  const due = candidates.filter(c => c.type === 'task_due')
+  assert(overdue.length === 1 && overdue[0].severity === 'critical', 'an overdue task must produce exactly one critical task_overdue candidate')
+  assert(due.length === 0, 'an overdue task must never ALSO produce a task_due candidate for the same task')
+}
+
+async function testCompletedTaskNeverNotifies() {
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore({ t1: JSON.stringify(taskRecord({ id: 't1', endAt: isoAt(-48), status: 'Completed' })) }))
+  setCampaignRedis(() => fakeHashStore())
+  const candidates = await getNotificationCandidates(OWNER)
+  assert(candidates.filter(c => c.type === 'task_due' || c.type === 'task_overdue').length === 0, 'a Completed task must stop notifying entirely, even if its due date has passed')
+}
+
+async function testCancelledTaskNeverNotifies() {
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore({ t1: JSON.stringify(taskRecord({ id: 't1', endAt: isoAt(2), status: 'Cancelled' })) }))
+  setCampaignRedis(() => fakeHashStore())
+  const candidates = await getNotificationCandidates(OWNER)
+  assert(candidates.filter(c => c.type === 'task_due' || c.type === 'task_overdue').length === 0, 'a Cancelled task must never notify')
+}
+
+async function testFutureTaskDoesNotNotifyYet() {
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore({ t1: JSON.stringify(taskRecord({ id: 't1', endAt: isoAt(72) })) })) // 3 days out
+  setCampaignRedis(() => fakeHashStore())
+  const candidates = await getNotificationCandidates(OWNER)
+  assert(candidates.filter(c => c.type === 'task_due' || c.type === 'task_overdue').length === 0, 'a task due several days from now must not notify yet')
+}
+
+async function testTaskNotificationsAreLocationScoped() {
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore({
+    t1: JSON.stringify(taskRecord({ id: 't1', locationIds: [1], endAt: isoAt(2) })),
+    t2: JSON.stringify(taskRecord({ id: 't2', locationIds: [3], endAt: isoAt(2) })),
+  }))
+  setCampaignRedis(() => fakeHashStore())
+  const scoped = await getNotificationCandidates(LOCATION_MANAGER) // locationIds: [1]
+  const scopedDue = scoped.filter(c => c.type === 'task_due')
+  assert(scopedDue.length === 1 && scopedDue[0].key === 'task_due:t1', 'a scoped account must only see task_due for its own location')
+
+  const owner = await getNotificationCandidates(OWNER)
+  assert(owner.filter(c => c.type === 'task_due').length === 2, 'Owner must see task_due notifications across every location')
+}
+
+async function testCompanyWideTaskVisibleToScopedAccountToo() {
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore({ t1: JSON.stringify(taskRecord({ id: 't1', locationIds: '*', endAt: isoAt(2) })) }))
+  setCampaignRedis(() => fakeHashStore())
+  const scoped = await getNotificationCandidates(LOCATION_MANAGER)
+  assert(scoped.filter(c => c.type === 'task_due').length === 1, 'a company-wide (\'*\') task must still notify a location-scoped account -- it was intentionally broadcast')
+}
+
+async function testPromotionStartingTomorrowNotifiesForApprovedCampaignOnly() {
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore())
+  const tomorrow = new Date(Date.now() + 24 * 3_600_000).toISOString().slice(0, 10)
+  setCampaignRedis(() => fakeHashStore({
+    approved: JSON.stringify({ id: 'approved', name: 'Kids Eat Free', status: 'Approved', startDate: tomorrow, locationIds: [1], createdAt: new Date().toISOString() }),
+    draft: JSON.stringify({ id: 'draft', name: 'Unlaunched Promo', status: 'Draft', startDate: tomorrow, locationIds: [1], createdAt: new Date().toISOString() }),
+  }))
+  const candidates = await getNotificationCandidates(OWNER)
+  const starting = candidates.filter(c => c.type === 'promotion_starting')
+  assert(starting.length === 1, `only the Approved campaign starting tomorrow should notify, got ${starting.length}`)
+  assert(starting[0].key === 'promotion_starting:approved', 'the dedup key must be promotion_starting:<campaignId>')
+}
+
+async function testPromotionStartingIsLocationScoped() {
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore())
+  const tomorrow = new Date(Date.now() + 24 * 3_600_000).toISOString().slice(0, 10)
+  setCampaignRedis(() => fakeHashStore({
+    mine: JSON.stringify({ id: 'mine', name: 'My Promo', status: 'Approved', startDate: tomorrow, locationIds: [1], createdAt: new Date().toISOString() }),
+    other: JSON.stringify({ id: 'other', name: 'Other Promo', status: 'Approved', startDate: tomorrow, locationIds: [3], createdAt: new Date().toISOString() }),
+  }))
+  const scoped = await getNotificationCandidates(LOCATION_MANAGER) // locationIds: [1]
+  const starting = scoped.filter(c => c.type === 'promotion_starting')
+  assert(starting.length === 1 && starting[0].key === 'promotion_starting:mine', 'a scoped account must only see promotion_starting for its own authorized location')
+}
+
+async function testPromotionNotStartingTomorrowDoesNotNotify() {
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore())
+  const nextWeek = new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10)
+  setCampaignRedis(() => fakeHashStore({
+    c1: JSON.stringify({ id: 'c1', name: 'Next Week Promo', status: 'Approved', startDate: nextWeek, locationIds: [1], createdAt: new Date().toISOString() }),
+  }))
+  const candidates = await getNotificationCandidates(OWNER)
+  assert(candidates.filter(c => c.type === 'promotion_starting').length === 0, 'a promotion starting next week must not notify yet -- only "starts tomorrow"')
+}
+
+async function testTaskAndPromotionNotificationsRespectReadUnreadViaSameStableKeyMechanism() {
+  // Read/unread itself is layered on top by the API layer
+  // (dashboard/api/notifications/[action].js), not this module -- this
+  // test confirms the precondition that mechanism depends on: the SAME
+  // underlying task always produces the SAME stable key across calls, so
+  // marking it read persists correctly rather than drifting to a new key.
+  installFixture()
+  noOtherSources()
+  setTaskRedis(() => fakeHashStore({ t1: JSON.stringify(taskRecord({ id: 't1', endAt: isoAt(2) })) }))
+  setCampaignRedis(() => fakeHashStore())
+  const first = await getNotificationCandidates(OWNER)
+  const second = await getNotificationCandidates(OWNER)
+  const firstDue = first.find(c => c.type === 'task_due')
+  const secondDue = second.find(c => c.type === 'task_due')
+  assert(firstDue.key === secondDue.key, 'the same task must produce the exact same stable key across repeated calls')
+}
+
 // --- Sorting / cap ---------------------------------------------------------
 
 async function testCandidatesAreSortedCriticalFirst() {
@@ -297,6 +456,17 @@ function main() {
     ['gbp_disconnected is shown only to Owner', testGbpDisconnectedShownOnlyToOwner],
     ['gbp connected/never_connected never notifies', testGbpConnectedOrNeverConnectedNeverNotifies],
     ['candidates sort critical-severity first', testCandidatesAreSortedCriticalFirst],
+    ['a task due later today produces a task_due notification', testTaskDueTodayProducesATaskDueNotification],
+    ['an overdue task produces task_overdue, never also task_due', testTaskOverdueProducesATaskOverdueNotificationNotBoth],
+    ['a Completed task never notifies, even if overdue', testCompletedTaskNeverNotifies],
+    ['a Cancelled task never notifies', testCancelledTaskNeverNotifies],
+    ['a task due several days out does not notify yet', testFutureTaskDoesNotNotifyYet],
+    ['task due/overdue notifications are location-scoped', testTaskNotificationsAreLocationScoped],
+    ['a company-wide (\'*\') task still notifies a scoped account', testCompanyWideTaskVisibleToScopedAccountToo],
+    ['a promotion starting tomorrow notifies only for an Approved campaign', testPromotionStartingTomorrowNotifiesForApprovedCampaignOnly],
+    ['promotion_starting is location-scoped', testPromotionStartingIsLocationScoped],
+    ['a promotion not starting tomorrow does not notify', testPromotionNotStartingTomorrowDoesNotNotify],
+    ['the same task produces the same stable key across calls (read/unread precondition)', testTaskAndPromotionNotificationsRespectReadUnreadViaSameStableKeyMechanism],
   ]
   return (async () => {
     for (const [name, fn] of tests) await run(name, fn)

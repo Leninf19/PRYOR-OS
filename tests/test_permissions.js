@@ -70,6 +70,11 @@ async function testPermissionRegistryIsFrozenAndComplete() {
     'CONTACTS_VIEW', 'CONTACTS_MANAGE', 'EMAIL_VIEW', 'SETTINGS_ADMIN', 'AUDIT_VIEW',
     // Multi-Location Authentication & User Access System
     'USERS_MANAGE',
+    // Operations Calendar + Content Library milestone
+    'TASK_VIEW', 'TASK_CREATE', 'TASK_ASSIGN', 'TASK_MANAGE',
+    'CALENDAR_VIEW', 'CALENDAR_MANAGE',
+    'CONTENT_VIEW', 'CONTENT_UPLOAD', 'CONTENT_MANAGE',
+    'CAMPAIGN_CREATE', 'CAMPAIGN_MANAGE',
   ]
   for (const key of expected) {
     assert(typeof Permission[key] === 'string' && Permission[key].length > 0, `Permission.${key} must be a non-empty string`)
@@ -91,12 +96,34 @@ async function testRolePermissionsIsFrozen() {
 // Written as an explicit table (not derived) so the expected grants are
 // legible here without cross-referencing the architecture doc, and so any
 // accidental drift in permissions.js shows up as a specific, named failure.
+// Operations Calendar + Content Library milestone: owner/admin/marketing
+// hold the full 11-permission set ("operationally similar to Owner for
+// Calendar/Content" -- an explicit product decision for admin, and
+// marketing's existing full-grant pattern for the rest); location_manager/
+// read_only hold only the three *_VIEW permissions via this table --
+// TASK_CREATE for a location_manager is a per-account override
+// (canCreateTasks, tested separately against auth.js's canCreateTask(),
+// not this table) rather than a role-wide grant.
+const CALENDAR_CONTENT_FULL = {
+  TASK_VIEW: true, TASK_CREATE: true, TASK_ASSIGN: true, TASK_MANAGE: true,
+  CALENDAR_VIEW: true, CALENDAR_MANAGE: true,
+  CONTENT_VIEW: true, CONTENT_UPLOAD: true, CONTENT_MANAGE: true,
+  CAMPAIGN_CREATE: true, CAMPAIGN_MANAGE: true,
+}
+const CALENDAR_CONTENT_VIEW_ONLY = {
+  TASK_VIEW: true, TASK_CREATE: false, TASK_ASSIGN: false, TASK_MANAGE: false,
+  CALENDAR_VIEW: true, CALENDAR_MANAGE: false,
+  CONTENT_VIEW: true, CONTENT_UPLOAD: false, CONTENT_MANAGE: false,
+  CAMPAIGN_CREATE: false, CAMPAIGN_MANAGE: false,
+}
+
 const EXPECTED_GRANTS = {
   owner: {
     VIEW_ALL: true, VIEW_ASSIGNED: true, REPLY: true, REPLY_ASSIGNED: false,
     EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: true,
     CONTACTS_VIEW: true, CONTACTS_MANAGE: true, EMAIL_VIEW: true, SETTINGS_ADMIN: true, AUDIT_VIEW: true,
     USERS_MANAGE: true,
+    ...CALENDAR_CONTENT_FULL,
   },
   admin: {
     // Commit 1 scope only -- Contacts/Email/Audit grants land in the later
@@ -106,24 +133,28 @@ const EXPECTED_GRANTS = {
     EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: false,
     CONTACTS_VIEW: false, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
     USERS_MANAGE: true,
+    ...CALENDAR_CONTENT_FULL,
   },
   marketing: {
     VIEW_ALL: true, VIEW_ASSIGNED: true, REPLY: true, REPLY_ASSIGNED: false,
     EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: false,
     CONTACTS_VIEW: true, CONTACTS_MANAGE: true, EMAIL_VIEW: true, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
     USERS_MANAGE: false,
+    ...CALENDAR_CONTENT_FULL,
   },
   location_manager: {
     VIEW_ALL: false, VIEW_ASSIGNED: true, REPLY: false, REPLY_ASSIGNED: true,
     EXPORT: false, EXPORT_ASSIGNED: true, CAMPAIGNS: false, ADMIN: false,
     CONTACTS_VIEW: true, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
     USERS_MANAGE: false,
+    ...CALENDAR_CONTENT_VIEW_ONLY,
   },
   read_only: {
     VIEW_ALL: false, VIEW_ASSIGNED: true, REPLY: false, REPLY_ASSIGNED: false,
     EXPORT: false, EXPORT_ASSIGNED: false, CAMPAIGNS: false, ADMIN: false,
     CONTACTS_VIEW: false, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
     USERS_MANAGE: false,
+    ...CALENDAR_CONTENT_VIEW_ONLY,
   },
 }
 
@@ -307,6 +338,13 @@ const EXPECTED_SCOPED_AUTH_CALLERS = new Set([
   // Notification Center Audit & Fix: calls requireLocationAccess directly
   // (per-review-and-per-notification-key checks), same pattern as data.js.
   path.join(DASHBOARD_DIR, 'api', 'notifications', '[action].js'),
+  // Operations Calendar + Content Library milestone: tasks/[action].js
+  // calls requireLocationAccess directly for review_assignment location
+  // cross-checks (see validateReviewAssignmentLocations()). content/
+  // [action].js deliberately does NOT appear here -- it authorizes purely
+  // via its own accountCoversLocations()/canViewCampaign() helpers against
+  // Campaign.locationIds, never calling these review/data-oriented helpers.
+  path.join(DASHBOARD_DIR, 'api', 'tasks', '[action].js'),
 ])
 
 async function testNewHelpersAreUsedOnlyByExpectedEndpoints() {

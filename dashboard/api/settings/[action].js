@@ -910,6 +910,10 @@ async function usersListAction(req, res) {
       lastLoginAt: a.lastLoginAt ?? null,
       invitedAt: a.invitedAt ?? null,
       createdAt: a.createdAt ?? null,
+      // Operations Calendar + Content Library milestone -- only meaningful
+      // for role: 'location_manager', but included for every row so the
+      // Users & Access table can render the toggle consistently.
+      canCreateTasks: Boolean(a.canCreateTasks),
     }))
     .sort((x, y) => x.displayName.localeCompare(y.displayName))
 
@@ -1053,6 +1057,65 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
 async function disableUserAction(req, res) { return setUserDisabledAction(req, res, { disabled: true, actionName: 'disable-user' }) }
 async function enableUserAction(req, res) { return setUserDisabledAction(req, res, { disabled: false, actionName: 'enable-user' }) }
 
+// POST /api/settings/update-user-can-create-tasks { userId, canCreateTasks }
+// Operations Calendar + Content Library milestone. Owner/Admin only
+// (USERS_MANAGE) -- the same server-side authorization every other user-
+// management write in this file uses; the frontend toggle is a convenience,
+// never the authorization boundary. Meaningful only for a location_manager
+// target, but not rejected for any other role -- it's simply inert there
+// (canCreateTask() in api/_lib/auth.js only ever consults it as a fallback
+// when the role itself doesn't already hold TASK_CREATE).
+async function updateUserCanCreateTasksAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+  if (!roleHasPermission(account.role, Permission.USERS_MANAGE)) {
+    return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to manage users.' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `settings:update-user-can-create-tasks:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { userId, canCreateTasks } = req.body ?? {}
+  if (typeof userId !== 'string' || !userId) {
+    return res.status(400).json({ error: 'invalid_request', message: 'userId is required.' })
+  }
+  if (typeof canCreateTasks !== 'boolean') {
+    return res.status(400).json({ error: 'invalid_request', message: 'canCreateTasks must be a boolean.' })
+  }
+
+  try {
+    const target = await getAccountById(userId)
+    if (!target) return res.status(404).json({ error: 'not_found' })
+
+    const now = new Date().toISOString()
+    const updated = await upsertUser({
+      createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
+      inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
+      ...target,
+      canCreateTasks,
+      updatedAt: now,
+    })
+
+    await appendAuditEntry({
+      ...actorFields(account, req), entity: 'user', entityId: userId,
+      action: 'user.can_create_tasks_changed',
+      changes: [{ field: 'canCreateTasks', oldValue: Boolean(target.canCreateTasks), newValue: canCreateTasks }],
+      result: 'success',
+      message: `${canCreateTasks ? 'Granted' : 'Revoked'} task-creation for ${target.email}.`,
+    })
+
+    return res.status(200).json({ userId: updated.userId, canCreateTasks: updated.canCreateTasks })
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError) {
+      console.error(`[settings/update-user-can-create-tasks] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
     case 'contacts':                       return listContacts(req, res)
@@ -1071,6 +1134,7 @@ export default async function handler(req, res) {
     case 'update-user-role-locations':      return updateUserRoleLocationsAction(req, res)
     case 'disable-user':                    return disableUserAction(req, res)
     case 'enable-user':                     return enableUserAction(req, res)
+    case 'update-user-can-create-tasks':    return updateUserCanCreateTasksAction(req, res)
     default:                                return res.status(404).json({ error: 'not_found' })
   }
 }

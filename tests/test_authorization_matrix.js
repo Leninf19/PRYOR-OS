@@ -46,6 +46,8 @@ import actionsHandler from '../dashboard/api/actions/[action].js'
 import googleHandler from '../dashboard/api/google/[action].js'
 import settingsHandler from '../dashboard/api/settings/[action].js'
 import notificationsHandler from '../dashboard/api/notifications/[action].js'
+import tasksHandler from '../dashboard/api/tasks/[action].js'
+import contentHandler from '../dashboard/api/content/[action].js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -506,6 +508,104 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Notification Center Audit & Fix. Safe by construction: the set of keys marked read is always server-derived from getNotificationCandidates(account), so it can never include a notification outside the caller\'s own authorized scope.',
   },
+
+  // ── Operations Calendar + Content Library milestone ──────────────────────
+  {
+    route: 'GET /api/tasks/list', file: 'api/tasks/[action].js', method: 'GET', action: 'list',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'per-file, per-location -- every role holds TASK_VIEW; a scoped account is filtered to company-wide (\'*\') tasks plus tasks intersecting its own locationIds, computed server-side before the response is serialized',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'No flat role gate -- TASK_VIEW is granted to every role (permissions.js); the real decision is per-record location scope, same pattern GET /api/data uses.',
+  },
+  {
+    route: 'GET /api/tasks/get', file: 'api/tasks/[action].js', method: 'GET', action: 'get',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'single-task location scope -- an unauthorized direct-id request returns 404, never 403',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Every role holds TASK_VIEW; per-record location authorization happens inside the handler after the role check passes.',
+  },
+  {
+    route: 'POST /api/tasks/create', file: 'api/tasks/[action].js', method: 'POST', action: 'create',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing'],
+    scope: 'canCreateTask() (TASK_CREATE role grant, OR the account-level canCreateTasks override for a location_manager) -- the fixture location_manager/read_only accounts below have no canCreateTasks flag set, so they are correctly rejected here; a real location_manager with canCreateTasks=true is covered by tests/test_tasks_endpoint.js, not this role-only matrix',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Requested locationIds are additionally checked against the caller\'s own grant (reject-outright, never silently trimmed) once past this role/override gate -- see validateCreateFields()/isRequestedLocationsAuthorized() in tasks/[action].js.',
+  },
+  {
+    route: 'POST /api/tasks/update', file: 'api/tasks/[action].js', method: 'POST', action: 'update',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'no flat role gate -- every role holds TASK_VIEW; the handler then decides full-management vs. self-service (status/notes only, on an assigned/own-location task) vs. denial per-record',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'Mirrors POST /api/data\'s "no flat role gate" precedent -- per-record authorization is exercised by tests/test_tasks_endpoint.js, not this coarse role matrix.',
+  },
+  {
+    route: 'POST /api/tasks/delete', file: 'api/tasks/[action].js', method: 'POST', action: 'delete',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing'],
+    scope: 'TASK_MANAGE + location coverage over the task\'s own locationIds',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'location_manager/read_only never hold TASK_MANAGE via the role table (permissions.js) -- deleting is never available to them regardless of canCreateTasks, which only ever affects creation.',
+  },
+  {
+    route: 'GET /api/content/list-campaigns', file: 'api/content/[action].js', method: 'GET', action: 'list-campaigns',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'CONTENT_VIEW or CONTENT_MANAGE (every role holds one of the two); Draft campaigns are additionally filtered to CONTENT_MANAGE holders only, Approved/Archived to a location grant covering the campaign, inside the handler',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'No flat role gate at the route level -- canViewCampaign() inside listCampaigns() is the real per-record/per-status decision, covered by tests/test_content_endpoint.js.',
+  },
+  {
+    route: 'POST /api/content/upsert-campaign', file: 'api/content/[action].js', method: 'POST', action: 'upsert-campaign',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing'],
+    scope: 'CAMPAIGN_CREATE (no id in the request body -- the create path) or CAMPAIGN_MANAGE (an existing id -- the edit/approve/archive path)',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'The role-matrix\'s minimal request body ({}) always exercises the CREATE branch (no id) -- location_manager/read_only hold neither CAMPAIGN_CREATE nor CAMPAIGN_MANAGE, so both are rejected before any store access. Company-wide (locationIds: \'*\') creation additionally requires an unscoped account, checked after this gate.',
+  },
+  {
+    route: 'GET /api/content/list-assets', file: 'api/content/[action].js', method: 'GET', action: 'list-assets',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'CONTENT_VIEW or CONTENT_MANAGE; every returned asset\'s parent campaign is independently re-checked via canViewCampaign() before inclusion',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'blobPathname is stripped from every response -- a client is never handed the storage pointer, only ever the download() action can resolve it, after its own full re-authorization.',
+  },
+  {
+    route: 'POST /api/content/create-text-asset', file: 'api/content/[action].js', method: 'POST', action: 'create-text-asset',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing'],
+    scope: 'CONTENT_UPLOAD + the target campaign\'s location grant',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'location_manager/read_only never hold CONTENT_UPLOAD via the role table -- captions (text-only, no Blob write) go through the exact same gate as a binary upload.',
+  },
+  {
+    route: 'POST /api/content/upload', file: 'api/content/[action].js', method: 'POST', action: 'upload',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing'],
+    scope: 'CONTENT_UPLOAD + the target campaign\'s location grant + server-side MIME/extension/size validation (validateUploadRequest())',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Server-mediated upload (see content/[action].js\'s own header comment for why this replaced the originally-planned client-direct-token flow) -- access: \'private\' is hardcoded server-side in the put() call, never client-influenceable.',
+  },
+  {
+    route: 'GET /api/content/download', file: 'api/content/[action].js', method: 'GET', action: 'download',
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'no flat role gate -- re-checks authentication, the asset\'s campaign, that campaign\'s status, and the caller\'s location grant on EVERY call via canViewCampaign(), never cached from an earlier decision',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
+    locationMilestone: null,
+    notes: 'A missing/unauthorized/Draft-for-a-non-manager asset id returns 404 -- never a redirect to a Blob URL, never a cached authorization decision. Fetches the private blob server-side (get(..., {access: \'private\'})) and streams it through, so the storage pointer is never exposed to the browser.',
+  },
+  {
+    route: 'POST /api/content/delete-asset', file: 'api/content/[action].js', method: 'POST', action: 'delete-asset',
+    authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing'],
+    scope: 'CONTENT_MANAGE + the asset\'s campaign\'s location grant',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'location_manager/read_only never hold CONTENT_MANAGE via the role table.',
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -813,6 +913,8 @@ const HANDLERS = {
   'api/google/[action].js': googleHandler,
   'api/settings/[action].js': settingsHandler,
   'api/notifications/[action].js': notificationsHandler,
+  'api/tasks/[action].js': tasksHandler,
+  'api/content/[action].js': contentHandler,
 }
 
 function minimalReqFor(entry, token) {
@@ -1473,6 +1575,11 @@ const EXPECTED_SCOPED_AUTH_CALLERS = new Set([
   // Notification Center Audit & Fix: calls requireLocationAccess directly
   // (per-review-and-per-notification-key checks), same pattern as data.js.
   path.join(API_DIR, 'notifications', '[action].js'),
+  // Operations Calendar + Content Library milestone: tasks/[action].js
+  // calls requireLocationAccess directly for review_assignment location
+  // cross-checks. content/[action].js is NOT here -- see permissions.js/
+  // test_permissions.js's mirrored note.
+  path.join(API_DIR, 'tasks', '[action].js'),
 ])
 
 async function testNoProductionEndpointImportsTheNewHelpers() {

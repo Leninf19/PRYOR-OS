@@ -104,7 +104,9 @@ function collectActionCenterPriorityCandidates(actionCenter) {
       explanation: a.reason,
       severity: a.priority === 'Critical' ? 'critical' : 'high',
       sourceLabel: 'Action Center',
-      sourcePath: '/actions',
+      // Operations Calendar + Content Library milestone: AI Suggestions now
+      // live inside Calendar, not the deprecated /actions-legacy page.
+      sourcePath: '/calendar',
       subject: normalizeSubject(a.title || a.id),
     }))
 }
@@ -155,7 +157,7 @@ function collectAssignedOverdueCandidates(assignedOverdueItems) {
     explanation: a.dueDate ? `Assigned to you, due ${a.dueDate}.` : 'Assigned to you and overdue.',
     severity: 'critical',
     sourceLabel: 'My Overdue Tasks',
-    sourcePath: '/actions',
+    sourcePath: '/calendar',
     subject: normalizeSubject(a.title || a.id),
   }))
 }

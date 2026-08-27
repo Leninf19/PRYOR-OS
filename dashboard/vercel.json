@@ -20,6 +20,9 @@
     },
     "api/notifications/[action].js": {
       "includeFiles": "private-data/{meta.json,_internal/review-location-index.json,reviews/by-location/*.json}"
+    },
+    "api/tasks/[action].js": {
+      "includeFiles": "private-data/{meta.json,_internal/review-location-index.json,reviews/by-location/*.json}"
     }
   },
   "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }]

@@ -34,10 +34,15 @@ const TrendsAnalytics        = lazy(() => import('./pages/TrendsAnalytics.jsx'))
 const ScraperStatus          = lazy(() => import('./pages/ScraperStatus.jsx'))
 const ComplaintIntelligence  = lazy(() => import('./pages/ComplaintIntelligence.jsx'))
 const DepartmentPerformance  = lazy(() => import('./pages/DepartmentPerformance.jsx'))
-// M6: Actions replaces ActionCenter at /actions. ActionCenter.jsx stays on
-// disk, fully working, for the same rollback path M4/M5's retired pages use
-// -- just no longer imported here since no route renders it directly anymore.
+// Operations Calendar + Content Library milestone: Calendar.jsx replaces
+// Actions.jsx as the primary /calendar experience. Actions.jsx stays on
+// disk, fully working, and gets its own explicit rollback route
+// (/actions-legacy, one release cycle) rather than going fully unrouted
+// like the M4/M5 retired pages -- the existing AI Action Center pipeline
+// underneath it is unchanged and still worth a direct escape hatch.
 const Actions                = lazy(() => import('./pages/Actions.jsx'))
+const Calendar                = lazy(() => import('./pages/Calendar.jsx'))
+const Content                 = lazy(() => import('./pages/Content.jsx'))
 const OperationsImpact       = lazy(() => import('./pages/OperationsImpact.jsx'))
 const WhatChanged            = lazy(() => import('./pages/WhatChanged.jsx'))
 const CompetitorIntelligence = lazy(() => import('./pages/CompetitorIntelligence.jsx'))
@@ -69,8 +74,14 @@ function RouteFallback() {
 // incorrectly showing on all four pages since M3 shipped. /executive-dashboard
 // is dropped (it's now a pure redirect to /today, which does want the filter
 // bar, matching Overview.jsx's prior un-excluded behavior).
+// Operations Calendar + Content Library milestone: /calendar and /content
+// replace /actions in this list -- both have their own dedicated filter
+// UIs (location/assignee/type/status/priority/date/campaign for Calendar;
+// location/campaign/type/status/date/tags for Content), unrelated to the
+// global review date-range/location/brand/star bar. /actions-legacy is
+// added (the rollback path keeps its own prior behavior).
 const NO_FILTER_PATHS = [
-  '/scraper-status', '/insights', '/department-performance', '/actions',
+  '/scraper-status', '/insights', '/department-performance', '/actions-legacy', '/calendar', '/content',
   '/operations-impact', '/competitive', '/alerts', '/studio',
   '/employee-intel', '/reports', '/settings',
 ]
@@ -370,7 +381,15 @@ export default function App() {
              target until M8 ships its real merged content. ── */}
         <Route path="today"    element={<Today />} />
         <Route path="reviews"  element={<RReviews />} />
-        <Route path="actions"  element={<Actions />} />
+        {/* Operations Calendar + Content Library milestone: Calendar
+            replaces Actions as the primary /calendar destination. /actions
+            now redirects here (see the M3-style migration redirects below);
+            /actions-legacy keeps the old UI reachable for one release
+            cycle. The underlying AI Action Center pipeline (actionStore.js,
+            action-center.json) is completely unchanged either way. */}
+        <Route path="calendar" element={<Calendar />} />
+        <Route path="content"  element={<Content />} />
+        <Route path="actions-legacy" element={<Actions />} />
         <Route path="insights" element={<ComplaintIntelligence />} />
         <Route path="studio"   element={<MarketingIntelligence />} />
         <Route path="reports"  element={<ExecutiveReports />} />
@@ -409,7 +428,12 @@ export default function App() {
         <Route path="executive-intelligence" element={<Navigate to="/today"    replace />} />
         <Route path="intelligence"           element={<Navigate to="/insights" replace />} />
         <Route path="explorer"               element={<RedirectPreservingSearch to="/reviews" />} />
-        <Route path="action-center"          element={<Navigate to="/actions" replace />} />
+        {/* Operations Calendar + Content Library milestone: both old
+            aliases for the AI Action Center now land on Calendar, its new
+            live home (AI Suggestions section) -- /actions itself is no
+            longer the primary destination, /actions-legacy is. */}
+        <Route path="actions"                element={<Navigate to="/calendar" replace />} />
+        <Route path="action-center"          element={<Navigate to="/calendar" replace />} />
         <Route path="marketing-intel"        element={<Navigate to="/studio"  replace />} />
         <Route path="executive-reports"      element={<Navigate to="/reports" replace />} />
 

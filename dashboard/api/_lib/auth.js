@@ -20,7 +20,7 @@
 import { parseCookies } from '../google/_lib/cookies.js'
 import { verifySession, SESSION_COOKIE } from './session.js'
 import { getAccountById } from './accountStore.js'
-import { roleHasPermission } from './permissions.js'
+import { Permission, roleHasPermission } from './permissions.js'
 
 // Never include passwordHash (or anything else not needed by the caller) in
 // data that might reach the frontend or a log line. The only caller is
@@ -34,6 +34,11 @@ function toSafeAccount(account) {
     role: account.role,
     locationIds: account.locationIds,
     displayName: account.displayName ?? account.email,
+    // Operations Calendar + Content Library milestone -- only meaningful
+    // for role: 'location_manager' (see canCreateTask() below), but exposed
+    // on every account's own session shape so the frontend can gate its
+    // "+ Add Task" button without a second round trip.
+    canCreateTasks: Boolean(account.canCreateTasks),
   }
 }
 
@@ -167,4 +172,21 @@ export async function requireScopedAuth(req, res, { permission, resolveLocationI
   }
 
   return { account, locationId }
+}
+
+// Operations Calendar + Content Library milestone: whether this account may
+// create a task. Deliberately NOT folded into ROLE_PERMISSIONS -- that table
+// is a pure function of role alone (owner/admin/marketing hold TASK_CREATE
+// unconditionally), and a per-account override doesn't belong inside a
+// table meant to answer "what can this ROLE do". A location_manager account
+// never holds TASK_CREATE via the role table (see permissions.js); this is
+// the ONE place that combines the role grant with the explicit, Owner/
+// Admin-controlled `canCreateTasks` flag (Users & Access, USERS_MANAGE-
+// gated) that lets a specific manager create tasks within their own
+// authorized locations. Every other role's answer is unaffected by
+// `canCreateTasks` -- the flag is inert noise on any account it doesn't
+// apply to.
+export function canCreateTask(account) {
+  if (!account) return false
+  return roleHasPermission(account.role, Permission.TASK_CREATE) || Boolean(account.canCreateTasks)
 }

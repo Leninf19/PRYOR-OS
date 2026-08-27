@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { Link, useOutletContext } from 'react-router-dom'
 import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
@@ -8,6 +9,8 @@ import AIBriefingCard from '../components/ui/AIBriefingCard.jsx'
 import KPIGrid from '../components/ui/KPIGrid.jsx'
 import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
 import { useTodayDigest } from '../hooks/useTodayDigest.js'
+import { useTasks } from '../hooks/useTasks.js'
+import { expandAllOccurrences } from '../utils/taskRecurrence.js'
 
 // Today UX Simplification -- the page is redesigned around one question,
 // "What do I need to know and act on today?" Everything below still traces
@@ -39,12 +42,14 @@ const SEVERITY_STYLE = {
 // Three concrete CTA labels instead of one generic "View details" (UX
 // Simplification requirement) -- derived from the same sourcePath
 // priorityDigest.js already assigns each candidate, so no new data is
-// needed: a /reviews link is always a specific review, /actions is always
-// an Action Center item, and every other source in this app's data model
-// (Operations Impact, Predictive Alerts, Trend Alerts) is location-centric.
+// needed: a /reviews link is always a specific review, /calendar is always
+// an Action Center item (Operations Calendar + Content Library milestone:
+// AI Suggestions now live inside Calendar, not the old /actions path), and
+// every other source in this app's data model (Operations Impact,
+// Predictive Alerts, Trend Alerts) is location-centric.
 function ctaLabelFor(sourcePath) {
   if (sourcePath?.startsWith('/reviews')) return 'View Review'
-  if (sourcePath === '/actions') return 'View Action'
+  if (sourcePath === '/calendar') return 'View Action'
   return 'View Location'
 }
 
@@ -162,6 +167,37 @@ const MORE_REPORTS = [
   { to: '/activity',  label: 'Activity History' },
 ]
 
+// Operations Calendar + Content Library milestone. Explicit product
+// decision: Today stays an executive summary, so this is ONE compact line
+// (a count + a link), never a rendered task list -- the actual work
+// management (list, complete, detail) lives entirely in Calendar. Reuses
+// useTasks() (already server-side location-scoped) and the same
+// expandAllOccurrences() Calendar.jsx uses, so "4 tasks" here always means
+// the exact same 4 Calendar's own Today tab would show.
+function DueTodayIndicator() {
+  const { tasks, isLoading } = useTasks()
+  const dueTodayCount = useMemo(() => {
+    const dayEnd = new Date(new Date().setHours(23, 59, 59, 999))
+    return expandAllOccurrences(tasks, new Date(0), dayEnd)
+      .filter(o => o.status !== 'Completed' && o.status !== 'Cancelled').length
+  }, [tasks])
+
+  if (isLoading) return null
+  return (
+    <Link to="/calendar" className="flex items-center justify-between px-4 py-2.5 rounded-xl hover:opacity-90 transition-opacity"
+          style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>Due Today</span>
+        <span className="text-lg font-black" style={{ color: dueTodayCount > 0 ? 'var(--color-danger)' : 'var(--color-text-1)', fontWeight: 800 }}>
+          {dueTodayCount}
+        </span>
+        <span className="text-xs" style={{ color: 'var(--color-text-3)' }}>{dueTodayCount === 1 ? 'task' : 'tasks'}</span>
+      </div>
+      <span className="text-xs font-medium" style={{ color: 'var(--color-accent)' }}>View Calendar →</span>
+    </Link>
+  )
+}
+
 function MoreReportsRow() {
   return (
     <div className="flex flex-wrap items-center gap-x-5 gap-y-2 px-1">
@@ -208,6 +244,8 @@ export default function Today() {
         </p>
         <KPIGrid kpis={kpis} loading={kpisLoading || replyBacklogLoading} replyBacklog={replyBacklog} />
       </div>
+
+      <DueTodayIndicator />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className="lg:col-span-2">

@@ -130,7 +130,11 @@ function testCTALabelsMatchTheirDestinations() {
   assert(fnMatch, 'could not find ctaLabelFor()')
   const body = fnMatch[1]
   assert(/sourcePath\?\.startsWith\('\/reviews'\)\)\s*return 'View Review'/.test(body), 'a /reviews link must be labeled "View Review"')
-  assert(/sourcePath === '\/actions'\)\s*return 'View Action'/.test(body), 'an /actions link must be labeled "View Action"')
+  // Operations Calendar + Content Library milestone: AI Suggestions now
+  // live inside Calendar, not the deprecated /actions-legacy page, so
+  // priorityDigest.js's Action Center/My Overdue Tasks candidates now
+  // sourcePath into /calendar instead of /actions.
+  assert(/sourcePath === '\/calendar'\)\s*return 'View Action'/.test(body), 'a /calendar (Action Center) link must be labeled "View Action"')
   assert(/return 'View Location'/.test(body), 'every other (location-centric) source must be labeled "View Location"')
   assert(/\{ctaLabelFor\(item\.sourcePath\)\} →/.test(TODAY), 'PriorityRow must actually render the derived CTA label, not a generic "View details"')
 }

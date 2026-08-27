@@ -35,6 +35,9 @@ const I = {
   settings:    <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path d="M5 4a1 1 0 00-2 0v7.268a2 2 0 000 3.464V16a1 1 0 102 0v-1.268a2 2 0 000-3.464V4zM11 4a1 1 0 10-2 0v1.268a2 2 0 000 3.464V16a1 1 0 102 0V8.732a2 2 0 000-3.464V4zM16 3a1 1 0 011 1v7.268a2 2 0 010 3.464V16a1 1 0 11-2 0v-1.268a2 2 0 010-3.464V4a1 1 0 011-1z"/></svg>,
   activity:    <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clipRule="evenodd"/></svg>,
   execintel:   <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path d="M10.707 2.293a1 1 0 00-1.414 0l-7 7a1 1 0 001.414 1.414L4 10.414V17a1 1 0 001 1h2a1 1 0 001-1v-2a1 1 0 011-1h2a1 1 0 011 1v2a1 1 0 001 1h2a1 1 0 001-1v-6.586l.293.293a1 1 0 001.414-1.414l-7-7z"/></svg>,
+  // Operations Calendar + Content Library milestone.
+  calendar:    <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path fillRule="evenodd" d="M6 2a1 1 0 00-1 1v1H4a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-1V3a1 1 0 10-2 0v1H7V3a1 1 0 00-1-1zm0 5a1 1 0 000 2h8a1 1 0 100-2H6z" clipRule="evenodd"/></svg>,
+  content:     <svg viewBox="0 0 20 20" fill="currentColor" className="w-[15px] h-[15px] flex-shrink-0"><path d="M2 6a2 2 0 012-2h4l2 2h6a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/></svg>,
 }
 
 // ── Navigation (M3: flat 8-item structure per Navigation Specification v1.0.
@@ -42,13 +45,21 @@ const I = {
 //    represents each merge target until M4/M8 ship their real merged content;
 //    see App.jsx's /today and /insights routes.) ──────────────────────────────
 
+// Operations Calendar + Content Library milestone: 'actions' is replaced by
+// 'calendar' (/calendar, Calendar.jsx) in the primary nav -- the old
+// Actions.jsx UI stays reachable at /actions-legacy for one release cycle
+// (App.jsx) but deliberately has no nav entry of its own anymore. 'content'
+// is new, placed right after Studio (Studio is where marketing content
+// gets planned; Content is where the approved result lives for locations
+// to retrieve -- adjacent placement reads as one pipeline).
 const NAV_ITEMS = [
   { id: 'today',     path: '/today',     label: 'Today',     icon: I.execintel },
   { id: 'reviews',   path: '/reviews',   label: 'Reviews',   icon: I.response, badge: 'unanswered' },
-  { id: 'actions',   path: '/actions',   label: 'Actions',   icon: I.actioncenter },
+  { id: 'calendar',  path: '/calendar',  label: 'Calendar',  icon: I.calendar },
   { id: 'locations', path: '/locations', label: 'Locations', icon: I.locations },
   { id: 'insights',  path: '/insights',  label: 'Insights',  icon: I.trends },
   { id: 'studio',    path: '/studio',    label: 'Studio',    icon: I.marketing },
+  { id: 'content',   path: '/content',   label: 'Content',   icon: I.content },
   { id: 'reports',   path: '/reports',   label: 'Reports',   icon: I.reports },
   { id: 'settings',  path: '/settings',  label: 'Settings',  icon: I.settings },
 ]
@@ -181,11 +192,15 @@ function SnapshotBar() {
 // this account is allowed to see; nothing here re-filters by location.
 
 const NOTIFICATION_TYPE_META = {
-  critical_review:   { icon: '⚠️', dot: 'var(--color-danger)' },
-  low_star_review:   { icon: '★',  dot: 'var(--color-grade-c)' },
-  reply_failed:      { icon: '⚠️', dot: 'var(--color-danger)' },
-  assigned_action:   { icon: '📋', dot: 'var(--color-accent)' },
-  gbp_disconnected:  { icon: '🔌', dot: 'var(--color-danger)' },
+  critical_review:    { icon: '⚠️', dot: 'var(--color-danger)' },
+  low_star_review:    { icon: '★',  dot: 'var(--color-grade-c)' },
+  reply_failed:       { icon: '⚠️', dot: 'var(--color-danger)' },
+  assigned_action:    { icon: '📋', dot: 'var(--color-accent)' },
+  gbp_disconnected:   { icon: '🔌', dot: 'var(--color-danger)' },
+  // Operations Calendar + Content Library milestone.
+  task_due:           { icon: '📅', dot: 'var(--color-warning)' },
+  task_overdue:       { icon: '⏰', dot: 'var(--color-danger)' },
+  promotion_starting: { icon: '🎉', dot: 'var(--color-accent)' },
 }
 
 function relativeTime(iso) {
@@ -206,7 +221,12 @@ function relativeTime(iso) {
 function notificationLinkTo(n) {
   if (!n.link) return null
   if (n.link.type === 'review') return `/reviews?reviewId=${encodeURIComponent(n.link.id)}`
-  if (n.link.type === 'action') return '/actions'
+  // 'action' (the pre-existing AI Action Center accountability type) now
+  // surfaces inside Calendar's AI Suggestions section, not the deprecated
+  // /actions-legacy page -- Operations Calendar + Content Library milestone.
+  if (n.link.type === 'action') return '/calendar'
+  if (n.link.type === 'task') return `/calendar?taskId=${encodeURIComponent(n.link.id)}`
+  if (n.link.type === 'campaign') return `/content?campaignId=${encodeURIComponent(n.link.id)}`
   if (n.link.type === 'settings') return '/settings/google'
   return null
 }
@@ -215,6 +235,8 @@ function notificationLinkLabel(n) {
   if (n.type === 'reply_failed') return 'Retry / View Review'
   if (n.link?.type === 'review') return 'View Review'
   if (n.link?.type === 'action') return 'View Action'
+  if (n.link?.type === 'task') return 'View Task'
+  if (n.link?.type === 'campaign') return 'View Campaign'
   if (n.link?.type === 'settings') return 'View Settings'
   return null
 }
