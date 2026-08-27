@@ -1,27 +1,32 @@
-import { useMemo, useState } from 'react'
 import { Link, useOutletContext } from 'react-router-dom'
 import Card from '../components/ui/Card.jsx'
 import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
 import ErrorState from '../components/ui/ErrorState.jsx'
-import RatingTrendCard from '../components/ui/RatingTrendCard.jsx'
-import LocationLeaderboard from '../components/ui/LocationLeaderboard.jsx'
 import AIBriefingCard from '../components/ui/AIBriefingCard.jsx'
-import ExecutiveScoreCard from '../components/ui/ExecutiveScoreCard.jsx'
-import CompanyGoalsSection from '../components/ui/CompanyGoalsSection.jsx'
 import KPIGrid from '../components/ui/KPIGrid.jsx'
 import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
 import { useTodayDigest } from '../hooks/useTodayDigest.js'
-import { useActivityFeed } from '../hooks/useActivityFeed.js'
-import { useMonthlyTrend, useLocationStats, useExecutiveScores } from '../hooks/useIntelligence.js'
 
-// M4 -- Today, the merged landing page (Overview, Executive Dashboard,
-// Executive Intelligence Center, Activity Timeline, Alerts content). Every
-// number here traces to an existing hook/pure function; see
-// useTodayDigest.js for the composition. Alerts.jsx itself is NOT merged --
-// it stays live at /alerts (Execution Master Plan v1.0 M4.4) and is linked
-// from the Needs Attention section below.
+// Today UX Simplification -- the page is redesigned around one question,
+// "What do I need to know and act on today?" Everything below still traces
+// to the exact same hooks/pure functions useTodayDigest.js already composed
+// (see that file); no new metric, no new backend call, no new component.
+// What changed is which of those existing pieces render on THIS page and how
+// much space each gets:
+//  - Kept, made primary: KPI row, Needs Attention, AI brief, What Changed,
+//    selected-period Reviews Received/sentiment.
+//  - Folded together: Reply Backlog's {total, overdue} numbers now live
+//    inside the KPI row's "Needs Reply" card instead of a separate card
+//    (KPIGrid's new optional `replyBacklog` prop).
+//  - Moved off-page (long-term reporting, not a daily action list): the
+//    12-month Rating Trend and Location Leaderboard already have a live,
+//    more complete home at /trends ("Company Trend"/"Rankings" tabs) and
+//    already-existing lists; Executive Performance (score cards + company
+//    goals) moved to /reports' new "Performance" tab; Activity History moved
+//    back to its own /activity route (ActivityTimeline.jsx, unchanged,
+//    un-redirected). See the "More reports" links row at the bottom.
 
 // ── Needs Attention ──────────────────────────────────────────────────────────
 
@@ -29,6 +34,18 @@ const SEVERITY_STYLE = {
   critical: { border: 'var(--color-danger)',  badge: 'danger'  },
   high:     { border: 'var(--color-warning)', badge: 'warning' },
   warning:  { border: 'var(--color-warning)', badge: 'warning' },
+}
+
+// Three concrete CTA labels instead of one generic "View details" (UX
+// Simplification requirement) -- derived from the same sourcePath
+// priorityDigest.js already assigns each candidate, so no new data is
+// needed: a /reviews link is always a specific review, /actions is always
+// an Action Center item, and every other source in this app's data model
+// (Operations Impact, Predictive Alerts, Trend Alerts) is location-centric.
+function ctaLabelFor(sourcePath) {
+  if (sourcePath?.startsWith('/reviews')) return 'View Review'
+  if (sourcePath === '/actions') return 'View Action'
+  return 'View Location'
 }
 
 function PriorityRow({ item }) {
@@ -50,7 +67,7 @@ function PriorityRow({ item }) {
             {item.sourceLabel}
           </span>
           <Link to={item.sourcePath} className="text-[11px] font-medium hover:underline" style={{ color: 'var(--color-accent)' }}>
-            View details →
+            {ctaLabelFor(item.sourcePath)} →
           </Link>
         </div>
       </div>
@@ -86,12 +103,15 @@ function NeedsAttention({ items, isLoading, isError }) {
   )
 }
 
-// ── Improving / Worsening / Reply Backlog ────────────────────────────────────
+// ── What Changed (Improving + Worsening, merged into one compact card) ──────
+// UX Simplification: previously two separate Card components side by side
+// (plus a third for Reply Backlog, now folded into the KPI row above). Same
+// data (digest.recentWins/recentLosses, already capped at 3 each), one card.
 
-function MomentumCard({ title, items, positive, emptyText }) {
+function ChangeColumn({ title, items, positive, emptyText }) {
   const color = positive ? 'var(--color-success)' : 'var(--color-danger)'
   return (
-    <Card className="p-4 h-full">
+    <div>
       <p className="text-[10px] font-bold uppercase tracking-wider mb-2" style={{ color: 'var(--color-text-3)' }}>{title}</p>
       {items.length === 0 ? (
         <p className="text-xs italic" style={{ color: 'var(--color-text-3)' }}>{emptyText}</p>
@@ -108,192 +128,52 @@ function MomentumCard({ title, items, positive, emptyText }) {
           ))}
         </div>
       )}
-    </Card>
-  )
-}
-
-function ReplyBacklogCard({ replyBacklog, isLoading }) {
-  return (
-    <Card className="p-4 h-full">
-      <p className="text-[10px] font-bold uppercase tracking-wider mb-2" style={{ color: 'var(--color-text-3)' }}>Reply Backlog</p>
-      {isLoading ? (
-        <Skeleton className="h-16 w-full" />
-      ) : (
-        <>
-          <p className="text-2xl font-black" style={{ color: replyBacklog.total > 0 ? 'var(--color-danger)' : 'var(--color-text-1)', fontWeight: 800 }}>
-            {replyBacklog.total}
-          </p>
-          <p className="text-xs" style={{ color: 'var(--color-text-2)' }}>
-            {replyBacklog.total === 1 ? 'review pending reply' : 'reviews pending reply'}
-          </p>
-          {replyBacklog.overdue > 0 && (
-            <p className="text-xs mt-2 font-semibold" style={{ color: 'var(--color-warning)' }}>
-              {replyBacklog.overdue} overdue &gt;{replyBacklog.overdueHours}h
-            </p>
-          )}
-          <Link to="/reviews" className="text-[11px] font-medium hover:underline block mt-2" style={{ color: 'var(--color-accent)' }}>
-            Open Reviews →
-          </Link>
-        </>
-      )}
-    </Card>
-  )
-}
-
-// ── Executive Scores + Company Goals (from Executive Dashboard) ─────────────
-// Reused verbatim from ExecutiveDashboard.jsx via the same hooks; see
-// ExecutiveScoresSection below. Kept as a collapsible section rather than
-// always-expanded, since 8 score cards + 5 goal cards is a lot of
-// below-the-fold content for a landing page (Design Principle 7: density is
-// a feature, not a compromise -- but a returning user shouldn't have to
-// scroll past it every single day if they don't need it).
-
-// ── Activity History (in-page drawer, not a route) ───────────────────────────
-// Navigation Specification v1.0: "/today (single page; History available as
-// an in-page tab/drawer, not a route)". Reuses useActivityFeed.js unchanged.
-
-function dayBucket(iso) {
-  const d = new Date(iso)
-  const now = new Date()
-  const startOfDay = date => new Date(date.getFullYear(), date.getMonth(), date.getDate())
-  const diffDays = Math.round((startOfDay(now) - startOfDay(d)) / 86_400_000)
-  if (diffDays === 0) return 'Today'
-  if (diffDays === 1) return 'Yesterday'
-  return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
-}
-
-function fmtTime(iso) {
-  return new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
-}
-
-function EventRow({ e }) {
-  const inner = (
-    <div className="flex items-start gap-3 py-2.5">
-      <span className="text-base flex-shrink-0 w-6 text-center" aria-hidden="true">{e.icon}</span>
-      <div className="min-w-0 flex-1">
-        <p className="text-sm font-medium" style={{ color: 'var(--color-text-1)' }}>{e.title}</p>
-        {e.sub && <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text-3)' }}>{e.sub}</p>}
-      </div>
-      {e.at && <span className="text-[10px] flex-shrink-0" style={{ color: 'var(--color-text-3)' }}>{fmtTime(e.at)}</span>}
     </div>
   )
-  if (!e.path) return inner
-  return <Link to={e.path} className="block -mx-2 px-2 rounded-lg hover:bg-[var(--color-surface-2)] transition-colors">{inner}</Link>
 }
 
-function ActivityHistoryDrawer({ allReviews, filtered, prevFiltered, periodLabel }) {
-  const [open, setOpen] = useState(false)
-  const { timed, signals } = useActivityFeed(allReviews, filtered, prevFiltered, periodLabel)
-
-  const grouped = useMemo(() => {
-    const out = []
-    let lastBucket = null
-    timed.forEach(e => {
-      const bucket = dayBucket(e.at)
-      if (bucket !== lastBucket) { out.push({ bucket, items: [] }); lastBucket = bucket }
-      out[out.length - 1].items.push(e)
-    })
-    return out
-  }, [timed])
-
+function WhatChangedCard({ wins, losses }) {
   return (
-    <Card className="overflow-hidden">
-      <button
-        type="button"
-        onClick={() => setOpen(o => !o)}
-        className="w-full flex items-center justify-between px-5 py-4 text-left"
-        aria-expanded={open}
-        aria-controls="today-activity-history"
-      >
-        <h2 className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Activity History</h2>
-        <svg className={`w-4 h-4 transition-transform ${open ? 'rotate-180' : ''}`}
-             fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
-             style={{ color: 'var(--color-text-3)' }} aria-hidden="true">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7"/>
-        </svg>
-      </button>
-      {open && (
-        <div id="today-activity-history" className="px-5 pb-5 space-y-4">
-          {signals.length > 0 && (
-            <div>
-              <p className="text-[10px] font-bold uppercase tracking-wider mb-2" style={{ color: 'var(--color-text-3)' }}>
-                This Period's Signals{periodLabel ? ` · ${periodLabel}` : ''}
-              </p>
-              <div className="divide-y" style={{ borderColor: 'var(--color-border)' }}>
-                {signals.map((e, i) => <EventRow key={i} e={e} />)}
-              </div>
-            </div>
-          )}
-          <div>
-            <p className="text-[10px] font-bold uppercase tracking-wider mb-2" style={{ color: 'var(--color-text-3)' }}>Recent Activity</p>
-            {grouped.length === 0 ? (
-              <EmptyState icon="🕓" title="No recent activity yet"
-                          body="Activity from responding to reviews, updating actions, and pipeline runs will show up here." />
-            ) : (
-              <div className="space-y-3">
-                {grouped.map(g => (
-                  <div key={g.bucket}>
-                    <p className="text-xs font-bold mb-1" style={{ color: 'var(--color-text-2)' }}>{g.bucket}</p>
-                    <div className="divide-y" style={{ borderColor: 'var(--color-border)' }}>
-                      {g.items.map(e => <EventRow key={e.id} e={e} />)}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+    <Card className="p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>What Changed</h2>
+        <Link to="/what-changed" className="text-[11px] font-medium hover:underline" style={{ color: 'var(--color-accent)' }}>
+          Full breakdown →
+        </Link>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+        <ChangeColumn title="Improving" items={wins} positive emptyText="No standout wins detected this period yet." />
+        <ChangeColumn title="Worsening" items={losses} positive={false} emptyText="Nothing declining this period." />
+      </div>
     </Card>
   )
 }
 
-// ── Executive Performance (in-page drawer, from Executive Dashboard) ─────────
-// Reuses ExecutiveScoreCard/CompanyGoalsSection unchanged (see
-// ExecutiveDashboard.jsx, which now shares these same components). Kept
-// collapsed by default -- 8 score cards + 5 goal cards is a lot of
-// below-the-fold content for a page returning users open daily.
+// ── More reports (quick links to where long-term reporting now lives) ──────
+// UX Simplification: Rating Trend, Location Leaderboard, Executive
+// Performance, and Activity History all moved off Today -- this is the
+// wayfinding back to them, at the cost of one compact row instead of four
+// full sections.
 
-function ExecutivePerformanceDrawer({ allReviews }) {
-  const [open, setOpen] = useState(false)
-  const { data: scores, isLoading, isError, refetch } = useExecutiveScores()
+const MORE_REPORTS = [
+  { to: '/trends',   label: 'Rating Trend & Rankings' },
+  { to: '/locations', label: 'All Locations' },
+  { to: '/reports',   label: 'Executive Performance' },
+  { to: '/activity',  label: 'Activity History' },
+]
 
+function MoreReportsRow() {
   return (
-    <Card className="overflow-hidden">
-      <button
-        type="button"
-        onClick={() => setOpen(o => !o)}
-        className="w-full flex items-center justify-between px-5 py-4 text-left"
-        aria-expanded={open}
-        aria-controls="today-executive-performance"
-      >
-        <h2 className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Executive Performance</h2>
-        <svg className={`w-4 h-4 transition-transform ${open ? 'rotate-180' : ''}`}
-             fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
-             style={{ color: 'var(--color-text-3)' }} aria-hidden="true">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7"/>
-        </svg>
-      </button>
-      {open && (
-        <div id="today-executive-performance" className="px-5 pb-5 space-y-6">
-          <CompanyGoalsSection allReviews={allReviews} />
-          {isError ? (
-            <ErrorState body="Couldn't load executive scores." onRetry={refetch} />
-          ) : isLoading ? (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              {[1,2,3,4,5,6,7,8].map(i => <Skeleton key={i} className="h-40 rounded-2xl" />)}
-            </div>
-          ) : !scores?.length ? (
-            <EmptyState icon="📊" title="No executive scores yet"
-                        body="Run the analytics pipeline to generate the Executive Dashboard." />
-          ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              {scores.map(s => <ExecutiveScoreCard key={s.id} s={s} />)}
-            </div>
-          )}
-        </div>
-      )}
-    </Card>
+    <div className="flex flex-wrap items-center gap-x-5 gap-y-2 px-1">
+      <span className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>
+        More reports
+      </span>
+      {MORE_REPORTS.map(r => (
+        <Link key={r.to} to={r.to} className="text-xs font-medium hover:underline" style={{ color: 'var(--color-accent)' }}>
+          {r.label} →
+        </Link>
+      ))}
+    </div>
   )
 }
 
@@ -301,8 +181,6 @@ function ExecutivePerformanceDrawer({ allReviews }) {
 
 export default function Today() {
   const { allReviews = [], filtered = [], prevFiltered = [], filters = {} } = useOutletContext() ?? {}
-  const { data: trend,  isLoading: trendLoading } = useMonthlyTrend()
-  const { data: stats,  isLoading: statsLoading } = useLocationStats()
 
   const {
     periodLabel, digest, digestLoading, digestError,
@@ -316,56 +194,39 @@ export default function Today() {
   }
 
   return (
-    <div className="space-y-6 max-w-[1200px]">
+    <div className="space-y-5 max-w-[1200px]">
       <div>
         <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Today</h1>
         <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
-          What needs you right now · {periodLabel ?? 'Selected period'}
+          What needs you right now
         </p>
       </div>
 
-      <KPIGrid kpis={kpis} loading={kpisLoading} />
-
-      {/* Recovery Milestone (Reviews Analytics KPI): unlike KPIGrid above
-          (kpis comes from useKPIs()'s fixed trailing-30-day pipeline
-          snapshot -- see useTodayDigest.js), this is driven live by the
-          same `filtered` array that produces the plain "N reviews" badge in
-          the global filter bar (App.jsx) -- so this card's own total always
-          reconciles exactly with that badge for the active date/location/
-          brand selection, with no separate filtering logic of its own. */}
-      <SentimentBreakdown reviews={filtered} periodLabel={periodLabel} showSummaryLine />
+      <div>
+        <p className="text-[10px] font-semibold uppercase tracking-wider mb-2 px-1" style={{ color: 'var(--color-text-3)' }}>
+          Fixed snapshot from the last analytics run · trailing 30 days · does not change with the filters below
+        </p>
+        <KPIGrid kpis={kpis} loading={kpisLoading || replyBacklogLoading} replyBacklog={replyBacklog} />
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className="lg:col-span-2">
           <NeedsAttention items={digest.topPriorities} isLoading={digestLoading} isError={digestError} />
         </div>
-        <AIBriefingCard label="AI Executive Summary" brief={brief} summary={summary} loading={summaryLoading} periodLabel={periodLabel} />
+        <AIBriefingCard label="AI Daily Brief" brief={brief} summary={summary} loading={summaryLoading}
+                        periodLabel={periodLabel} topPriorities={digest.topPriorities} />
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <MomentumCard title="Improving" items={digest.recentWins} positive
-                      emptyText="No standout wins detected this period yet." />
-        <MomentumCard title="Worsening" items={digest.recentLosses} positive={false}
-                      emptyText="Nothing declining this period." />
-        <ReplyBacklogCard replyBacklog={replyBacklog} isLoading={replyBacklogLoading} />
+      <WhatChangedCard wins={digest.recentWins} losses={digest.recentLosses} />
+
+      <div>
+        <p className="text-[10px] font-semibold uppercase tracking-wider mb-2 px-1" style={{ color: 'var(--color-text-3)' }}>
+          Selected period · updates with the filters above
+        </p>
+        <SentimentBreakdown reviews={filtered} periodLabel={periodLabel} showSummaryLine />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-        <RatingTrendCard trend={trend} loading={trendLoading} />
-        <Card className="p-5">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-label" style={{ color: 'var(--color-text-2)' }}>Location Leaderboard</h3>
-            <Link to="/locations" className="text-xs font-medium" style={{ color: 'var(--color-accent)' }}>
-              All locations →
-            </Link>
-          </div>
-          <LocationLeaderboard stats={stats} loading={statsLoading} />
-        </Card>
-      </div>
-
-      <ExecutivePerformanceDrawer allReviews={allReviews} />
-
-      <ActivityHistoryDrawer allReviews={allReviews} filtered={filtered} prevFiltered={prevFiltered} periodLabel={periodLabel} />
+      <MoreReportsRow />
     </div>
   )
 }

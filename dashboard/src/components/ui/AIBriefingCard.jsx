@@ -7,7 +7,12 @@ import Skeleton from './Skeleton.jsx'
 // location filters change); falls back to the last pipeline-generated
 // summary if the live endpoint errors or no API key is configured -- same
 // graceful-degradation pattern used on "What Changed?".
-export default function AIBriefingCard({ label, brief, summary, loading, periodLabel }) {
+// Today UX Simplification: `topPriorities` is optional (Today.jsx passes its
+// digest's already-computed, already-capped top items; Overview.jsx doesn't
+// pass it and is unaffected) -- a quick-glance echo of titles only, no
+// explanation/CTA, so it doesn't duplicate the full actionable Needs
+// Attention cards sitting right next to this card.
+export default function AIBriefingCard({ label, brief, summary, loading, periodLabel, topPriorities }) {
   const aiSummaryText = summary?.summary ?? summary?.narrative ?? summary?.text ?? null
 
   return (
@@ -44,6 +49,18 @@ export default function AIBriefingCard({ label, brief, summary, loading, periodL
         <p className="text-sm italic" style={{ color: 'var(--ai-card-text-2)', opacity: 0.5 }}>
           AI summary will appear here once ANTHROPIC_API_KEY is added to GitHub secrets.
         </p>
+      )}
+      {topPriorities?.length > 0 && (
+        <div className="mt-4 pt-3" style={{ borderTop: '1px solid var(--ai-card-border)' }}>
+          <p className="text-[10px] font-bold uppercase tracking-wider mb-1.5 opacity-60">Top priorities</p>
+          <ul className="space-y-1">
+            {topPriorities.slice(0, 3).map(p => (
+              <li key={p.id} className="text-xs leading-snug" style={{ color: 'var(--ai-card-text-2)' }}>
+                · {p.title}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   )

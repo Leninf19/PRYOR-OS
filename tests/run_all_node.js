@@ -85,6 +85,7 @@ const TESTS = [
   'test_notification_events.js',
   'test_notifications_endpoint.js',
   'test_notification_bell_ui.js',
+  'test_today_page_ux.js',
 ]
 
 const results = {}

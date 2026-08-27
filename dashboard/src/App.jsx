@@ -46,6 +46,11 @@ const MarketingIntelligence  = lazy(() => import('./pages/MarketingIntelligence.
 const EmployeeIntelligence   = lazy(() => import('./pages/EmployeeIntelligence.jsx'))
 const ExecutiveReports       = lazy(() => import('./pages/ExecutiveReports.jsx'))
 const SettingsLayout         = lazy(() => import('./pages/settings/SettingsLayout.jsx'))
+// Today UX Simplification: Activity History moves off Today (a "what do I
+// act on today" command center) back to its own page -- ActivityTimeline.jsx
+// already existed for exactly this content (pre-M4) and needs no changes,
+// it just gets a live route again instead of redirecting to /today.
+const ActivityTimeline       = lazy(() => import('./pages/ActivityTimeline.jsx'))
 
 function RouteFallback() {
   return (
@@ -412,7 +417,9 @@ export default function App() {
             Master Plan v1.0 M4.4). /alerts is deliberately excluded above. */}
         <Route path="overview"            element={<Navigate to="/today" replace />} />
         <Route path="executive-dashboard" element={<Navigate to="/today" replace />} />
-        <Route path="activity"            element={<Navigate to="/today" replace />} />
+        {/* Today UX Simplification: un-redirected -- Activity History moved
+            back off Today onto its own page, exactly where it lived pre-M4. */}
+        <Route path="activity"            element={<ActivityTimeline />} />
 
         <Route path="*"          element={<Navigate to="/overview"    replace />} />
       </Route>

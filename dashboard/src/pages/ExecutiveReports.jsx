@@ -10,11 +10,13 @@ import Tabs from '../components/ui/Tabs.jsx'
 import PeriodComparison from '../components/ui/PeriodComparison.jsx'
 import RatingBreakdown from '../components/ui/RatingBreakdown.jsx'
 import SentimentBreakdown from '../components/ui/SentimentBreakdown.jsx'
+import ExecutiveScoreCard from '../components/ui/ExecutiveScoreCard.jsx'
+import CompanyGoalsSection from '../components/ui/CompanyGoalsSection.jsx'
 import { filterReviews, getMonthlyTrend } from '../utils/dataUtils.js'
 import { exportCSV, printReport } from '../utils/exportUtils.js'
 import {
   useWeeklyReportData, useKPIs, useCompanySummary,
-  useComplaintIntel, useCompetitorIntel, useActionCenter,
+  useComplaintIntel, useCompetitorIntel, useActionCenter, useExecutiveScores,
 } from '../hooks/useIntelligence.js'
 import { useActionWorkspace } from '../hooks/useActionWorkspace.js'
 
@@ -443,15 +445,45 @@ function CustomPeriodPanel({ allReviews }) {
   )
 }
 
+// ── Executive Performance panel (moved from Today, Today UX Simplification) ──
+// Reuses ExecutiveScoreCard/CompanyGoalsSection/useExecutiveScores exactly as
+// Today.jsx's old ExecutivePerformanceDrawer did -- no new component, no new
+// fetch. Today's command-center page now links here instead of rendering
+// this itself, since it's long-term performance reporting, not a "what do I
+// act on today" signal.
+function PerformancePanel({ allReviews }) {
+  const { data: scores, isLoading, isError, refetch } = useExecutiveScores()
+  return (
+    <div className="space-y-6">
+      <CompanyGoalsSection allReviews={allReviews} />
+      {isError ? (
+        <ErrorState body="Couldn't load executive scores." onRetry={refetch} />
+      ) : isLoading ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {[1,2,3,4,5,6,7,8].map(i => <Skeleton key={i} className="h-40 rounded-2xl" />)}
+        </div>
+      ) : !scores?.length ? (
+        <EmptyState icon="📊" title="No executive scores yet"
+                    body="Run the analytics pipeline to generate the Executive Dashboard." />
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {scores.map(s => <ExecutiveScoreCard key={s.id} s={s} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 const TABS = [
-  { id: 'custom',    label: 'Custom Period' },
-  { id: 'weekly',    label: 'Weekly'      },
-  { id: 'complaint', label: 'Complaints'  },
-  { id: 'competitor',label: 'Competitive' },
-  { id: 'actions',   label: 'Action Items' },
-  { id: 'network',   label: 'Network AI'  },
+  { id: 'custom',      label: 'Custom Period' },
+  { id: 'weekly',      label: 'Weekly'      },
+  { id: 'complaint',   label: 'Complaints'  },
+  { id: 'competitor',  label: 'Competitive' },
+  { id: 'actions',     label: 'Action Items' },
+  { id: 'performance', label: 'Performance' },
+  { id: 'network',     label: 'Network AI'  },
 ]
 
 export default function ExecutiveReports() {
@@ -465,9 +497,9 @@ export default function ExecutiveReports() {
   const { data: actionWs } = useActionWorkspace()
   const [tab, setTab] = useState('custom')
 
-  const loading = { custom: false, weekly: lW, complaint: lC, competitor: lR, actions: lA, network: lS }
-  const error   = { custom: false, weekly: eW, complaint: eC, competitor: eR, actions: eA, network: eS }
-  const retry   = { custom: () => {}, weekly: rW, complaint: rC, competitor: rR, actions: rA, network: rS }
+  const loading = { custom: false, weekly: lW, complaint: lC, competitor: lR, actions: lA, performance: false, network: lS }
+  const error   = { custom: false, weekly: eW, complaint: eC, competitor: eR, actions: eA, performance: false, network: eS }
+  const retry   = { custom: () => {}, weekly: rW, complaint: rC, competitor: rR, actions: rA, performance: () => {}, network: rS }
 
   return (
     <div className="space-y-6 max-w-[900px]">
@@ -498,6 +530,7 @@ export default function ExecutiveReports() {
           {tab === 'complaint'  && <ComplaintPanel  complaint={complaint} />}
           {tab === 'competitor' && <CompetitorPanel competitor={competitor} />}
           {tab === 'actions'    && <ActionItemsPanel actions={actions} ws={actionWs} />}
+          {tab === 'performance' && <PerformancePanel allReviews={allReviews} />}
           {tab === 'network'    && <NetworkSummaryPanel summary={summary} />}
         </>
       )}
