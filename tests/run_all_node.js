@@ -35,6 +35,7 @@ const TESTS = [
   'test_review_email_config.js',
   'test_location_contacts_reader.js',
   'test_email_sender.js',
+  'test_graph_mail_sender.js',
   'test_review_email_template.js',
   'test_send_review_email.js',
   'test_review_email_workflow_frontend.js',

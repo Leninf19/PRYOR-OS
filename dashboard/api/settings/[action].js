@@ -67,6 +67,7 @@ function sanitizeErrorMessage(message) {
   let out = String(message ?? 'unknown error')
   if (process.env.SMTP_PASSWORD) out = out.split(process.env.SMTP_PASSWORD).join('[redacted]')
   if (process.env.SMTP_USER) out = out.split(process.env.SMTP_USER).join('[redacted]')
+  if (process.env.MICROSOFT_CLIENT_SECRET) out = out.split(process.env.MICROSOFT_CLIENT_SECRET).join('[redacted]')
   return out.slice(0, 300)
 }
 

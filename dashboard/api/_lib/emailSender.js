@@ -54,9 +54,21 @@
 // retrying credentials.
 
 import nodemailer from 'nodemailer'
+import { hasGraphConfig, sendGraphMail } from './graphMailSender.js'
 
 const DEFAULT_FROM_NAME = 'LTA Review Dashboard'
 const DEFAULT_PORT = 587
+
+// Provider switch (Microsoft Graph migration) -- MAIL_PROVIDER=graph opts
+// in explicitly; anything else (unset, 'smtp', a typo) keeps the existing
+// SMTP behavior so deployment stays non-breaking until this is flipped on
+// purpose in Vercel. There is deliberately no automatic fallback from graph
+// to smtp on a Graph failure -- once graph is explicitly selected, a Graph
+// failure must be visible, not silently masked by a second delivery
+// attempt through a different provider.
+export function getMailProvider() {
+  return (process.env.MAIL_PROVIDER || '').trim().toLowerCase() === 'graph' ? 'graph' : 'smtp'
+}
 
 let transporter = null
 // Test-only seam -- lets tests simulate a real transporter's sendMail()
@@ -143,6 +155,11 @@ function getTransporter() {
 // rather than this module deciding that for every caller. This module
 // itself never logs the raw error or any credential.
 export async function sendReviewEmail({ to, cc, replyTo, subject, html, text }) {
+  if (getMailProvider() === 'graph') {
+    if (!hasGraphConfig()) throw new EmailSenderUnavailableError('Email service configuration error: Microsoft Graph is not configured (MICROSOFT_TENANT_ID/MICROSOFT_CLIENT_ID/MICROSOFT_CLIENT_SECRET/MAIL_FROM_ADDRESS missing).')
+    return sendGraphMail({ to, cc, replyTo, subject, html, text })
+  }
+
   const t = getTransporter()
   if (!t) throw new EmailSenderUnavailableError('Email service configuration error: SMTP is not configured (SMTP_HOST/SMTP_USER/SMTP_PASSWORD missing).')
 
