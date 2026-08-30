@@ -409,7 +409,8 @@ function SidebarContent({ unansweredCount, onLinkClick }) {
     <>
       {/* Brand */}
       <div className="px-5 py-5 flex-shrink-0" style={{ borderBottom: '1px solid var(--color-border)' }}>
-        <img src="/pryor-os-black-cropped.svg" alt="Pryor OS" className="w-[112px] h-auto" />
+        <img src="/pryor-os-black-cropped.svg" alt="Pryor OS" className="w-[112px] h-auto dark:hidden" />
+        <img src="/pryor-os-white-cropped.svg" alt="Pryor OS" className="hidden w-[112px] h-auto dark:block" />
         <p className="text-[9px] font-bold tracking-[0.18em] uppercase mt-2"
            style={{ color: 'var(--color-text-3)' }}>
           By Future Marketing Studio

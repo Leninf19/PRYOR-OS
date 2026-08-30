@@ -33,7 +33,8 @@ export default function ForgotPassword() {
     <div className="min-h-screen flex flex-col items-center justify-center gap-8 px-4"
          style={{ background: 'var(--color-bg)' }}>
       <div className="text-center">
-        <img src="/pryor-os-black-cropped.svg" alt="Pryor OS" className="mx-auto w-[210px] max-w-[75vw] h-auto" />
+        <img src="/pryor-os-black-cropped.svg" alt="Pryor OS" className="mx-auto w-[210px] max-w-[75vw] h-auto dark:hidden" />
+        <img src="/pryor-os-white-cropped.svg" alt="Pryor OS" className="hidden mx-auto w-[210px] max-w-[75vw] h-auto dark:block" />
         <p className="text-[10px] font-bold tracking-[0.2em] uppercase mt-3" style={{ color: 'var(--color-text-3)' }}>
           By Future Marketing Studio
         </p>
