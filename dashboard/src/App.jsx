@@ -95,11 +95,10 @@ function LoadingScreen() {
     <div className="min-h-screen flex flex-col items-center justify-center gap-6"
          style={{ background: 'var(--color-bg)' }}>
       <div className="text-center">
-        <p className="text-[10px] font-bold tracking-[0.2em] uppercase mb-2"
-           style={{ color: 'var(--color-accent)' }}>
-          Future Marketing Studio
+        <img src="/pryor-os-black-cropped.svg" alt="Pryor OS" className="mx-auto w-[250px] max-w-[80vw] h-auto" />
+        <p className="text-[10px] font-bold tracking-[0.2em] uppercase mt-3" style={{ color: 'var(--color-text-3)' }}>
+          By Future Marketing Studio
         </p>
-        <img src="/pryor-os-black.svg" alt="Pryor OS" className="h-6 mx-auto mt-0.5" />
       </div>
       <div className="flex items-center gap-2">
         {[0, 1, 2].map(i => (

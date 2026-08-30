@@ -409,11 +409,11 @@ function SidebarContent({ unansweredCount, onLinkClick }) {
     <>
       {/* Brand */}
       <div className="px-5 py-5 flex-shrink-0" style={{ borderBottom: '1px solid var(--color-border)' }}>
-        <p className="text-[10px] font-bold tracking-[0.18em] uppercase mb-1"
+        <img src="/pryor-os-black-cropped.svg" alt="Pryor OS" className="w-[112px] h-auto" />
+        <p className="text-[9px] font-bold tracking-[0.18em] uppercase mt-2"
            style={{ color: 'var(--color-text-3)' }}>
-          Future Marketing Studio
+          By Future Marketing Studio
         </p>
-        <img src="/pryor-os-black.svg" alt="Pryor OS" className="h-5" />
       </div>
 
       {/* Smart Search */}
