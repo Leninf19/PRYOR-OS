@@ -492,7 +492,7 @@ def generate_competitive_briefing(data: dict) -> dict | None:
         chg = v.get("change", "")
         return f"{val} ({chg})" if chg else str(val)
 
-    prompt = f"""You are Future Insights, an AI business intelligence consultant for Los Tres Amigos, a {data.get('location_count', 21)}-location Mexican restaurant group.
+    prompt = f"""You are Pryor OS, an AI business intelligence consultant for Los Tres Amigos, a {data.get('location_count', 21)}-location Mexican restaurant group.
 
 Period analyzed: {data.get('period', 'last 30 days')}
 

@@ -60,7 +60,7 @@ function credentialMetaFields(credential) {
 function page(title, body) {
   return `<!DOCTYPE html><html><head>
     <meta charset="utf-8">
-    <title>${title} — Future Insights</title>
+    <title>${title} — Pryor OS</title>
     <style>
       body{font-family:system-ui,sans-serif;max-width:600px;margin:60px auto;padding:0 20px;color:#1a1a1a;line-height:1.6}
       h2,h3{margin-top:1.5em}

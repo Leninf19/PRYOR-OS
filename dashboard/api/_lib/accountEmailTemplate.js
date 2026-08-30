@@ -15,7 +15,7 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
 }
 
-const BRAND = 'Future Insights'
+const BRAND = 'Pryor OS'
 
 export function buildInviteEmailSubject() {
   return `You've been invited to ${BRAND}`

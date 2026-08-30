@@ -37,7 +37,7 @@ export default function SettingsLayout() {
       <div>
         <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Settings</h1>
         <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
-          Integrations and configuration for Future Insights
+          Integrations and configuration for Pryor OS
         </p>
       </div>
 

@@ -413,9 +413,7 @@ function SidebarContent({ unansweredCount, onLinkClick }) {
            style={{ color: 'var(--color-text-3)' }}>
           Future Marketing Studio
         </p>
-        <h1 className="text-sm font-bold leading-tight" style={{ color: 'var(--color-text-1)' }}>
-          Future Insights
-        </h1>
+        <img src="/pryor-os-black.svg" alt="Pryor OS" className="h-5" />
       </div>
 
       {/* Smart Search */}
@@ -540,7 +538,7 @@ export default function Layout({ unansweredCount = 0, children }) {
             </svg>
           </button>
           <span className="font-semibold text-sm truncate" style={{ color: 'var(--color-text-1)' }}>
-            {current?.label ?? 'Future Insights'}
+            {current?.label ?? 'Pryor OS'}
           </span>
           {current?.id === 'actions' && unansweredCount > 0 && (
             <span className="badge badge-danger">{unansweredCount} pending</span>

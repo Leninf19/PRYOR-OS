@@ -9,14 +9,14 @@ Problem this solves: Milestone 6A's production diagnostic proved the
 would ever re-discover an OLD review's NEW owner reply -- the 15-minute
 critical-alert-check only fetches page 1 by review POST date, which can
 never see a reply added to an old review. That left up to ~6 hours (plus
-GitHub's own scheduling delay) where a review Future Insights had already
+GitHub's own scheduling delay) where a review Pryor OS had already
 successfully published to Google still showed Needs Reply everywhere except
 the one browser that published it.
 
 This script closes that gap WITHOUT turning the 15-minute check into a full
 all-pages sync (explicitly ruled out -- unnecessary Google API quota
 pressure across all 23 locations). It only ever looks at reviews that have
-an ACTIVE bridge record -- i.e. reviews Future Insights itself just
+an ACTIVE bridge record -- i.e. reviews Pryor OS itself just
 published and is still waiting on Google/the full sync to confirm -- and
 checks each one by its exact gbp_review_name (a single targeted GET, the
 same google_api.get_review() reconcile_gbp_replies.py already uses), not by

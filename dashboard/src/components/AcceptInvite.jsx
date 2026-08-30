@@ -85,9 +85,7 @@ export default function AcceptInvite() {
         <p className="text-[10px] font-bold tracking-[0.2em] uppercase mb-2" style={{ color: 'var(--color-accent)' }}>
           Future Marketing Studio
         </p>
-        <p className="text-lg font-bold" style={{ color: 'var(--color-text-1)' }}>
-          Future Insights
-        </p>
+        <img src="/pryor-os-black.svg" alt="Pryor OS" className="h-6 mx-auto mt-0.5" />
       </div>
 
       <div className="w-full max-w-sm rounded-2xl border p-6"
@@ -118,7 +116,7 @@ export default function AcceptInvite() {
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="text-center space-y-1 pb-1">
               <p className="text-sm font-semibold" style={{ color: 'var(--color-text-1)' }}>
-                You've been invited to Future Insights
+                You've been invited to Pryor OS
               </p>
               <p className="text-xs" style={{ color: 'var(--color-text-2)' }}>
                 {invite?.email} · {ROLE_LABELS[invite?.role] ?? invite?.role}

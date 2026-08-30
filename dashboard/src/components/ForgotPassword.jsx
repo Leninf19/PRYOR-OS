@@ -36,9 +36,7 @@ export default function ForgotPassword() {
         <p className="text-[10px] font-bold tracking-[0.2em] uppercase mb-2" style={{ color: 'var(--color-accent)' }}>
           Future Marketing Studio
         </p>
-        <p className="text-lg font-bold" style={{ color: 'var(--color-text-1)' }}>
-          Future Insights
-        </p>
+        <img src="/pryor-os-black.svg" alt="Pryor OS" className="h-6 mx-auto mt-0.5" />
       </div>
 
       <div className="w-full max-w-sm rounded-2xl border p-6"

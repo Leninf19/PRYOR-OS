@@ -45,9 +45,7 @@ export default function Login({ onSuccess }) {
            style={{ color: 'var(--color-accent)' }}>
           Future Marketing Studio
         </p>
-        <p className="text-lg font-bold" style={{ color: 'var(--color-text-1)' }}>
-          Future Insights
-        </p>
+        <img src="/pryor-os-black.svg" alt="Pryor OS" className="h-6 mx-auto mt-0.5" />
       </div>
 
       <form onSubmit={handleSubmit}

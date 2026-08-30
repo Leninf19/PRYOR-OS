@@ -493,7 +493,7 @@ export default function GoogleBusinessProfile() {
           ) : (
             <>
               <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)', lineHeight: 1.75 }}>
-                Once connected, one Google account covers all 21 locations. Future Insights can publish
+                Once connected, one Google account covers all 21 locations. Pryor OS can publish
                 responses directly to Google, sync new reviews automatically, and track publish status
                 for every response your team sends.
               </p>

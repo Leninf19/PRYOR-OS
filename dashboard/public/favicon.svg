@@ -1,38 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="510 90 900 900">
   <defs>
-    <!-- Background: deep midnight with subtle radial light at apex -->
-    <radialGradient id="bg" cx="50%" cy="26%" r="72%" gradientUnits="objectBoundingBox">
-      <stop offset="0%"   stop-color="#18304E"/>
-      <stop offset="100%" stop-color="#05090F"/>
-    </radialGradient>
-
-    <!-- Chevron: pure white at apex → sky blue → electric blue at base -->
-    <linearGradient id="v" x1="256" y1="124" x2="256" y2="394" gradientUnits="userSpaceOnUse">
-      <stop offset="0%"   stop-color="#FFFFFF"/>
-      <stop offset="26%"  stop-color="#E0F2FE"/>
-      <stop offset="55%"  stop-color="#38BDF8"/>
-      <stop offset="100%" stop-color="#1E40AF"/>
-    </linearGradient>
-
-    <!-- Soft halo behind the apex — the intelligence focal point -->
-    <radialGradient id="halo" cx="50%" cy="50%" r="50%" gradientUnits="objectBoundingBox">
-      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0.72"/>
-      <stop offset="42%"  stop-color="#7DD3FC" stop-opacity="0.28"/>
-      <stop offset="100%" stop-color="#38BDF8"  stop-opacity="0"/>
-    </radialGradient>
+    <style>
+      .cls-1 {
+        fill: #fff;
+      }
+    </style>
   </defs>
-
-  <!-- Background -->
-  <rect width="512" height="512" rx="96" fill="url(#bg)"/>
-
-  <!-- Apex glow halo (sits behind the chevron stroke) -->
-  <circle cx="256" cy="124" r="64" fill="url(#halo)"/>
-
-  <!-- The VERTEX mark: two precision bars meeting at a single apex -->
-  <path d="M 86 394 L 256 124 L 426 394"
-        fill="none"
-        stroke="url(#v)"
-        stroke-width="54"
-        stroke-linecap="round"
-        stroke-linejoin="round"/>
+  <path class="cls-1" d="M961.9,338.73c63.98,3.19,122.49,46.24,148.15,104.54,53.94-10.3,103.28,14.76,130.25,61.98,11.45,20.04,18.65,43.75,19.7,66.54v41.3c-.15.68-.31,1.31-.5,1.89.64,14.86-4.64,32.24-11.02,46.23-10.4,22.83-26.91,41-47.63,55.03-20.53,13.91-45.98,24.11-70.91,24.68-1.27,0-2.54.12-3.81.34h-351.74c-1.13-.19-2.24-.32-3.33-.39-21.04.04-42.56-9.44-59.37-21.8-31.21-22.94-49.89-60.23-51.69-98.38l.2-23.76c1.88-59.56,49.49-104.86,106.46-116.58,9.65-40.47,30.74-76.78,63.24-103.1,27.14-21.98,61.98-37.05,96.94-38.43l35.06-.1Z"/>
+  <path d="M1190.69,677.45c-20.17,16.92-47.22,27.82-73.69,27.83l-331.59.02c-15.24,0-30.07-3.1-43.25-10.62-16.21-9.25-28.78-23.31-36.62-40.29-16.7-36.14-13.32-83.82,17.07-111.58,20.28-17.81,48.1-27.61,74.94-28.99,4.69-37.36,17.97-71,44.68-97.71,9.72-8.97,19.8-16.95,31.47-23.19,33.1-17.68,71.95-22.31,108.26-13.05,40.04,10.21,73.53,36.64,92.3,74.01-22.03,9.69-41.85,22.86-59.4,39.64l23.26,27.97c10.59-9.77,22.06-18.38,34.69-25.8,25.88-14.89,55.97-21.97,85.07-13.51,28.31,8.23,49.03,32.53,58.89,59.77,8.47,23.38,10.48,48.33,7.02,72.9-3.56,25.27-13.23,45.95-33.1,62.62Z"/>
 </svg>

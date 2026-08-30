@@ -538,7 +538,7 @@ function BecomeNumber1({ selectedLoc, rankings, metrics, briefing }) {
           {!isLeader ? (
             <p className="text-sm leading-relaxed mb-5"
                style={{ color: 'var(--color-text-1)', lineHeight: 1.8 }}>
-              Future Insights estimates that if <strong>{selectedLoc.name}</strong> improves
+              Pryor OS estimates that if <strong>{selectedLoc.name}</strong> improves
               its average rating from {selectedLoc.avgRating?.toFixed(2)}★ to at least{' '}
               {leader.avgRating.toFixed(2)}★
               {responseRate < 85 && `, raises its review response rate above 85%`}

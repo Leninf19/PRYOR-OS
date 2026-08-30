@@ -1218,7 +1218,7 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpd
       ) : bridgeEntry ? (
         <div>
           <p className="text-[10px] font-bold uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-3)' }}>
-            Published via Future Insights
+            Published via Pryor OS
           </p>
           <div className="p-3 rounded-xl text-xs leading-relaxed italic"
                style={{ background: 'var(--color-accent-lt)', border: '1px solid var(--color-accent-md)', color: 'var(--color-text-2)' }}>

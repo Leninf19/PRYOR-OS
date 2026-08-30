@@ -276,11 +276,11 @@ async function testSubjectAndHtmlBodyPassedThrough() {
 
 async function testFromDisplayNameUsesMailFromNameWhenSet() {
   setFullGraphConfig()
-  process.env.MAIL_FROM_NAME = 'Future Insights'
+  process.env.MAIL_FROM_NAME = 'Pryor OS'
   let capturedBody = null
   _setFetchForTests(mockFetchCapturingSendMail((_url, init) => { capturedBody = JSON.parse(init.body) }))
   await sendGraphMail(BASE_MESSAGE)
-  assert(capturedBody.message.from.emailAddress.name === 'Future Insights')
+  assert(capturedBody.message.from.emailAddress.name === 'Pryor OS')
   assert(capturedBody.message.from.emailAddress.address === 'advertising@l3amigos.com')
 }
 
