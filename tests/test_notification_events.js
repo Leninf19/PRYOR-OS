@@ -140,7 +140,13 @@ async function testReviewOlderThanRetentionWindowIsExcluded() {
 // --- Stable identity / dedup -------------------------------------------------
 
 async function testRepeatedCallsProduceTheExactSameStableKey() {
-  installFixture({ ctp: [review({ ai_priority: 'critical', reviewer_name: 'Alpha', review_date: '2026-08-01' })] })
+  // A relative date (isoDaysAgo), not a hardcoded calendar date -- a fixed
+  // past date ages out of REVIEW_NOTIFICATION_RETENTION_DAYS as real time
+  // advances, which would fail this test merely because it was run long
+  // enough after the date was chosen (confirmed root cause of a prior
+  // failure: '2026-08-01' aged past the 30-day window). isoDaysAgo(1)
+  // matches review()'s own default and stays within the window forever.
+  installFixture({ ctp: [review({ ai_priority: 'critical', reviewer_name: 'Alpha', review_date: isoDaysAgo(1) })] })
   noOtherSources()
   const first = await getNotificationCandidates(OWNER)
   const second = await getNotificationCandidates(OWNER)
@@ -149,7 +155,8 @@ async function testRepeatedCallsProduceTheExactSameStableKey() {
 }
 
 async function testStableKeyUsesTheCanonicalReviewIdFormula() {
-  const r = review({ ai_priority: 'critical', reviewer_name: 'Alpha', review_date: '2026-08-01' })
+  // Relative date, same reasoning as testRepeatedCallsProduceTheExactSameStableKey above.
+  const r = review({ ai_priority: 'critical', reviewer_name: 'Alpha', review_date: isoDaysAgo(1) })
   installFixture({ ctp: [r] })
   noOtherSources()
   const [candidate] = await getNotificationCandidates(OWNER)
