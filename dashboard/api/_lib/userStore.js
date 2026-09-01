@@ -41,9 +41,18 @@
 
 import { Redis } from '@upstash/redis'
 import { normalizeEmail, isValidLocationIds, ROLES } from './accounts.js'
+import { usersKeyV2, usersEmailIndexKeyV2 } from './tenantKeys.js'
+import { resolveHashReadKey, resolveHashWriteKey } from './tenantDualRead.js'
 
 const USERS_KEY = 'users:v1'
 const EMAIL_INDEX_KEY = 'users_email_index:v1'
+
+// Multi-Tenant Phase 2: every exported function below now takes `tenantId`
+// as its first argument -- see tenantDualRead.js's header for the full
+// read/write rule. For DEFAULT_TENANT_ID (the only tenant that exists
+// today), this resolves to exactly USERS_KEY/EMAIL_INDEX_KEY, unchanged --
+// nothing about login, the Users & Access admin list, or invite/reset
+// behavior changes for Los Tres Amigos as a result of this refactor.
 
 let redisClient = null
 let testClientFactory = null
@@ -99,41 +108,44 @@ export function deriveUserStatus(record) {
   return 'invited'
 }
 
-export async function getUserById(userId) {
+export async function getUserById(tenantId, userId) {
   const client = getClient()
   if (!client) throw new UserStoreUnavailableError('user store is not configured')
   let raw
   try {
-    raw = await client.hget(USERS_KEY, userId)
+    const key = await resolveHashReadKey(client, { v1Key: USERS_KEY, v2Key: usersKeyV2(tenantId), tenantId })
+    raw = key ? await client.hget(key, userId) : null
   } catch (err) {
     throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
   }
   return parseRecord(raw)
 }
 
-export async function getUserByEmail(email) {
+export async function getUserByEmail(tenantId, email) {
   const client = getClient()
   if (!client) throw new UserStoreUnavailableError('user store is not configured')
   const normalized = normalizeEmail(email)
   let userId
   try {
-    userId = await client.hget(EMAIL_INDEX_KEY, normalized)
+    const indexKey = await resolveHashReadKey(client, { v1Key: EMAIL_INDEX_KEY, v2Key: usersEmailIndexKeyV2(tenantId), tenantId })
+    userId = indexKey ? await client.hget(indexKey, normalized) : null
   } catch (err) {
     throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
   }
   if (!userId) return null
-  return getUserById(userId)
+  return getUserById(tenantId, userId)
 }
 
 // Returns every user record (no filtering) -- callers (the Users & Access
 // admin action, assertNotLastActiveOwner) are responsible for any
 // filtering/sanitization they need.
-export async function listUsers() {
+export async function listUsers(tenantId) {
   const client = getClient()
   if (!client) throw new UserStoreUnavailableError('user store is not configured')
   let raw
   try {
-    raw = await client.hgetall(USERS_KEY)
+    const key = await resolveHashReadKey(client, { v1Key: USERS_KEY, v2Key: usersKeyV2(tenantId), tenantId })
+    raw = key ? await client.hgetall(key) : {}
   } catch (err) {
     throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
   }
@@ -160,7 +172,7 @@ function isValidRoleIncludingAdmin(role) {
 // well-formed if present) -- the caller (invitation-accept, user-management
 // actions) is responsible for its own request-body validation; this is a
 // second, defensive layer, matching contactStore.js's division of labor.
-export async function upsertUser(record, { previousEmail } = {}) {
+export async function upsertUser(tenantId, record, { previousEmail } = {}) {
   const client = getClient()
   if (!client) throw new UserStoreUnavailableError('user store is not configured')
   if (!record || typeof record.userId !== 'string' || !record.userId) {
@@ -173,14 +185,17 @@ export async function upsertUser(record, { previousEmail } = {}) {
     throw new Error('upsertUser: invalid locationIds')
   }
 
+  const usersKey = resolveHashWriteKey({ v1Key: USERS_KEY, v2Key: usersKeyV2(tenantId), tenantId })
+  const emailIndexKey = resolveHashWriteKey({ v1Key: EMAIL_INDEX_KEY, v2Key: usersEmailIndexKeyV2(tenantId), tenantId })
+
   const normalized = normalizeEmail(record.email)
   const toWrite = { ...record, email: normalized }
 
   try {
-    await client.hset(USERS_KEY, { [record.userId]: JSON.stringify(toWrite) })
-    await client.hset(EMAIL_INDEX_KEY, { [normalized]: record.userId })
+    await client.hset(usersKey, { [record.userId]: JSON.stringify(toWrite) })
+    await client.hset(emailIndexKey, { [normalized]: record.userId })
     if (previousEmail && normalizeEmail(previousEmail) !== normalized) {
-      await client.hdel(EMAIL_INDEX_KEY, normalizeEmail(previousEmail))
+      await client.hdel(emailIndexKey, normalizeEmail(previousEmail))
     }
   } catch (err) {
     throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
@@ -192,8 +207,8 @@ export async function upsertUser(record, { previousEmail } = {}) {
 // change, location change, disable/enable, password set) actually wants,
 // rather than requiring every caller to read-modify-write the full record
 // itself. Returns the updated record, or null if userId doesn't exist.
-export async function updateUser(userId, patch) {
-  const existing = await getUserById(userId)
+export async function updateUser(tenantId, userId, patch) {
+  const existing = await getUserById(tenantId, userId)
   if (!existing) return null
   const next = {
     ...existing,
@@ -201,7 +216,7 @@ export async function updateUser(userId, patch) {
     userId, // never overwritable via patch
     updatedAt: new Date().toISOString(),
   }
-  return upsertUser(next, { previousEmail: patch.email ? existing.email : undefined })
+  return upsertUser(tenantId, next, { previousEmail: patch.email ? existing.email : undefined })
 }
 
 // Best-effort, non-blocking timestamp touch -- called from the login
@@ -210,9 +225,9 @@ export async function updateUser(userId, patch) {
 // otherwise-successful login, mirroring auditLog.js's appendAuditEntry()
 // same "this matters but is not the source of truth for the action itself"
 // reasoning.
-export async function touchLastLogin(userId) {
+export async function touchLastLogin(tenantId, userId) {
   try {
-    await updateUser(userId, { lastLoginAt: new Date().toISOString() })
+    await updateUser(tenantId, userId, { lastLoginAt: new Date().toISOString() })
     return true
   } catch (err) {
     console.error(`[userStore] failed to record lastLoginAt for ${userId}: ${err.message}`)

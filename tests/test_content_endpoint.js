@@ -20,6 +20,7 @@ import { _setRedisClientForTests as _setAssetRedis, _resetRedisClientForTests as
 import { _setBlobClientForTests, _resetBlobClientForTests } from '../dashboard/api/_lib/blobStore.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
 import { _setRedisClientForTests as _setTaskRedis, _resetRedisClientForTests as _resetTaskRedis, createTask, getTask } from '../dashboard/api/_lib/taskStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -493,9 +494,9 @@ async function testEditDoesNotAffectLinkedCalendarTask() {
   setFreshTaskStore()
   const created = await invoke({ action: 'upsert-campaign', method: 'POST', token: ownerToken(), body: { name: 'Original', locationIds: [7] } })
   const campaignId = created.body.campaign.id
-  const task = await createTask({ title: 'Post flyer', type: 'promotion', locationIds: [7], startAt: '2026-09-01T00:00:00.000Z', campaignId }, { userId: 'usr_owner', displayName: 'Owner', email: 'owner@example.com' })
+  const task = await createTask(DEFAULT_TENANT_ID, { title: 'Post flyer', type: 'promotion', locationIds: [7], startAt: '2026-09-01T00:00:00.000Z', campaignId }, { userId: 'usr_owner', displayName: 'Owner', email: 'owner@example.com' })
   await invoke({ action: 'upsert-campaign', method: 'POST', token: ownerToken(), body: { id: campaignId, name: 'Renamed' } })
-  const afterEdit = await getTask(task.id)
+  const afterEdit = await getTask(DEFAULT_TENANT_ID, task.id)
   assert(afterEdit.campaignId === campaignId, 'editing a campaign\'s metadata must never disturb a task\'s reference to it')
 }
 
@@ -613,7 +614,7 @@ async function testDeleteCleansUpBlobAndAssetMetadata() {
   assert(res.statusCode === 200, `campaign delete with an asset attached expected 200, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
   assert(Object.keys(blob.blobs).length === 0, 'deleting the campaign must delete every associated asset\'s blob object, never leaving an orphan')
 
-  const assetRecord = await getAsset(listBefore.body.assets[0].id)
+  const assetRecord = await getAsset(DEFAULT_TENANT_ID, listBefore.body.assets[0].id)
   assert(assetRecord === null, 'the asset\'s own metadata record must also be deleted, not just hidden by the campaign\'s disappearance')
 }
 
@@ -624,13 +625,13 @@ async function testDeleteUnlinksLinkedTaskWithoutDeletingIt() {
   setFreshTaskStore()
   const created = await invoke({ action: 'upsert-campaign', method: 'POST', token: ownerToken(), body: { name: 'Linked', locationIds: [7] } })
   const campaignId = created.body.campaign.id
-  const task = await createTask({ title: 'Post flyer', type: 'promotion', locationIds: [7], startAt: '2026-09-01T00:00:00.000Z', campaignId }, { userId: 'usr_owner', displayName: 'Owner', email: 'owner@example.com' })
+  const task = await createTask(DEFAULT_TENANT_ID, { title: 'Post flyer', type: 'promotion', locationIds: [7], startAt: '2026-09-01T00:00:00.000Z', campaignId }, { userId: 'usr_owner', displayName: 'Owner', email: 'owner@example.com' })
 
   const res = await invoke({ action: 'delete-campaign', method: 'POST', token: ownerToken(), body: { id: campaignId } })
   assert(res.statusCode === 200, `delete expected 200, got ${res.statusCode}`)
   assert(res.body.unlinkedTaskCount === 1, 'the response must report exactly one unlinked task')
 
-  const afterDelete = await getTask(task.id)
+  const afterDelete = await getTask(DEFAULT_TENANT_ID, task.id)
   assert(afterDelete !== null, 'campaign deletion must never delete a Calendar task that merely referenced it')
   assert(afterDelete.campaignId === null, 'the task\'s broken campaignId reference must be cleared')
   assert(afterDelete.history.some(h => h.action.includes('Unlinked')), 'the unlink must be recorded in the task\'s own audit history')

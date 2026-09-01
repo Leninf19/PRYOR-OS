@@ -26,6 +26,7 @@ import { getStoredCredential } from './credentialStore.js'
 import { listReplyFailures } from './notificationStore.js'
 import { getAllTasks, TaskStoreUnavailableError } from './taskStore.js'
 import { getAllCampaigns, CampaignStoreUnavailableError } from './campaignStore.js'
+import { resolveTenantId } from './tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PRIVATE_ROOT = path.resolve(__dirname, '..', '..', 'private-data')
@@ -175,7 +176,7 @@ function replyFailureCandidates(failures, account) {
 async function assignedActionCandidates(account) {
   let all
   try {
-    all = await getAllActions()
+    all = await getAllActions(resolveTenantId(account))
   } catch (err) {
     if (err instanceof ActionStoreUnavailableError) return []
     throw err
@@ -334,18 +335,18 @@ const MAX_NOTIFICATIONS = 50
 // notifications/[action].js), not here, since read state is per-user and
 // this function's output must stay identical for every user sharing the
 // same authorized scope.
-async function tasksForNotifications() {
+async function tasksForNotifications(tenantId) {
   try {
-    return Object.values(await getAllTasks())
+    return Object.values(await getAllTasks(tenantId))
   } catch (err) {
     if (err instanceof TaskStoreUnavailableError) return []
     throw err
   }
 }
 
-async function campaignsForNotifications() {
+async function campaignsForNotifications(tenantId) {
   try {
-    return Object.values(await getAllCampaigns())
+    return Object.values(await getAllCampaigns(tenantId))
   } catch (err) {
     if (err instanceof CampaignStoreUnavailableError) return []
     throw err
@@ -353,13 +354,14 @@ async function campaignsForNotifications() {
 }
 
 export async function getNotificationCandidates(account) {
+  const tenantId = resolveTenantId(account)
   const [reviews, failures, assignedActions, gbpDisconnected, tasks, campaigns] = await Promise.all([
     loadAuthorizedReviews(account),
-    listReplyFailures(),
+    listReplyFailures(tenantId),
     assignedActionCandidates(account),
     gbpDisconnectedCandidate(account),
-    tasksForNotifications(),
-    campaignsForNotifications(),
+    tasksForNotifications(tenantId),
+    campaignsForNotifications(tenantId),
   ])
 
   const candidates = [

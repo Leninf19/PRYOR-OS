@@ -8,8 +8,16 @@
 
 import { Redis } from '@upstash/redis'
 import { randomUUID } from 'crypto'
+import { campaignsKeyV2 } from './tenantKeys.js'
+import { resolveHashReadKey, resolveHashWriteKey } from './tenantDualRead.js'
 
 const CAMPAIGN_KEY = 'content_campaigns:v1'
+
+// Multi-Tenant Phase 2: every exported function below (except
+// generateCampaignId, which touches no store) now takes `tenantId` as its
+// first argument -- see tenantDualRead.js's header for the full read/write
+// rule. For DEFAULT_TENANT_ID, this resolves to exactly CAMPAIGN_KEY,
+// unchanged.
 
 let redisClient = null
 let testClientFactory = null
@@ -49,12 +57,13 @@ export function generateCampaignId() {
   return `campaign_${randomUUID()}`
 }
 
-export async function getAllCampaigns() {
+export async function getAllCampaigns(tenantId) {
   const client = getClient()
   if (!client) throw new CampaignStoreUnavailableError('campaign store is not configured')
   let raw
   try {
-    raw = await client.hgetall(CAMPAIGN_KEY)
+    const key = await resolveHashReadKey(client, { v1Key: CAMPAIGN_KEY, v2Key: campaignsKeyV2(tenantId), tenantId })
+    raw = key ? await client.hgetall(key) : {}
   } catch (err) {
     throw new CampaignStoreUnavailableError(`campaign store unreachable: ${err.message}`)
   }
@@ -66,19 +75,20 @@ export async function getAllCampaigns() {
   return out
 }
 
-export async function getCampaign(id) {
+export async function getCampaign(tenantId, id) {
   const client = getClient()
   if (!client) throw new CampaignStoreUnavailableError('campaign store is not configured')
   let raw
   try {
-    raw = await client.hget(CAMPAIGN_KEY, id)
+    const key = await resolveHashReadKey(client, { v1Key: CAMPAIGN_KEY, v2Key: campaignsKeyV2(tenantId), tenantId })
+    raw = key ? await client.hget(key, id) : null
   } catch (err) {
     throw new CampaignStoreUnavailableError(`campaign store unreachable: ${err.message}`)
   }
   return parseRecord(raw)
 }
 
-export async function createCampaign(fields, account) {
+export async function createCampaign(tenantId, fields, account) {
   const client = getClient()
   if (!client) throw new CampaignStoreUnavailableError('campaign store is not configured')
 
@@ -99,19 +109,20 @@ export async function createCampaign(fields, account) {
     updatedAt: now,
   }
 
+  const writeKey = resolveHashWriteKey({ v1Key: CAMPAIGN_KEY, v2Key: campaignsKeyV2(tenantId), tenantId })
   try {
-    await client.hset(CAMPAIGN_KEY, { [id]: JSON.stringify(record) })
+    await client.hset(writeKey, { [id]: JSON.stringify(record) })
   } catch (err) {
     throw new CampaignStoreUnavailableError(`campaign store unreachable: ${err.message}`)
   }
   return record
 }
 
-export async function updateCampaign(id, patch, account) {
+export async function updateCampaign(tenantId, id, patch, account) {
   const client = getClient()
   if (!client) throw new CampaignStoreUnavailableError('campaign store is not configured')
 
-  const existing = await getCampaign(id)
+  const existing = await getCampaign(tenantId, id)
   if (!existing) return null
 
   const next = {
@@ -124,19 +135,21 @@ export async function updateCampaign(id, patch, account) {
     updatedAt: new Date().toISOString(),
   }
 
+  const writeKey = resolveHashWriteKey({ v1Key: CAMPAIGN_KEY, v2Key: campaignsKeyV2(tenantId), tenantId })
   try {
-    await client.hset(CAMPAIGN_KEY, { [id]: JSON.stringify(next) })
+    await client.hset(writeKey, { [id]: JSON.stringify(next) })
   } catch (err) {
     throw new CampaignStoreUnavailableError(`campaign store unreachable: ${err.message}`)
   }
   return next
 }
 
-export async function deleteCampaign(id) {
+export async function deleteCampaign(tenantId, id) {
   const client = getClient()
   if (!client) throw new CampaignStoreUnavailableError('campaign store is not configured')
+  const writeKey = resolveHashWriteKey({ v1Key: CAMPAIGN_KEY, v2Key: campaignsKeyV2(tenantId), tenantId })
   try {
-    const removed = await client.hdel(CAMPAIGN_KEY, id)
+    const removed = await client.hdel(writeKey, id)
     return removed > 0
   } catch (err) {
     throw new CampaignStoreUnavailableError(`campaign store unreachable: ${err.message}`)

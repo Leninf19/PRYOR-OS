@@ -42,6 +42,7 @@ import {
   getAllContacts, getContact, upsertContact, deleteContact, ContactStoreUnavailableError,
 } from '../_lib/contactStore.js'
 import { appendAuditEntry, listAuditEntries, clientIp, AuditLogUnavailableError } from '../_lib/auditLog.js'
+import { resolveTenantId } from '../_lib/tenants.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
 import { getAccountByEmail, getAccountById, listAccounts } from '../_lib/accountStore.js'
@@ -165,7 +166,7 @@ async function listContacts(req, res) {
   }
 
   try {
-    const all = await getAllContacts()
+    const all = await getAllContacts(resolveTenantId(account))
     const scoped = account.locationIds === '*'
       ? all
       : Object.fromEntries(
@@ -216,13 +217,13 @@ async function upsertContactAction(req, res) {
   }
 
   try {
-    const existing = await getContact(locationId)
+    const existing = await getContact(resolveTenantId(account), locationId)
     const isNew = !existing
-    const record = await upsertContact(locationId, sanitized, account, logAction ?? (isNew ? 'Contact created' : 'Contact updated'))
+    const record = await upsertContact(resolveTenantId(account), locationId, sanitized, account, logAction ?? (isNew ? 'Contact created' : 'Contact updated'))
 
     const warnings = []
     if (sanitized.primaryEmail) {
-      const all = await getAllContacts()
+      const all = await getAllContacts(resolveTenantId(account))
       const dupe = Object.values(all).find(c =>
         c.locationId !== locationId && c.primaryEmail?.toLowerCase() === sanitized.primaryEmail.toLowerCase()
       )
@@ -231,7 +232,7 @@ async function upsertContactAction(req, res) {
       }
     }
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req),
       entity: 'contact',
       entityId: String(locationId),
@@ -272,10 +273,10 @@ async function deleteContactAction(req, res) {
   if (!allowed) return
 
   try {
-    const existing = await getContact(locationId)
-    const removed = await deleteContact(locationId)
+    const existing = await getContact(resolveTenantId(account), locationId)
+    const removed = await deleteContact(resolveTenantId(account), locationId)
     if (removed) {
-      await appendAuditEntry({
+      await appendAuditEntry(resolveTenantId(account), {
         ...actorFields(account, req),
         entity: 'contact',
         entityId: String(locationId),
@@ -317,14 +318,14 @@ async function toggleContactActiveAction(req, res) {
   if (!allowed) return
 
   try {
-    const existing = await getContact(locationId)
+    const existing = await getContact(resolveTenantId(account), locationId)
     if (!existing) {
       return res.status(404).json({ error: 'not_found', message: 'No contact is configured for this location yet.' })
     }
     const active = req.body.active
-    const record = await upsertContact(locationId, { active }, account, active ? 'Contact enabled' : 'Contact disabled')
+    const record = await upsertContact(resolveTenantId(account), locationId, { active }, account, active ? 'Contact enabled' : 'Contact disabled')
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req),
       entity: 'contact',
       entityId: String(locationId),
@@ -387,13 +388,13 @@ async function backfillContactsFromLegacyAction(req, res) {
       const locationId = Number(locationIdStr)
       if (!isPositiveInteger(locationId) || !isValidEmail(entry?.email)) continue
 
-      const existing = await getContact(locationId)
+      const existing = await getContact(resolveTenantId(account), locationId)
       if (existing) {
         skipped.push(locationId) // Redis already has this location -- never overwrite
         continue
       }
 
-      await upsertContact(locationId, {
+      await upsertContact(resolveTenantId(account), locationId, {
         locationName: nameById.get(locationIdStr) ?? null,
         managerName: entry.name ?? null,
         primaryEmail: entry.email,
@@ -403,7 +404,7 @@ async function backfillContactsFromLegacyAction(req, res) {
       seeded.push(locationId)
     }
     if (seeded.length > 0) {
-      await appendAuditEntry({
+      await appendAuditEntry(resolveTenantId(account), {
         ...actorFields(account, req),
         entity: 'contact',
         entityId: null,
@@ -444,7 +445,7 @@ async function auditLogAction(req, res) {
   const offset = Number.isInteger(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0
 
   try {
-    const { entries, total } = await listAuditEntries({ entity, actorId, from, to, result, limit, offset })
+    const { entries, total } = await listAuditEntries(resolveTenantId(account), { entity, actorId, from, to, result, limit, offset })
     return res.status(200).json({ entries, total })
   } catch (err) {
     if (err instanceof AuditLogUnavailableError) {
@@ -483,7 +484,7 @@ async function emailStatusAction(req, res) {
   let auditDegraded = false
 
   try {
-    const { entries } = await listAuditEntries({ entity: 'email', limit: 200, offset: 0 })
+    const { entries } = await listAuditEntries(resolveTenantId(account), { entity: 'email', limit: 200, offset: 0 })
     lastSuccess = entries.find(e => e.result === 'success') ?? null
     lastFailure = entries.find(e => e.result === 'failure') ?? null
     recentErrors = entries.filter(e => e.result === 'failure').slice(0, 5)
@@ -539,7 +540,7 @@ async function sendTestEmailAction(req, res) {
 
   let contact
   try {
-    contact = await getContact(locationId)
+    contact = await getContact(resolveTenantId(account), locationId)
   } catch (err) {
     if (err instanceof ContactStoreUnavailableError) {
       console.error(`[settings/contacts-send-test-email] ${err.message}`)
@@ -561,8 +562,8 @@ async function sendTestEmailAction(req, res) {
     const { response } = await sendReviewEmail({ to: contact.primaryEmail, cc: contact.ccEmails, replyTo: undefined, subject, html, text })
 
     await Promise.all([
-      upsertContact(locationId, {}, account, 'Test email sent'),
-      appendAuditEntry({
+      upsertContact(resolveTenantId(account), locationId, {}, account, 'Test email sent'),
+      appendAuditEntry(resolveTenantId(account), {
         ...actorFields(account, req),
         entity: 'email',
         entityId: String(locationId),
@@ -585,8 +586,8 @@ async function sendTestEmailAction(req, res) {
 
     try {
       await Promise.all([
-        upsertContact(locationId, {}, account, 'Test email failed'),
-        appendAuditEntry({
+        upsertContact(resolveTenantId(account), locationId, {}, account, 'Test email failed'),
+        appendAuditEntry(resolveTenantId(account), {
           ...actorFields(account, req),
           entity: 'email',
           entityId: String(locationId),
@@ -655,7 +656,7 @@ async function inviteUserAction(req, res) {
       userId, email: email.toLowerCase(), role, locationIds, invitedBy: account.userId,
     })
 
-    await upsertUser({
+    await upsertUser(resolveTenantId(account), {
       userId, email, passwordHash: null, role, locationIds,
       sessionVersion: 1, disabled: false, displayName: trimmedName,
       createdAt: now, updatedAt: now, lastLoginAt: null,
@@ -678,7 +679,7 @@ async function inviteUserAction(req, res) {
       console.error(`[settings/invite-user] invite email failed: ${sanitizeErrorMessage(err.message)}`)
     }
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req),
       entity: 'user', entityId: userId,
       action: 'invitation.created',
@@ -719,7 +720,7 @@ async function resendInviteAction(req, res) {
   }
 
   try {
-    const target = await getUserById(userId)
+    const target = await getUserById(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
     if (target.passwordSetAt) {
       return res.status(409).json({ error: 'already_active', message: 'This account has already been activated -- use password reset instead.' })
@@ -733,7 +734,7 @@ async function resendInviteAction(req, res) {
       userId, email: target.email, role: target.role, locationIds: target.locationIds, invitedBy: account.userId,
     })
     const now = new Date().toISOString()
-    await updateUser(userId, {
+    await updateUser(resolveTenantId(account), userId, {
       inviteTokenHash: tokenHash, inviteExpiresAt: expiresAt, inviteRevokedAt: null, lastInviteSentAt: now,
     })
 
@@ -751,7 +752,7 @@ async function resendInviteAction(req, res) {
       console.error(`[settings/resend-invite] invite email failed: ${sanitizeErrorMessage(err.message)}`)
     }
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: 'invitation.resent', changes: null, result: 'success',
       message: `Resent invitation to ${target.email}.`,
@@ -790,7 +791,7 @@ async function revokeInviteAction(req, res) {
   }
 
   try {
-    const target = await getUserById(userId)
+    const target = await getUserById(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
     if (target.passwordSetAt) {
       return res.status(409).json({ error: 'already_active', message: 'This account has already been activated -- disable it instead.' })
@@ -799,9 +800,9 @@ async function revokeInviteAction(req, res) {
     if (target.inviteTokenHash) {
       await revokeInviteToken(target.inviteTokenHash)
     }
-    await updateUser(userId, { inviteRevokedAt: new Date().toISOString() })
+    await updateUser(resolveTenantId(account), userId, { inviteRevokedAt: new Date().toISOString() })
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: 'invitation.revoked', changes: null, result: 'success',
       message: `Revoked invitation for ${target.email}.`,
@@ -843,7 +844,7 @@ async function generateResetLinkAction(req, res) {
   }
 
   try {
-    const target = await getUserById(userId)
+    const target = await getUserById(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
     if (!target.passwordSetAt) {
       return res.status(409).json({ error: 'not_yet_active', message: 'This account has not been activated yet -- resend the invitation instead.' })
@@ -864,7 +865,7 @@ async function generateResetLinkAction(req, res) {
       console.error(`[settings/generate-reset-link] reset email failed: ${sanitizeErrorMessage(err.message)}`)
     }
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: 'password_reset.link_generated', changes: null, result: 'success',
       message: `Generated a password reset link for ${target.email}.`,
@@ -964,7 +965,7 @@ async function updateUserRoleLocationsAction(req, res) {
     }
 
     const now = new Date().toISOString()
-    const updated = await upsertUser({
+    const updated = await upsertUser(resolveTenantId(account), {
       createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
       inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
       ...target,
@@ -973,7 +974,7 @@ async function updateUserRoleLocationsAction(req, res) {
       updatedAt: now,
     })
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: 'user.role_or_locations_changed',
       changes: [
@@ -1028,7 +1029,7 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
     }
 
     const now = new Date().toISOString()
-    const updated = await upsertUser({
+    const updated = await upsertUser(resolveTenantId(account), {
       createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
       inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
       ...target,
@@ -1037,7 +1038,7 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
       updatedAt: now,
     })
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: disabled ? 'user.disabled' : 'user.enabled',
       changes: [{ field: 'disabled', oldValue: target.disabled, newValue: disabled }],
@@ -1091,7 +1092,7 @@ async function updateUserCanCreateTasksAction(req, res) {
     if (!target) return res.status(404).json({ error: 'not_found' })
 
     const now = new Date().toISOString()
-    const updated = await upsertUser({
+    const updated = await upsertUser(resolveTenantId(account), {
       createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
       inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
       ...target,
@@ -1099,7 +1100,7 @@ async function updateUserCanCreateTasksAction(req, res) {
       updatedAt: now,
     })
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: 'user.can_create_tasks_changed',
       changes: [{ field: 'canCreateTasks', oldValue: Boolean(target.canCreateTasks), newValue: canCreateTasks }],

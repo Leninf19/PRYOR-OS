@@ -208,8 +208,8 @@ function testKeyBuildersProduceExactExpectedStrings() {
   assert(auditLogKeyV2(t) === `audit_log:v2:${t}`)
   assert(credentialKeyV2(t) === `gbp_credentials:v2:${t}`)
   assert(notifSeededKeyV2(t, 'u1') === `notif_seeded:v2:${t}:u1`)
-  assert(notifReplyFailureKeyV2(t, 'r1') === `notif_reply_failure:v2:${t}:r1`)
-  assert(notifReadStateKeyV2(t, 'u1') === `notif_read_state:v2:${t}:u1`)
+  assert(notifReplyFailureKeyV2(t, 'r1') === `notif_reply_failed:v2:${t}:r1`)
+  assert(notifReadStateKeyV2(t, 'u1') === `notif_read:v2:${t}:u1`)
   assert(publishBridgeKeyV2(t, 'r1') === `publish_bridge:v2:${t}:r1`)
 }
 

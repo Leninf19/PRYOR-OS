@@ -20,6 +20,7 @@ import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests as setCredentialRedis, setStoredCredential } from '../dashboard/api/_lib/credentialStore.js'
 import { _setRedisClientForTests as setBridgeRedis, _resetRedisClientForTests as resetBridgeRedis, writePublishBridge } from '../dashboard/api/_lib/publishBridgeStore.js'
 import { _setReviewLocationIndexForTests, _resetReviewLocationIndexForTests } from '../dashboard/api/_lib/reviewLocationIndex.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 process.env.GOOGLE_CLIENT_ID = 'fake-client-id'
 process.env.GOOGLE_CLIENT_SECRET = 'fake-client-secret'
@@ -155,8 +156,8 @@ async function testReadOnlyDeniedEntirelyNoFetchAttempted() {
 
 async function testPublishBridgeBulkReadFiltersForeignLocationRecords() {
   await seedDirectory()
-  await writePublishBridge('mine', { gbpReviewName: 'accounts/1/locations/7/reviews/1', responseText: 'x', locationName: null, reviewerName: null, reviewDate: null })
-  await writePublishBridge('foreign', { gbpReviewName: 'accounts/1/locations/99/reviews/1', responseText: 'x', locationName: null, reviewerName: null, reviewDate: null })
+  await writePublishBridge(DEFAULT_TENANT_ID, 'mine', { gbpReviewName: 'accounts/1/locations/7/reviews/1', responseText: 'x', locationName: null, reviewerName: null, reviewDate: null })
+  await writePublishBridge(DEFAULT_TENANT_ID, 'foreign', { gbpReviewName: 'accounts/1/locations/99/reviews/1', responseText: 'x', locationName: null, reviewerName: null, reviewDate: null })
   _setReviewLocationIndexForTests({ mine: 7, foreign: 99 })
 
   const res = fakeRes()

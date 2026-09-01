@@ -14,6 +14,7 @@ import {
   _setRedisClientForTests,
   _resetRedisClientForTests,
 } from '../dashboard/api/_lib/contactStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -59,32 +60,32 @@ const OWNER = { userId: 'usr_owner', email: 'owner@example.com', displayName: 'O
 async function testUnconfiguredStoreThrowsOnRead() {
   let threw = false
   try {
-    await getAllContacts()
+    await getAllContacts(DEFAULT_TENANT_ID)
   } catch (err) {
     threw = err instanceof ContactStoreUnavailableError
   }
-  assert(threw, 'getAllContacts() must throw ContactStoreUnavailableError when unconfigured')
+  assert(threw, 'getAllContacts(DEFAULT_TENANT_ID) must throw ContactStoreUnavailableError when unconfigured')
 }
 
 async function testUnconfiguredStoreThrowsOnWrite() {
   let threw = false
   try {
-    await upsertContact(9, { primaryEmail: 'test@example.com' }, OWNER, 'Contact created')
+    await upsertContact(DEFAULT_TENANT_ID, 9, { primaryEmail: 'test@example.com' }, OWNER, 'Contact created')
   } catch (err) {
     threw = err instanceof ContactStoreUnavailableError
   }
-  assert(threw, 'upsertContact() must throw ContactStoreUnavailableError when unconfigured, never silently no-op')
+  assert(threw, 'upsertContact(DEFAULT_TENANT_ID, ) must throw ContactStoreUnavailableError when unconfigured, never silently no-op')
 }
 
 async function testEmptyStoreReturnsEmptyObject() {
   _setRedisClientForTests(() => fakeRedis())
-  const all = await getAllContacts()
+  const all = await getAllContacts(DEFAULT_TENANT_ID)
   assert(typeof all === 'object' && Object.keys(all).length === 0, 'an empty hash must yield {}')
 }
 
 async function testUpsertCreatesRecordWithServerStamps() {
   _setRedisClientForTests(() => fakeRedis())
-  const record = await upsertContact(9, {
+  const record = await upsertContact(DEFAULT_TENANT_ID, 9, {
     locationName: 'Los Tres Amigos Canton', managerName: 'Lenin', primaryEmail: 'test@example.com', ccEmails: [],
   }, OWNER, 'Contact created')
   assert(record.locationId === 9, 'locationId is set on the record, coerced to a number')
@@ -102,7 +103,7 @@ async function testUpsertCreatesRecordWithServerStamps() {
 
 async function testUpsertDefaultsActiveTrueForNewRecord() {
   _setRedisClientForTests(() => fakeRedis())
-  const record = await upsertContact(9, { primaryEmail: 'test@example.com' }, OWNER, 'Contact created')
+  const record = await upsertContact(DEFAULT_TENANT_ID, 9, { primaryEmail: 'test@example.com' }, OWNER, 'Contact created')
   assert(record.active === true, 'a newly created contact defaults to active: true')
   assert(Array.isArray(record.ccEmails) && record.ccEmails.length === 0, 'ccEmails defaults to an empty array when not provided')
 }
@@ -110,9 +111,9 @@ async function testUpsertDefaultsActiveTrueForNewRecord() {
 async function testUpsertPreservesCreatedByAcrossUpdates() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await upsertContact(9, { primaryEmail: 'first@example.com' }, OWNER, 'Contact created')
+  await upsertContact(DEFAULT_TENANT_ID, 9, { primaryEmail: 'first@example.com' }, OWNER, 'Contact created')
   const SECOND_ACTOR = { userId: 'usr_martin', email: 'martin@example.com', displayName: 'Martin' }
-  const record = await upsertContact(9, { primaryEmail: 'second@example.com' }, SECOND_ACTOR, 'Primary email updated')
+  const record = await upsertContact(DEFAULT_TENANT_ID, 9, { primaryEmail: 'second@example.com' }, SECOND_ACTOR, 'Primary email updated')
   assert(record.createdBy === 'usr_owner', 'createdBy must never change on a later update')
   assert(record.updatedBy === 'usr_martin', 'updatedBy reflects the most recent actor')
   assert(record.primaryEmail === 'second@example.com', 'the patch overwrites the previous value')
@@ -123,7 +124,7 @@ async function testUpsertPreservesCreatedByAcrossUpdates() {
 
 async function testUpsertWithoutLogActionDoesNotAppendHistory() {
   _setRedisClientForTests(() => fakeRedis())
-  const record = await upsertContact(9, { managerName: 'draft edit' }, OWNER, undefined)
+  const record = await upsertContact(DEFAULT_TENANT_ID, 9, { managerName: 'draft edit' }, OWNER, undefined)
   assert(record.history.length === 0, 'a write with no logAction must not add a history entry')
   assert(record.managerName === 'draft edit', 'the patch is still applied')
 }
@@ -131,9 +132,9 @@ async function testUpsertWithoutLogActionDoesNotAppendHistory() {
 async function testClientSuppliedServerFieldsAreOverwritten() {
   _setRedisClientForTests(() => fakeRedis())
   // Simulates the API layer forwarding a patch that still contains
-  // server-owned keys -- upsertContact() itself is the last line of defense
+  // server-owned keys -- upsertContact(DEFAULT_TENANT_ID, ) itself is the last line of defense
   // even though dashboard/api/settings/[action].js is expected to strip these.
-  const record = await upsertContact(9, {
+  const record = await upsertContact(DEFAULT_TENANT_ID, 9, {
     primaryEmail: 'test@example.com',
     locationId: 999,
     createdBy: 'usr_attacker', createdAt: '1999-01-01T00:00:00.000Z',
@@ -152,9 +153,9 @@ async function testClientSuppliedServerFieldsAreOverwritten() {
 async function testGetAllContactsReturnsMultipleRecords() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await upsertContact(9, { primaryEmail: 'canton@example.com' }, OWNER, 'Contact created')
-  await upsertContact(2, { primaryEmail: 'chelsea@example.com' }, OWNER, 'Contact created')
-  const all = await getAllContacts()
+  await upsertContact(DEFAULT_TENANT_ID, 9, { primaryEmail: 'canton@example.com' }, OWNER, 'Contact created')
+  await upsertContact(DEFAULT_TENANT_ID, 2, { primaryEmail: 'chelsea@example.com' }, OWNER, 'Contact created')
+  const all = await getAllContacts(DEFAULT_TENANT_ID)
   assert(Object.keys(all).length === 2, 'both records are returned')
   assert(all['9'].primaryEmail === 'canton@example.com' && all['2'].primaryEmail === 'chelsea@example.com',
     'each record keeps its own fields, keyed by locationId')
@@ -166,7 +167,7 @@ async function testReadFailureThrowsUnavailable() {
   }))
   let threw = false
   try {
-    await getAllContacts()
+    await getAllContacts(DEFAULT_TENANT_ID)
   } catch (err) {
     threw = err instanceof ContactStoreUnavailableError
   }
@@ -180,7 +181,7 @@ async function testWriteFailureThrowsUnavailable() {
   }))
   let threw = false
   try {
-    await upsertContact(9, { primaryEmail: 'test@example.com' }, OWNER, 'Contact created')
+    await upsertContact(DEFAULT_TENANT_ID, 9, { primaryEmail: 'test@example.com' }, OWNER, 'Contact created')
   } catch (err) {
     threw = err instanceof ContactStoreUnavailableError
   }
@@ -190,23 +191,23 @@ async function testWriteFailureThrowsUnavailable() {
 async function testGetContactReturnsSingleRecordWithoutFetchingAll() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await upsertContact(9, { primaryEmail: 'canton@example.com' }, OWNER, 'Contact created')
-  await upsertContact(2, { primaryEmail: 'chelsea@example.com' }, OWNER, 'Contact created')
-  const record = await getContact(9)
+  await upsertContact(DEFAULT_TENANT_ID, 9, { primaryEmail: 'canton@example.com' }, OWNER, 'Contact created')
+  await upsertContact(DEFAULT_TENANT_ID, 2, { primaryEmail: 'chelsea@example.com' }, OWNER, 'Contact created')
+  const record = await getContact(DEFAULT_TENANT_ID, 9)
   assert(record.primaryEmail === 'canton@example.com', 'getContact must return the requested record')
   assert(record.locationId === 9, 'getContact must return the correct locationId')
 }
 
 async function testGetContactReturnsNullForUnknownLocation() {
   _setRedisClientForTests(() => fakeRedis())
-  const record = await getContact(999)
+  const record = await getContact(DEFAULT_TENANT_ID, 999)
   assert(record === null, 'getContact must return null for a locationId with no record, not throw')
 }
 
 async function testGetContactThrowsWhenUnconfigured() {
   let threw = false
   try {
-    await getContact(9)
+    await getContact(DEFAULT_TENANT_ID, 9)
   } catch (err) {
     threw = err instanceof ContactStoreUnavailableError
   }
@@ -215,30 +216,30 @@ async function testGetContactThrowsWhenUnconfigured() {
 
 async function testMalformedStoredValueIsSkippedNotThrown() {
   _setRedisClientForTests(() => fakeRedis({ 9: 'not valid json {{{' }))
-  const all = await getAllContacts()
+  const all = await getAllContacts(DEFAULT_TENANT_ID)
   assert(Object.keys(all).length === 0, 'a corrupted stored record is skipped rather than crashing the whole read')
 }
 
 async function testDeleteContactRemovesRecordAndReturnsTrue() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await upsertContact(9, { primaryEmail: 'canton@example.com' }, OWNER, 'Contact created')
-  const removed = await deleteContact(9)
+  await upsertContact(DEFAULT_TENANT_ID, 9, { primaryEmail: 'canton@example.com' }, OWNER, 'Contact created')
+  const removed = await deleteContact(DEFAULT_TENANT_ID, 9)
   assert(removed === true, 'deleteContact must return true when a record existed')
-  const record = await getContact(9)
+  const record = await getContact(DEFAULT_TENANT_ID, 9)
   assert(record === null, 'the record must actually be gone after delete, not just marked inactive')
 }
 
 async function testDeleteContactReturnsFalseForUnknownLocation() {
   _setRedisClientForTests(() => fakeRedis())
-  const removed = await deleteContact(999)
+  const removed = await deleteContact(DEFAULT_TENANT_ID, 999)
   assert(removed === false, 'deleteContact must return false, not throw, when there was nothing to delete')
 }
 
 async function testDeleteContactThrowsWhenUnconfigured() {
   let threw = false
   try {
-    await deleteContact(9)
+    await deleteContact(DEFAULT_TENANT_ID, 9)
   } catch (err) {
     threw = err instanceof ContactStoreUnavailableError
   }
@@ -246,16 +247,16 @@ async function testDeleteContactThrowsWhenUnconfigured() {
 }
 
 async function testDisableIsUpsertNotDelete() {
-  // Disable/Enable Contact must be a normal upsertContact({ active: false })
+  // Disable/Enable Contact must be a normal upsertContact(DEFAULT_TENANT_ID, { active: false })
   // -- the record (and its history) survives, unlike Delete Contact.
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await upsertContact(9, { primaryEmail: 'canton@example.com' }, OWNER, 'Contact created')
-  const disabled = await upsertContact(9, { active: false }, OWNER, 'Contact disabled')
+  await upsertContact(DEFAULT_TENANT_ID, 9, { primaryEmail: 'canton@example.com' }, OWNER, 'Contact created')
+  const disabled = await upsertContact(DEFAULT_TENANT_ID, 9, { active: false }, OWNER, 'Contact disabled')
   assert(disabled.active === false, 'active flips to false')
   assert(disabled.primaryEmail === 'canton@example.com', 'other fields survive a disable')
   assert(disabled.history.length === 2, 'disabling is recorded in history, not a silent removal')
-  const enabled = await upsertContact(9, { active: true }, OWNER, 'Contact enabled')
+  const enabled = await upsertContact(DEFAULT_TENANT_ID, 9, { active: true }, OWNER, 'Contact enabled')
   assert(enabled.active === true, 're-enabling flips active back to true')
   assert(enabled.history.length === 3, 're-enabling is also recorded in history')
 }

@@ -39,6 +39,7 @@ import {
   writePublishBridge, getPublishBridges, PublishBridgeUnavailableError,
 } from '../_lib/publishBridgeStore.js'
 import { recordReplyFailure, clearReplyFailure } from '../_lib/notificationStore.js'
+import { resolveTenantId } from '../_lib/tenants.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -285,7 +286,7 @@ async function callback(req, res) {
     `))
   }
 
-  await appendAuditEntry({
+  await appendAuditEntry(resolveTenantId(account), {
     actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
     entity: 'google_oauth', entityId: null, action: 'google.reconnected', changes: null, result: 'success',
     message: connectedAccountName ? `Connected Google Business Profile account "${connectedAccountName}".` : 'Connected a Google Business Profile account.',
@@ -878,7 +879,7 @@ async function publish(req, res) {
     // publish response (matches the bridge-write tolerance immediately
     // below, and the publish bridge's own success path is entirely
     // unaffected by this).
-    if (localReviewId) await clearReplyFailure(localReviewId)
+    if (localReviewId) await clearReplyFailure(resolveTenantId(account), localReviewId)
     if (!localReviewId) {
       // Frontend didn't send its own review id (older client, or a caller
       // hitting this endpoint directly) -- Google still succeeded, there's
@@ -887,7 +888,7 @@ async function publish(req, res) {
       return res.status(200).json({ success: true, bridgeWarning: true })
     }
     try {
-      await writePublishBridge(localReviewId, {
+      await writePublishBridge(resolveTenantId(account), localReviewId, {
         gbpReviewName: resolvedGbpReviewName ?? null,
         responseText: replyText,
         locationName: locationName ?? null,
@@ -989,7 +990,7 @@ async function publish(req, res) {
     // below is returned exactly as it always was.
     if (localReviewId) {
       const failedLocationId = await resolveLocationIdForReview(localReviewId).catch(() => null)
-      await recordReplyFailure(localReviewId, {
+      await recordReplyFailure(resolveTenantId(account), localReviewId, {
         locationId: failedLocationId,
         locationName: locationName ?? null,
         reviewerName: reviewerName ?? null,
@@ -1047,7 +1048,7 @@ async function publishBridge(req, res) {
 
   let records
   try {
-    records = await getPublishBridges(ids)
+    records = await getPublishBridges(resolveTenantId(account), ids)
   } catch (err) {
     if (err instanceof PublishBridgeUnavailableError) {
       // Degrade gracefully -- the frontend's own localStorage fallback
@@ -1117,7 +1118,7 @@ async function disconnect(req, res) {
     throw err
   }
 
-  await appendAuditEntry({
+  await appendAuditEntry(resolveTenantId(account), {
     actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
     entity: 'google_oauth', entityId: null, action: 'google.disconnected', changes: null, result: 'success',
     message: 'Disconnected the Google Business Profile connection.',

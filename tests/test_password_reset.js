@@ -21,6 +21,7 @@ import { _setRedisClientForTests as setUserStoreClient, _resetRedisClientForTest
 import { _setRedisClientForTests as setTokenStoreClient, _resetRedisClientForTests as resetTokenStoreClient, hashToken } from '../dashboard/api/_lib/tokenStore.js'
 import { getAccountByEmail } from '../dashboard/api/_lib/accountStore.js'
 import { _setTransportForTests, _resetTransportForTests } from '../dashboard/api/_lib/emailSender.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -345,7 +346,11 @@ async function testAuditEntriesNeverCarryTokenOrPassword() {
   ]
   for (const [fileName, src, fnName] of functionsToCheck) {
     const fnSrc = extractFunctionSource(src, fnName)
-    const calls = fnSrc.match(/appendAuditEntry\(\{[\s\S]*?\}\)/g) ?? []
+    // Multi-Tenant Phase 2 prefixed every real call with a leading
+    // `resolveTenantId(account), ` argument before the object literal --
+    // [^,]* tolerates that (or any other single tenantId expression with no
+    // comma of its own) ahead of the required comma + object literal.
+    const calls = fnSrc.match(/appendAuditEntry\([^,]*,\s*\{[\s\S]*?\}\)/g) ?? []
     assert(calls.length > 0, `${fileName}#${fnName} must contain at least one appendAuditEntry call to check`)
     for (const call of calls) {
       assert(!/\brawToken\b/.test(call), `${fileName}#${fnName}: references rawToken -- ${call}`)

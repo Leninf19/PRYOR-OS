@@ -44,6 +44,7 @@ import { putBlob, getBlob, deleteBlob, BlobStoreUnavailableError } from '../_lib
 import { requireAuth } from '../_lib/auth.js'
 import { Permission, roleHasPermission } from '../_lib/permissions.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
+import { resolveTenantId } from '../_lib/tenants.js'
 import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
 import {
   getAllCampaigns, getCampaign, createCampaign, updateCampaign, deleteCampaign, CampaignStoreUnavailableError,
@@ -165,7 +166,7 @@ async function listCampaigns(req, res) {
   const includeArchived = req.query?.includeArchived === '1' || req.query?.includeArchived === 'true'
 
   try {
-    const all = await getAllCampaigns()
+    const all = await getAllCampaigns(resolveTenantId(account))
     const visible = Object.values(all).filter(c => canViewCampaign(account, c) && (includeArchived || c.status !== 'Archived'))
     return res.status(200).json({ campaigns: visible })
   } catch (err) {
@@ -201,7 +202,7 @@ async function upsertCampaign(req, res) {
       if (!roleHasPermission(account.role, Permission.CAMPAIGN_MANAGE)) {
         return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to manage campaigns.' })
       }
-      const existing = await getCampaign(id)
+      const existing = await getCampaign(resolveTenantId(account), id)
       if (!existing || !accountCoversLocations(account, existing.locationIds)) {
         return res.status(404).json({ error: 'not_found' })
       }
@@ -226,9 +227,9 @@ async function upsertCampaign(req, res) {
         patch.status = status
       }
 
-      const record = await updateCampaign(id, patch, account)
+      const record = await updateCampaign(resolveTenantId(account), id, patch, account)
       if (status && status !== existing.status) {
-        await appendAuditEntry({
+        await appendAuditEntry(resolveTenantId(account), {
           ...actorFields(account, req), entity: 'campaign', entityId: id,
           action: status === 'Approved' ? 'campaign.approved' : status === 'Archived' ? 'campaign.archived' : 'campaign.status_changed',
           changes: [{ field: 'status', oldValue: existing.status, newValue: status }],
@@ -252,8 +253,8 @@ async function upsertCampaign(req, res) {
       return res.status(403).json({ error: 'forbidden', message: 'You are not authorized to create a campaign for one or more of the requested locations.' })
     }
 
-    const record = await createCampaign({ name: name.trim(), description, startDate, endDate, locationIds, tags }, account)
-    await appendAuditEntry({
+    const record = await createCampaign(resolveTenantId(account), { name: name.trim(), description, startDate, endDate, locationIds, tags }, account)
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'campaign', entityId: record.id,
       action: 'campaign.created', result: 'success', message: `Created campaign "${record.name}".`,
     })
@@ -292,10 +293,10 @@ async function deleteCampaignAction(req, res) {
   if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'invalid_request', message: 'id is required.' })
 
   try {
-    const campaign = await getCampaign(id)
+    const campaign = await getCampaign(resolveTenantId(account), id)
     if (!campaign || !accountCoversLocations(account, campaign.locationIds)) return res.status(404).json({ error: 'not_found' })
 
-    const allAssets = await getAllAssets()
+    const allAssets = await getAllAssets(resolveTenantId(account))
     const campaignAssets = Object.values(allAssets).filter(a => a.campaignId === id)
 
     // An asset's blobPathname is always a fresh randomUUID minted at upload
@@ -317,18 +318,18 @@ async function deleteCampaignAction(req, res) {
           continue
         }
       }
-      await deleteAsset(asset.id)
+      await deleteAsset(resolveTenantId(account), asset.id)
     }
 
-    const allTasks = await getAllTasks()
+    const allTasks = await getAllTasks(resolveTenantId(account))
     const linkedTasks = Object.values(allTasks).filter(t => t.campaignId === id)
     for (const task of linkedTasks) {
-      await updateTask(task.id, { campaignId: null }, account, `Unlinked from deleted campaign "${campaign.name}".`)
+      await updateTask(resolveTenantId(account), task.id, { campaignId: null }, account, `Unlinked from deleted campaign "${campaign.name}".`)
     }
 
-    await deleteCampaign(id)
+    await deleteCampaign(resolveTenantId(account), id)
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'campaign', entityId: id,
       action: 'campaign.deleted', result: blobFailures > 0 ? 'partial' : 'success',
       message: `Deleted campaign "${campaign.name}" (${campaignAssets.length} asset(s), ${linkedTasks.length} task(s) unlinked)`
@@ -368,7 +369,7 @@ async function listAssets(req, res) {
   const { campaignId } = req.query ?? {}
 
   try {
-    const [campaigns, assets] = await Promise.all([getAllCampaigns(), getAllAssets()])
+    const [campaigns, assets] = await Promise.all([getAllCampaigns(resolveTenantId(account)), getAllAssets(resolveTenantId(account))])
     const visibleCampaignIds = new Set(Object.values(campaigns).filter(c => canViewCampaign(account, c)).map(c => c.id))
     let visible = Object.values(assets).filter(a => visibleCampaignIds.has(a.campaignId))
     if (campaignId) visible = visible.filter(a => a.campaignId === campaignId)
@@ -409,14 +410,14 @@ async function createTextAsset(req, res) {
   }
 
   try {
-    const campaign = await getCampaign(campaignId)
+    const campaign = await getCampaign(resolveTenantId(account), campaignId)
     if (!campaign || !accountCoversLocations(account, campaign.locationIds)) return res.status(404).json({ error: 'not_found' })
 
-    const record = await createAsset({
+    const record = await createAsset(resolveTenantId(account), {
       campaignId, type: 'caption', filename: filename || 'caption.txt',
       mimeType: 'text/plain', sizeBytes: captionText.length, blobPathname: null, captionText: captionText.trim(),
     }, account)
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'content_asset', entityId: record.id,
       action: 'asset.uploaded', result: 'success', message: `Added caption to campaign "${campaign.name}".`,
     })
@@ -469,16 +470,16 @@ async function upload(req, res) {
   if (!check.valid) return res.status(400).json({ error: 'invalid_request', message: check.message })
 
   try {
-    const campaign = await getCampaign(campaignId)
+    const campaign = await getCampaign(resolveTenantId(account), campaignId)
     if (!campaign || !accountCoversLocations(account, campaign.locationIds)) return res.status(404).json({ error: 'not_found' })
 
     const pathname = `content/${campaignId}/${randomUUID()}${extOf(filename)}`
     const blob = await putBlob(pathname, buffer, { contentType: mimeType })
 
-    const record = await createAsset({
+    const record = await createAsset(resolveTenantId(account), {
       campaignId, type, filename, mimeType, sizeBytes: buffer.length, blobPathname: blob.pathname, captionText: null,
     }, account)
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'content_asset', entityId: record.id,
       action: 'asset.uploaded', result: 'success', message: `Uploaded "${filename}" to campaign "${campaign.name}".`,
     })
@@ -515,10 +516,10 @@ async function download(req, res) {
   if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'invalid_request', message: 'id is required.' })
 
   try {
-    const asset = await getAsset(id)
+    const asset = await getAsset(resolveTenantId(account), id)
     if (!asset || !asset.blobPathname) return res.status(404).json({ error: 'not_found' })
 
-    const campaign = await getCampaign(asset.campaignId)
+    const campaign = await getCampaign(resolveTenantId(account), asset.campaignId)
     if (!canViewCampaign(account, campaign)) return res.status(404).json({ error: 'not_found' })
 
     // getBlob() with access: 'private' performs the SDK's own authenticated
@@ -563,16 +564,16 @@ async function deleteAssetAction(req, res) {
   if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'invalid_request', message: 'id is required.' })
 
   try {
-    const asset = await getAsset(id)
+    const asset = await getAsset(resolveTenantId(account), id)
     if (!asset) return res.status(404).json({ error: 'not_found' })
-    const campaign = await getCampaign(asset.campaignId)
+    const campaign = await getCampaign(resolveTenantId(account), asset.campaignId)
     if (!campaign || !accountCoversLocations(account, campaign.locationIds)) return res.status(404).json({ error: 'not_found' })
 
     if (asset.blobPathname) {
       try { await deleteBlob(asset.blobPathname) } catch (err) { console.error(`[content/delete-asset] blob delete failed: ${err.message}`) }
     }
-    await deleteAsset(id)
-    await appendAuditEntry({
+    await deleteAsset(resolveTenantId(account), id)
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'content_asset', entityId: id,
       action: 'asset.deleted', result: 'success', message: `Deleted asset "${asset.filename}" from campaign ${asset.campaignId}.`,
     })

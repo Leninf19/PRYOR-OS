@@ -17,6 +17,7 @@ import handler, {
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests, _resetRedisClientForTests, getContact } from '../dashboard/api/_lib/contactStore.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -112,7 +113,7 @@ async function testSeedsFromFixtureIntoEmptyStore() {
   assert(res.body.seeded.includes(9) && res.body.seeded.includes(2), 'both valid locations must be seeded')
   assert(!res.body.seeded.includes(5), 'the malformed-email row must be skipped, not seeded')
 
-  const canton = await getContact(9)
+  const canton = await getContact(DEFAULT_TENANT_ID, 9)
   assert(canton.primaryEmail === 'canton@example.com', 'seeded record must carry the legacy email')
   assert(canton.managerName === 'Legacy Canton Manager', 'seeded record must carry the legacy manager name')
   assert(canton.locationName === 'Los Tres Amigos Canton', 'seeded record must resolve the location name from meta.json')
@@ -130,14 +131,14 @@ async function testNeverOverwritesAnExistingRedisRecord() {
   // value, even though the legacy file also has an entry for it.
   const owner = { userId: 'usr_owner', email: 'owner@example.com', displayName: 'Owner Person' }
   const { upsertContact } = await import('../dashboard/api/_lib/contactStore.js')
-  await upsertContact(9, { primaryEmail: 'already-edited@example.com', locationName: 'Los Tres Amigos Canton' }, owner, 'Contact created')
+  await upsertContact(DEFAULT_TENANT_ID, 9, { primaryEmail: 'already-edited@example.com', locationName: 'Los Tres Amigos Canton' }, owner, 'Contact created')
 
   const res = await invoke(await ownerToken())
   assert(res.statusCode === 200, `expected 200, got ${res.statusCode}`)
   assert(res.body.skipped.includes(9), 'location 9 must be reported as skipped, not re-seeded')
   assert(res.body.seeded.includes(2), 'location 2 (never configured) must still be seeded')
 
-  const canton = await getContact(9)
+  const canton = await getContact(DEFAULT_TENANT_ID, 9)
   assert(canton.primaryEmail === 'already-edited@example.com', 'the existing Redis record must be completely untouched by the backfill')
 }
 

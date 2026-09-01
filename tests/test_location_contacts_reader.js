@@ -18,10 +18,19 @@ import {
   _setRedisClientForTests,
   _resetRedisClientForTests,
 } from '../dashboard/api/_lib/contactStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function fakeRedis(initial = {}) {
   const store = { ...initial }
-  return { hget: async (_key, field) => store[field] ?? null }
+  // hgetall included (always empty) so tenantDualRead.js's "is the v2 key
+  // populated" check succeeds and correctly falls through to hget against
+  // the v1 key -- a real Upstash client always supports both commands;
+  // this fake previously only modeled hget, which happened to work before
+  // Multi-Tenant Phase 2 added a dual-read check ahead of every read.
+  return {
+    hget: async (_key, field) => store[field] ?? null,
+    hgetall: async () => ({}),
+  }
 }
 
 function assert(cond, msg) {
@@ -45,21 +54,21 @@ async function run(name, fn) {
 
 async function testReturnsConfiguredContact() {
   _setContactsForTests({ '3': { email: 'manager@example.com', name: 'Jane' } })
-  const contact = await getLocationContact(3)
+  const contact = await getLocationContact(DEFAULT_TENANT_ID, 3)
   assert(contact.email === 'manager@example.com', 'expected the configured contact to be returned')
   assert(contact.name === 'Jane')
 }
 
 async function testReturnsNullForUnconfiguredLocation() {
   _setContactsForTests({ '3': { email: 'manager@example.com', name: null } })
-  const contact = await getLocationContact(999)
+  const contact = await getLocationContact(DEFAULT_TENANT_ID, 999)
   assert(contact === null, 'a location absent from the map must resolve to null, never a guessed value')
 }
 
 async function testCoercesNumericLocationIdToStringKey() {
   _setContactsForTests({ '42': { email: 'x@example.com', name: null } })
-  const byNumber = await getLocationContact(42)
-  const byString = await getLocationContact('42')
+  const byNumber = await getLocationContact(DEFAULT_TENANT_ID, 42)
+  const byString = await getLocationContact(DEFAULT_TENANT_ID, '42')
   assert(byNumber?.email === 'x@example.com', 'a numeric locationId must match the string-keyed map')
   assert(byString?.email === 'x@example.com', 'a string locationId must also match')
 }
@@ -71,14 +80,14 @@ async function testMissingRealFileFallsBackGracefully() {
   // contact emails exist yet -- see set_location_contacts.py --status),
   // so this proves the "file doesn't exist" path resolves to null rather
   // than throwing, exactly like an unconfigured location would.
-  const contact = await getLocationContact(1)
+  const contact = await getLocationContact(DEFAULT_TENANT_ID, 1)
   assert(contact === null, 'a missing location-contacts.json must resolve to null, never throw')
 }
 
 async function testRedisContactTakesPriorityOverLegacyFile() {
   _setContactsForTests({ '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
   _setRedisClientForTests(() => fakeRedis({ 9: JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', managerName: 'Redis Name', active: true }) }))
-  const contact = await getLocationContact(9)
+  const contact = await getLocationContact(DEFAULT_TENANT_ID, 9)
   assert(contact.email === 'redis@example.com', 'a Redis-configured contact must win over the legacy file')
   assert(contact.name === 'Redis Name')
 }
@@ -86,7 +95,7 @@ async function testRedisContactTakesPriorityOverLegacyFile() {
 async function testRedisUnavailableFallsBackToLegacyFile() {
   _setContactsForTests({ '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
   _setRedisClientForTests(() => ({ hget: async () => { throw new Error('ECONNREFUSED fake-upstash-outage') } }))
-  const contact = await getLocationContact(9)
+  const contact = await getLocationContact(DEFAULT_TENANT_ID, 9)
   assert(contact.email === 'legacy@example.com', 'a Redis outage must fall back to the legacy file, not fail the whole lookup')
 }
 
@@ -96,7 +105,7 @@ async function testRedisContactExplicitlyDisabledNeverFallsBackToLegacy() {
   // would resurrect an intentionally-disabled contact.
   _setContactsForTests({ '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
   _setRedisClientForTests(() => fakeRedis({ 9: JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', active: false }) }))
-  const contact = await getLocationContact(9)
+  const contact = await getLocationContact(DEFAULT_TENANT_ID, 9)
   assert(contact === null, 'an explicitly disabled Redis contact must resolve to null, never the legacy fallback')
 }
 

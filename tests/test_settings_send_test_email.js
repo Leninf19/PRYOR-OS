@@ -15,6 +15,7 @@ import { _setRedisClientForTests, _resetRedisClientForTests, getContact } from '
 import { _setTransportForTests, _resetTransportForTests } from '../dashboard/api/_lib/emailSender.js'
 import { _setRedisClientForTests as _setAuditRedisClientForTests, _resetRedisClientForTests as _resetAuditRedisClientForTests } from '../dashboard/api/_lib/auditLog.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -150,7 +151,7 @@ async function testSuccessfulSendRecordsContactHistory() {
   })
   _setTransportForTests(fakeMailer())
   await invoke({ token: await ownerToken(), body: { locationId: 9 } })
-  const record = await getContact(9)
+  const record = await getContact(DEFAULT_TENANT_ID, 9)
   assert(record.history.length === 1, `expected one history entry, got ${record.history.length}`)
   assert(record.history[0].action === 'Test email sent')
 }
@@ -186,7 +187,7 @@ async function testFailedSendReturns502AndRecordsFailure() {
   assert(res.statusCode === 502, `expected 502, got ${res.statusCode}`)
   assert(res.body.error === 'send_failed')
   assert(res.body.detail.includes('Authentication unsuccessful'))
-  const record = await getContact(9)
+  const record = await getContact(DEFAULT_TENANT_ID, 9)
   assert(record.history[0].action === 'Test email failed')
   const raw = await auditClient.lrange()
   const entry = JSON.parse(raw[0])

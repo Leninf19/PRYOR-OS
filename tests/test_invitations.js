@@ -21,6 +21,7 @@ import sessionHandler from '../dashboard/api/session/[action].js'
 import { _setRedisClientForTests as setUserStoreClient, _resetRedisClientForTests as resetUserStoreClient, getUserById } from '../dashboard/api/_lib/userStore.js'
 import { _setRedisClientForTests as setTokenStoreClient, _resetRedisClientForTests as resetTokenStoreClient } from '../dashboard/api/_lib/tokenStore.js'
 import { _setTransportForTests, _resetTransportForTests } from '../dashboard/api/_lib/emailSender.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -177,7 +178,7 @@ async function testOwnerCanInviteLocationManager() {
   assert(res.body.emailWarning === null, 'a working email transport must not produce an emailWarning')
   assert(!JSON.stringify(res.body).toLowerCase().includes('password'), 'the invite-user response must never mention a password')
 
-  const record = await getUserById(res.body.userId)
+  const record = await getUserById(DEFAULT_TENANT_ID, res.body.userId)
   assert(record.passwordHash === null, 'a freshly invited user must have no password hash yet')
   assert(record.role === 'location_manager' && JSON.stringify(record.locationIds) === JSON.stringify([7]), 'role/locationIds must be stored exactly as requested')
 }
@@ -311,7 +312,7 @@ async function testPartialFailureRecoveryDoesNotDoubleCreateOrLoseTheAccount() {
   const { client, rawToken, userId } = await inviteAndGetToken()
 
   // Force the FIRST hset after the token is consumed (i.e. the user-record
-  // update inside updateUser()) to throw once, simulating a Redis hiccup
+  // update inside updateUser(DEFAULT_TENANT_ID, )) to throw once, simulating a Redis hiccup
   // AFTER the token's GETDEL already succeeded -- exactly the partial-
   // failure window tokenStore.js's pending-record safety net exists for.
   let hsetCalls = 0
@@ -332,7 +333,7 @@ async function testPartialFailureRecoveryDoesNotDoubleCreateOrLoseTheAccount() {
   assert(retry.statusCode === 200, `retry with the same token must succeed once the transient failure clears, got ${retry.statusCode} (${JSON.stringify(retry.body)})`)
   assert(retry.body.account.userId === userId, 'the retry must complete the SAME account, not create a new one')
 
-  const record = await getUserById(userId)
+  const record = await getUserById(DEFAULT_TENANT_ID, userId)
   assert(record.passwordSetAt !== null, 'the account must end up genuinely activated')
 }
 
@@ -424,7 +425,11 @@ async function testAuditEntriesNeverCarryTokenOrPassword() {
 
   for (const [fileName, src, fnName] of functionsToCheck) {
     const fnSrc = extractFunctionSource(src, fnName)
-    const calls = fnSrc.match(/appendAuditEntry\(\{[\s\S]*?\}\)/g) ?? []
+    // Multi-Tenant Phase 2 prefixed every real call with a leading
+    // `resolveTenantId(account), ` argument before the object literal --
+    // [^,]* tolerates that (or any other single tenantId expression with no
+    // comma of its own) ahead of the required comma + object literal.
+    const calls = fnSrc.match(/appendAuditEntry\([^,]*,\s*\{[\s\S]*?\}\)/g) ?? []
     assert(calls.length > 0, `${fileName}#${fnName} must contain at least one appendAuditEntry call to check`)
     for (const call of calls) {
       assert(!/\brawToken\b/.test(call), `${fileName}#${fnName}: an appendAuditEntry call references rawToken -- ${call}`)

@@ -17,6 +17,7 @@ import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError } from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
+import { resolveTenantId } from '../_lib/tenants.js'
 import {
   consumeInviteToken, markInviteConsumedPending, clearInviteConsumedPending, peekInviteToken,
   createResetToken, consumeResetToken, markResetConsumedPending, clearResetConsumedPending, peekResetToken,
@@ -76,7 +77,7 @@ async function login(req, res) {
     // logging the distinction internally would just move the same
     // information into a second, easier-to-overlook surface. Never logs the
     // attempted password itself.
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       actorId: account?.userId ?? null, actorEmail: email, ip: clientIp(req),
       action: 'user.login_failed', entity: 'user', entityId: account?.userId ?? null,
       result: 'failure', message: 'Sign-in attempt failed.',
@@ -107,8 +108,8 @@ async function login(req, res) {
   // no-op for static-directory-only accounts (no Redis record to update),
   // and swallows its own Redis errors -- a bookkeeping-field write must
   // never turn a successful login into a failed one.
-  await touchLastLogin(account.userId)
-  await appendAuditEntry({
+  await touchLastLogin(resolveTenantId(account), account.userId)
+  await appendAuditEntry(resolveTenantId(account), {
     actorId: account.userId, actorEmail: account.email, ip: clientIp(req),
     action: 'user.login', entity: 'user', entityId: account.userId,
     result: 'success', message: 'Signed in.',
@@ -249,7 +250,7 @@ async function acceptInvite(req, res) {
   try {
     const passwordHash = await hashPassword(password)
     const now = new Date().toISOString()
-    const updated = await updateUser(userId, {
+    const updated = await updateUser(resolveTenantId(null), userId, {
       passwordHash, passwordSetAt: now,
       ...(isValidDisplayName(name) ? { displayName: name.trim() } : {}),
     })
@@ -267,7 +268,7 @@ async function acceptInvite(req, res) {
     setCookie(res, SESSION_COOKIE, sessionToken, { maxAgeSeconds: SESSION_TTL_SECONDS })
 
     await clearInviteConsumedPending(tokenHash)
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(null), {
       actorId: userId, actorEmail: updated.email, ip: clientIp(req),
       action: 'invitation.accepted', entity: 'user', entityId: userId,
       result: 'success', message: 'Invitation accepted, account activated.',
@@ -329,7 +330,7 @@ async function forgotPassword(req, res) {
         // security one.
         console.error(`[session/forgot-password] reset email failed: ${err.message}`)
       }
-      await appendAuditEntry({
+      await appendAuditEntry(resolveTenantId(account), {
         actorId: account.userId, actorEmail: account.email, ip: clientIp(req),
         action: 'password_reset.requested', entity: 'user', entityId: account.userId,
         result: 'success', message: 'Password reset requested.',
@@ -427,7 +428,7 @@ async function resetPassword(req, res) {
 
     const passwordHash = await hashPassword(password)
     const now = new Date().toISOString()
-    const updated = await upsertUser({
+    const updated = await upsertUser(resolveTenantId(null), {
       // Base fields present on either a static or an already-Redis account;
       // Redis-specific bookkeeping fields default sensibly the first time a
       // static account is promoted (never known/never happened for it).
@@ -445,7 +446,7 @@ async function resetPassword(req, res) {
     setCookie(res, SESSION_COOKIE, sessionToken, { maxAgeSeconds: SESSION_TTL_SECONDS })
 
     await clearResetConsumedPending(tokenHash)
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(null), {
       actorId: userId, actorEmail: updated.email, ip: clientIp(req),
       action: 'password_reset.completed', entity: 'user', entityId: userId,
       result: 'success', message: 'Password reset completed; all prior sessions invalidated.',

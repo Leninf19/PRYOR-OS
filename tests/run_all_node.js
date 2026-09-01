@@ -93,6 +93,7 @@ const TESTS = [
   'test_campaign_store.js',
   'test_content_endpoint.js',
   'test_tenant_model.js',
+  'test_tenant_migration_policy.js',
 ]
 
 const results = {}

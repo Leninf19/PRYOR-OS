@@ -13,6 +13,7 @@
 import { readFileSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -110,7 +111,11 @@ function testNoNewFunctionEverLogsASecretToAppendAuditEntry() {
   for (const [fileName, src, fnName] of functionsToCheck) {
     const fnSrc = extractFunctionSource(src, fnName)
     assert(fnSrc, `could not locate function ${fnName} in ${fileName} -- has it been renamed?`)
-    const calls = fnSrc.match(/appendAuditEntry\(\{[\s\S]*?\}\)/g) ?? []
+    // Multi-Tenant Phase 2 prefixed every real call with a leading
+    // `resolveTenantId(account), ` argument before the object literal --
+    // [^,]* tolerates that (or any other single tenantId expression with no
+    // comma of its own) ahead of the required comma + object literal.
+    const calls = fnSrc.match(/appendAuditEntry\([^,]*,\s*\{[\s\S]*?\}\)/g) ?? []
     for (const call of calls) {
       checkedAtLeastOneCall = true
       for (const pattern of forbidden) {

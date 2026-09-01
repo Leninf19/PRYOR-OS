@@ -24,6 +24,7 @@ import {
 } from '../_lib/notificationStore.js'
 import { getAction } from '../_lib/actionStore.js'
 import { resolveLocationIdForReview } from '../_lib/reviewLocationIndex.js'
+import { resolveTenantId } from '../_lib/tenants.js'
 
 async function list(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
@@ -34,8 +35,8 @@ async function list(req, res) {
 
   const [candidates, readState, seeded] = await Promise.all([
     getNotificationCandidates(account),
-    getReadState(account.userId),
-    hasBeenSeeded(account.userId),
+    getReadState(resolveTenantId(account), account.userId),
+    hasBeenSeeded(resolveTenantId(account), account.userId),
   ])
 
   // Rollout-backlog fix: a user's FIRST-EVER visit seeds whatever's
@@ -48,8 +49,8 @@ async function list(req, res) {
   // badge treats this one-time baseline as already seen.
   if (!seeded) {
     try {
-      if (candidates.length) await markRead(account.userId, candidates.map(c => c.key))
-      await markSeeded(account.userId)
+      if (candidates.length) await markRead(resolveTenantId(account), account.userId, candidates.map(c => c.key))
+      await markSeeded(resolveTenantId(account), account.userId)
       return res.status(200).json({
         notifications: candidates.map(c => ({ ...c, read: true })),
         unreadCount: 0,
@@ -84,7 +85,7 @@ async function callerMayMarkKeyRead(key, account) {
     return locationId !== null && requireLocationAccess(account, locationId)
   }
   if (type === 'assigned_action') {
-    const action = await getAction(id).catch(() => null)
+    const action = await getAction(resolveTenantId(account), id).catch(() => null)
     return Boolean(action) && action.assignedTo === account.userId
   }
   if (type === 'gbp_disconnected') {
@@ -107,7 +108,7 @@ async function markOneRead(req, res) {
   if (!allowed) return res.status(404).json({ error: 'not_found' })
 
   try {
-    await markRead(account.userId, [key])
+    await markRead(resolveTenantId(account), account.userId, [key])
   } catch (err) {
     if (err instanceof NotificationStoreUnavailableError) {
       return res.status(503).json({ error: 'server_error', message: 'Could not save read state right now.' })
@@ -130,7 +131,7 @@ async function markAllRead(req, res) {
   const keys = candidates.map(c => c.key)
 
   try {
-    await markRead(account.userId, keys)
+    await markRead(resolveTenantId(account), account.userId, keys)
   } catch (err) {
     if (err instanceof NotificationStoreUnavailableError) {
       return res.status(503).json({ error: 'server_error', message: 'Could not save read state right now.' })

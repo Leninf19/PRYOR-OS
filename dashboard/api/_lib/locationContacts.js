@@ -47,9 +47,9 @@ async function getLegacyContact(locationId) {
 // falls back to the last-baked legacy JSON file rather than failing the
 // whole send/preview action -- a real outage of the newer store should
 // degrade to the old behavior, not break a working feature.
-export async function getLocationContact(locationId) {
+export async function getLocationContact(tenantId, locationId) {
   try {
-    const record = await getRedisContact(locationId)
+    const record = await getRedisContact(tenantId, locationId)
     if (record && record.active && record.primaryEmail) {
       return { email: record.primaryEmail, name: record.managerName ?? null }
     }

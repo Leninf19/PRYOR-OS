@@ -13,6 +13,7 @@ import {
   _setRedisClientForTests,
   _resetRedisClientForTests,
 } from '../dashboard/api/_lib/auditLog.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -50,14 +51,14 @@ function fakeRedis() {
 const OWNER = { actorId: 'usr_owner', actorName: 'Owner Person', actorEmail: 'owner@example.com', ip: '203.0.113.5' }
 
 async function testAppendNeverThrowsWhenUnconfigured() {
-  const ok = await appendAuditEntry({ ...OWNER, entity: 'contact', entityId: '9', action: 'contact.created', changes: null, result: 'success', message: 'x' })
+  const ok = await appendAuditEntry(DEFAULT_TENANT_ID, { ...OWNER, entity: 'contact', entityId: '9', action: 'contact.created', changes: null, result: 'success', message: 'x' })
   assert(ok === false, 'appendAuditEntry must return false (not throw) when the audit log is unconfigured -- it must never break the caller\'s primary action')
 }
 
 async function testListThrowsWhenUnconfigured() {
   let threw = false
   try {
-    await listAuditEntries({})
+    await listAuditEntries(DEFAULT_TENANT_ID, {})
   } catch (err) {
     threw = err instanceof AuditLogUnavailableError
   }
@@ -67,9 +68,9 @@ async function testListThrowsWhenUnconfigured() {
 async function testAppendStampsIdAndTimestamp() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  const ok = await appendAuditEntry({ ...OWNER, entity: 'contact', entityId: '9', action: 'contact.created', changes: null, result: 'success', message: 'Created contact for Canton.' })
+  const ok = await appendAuditEntry(DEFAULT_TENANT_ID, { ...OWNER, entity: 'contact', entityId: '9', action: 'contact.created', changes: null, result: 'success', message: 'Created contact for Canton.' })
   assert(ok === true, 'a configured store must return true on a successful append')
-  const { entries } = await listAuditEntries({})
+  const { entries } = await listAuditEntries(DEFAULT_TENANT_ID, {})
   assert(entries.length === 1, 'the appended entry must be readable back')
   assert(typeof entries[0].id === 'string' && entries[0].id.length > 0, 'a server-generated id must be stamped')
   assert(typeof entries[0].at === 'string' && !isNaN(new Date(entries[0].at).getTime()), 'a server-generated ISO timestamp must be stamped')
@@ -79,7 +80,7 @@ async function testAppendStampsIdAndTimestamp() {
 async function testAppendCallsLtrimToCapTheList() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await appendAuditEntry({ ...OWNER, entity: 'contact', entityId: '9', action: 'contact.created', changes: null, result: 'success', message: 'x' })
+  await appendAuditEntry(DEFAULT_TENANT_ID, { ...OWNER, entity: 'contact', entityId: '9', action: 'contact.created', changes: null, result: 'success', message: 'x' })
   assert(client._ltrimCalls.length === 1, 'every append must call ltrim to cap the list length')
   const [start, stop] = client._ltrimCalls[0]
   assert(start === 0 && stop === 19999, `ltrim must cap at the most recent 20,000 entries, got [${start}, ${stop}]`)
@@ -88,9 +89,9 @@ async function testAppendCallsLtrimToCapTheList() {
 async function testListReturnsNewestFirst() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await appendAuditEntry({ ...OWNER, entity: 'contact', entityId: '1', action: 'contact.created', changes: null, result: 'success', message: 'first' })
-  await appendAuditEntry({ ...OWNER, entity: 'contact', entityId: '2', action: 'contact.created', changes: null, result: 'success', message: 'second' })
-  const { entries } = await listAuditEntries({})
+  await appendAuditEntry(DEFAULT_TENANT_ID, { ...OWNER, entity: 'contact', entityId: '1', action: 'contact.created', changes: null, result: 'success', message: 'first' })
+  await appendAuditEntry(DEFAULT_TENANT_ID, { ...OWNER, entity: 'contact', entityId: '2', action: 'contact.created', changes: null, result: 'success', message: 'second' })
+  const { entries } = await listAuditEntries(DEFAULT_TENANT_ID, {})
   assert(entries[0].message === 'second', 'the most recently appended entry must come first (LPUSH prepends)')
   assert(entries[1].message === 'first', 'older entries follow in order')
 }
@@ -98,9 +99,9 @@ async function testListReturnsNewestFirst() {
 async function testFiltersByEntity() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await appendAuditEntry({ ...OWNER, entity: 'contact', entityId: '1', action: 'contact.created', changes: null, result: 'success', message: 'a contact event' })
-  await appendAuditEntry({ ...OWNER, entity: 'google_oauth', entityId: null, action: 'google.reconnected', changes: null, result: 'success', message: 'an oauth event' })
-  const { entries, total } = await listAuditEntries({ entity: 'contact' })
+  await appendAuditEntry(DEFAULT_TENANT_ID, { ...OWNER, entity: 'contact', entityId: '1', action: 'contact.created', changes: null, result: 'success', message: 'a contact event' })
+  await appendAuditEntry(DEFAULT_TENANT_ID, { ...OWNER, entity: 'google_oauth', entityId: null, action: 'google.reconnected', changes: null, result: 'success', message: 'an oauth event' })
+  const { entries, total } = await listAuditEntries(DEFAULT_TENANT_ID, { entity: 'contact' })
   assert(total === 1 && entries.length === 1, 'filtering by entity must exclude non-matching entries')
   assert(entries[0].entity === 'contact')
 }
@@ -108,11 +109,11 @@ async function testFiltersByEntity() {
 async function testFiltersByActorIdAndResult() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await appendAuditEntry({ ...OWNER, entity: 'contact', entityId: '1', action: 'contact.created', changes: null, result: 'success', message: 'owner did this' })
-  await appendAuditEntry({ actorId: 'usr_martin', actorName: 'Martin', actorEmail: 'martin@example.com', ip: null, entity: 'contact', entityId: '2', action: 'contact.created', changes: null, result: 'failure', message: 'martin failed' })
-  const byActor = await listAuditEntries({ actorId: 'usr_martin' })
+  await appendAuditEntry(DEFAULT_TENANT_ID, { ...OWNER, entity: 'contact', entityId: '1', action: 'contact.created', changes: null, result: 'success', message: 'owner did this' })
+  await appendAuditEntry(DEFAULT_TENANT_ID, { actorId: 'usr_martin', actorName: 'Martin', actorEmail: 'martin@example.com', ip: null, entity: 'contact', entityId: '2', action: 'contact.created', changes: null, result: 'failure', message: 'martin failed' })
+  const byActor = await listAuditEntries(DEFAULT_TENANT_ID, { actorId: 'usr_martin' })
   assert(byActor.total === 1 && byActor.entries[0].message === 'martin failed', 'filtering by actorId must work')
-  const byResult = await listAuditEntries({ result: 'failure' })
+  const byResult = await listAuditEntries(DEFAULT_TENANT_ID, { result: 'failure' })
   assert(byResult.total === 1 && byResult.entries[0].result === 'failure', 'filtering by result must work')
 }
 
@@ -120,11 +121,11 @@ async function testPaginatesWithLimitAndOffset() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
   for (let i = 0; i < 5; i++) {
-    await appendAuditEntry({ ...OWNER, entity: 'contact', entityId: String(i), action: 'contact.created', changes: null, result: 'success', message: `event ${i}` })
+    await appendAuditEntry(DEFAULT_TENANT_ID, { ...OWNER, entity: 'contact', entityId: String(i), action: 'contact.created', changes: null, result: 'success', message: `event ${i}` })
   }
-  const page1 = await listAuditEntries({ limit: 2, offset: 0 })
+  const page1 = await listAuditEntries(DEFAULT_TENANT_ID, { limit: 2, offset: 0 })
   assert(page1.entries.length === 2 && page1.total === 5, 'a page must respect limit while total reflects the full filtered count')
-  const page2 = await listAuditEntries({ limit: 2, offset: 2 })
+  const page2 = await listAuditEntries(DEFAULT_TENANT_ID, { limit: 2, offset: 2 })
   assert(page2.entries.length === 2, 'offset must skip already-seen entries')
   assert(page1.entries[0].message !== page2.entries[0].message, 'different pages must return different entries')
 }
@@ -133,7 +134,7 @@ async function testMalformedStoredEntryIsSkippedNotThrown() {
   const client = fakeRedis()
   client._list.push('not valid json {{{')
   _setRedisClientForTests(() => client)
-  const { entries, total } = await listAuditEntries({})
+  const { entries, total } = await listAuditEntries(DEFAULT_TENANT_ID, {})
   assert(entries.length === 0 && total === 0, 'a corrupted stored entry must be skipped, not crash the whole read')
 }
 
@@ -141,7 +142,7 @@ async function testReadFailureThrowsUnavailable() {
   _setRedisClientForTests(() => ({ lrange: async () => { throw new Error('ECONNREFUSED fake-upstash-outage') } }))
   let threw = false
   try {
-    await listAuditEntries({})
+    await listAuditEntries(DEFAULT_TENANT_ID, {})
   } catch (err) {
     threw = err instanceof AuditLogUnavailableError
   }
@@ -150,7 +151,7 @@ async function testReadFailureThrowsUnavailable() {
 
 async function testAppendFailureLogsAndReturnsFalseNeverThrows() {
   _setRedisClientForTests(() => ({ lpush: async () => { throw new Error('ECONNREFUSED fake-upstash-outage') } }))
-  const ok = await appendAuditEntry({ ...OWNER, entity: 'contact', entityId: '1', action: 'contact.created', changes: null, result: 'success', message: 'x' })
+  const ok = await appendAuditEntry(DEFAULT_TENANT_ID, { ...OWNER, entity: 'contact', entityId: '1', action: 'contact.created', changes: null, result: 'success', message: 'x' })
   assert(ok === false, 'an append failure must return false, never throw -- the audit log must never break the caller\'s primary action')
 }
 

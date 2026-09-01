@@ -31,6 +31,7 @@ import { resolveLocationIdForReview, resolveLocationIdForReviewOrDeny } from '..
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import { getAllActions, getAction, upsertAction, ActionStoreUnavailableError } from '../_lib/actionStore.js'
 import { getLocationContact } from '../_lib/locationContacts.js'
+import { resolveTenantId } from '../_lib/tenants.js'
 import { getEscalationCcEmails, getReplyToEmail } from '../_lib/reviewEmailConfig.js'
 import { sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildDefaultSubject, buildReviewEmail } from '../_lib/reviewEmailTemplate.js'
@@ -205,7 +206,7 @@ async function previewReviewEmail(req, res) {
   }
 
   try {
-    const [contact, existing] = await Promise.all([getLocationContact(locationId), getAction(id)])
+    const [contact, existing] = await Promise.all([getLocationContact(resolveTenantId(account), locationId), getAction(resolveTenantId(account), id)])
     return res.status(200).json({
       recipient: contact ? { email: contact.email, name: contact.name ?? null } : null,
       cc,
@@ -277,7 +278,7 @@ async function sendReviewEmailAction(req, res) {
 
   let contact, existing
   try {
-    ;[contact, existing] = await Promise.all([getLocationContact(locationId), getAction(id)])
+    ;[contact, existing] = await Promise.all([getLocationContact(resolveTenantId(account), locationId), getAction(resolveTenantId(account), id)])
   } catch (err) {
     if (err instanceof ActionStoreUnavailableError) {
       console.error(`[actions/send-review-email] ${err.message}`)
@@ -325,7 +326,7 @@ async function sendReviewEmailAction(req, res) {
 
   try {
     const { messageId } = await sendReviewEmail({ to: contact.email, cc, replyTo, subject, html, text })
-    const record = await upsertAction(id, {
+    const record = await upsertAction(resolveTenantId(account), id, {
       ...basePatch,
       emailStatus: 'sent',
       emailSentAt: new Date().toISOString(),
@@ -344,7 +345,7 @@ async function sendReviewEmailAction(req, res) {
     console.error(`[actions/send-review-email] send failed: ${sanitized}`)
     let record
     try {
-      record = await upsertAction(id, { ...basePatch, emailStatus: 'failed', emailLastError: sanitized }, account, 'Send failed')
+      record = await upsertAction(resolveTenantId(account), id, { ...basePatch, emailStatus: 'failed', emailLastError: sanitized }, account, 'Send failed')
     } catch (storeErr) {
       if (storeErr instanceof ActionStoreUnavailableError) {
         return res.status(503).json({ error: 'service_unavailable', message: 'The email failed to send, and the task workspace is also unavailable to record it. Please try again shortly.' })
@@ -383,7 +384,7 @@ async function updateEmailStatus(req, res) {
   }
 
   try {
-    const existing = await getAction(id)
+    const existing = await getAction(resolveTenantId(account), id)
     // A manual transition is only valid from a genuinely-sent email
     // (including one already in a manual state, so replied -> resolved
     // etc. is allowed) -- 'not_sent' (nothing sent yet) and 'failed' (never
@@ -392,7 +393,7 @@ async function updateEmailStatus(req, res) {
     if (!existing || !TRANSITIONABLE_EMAIL_STATUSES.has(existing.emailStatus)) {
       return res.status(400).json({ error: 'invalid_request', message: 'This item has no successfully-sent outgoing email to update the status of yet.' })
     }
-    const record = await upsertAction(id, { emailStatus }, account, MANUAL_EMAIL_STATUS_HISTORY_LABEL[emailStatus])
+    const record = await upsertAction(resolveTenantId(account), id, { emailStatus }, account, MANUAL_EMAIL_STATUS_HISTORY_LABEL[emailStatus])
     return res.status(200).json({ record })
   } catch (err) {
     if (err instanceof ActionStoreUnavailableError) {
@@ -416,7 +417,7 @@ async function list(req, res) {
   if (!account) return
 
   try {
-    const all = await getAllActions()
+    const all = await getAllActions(resolveTenantId(account))
     if (account.locationIds === '*') {
       return res.status(200).json({ actions: all })
     }
@@ -467,7 +468,7 @@ async function update(req, res) {
   }
 
   try {
-    const record = await upsertAction(id, sanitized, account, logAction)
+    const record = await upsertAction(resolveTenantId(account), id, sanitized, account, logAction)
     return res.status(200).json({ record })
   } catch (err) {
     if (err instanceof ActionStoreUnavailableError) {

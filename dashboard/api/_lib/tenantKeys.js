@@ -77,6 +77,13 @@ export function auditLogKeyV2(tenantId) {
 // per-user "has this user been seeded" marker, per-review reply-failure
 // records, and a per-user read-state hash) -- all three gain a tenant
 // segment, ahead of the userId/reviewId segment they already have.
+//
+// Phase 2 correction: the real v1 prefixes (dashboard/api/_lib/
+// notificationStore.js) are `notif_reply_failed:v1:` and `notif_read:v1:`
+// -- Phase 1's first draft of these two builders used slightly different
+// words ("notif_reply_failure"/"notif_read_state"). Fixed here, before
+// anything reads or writes a v2 key, so the v2 family stays a true parallel
+// of the real v1 names rather than diverging from them.
 export function notifSeededKeyV2(tenantId, userId) {
   assertValidTenantId(tenantId, 'notifSeededKeyV2')
   assertNonEmptyString(userId, 'userId', 'notifSeededKeyV2')
@@ -86,13 +93,13 @@ export function notifSeededKeyV2(tenantId, userId) {
 export function notifReplyFailureKeyV2(tenantId, reviewId) {
   assertValidTenantId(tenantId, 'notifReplyFailureKeyV2')
   assertNonEmptyString(reviewId, 'reviewId', 'notifReplyFailureKeyV2')
-  return `notif_reply_failure:v2:${tenantId}:${reviewId}`
+  return `notif_reply_failed:v2:${tenantId}:${reviewId}`
 }
 
 export function notifReadStateKeyV2(tenantId, userId) {
   assertValidTenantId(tenantId, 'notifReadStateKeyV2')
   assertNonEmptyString(userId, 'userId', 'notifReadStateKeyV2')
-  return `notif_read_state:v2:${tenantId}:${userId}`
+  return `notif_read:v2:${tenantId}:${userId}`
 }
 
 export function publishBridgeKeyV2(tenantId, reviewId) {

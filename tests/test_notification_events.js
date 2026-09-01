@@ -17,6 +17,7 @@ import { _setRedisClientForTests as setCredentialRedis, _resetRedisClientForTest
 import { _setRedisClientForTests as setNotifRedis, _resetRedisClientForTests as resetNotifRedis } from '../dashboard/api/_lib/notificationStore.js'
 import { _setRedisClientForTests as setTaskRedis, _resetRedisClientForTests as resetTaskRedis } from '../dashboard/api/_lib/taskStore.js'
 import { _setRedisClientForTests as setCampaignRedis, _resetRedisClientForTests as resetCampaignRedis } from '../dashboard/api/_lib/campaignStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)

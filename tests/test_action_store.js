@@ -15,6 +15,7 @@ import {
   _setRedisClientForTests,
   _resetRedisClientForTests,
 } from '../dashboard/api/_lib/actionStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -56,32 +57,32 @@ async function testUnconfiguredStoreThrowsOnRead() {
   // No UPSTASH_* env vars, no test factory -- getClient() returns null.
   let threw = false
   try {
-    await getAllActions()
+    await getAllActions(DEFAULT_TENANT_ID)
   } catch (err) {
     threw = err instanceof ActionStoreUnavailableError
   }
-  assert(threw, 'getAllActions() must throw ActionStoreUnavailableError when unconfigured')
+  assert(threw, 'getAllActions(DEFAULT_TENANT_ID) must throw ActionStoreUnavailableError when unconfigured')
 }
 
 async function testUnconfiguredStoreThrowsOnWrite() {
   let threw = false
   try {
-    await upsertAction('a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
+    await upsertAction(DEFAULT_TENANT_ID, 'a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
   } catch (err) {
     threw = err instanceof ActionStoreUnavailableError
   }
-  assert(threw, 'upsertAction() must throw ActionStoreUnavailableError when unconfigured, never silently no-op')
+  assert(threw, 'upsertAction(DEFAULT_TENANT_ID, ) must throw ActionStoreUnavailableError when unconfigured, never silently no-op')
 }
 
 async function testEmptyStoreReturnsEmptyObject() {
   _setRedisClientForTests(() => fakeRedis())
-  const all = await getAllActions()
+  const all = await getAllActions(DEFAULT_TENANT_ID)
   assert(typeof all === 'object' && Object.keys(all).length === 0, 'an empty hash must yield {}')
 }
 
 async function testUpsertCreatesRecordWithServerStamps() {
   _setRedisClientForTests(() => fakeRedis())
-  const record = await upsertAction('complaint_wait_time', { status: 'Assigned', assignedTo: 'usr_martin' }, OWNER, 'Status -> Assigned')
+  const record = await upsertAction(DEFAULT_TENANT_ID, 'complaint_wait_time', { status: 'Assigned', assignedTo: 'usr_martin' }, OWNER, 'Status -> Assigned')
   assert(record.id === 'complaint_wait_time', 'id is set on the record')
   assert(record.status === 'Assigned', 'patch fields are applied')
   assert(record.assignedTo === 'usr_martin', 'patch fields are applied')
@@ -98,9 +99,9 @@ async function testUpsertCreatesRecordWithServerStamps() {
 async function testUpsertPreservesCreatedByAcrossUpdates() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await upsertAction('a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
+  await upsertAction(DEFAULT_TENANT_ID, 'a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
   const SECOND_ACTOR = { userId: 'usr_martin', email: 'martin@example.com', displayName: 'Martin' }
-  const record = await upsertAction('a1', { status: 'In Progress' }, SECOND_ACTOR, 'Status -> In Progress')
+  const record = await upsertAction(DEFAULT_TENANT_ID, 'a1', { status: 'In Progress' }, SECOND_ACTOR, 'Status -> In Progress')
   assert(record.createdBy === 'usr_owner', 'createdBy must never change on a later update')
   assert(record.updatedBy === 'usr_martin', 'updatedBy reflects the most recent actor')
   assert(record.history.length === 2, 'history accumulates across updates')
@@ -110,7 +111,7 @@ async function testUpsertPreservesCreatedByAcrossUpdates() {
 
 async function testUpsertWithoutLogActionDoesNotAppendHistory() {
   _setRedisClientForTests(() => fakeRedis())
-  const record = await upsertAction('a1', { notes: 'draft in progress' }, OWNER, undefined)
+  const record = await upsertAction(DEFAULT_TENANT_ID, 'a1', { notes: 'draft in progress' }, OWNER, undefined)
   assert(record.history.length === 0, 'a write with no logAction must not add a history entry (high-frequency draft edits)')
   assert(record.notes === 'draft in progress', 'the patch is still applied')
 }
@@ -118,9 +119,9 @@ async function testUpsertWithoutLogActionDoesNotAppendHistory() {
 async function testClientSuppliedServerFieldsAreOverwritten() {
   _setRedisClientForTests(() => fakeRedis())
   // Simulates the API layer forwarding a patch that still contains
-  // server-owned keys -- upsertAction() itself is the last line of defense
+  // server-owned keys -- upsertAction(DEFAULT_TENANT_ID, ) itself is the last line of defense
   // even though dashboard/api/actions/[action].js is expected to strip these.
-  const record = await upsertAction('a1', {
+  const record = await upsertAction(DEFAULT_TENANT_ID, 'a1', {
     status: 'Assigned',
     createdBy: 'usr_attacker', createdAt: '1999-01-01T00:00:00.000Z',
     updatedBy: 'usr_attacker', updatedAt: '1999-01-01T00:00:00.000Z',
@@ -137,9 +138,9 @@ async function testClientSuppliedServerFieldsAreOverwritten() {
 async function testGetAllActionsReturnsMultipleRecords() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await upsertAction('a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
-  await upsertAction('a2', { status: 'Completed' }, OWNER, 'Status -> Completed')
-  const all = await getAllActions()
+  await upsertAction(DEFAULT_TENANT_ID, 'a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
+  await upsertAction(DEFAULT_TENANT_ID, 'a2', { status: 'Completed' }, OWNER, 'Status -> Completed')
+  const all = await getAllActions(DEFAULT_TENANT_ID)
   assert(Object.keys(all).length === 2, 'both records are returned')
   assert(all.a1.status === 'Assigned' && all.a2.status === 'Completed', 'each record keeps its own fields')
 }
@@ -150,7 +151,7 @@ async function testReadFailureThrowsUnavailable() {
   }))
   let threw = false
   try {
-    await getAllActions()
+    await getAllActions(DEFAULT_TENANT_ID)
   } catch (err) {
     threw = err instanceof ActionStoreUnavailableError
   }
@@ -164,7 +165,7 @@ async function testWriteFailureThrowsUnavailable() {
   }))
   let threw = false
   try {
-    await upsertAction('a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
+    await upsertAction(DEFAULT_TENANT_ID, 'a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
   } catch (err) {
     threw = err instanceof ActionStoreUnavailableError
   }
@@ -174,23 +175,23 @@ async function testWriteFailureThrowsUnavailable() {
 async function testGetActionReturnsSingleRecordWithoutFetchingAll() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  await upsertAction('a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
-  await upsertAction('a2', { status: 'Completed' }, OWNER, 'Status -> Completed')
-  const record = await getAction('a1')
+  await upsertAction(DEFAULT_TENANT_ID, 'a1', { status: 'Assigned' }, OWNER, 'Status -> Assigned')
+  await upsertAction(DEFAULT_TENANT_ID, 'a2', { status: 'Completed' }, OWNER, 'Status -> Completed')
+  const record = await getAction(DEFAULT_TENANT_ID, 'a1')
   assert(record.status === 'Assigned', 'getAction must return the requested record')
   assert(record.id === 'a1', 'getAction must return the correct id')
 }
 
 async function testGetActionReturnsNullForUnknownId() {
   _setRedisClientForTests(() => fakeRedis())
-  const record = await getAction('does-not-exist')
+  const record = await getAction(DEFAULT_TENANT_ID, 'does-not-exist')
   assert(record === null, 'getAction must return null for an id with no record, not throw')
 }
 
 async function testGetActionThrowsWhenUnconfigured() {
   let threw = false
   try {
-    await getAction('a1')
+    await getAction(DEFAULT_TENANT_ID, 'a1')
   } catch (err) {
     threw = err instanceof ActionStoreUnavailableError
   }
@@ -199,7 +200,7 @@ async function testGetActionThrowsWhenUnconfigured() {
 
 async function testMalformedStoredValueIsSkippedNotThrown() {
   _setRedisClientForTests(() => fakeRedis({ a1: 'not valid json {{{' }))
-  const all = await getAllActions()
+  const all = await getAllActions(DEFAULT_TENANT_ID)
   assert(Object.keys(all).length === 0, 'a corrupted stored record is skipped rather than crashing the whole read')
 }
 

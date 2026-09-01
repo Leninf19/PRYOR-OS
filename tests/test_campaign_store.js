@@ -8,6 +8,7 @@ import {
   getAllCampaigns, getCampaign, createCampaign, updateCampaign, deleteCampaign, generateCampaignId,
   CampaignStoreUnavailableError, _setRedisClientForTests, _resetRedisClientForTests,
 } from '../dashboard/api/_lib/campaignStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -44,14 +45,14 @@ const CAMPAIGN_FIELDS = { name: 'Kids Eat Free — Wednesdays', description: 'We
 
 async function testCreateCampaignAlwaysStartsDraftRegardlessOfInput() {
   _setRedisClientForTests(() => fakeRedis())
-  const record = await createCampaign({ ...CAMPAIGN_FIELDS, status: 'Approved' }, OWNER)
+  const record = await createCampaign(DEFAULT_TENANT_ID, { ...CAMPAIGN_FIELDS, status: 'Approved' }, OWNER)
   assert(record.status === 'Draft', 'a newly created campaign must always start Draft, ignoring any client-supplied status')
 }
 
 async function testCreateCampaignGeneratesStableUniqueIds() {
   _setRedisClientForTests(() => fakeRedis())
-  const a = await createCampaign(CAMPAIGN_FIELDS, OWNER)
-  const b = await createCampaign(CAMPAIGN_FIELDS, OWNER)
+  const a = await createCampaign(DEFAULT_TENANT_ID, CAMPAIGN_FIELDS, OWNER)
+  const b = await createCampaign(DEFAULT_TENANT_ID, CAMPAIGN_FIELDS, OWNER)
   assert(a.id.startsWith('campaign_') && a.id !== b.id, 'each campaign gets a unique, stable id')
   assert(generateCampaignId() !== generateCampaignId(), 'generateCampaignId never repeats')
 }
@@ -59,40 +60,40 @@ async function testCreateCampaignGeneratesStableUniqueIds() {
 async function testUpdateCampaignTransitionsStatus() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  const created = await createCampaign(CAMPAIGN_FIELDS, OWNER)
-  const approved = await updateCampaign(created.id, { status: 'Approved' }, OWNER)
+  const created = await createCampaign(DEFAULT_TENANT_ID, CAMPAIGN_FIELDS, OWNER)
+  const approved = await updateCampaign(DEFAULT_TENANT_ID, created.id, { status: 'Approved' }, OWNER)
   assert(approved.status === 'Approved', 'status transitions to Approved')
-  const archived = await updateCampaign(created.id, { status: 'Archived' }, OWNER)
+  const archived = await updateCampaign(DEFAULT_TENANT_ID, created.id, { status: 'Archived' }, OWNER)
   assert(archived.status === 'Archived', 'status transitions to Archived')
 }
 
 async function testUpdateCampaignPreservesCreatedByAndStampsUpdatedBy() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  const created = await createCampaign(CAMPAIGN_FIELDS, OWNER)
+  const created = await createCampaign(DEFAULT_TENANT_ID, CAMPAIGN_FIELDS, OWNER)
   const MARKETING = { userId: 'usr_marketing', email: 'marketing@example.com', displayName: 'Marketing' }
-  const updated = await updateCampaign(created.id, { status: 'Approved' }, MARKETING)
+  const updated = await updateCampaign(DEFAULT_TENANT_ID, created.id, { status: 'Approved' }, MARKETING)
   assert(updated.createdBy === 'usr_owner', 'createdBy never changes')
   assert(updated.updatedBy === 'usr_marketing', 'updatedBy reflects the latest actor')
 }
 
 async function testUpdateCampaignReturnsNullForUnknownId() {
   _setRedisClientForTests(() => fakeRedis())
-  assert(await updateCampaign('does-not-exist', { status: 'Approved' }, OWNER) === null, 'updating an unknown campaign returns null')
+  assert(await updateCampaign(DEFAULT_TENANT_ID, 'does-not-exist', { status: 'Approved' }, OWNER) === null, 'updating an unknown campaign returns null')
 }
 
 async function testDeleteCampaignRemovesRecord() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  const created = await createCampaign(CAMPAIGN_FIELDS, OWNER)
-  assert(await deleteCampaign(created.id) === true, 'deleting an existing campaign returns true')
-  assert(await getCampaign(created.id) === null, 'the campaign is genuinely gone')
+  const created = await createCampaign(DEFAULT_TENANT_ID, CAMPAIGN_FIELDS, OWNER)
+  assert(await deleteCampaign(DEFAULT_TENANT_ID, created.id) === true, 'deleting an existing campaign returns true')
+  assert(await getCampaign(DEFAULT_TENANT_ID, created.id) === null, 'the campaign is genuinely gone')
 }
 
 async function testUnconfiguredStoreThrows() {
   let threwRead = false, threwWrite = false
-  try { await getAllCampaigns() } catch (err) { threwRead = err instanceof CampaignStoreUnavailableError }
-  try { await createCampaign(CAMPAIGN_FIELDS, OWNER) } catch (err) { threwWrite = err instanceof CampaignStoreUnavailableError }
+  try { await getAllCampaigns(DEFAULT_TENANT_ID) } catch (err) { threwRead = err instanceof CampaignStoreUnavailableError }
+  try { await createCampaign(DEFAULT_TENANT_ID, CAMPAIGN_FIELDS, OWNER) } catch (err) { threwWrite = err instanceof CampaignStoreUnavailableError }
   assert(threwRead && threwWrite, 'an unconfigured store must throw on read and write, never silently degrade')
 }
 

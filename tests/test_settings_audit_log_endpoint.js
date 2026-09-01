@@ -13,6 +13,7 @@ import handler from '../dashboard/api/settings/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests, _resetRedisClientForTests, appendAuditEntry } from '../dashboard/api/_lib/auditLog.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -101,7 +102,7 @@ async function testOwnerSeesEntriesAndTotal() {
   await setDirectory()
   const client = fakeAuditRedis()
   _setRedisClientForTests(() => client)
-  await appendAuditEntry({ actorId: 'usr_owner', actorName: 'Owner', actorEmail: 'owner@example.com', ip: null, entity: 'contact', entityId: '9', action: 'contact.created', changes: null, result: 'success', message: 'x' })
+  await appendAuditEntry(DEFAULT_TENANT_ID, { actorId: 'usr_owner', actorName: 'Owner', actorEmail: 'owner@example.com', ip: null, entity: 'contact', entityId: '9', action: 'contact.created', changes: null, result: 'success', message: 'x' })
   const res = await invoke({ token: await ownerToken() })
   assert(res.statusCode === 200, `expected 200, got ${res.statusCode}`)
   assert(res.body.total === 1 && res.body.entries.length === 1, 'the appended entry must be returned')
@@ -111,8 +112,8 @@ async function testQueryFiltersPassThrough() {
   await setDirectory()
   const client = fakeAuditRedis()
   _setRedisClientForTests(() => client)
-  await appendAuditEntry({ actorId: 'usr_owner', actorName: 'Owner', actorEmail: 'owner@example.com', ip: null, entity: 'contact', entityId: '9', action: 'contact.created', changes: null, result: 'success', message: 'contact event' })
-  await appendAuditEntry({ actorId: 'usr_owner', actorName: 'Owner', actorEmail: 'owner@example.com', ip: null, entity: 'google_oauth', entityId: null, action: 'google.reconnected', changes: null, result: 'success', message: 'oauth event' })
+  await appendAuditEntry(DEFAULT_TENANT_ID, { actorId: 'usr_owner', actorName: 'Owner', actorEmail: 'owner@example.com', ip: null, entity: 'contact', entityId: '9', action: 'contact.created', changes: null, result: 'success', message: 'contact event' })
+  await appendAuditEntry(DEFAULT_TENANT_ID, { actorId: 'usr_owner', actorName: 'Owner', actorEmail: 'owner@example.com', ip: null, entity: 'google_oauth', entityId: null, action: 'google.reconnected', changes: null, result: 'success', message: 'oauth event' })
   const res = await invoke({ token: await ownerToken(), query: { entity: 'contact' } })
   assert(res.body.total === 1 && res.body.entries[0].entity === 'contact', 'the entity query param must filter the results')
 }
@@ -122,7 +123,7 @@ async function testLimitIsClampedToASaneRange() {
   const client = fakeAuditRedis()
   _setRedisClientForTests(() => client)
   for (let i = 0; i < 3; i++) {
-    await appendAuditEntry({ actorId: 'usr_owner', actorName: 'Owner', actorEmail: 'owner@example.com', ip: null, entity: 'contact', entityId: String(i), action: 'contact.created', changes: null, result: 'success', message: `e${i}` })
+    await appendAuditEntry(DEFAULT_TENANT_ID, { actorId: 'usr_owner', actorName: 'Owner', actorEmail: 'owner@example.com', ip: null, entity: 'contact', entityId: String(i), action: 'contact.created', changes: null, result: 'success', message: `e${i}` })
   }
   // An out-of-range limit (e.g. 99999 or a non-numeric value) must fall
   // back to the default (50), never be passed through unchecked.

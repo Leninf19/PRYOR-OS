@@ -8,6 +8,7 @@ import {
   getAllTasks, getTask, createTask, updateTask, deleteTask, generateTaskId,
   TaskStoreUnavailableError, _setRedisClientForTests, _resetRedisClientForTests,
 } from '../dashboard/api/_lib/taskStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -53,16 +54,16 @@ const BASE_FIELDS = {
 
 async function testUnconfiguredStoreThrowsOnReadAndWrite() {
   let threwRead = false, threwWrite = false
-  try { await getAllTasks() } catch (err) { threwRead = err instanceof TaskStoreUnavailableError }
-  try { await createTask(BASE_FIELDS, OWNER) } catch (err) { threwWrite = err instanceof TaskStoreUnavailableError }
+  try { await getAllTasks(DEFAULT_TENANT_ID) } catch (err) { threwRead = err instanceof TaskStoreUnavailableError }
+  try { await createTask(DEFAULT_TENANT_ID, BASE_FIELDS, OWNER) } catch (err) { threwWrite = err instanceof TaskStoreUnavailableError }
   assert(threwRead, 'getAllTasks must throw when unconfigured')
   assert(threwWrite, 'createTask must throw when unconfigured, never silently no-op')
 }
 
 async function testCreateTaskGeneratesAStableNonPositionalId() {
   _setRedisClientForTests(() => fakeRedis())
-  const a = await createTask(BASE_FIELDS, OWNER)
-  const b = await createTask(BASE_FIELDS, OWNER)
+  const a = await createTask(DEFAULT_TENANT_ID, BASE_FIELDS, OWNER)
+  const b = await createTask(DEFAULT_TENANT_ID, BASE_FIELDS, OWNER)
   assert(typeof a.id === 'string' && a.id.startsWith('task_'), 'generated id must be a string with the task_ prefix')
   assert(a.id !== b.id, 'two created tasks must never collide on id, even with identical fields')
   assert(generateTaskId() !== generateTaskId(), 'generateTaskId() must never repeat')
@@ -70,7 +71,7 @@ async function testCreateTaskGeneratesAStableNonPositionalId() {
 
 async function testCreateTaskStampsServerAuthoritativeFields() {
   _setRedisClientForTests(() => fakeRedis())
-  const record = await createTask(BASE_FIELDS, OWNER)
+  const record = await createTask(DEFAULT_TENANT_ID, BASE_FIELDS, OWNER)
   assert(record.createdBy === 'usr_owner', 'createdBy stamped from the authenticated account')
   assert(record.updatedBy === 'usr_owner', 'updatedBy stamped from the authenticated account')
   assert(record.createdAt === record.updatedAt, 'on creation, createdAt and updatedAt coincide')
@@ -82,7 +83,7 @@ async function testCreateTaskStampsServerAuthoritativeFields() {
 
 async function testCreateTaskDefaultsMissingOptionalFields() {
   _setRedisClientForTests(() => fakeRedis())
-  const record = await createTask({ title: 'Minimal task', type: 'other', locationIds: '*', startAt: '2026-08-27T09:00:00.000Z' }, OWNER)
+  const record = await createTask(DEFAULT_TENANT_ID, { title: 'Minimal task', type: 'other', locationIds: '*', startAt: '2026-08-27T09:00:00.000Z' }, OWNER)
   assert(record.status === 'Scheduled', 'status defaults to Scheduled')
   assert(record.priority === 'Medium', 'priority defaults to Medium')
   assert(record.assignee === null, 'assignee defaults to null')
@@ -93,8 +94,8 @@ async function testCreateTaskDefaultsMissingOptionalFields() {
 async function testUpdateTaskMergesAndStampsUpdatedFields() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  const created = await createTask(BASE_FIELDS, OWNER)
-  const updated = await updateTask(created.id, { status: 'Completed' }, MARIA, 'Marked complete')
+  const created = await createTask(DEFAULT_TENANT_ID, BASE_FIELDS, OWNER)
+  const updated = await updateTask(DEFAULT_TENANT_ID, created.id, { status: 'Completed' }, MARIA, 'Marked complete')
   assert(updated.status === 'Completed', 'patch is applied')
   assert(updated.createdBy === 'usr_owner', 'createdBy never changes on update')
   assert(updated.updatedBy === 'usr_maria', 'updatedBy reflects the most recent actor')
@@ -104,15 +105,15 @@ async function testUpdateTaskMergesAndStampsUpdatedFields() {
 
 async function testUpdateTaskReturnsNullForUnknownId() {
   _setRedisClientForTests(() => fakeRedis())
-  const result = await updateTask('does-not-exist', { status: 'Completed' }, OWNER, 'x')
+  const result = await updateTask(DEFAULT_TENANT_ID, 'does-not-exist', { status: 'Completed' }, OWNER, 'x')
   assert(result === null, 'updating an unknown id must return null, never create a task the caller did not ask for')
 }
 
 async function testUpdateWithoutLogActionDoesNotAppendHistory() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  const created = await createTask(BASE_FIELDS, OWNER)
-  const updated = await updateTask(created.id, { notes: 'checked in' }, OWNER, undefined)
+  const created = await createTask(DEFAULT_TENANT_ID, BASE_FIELDS, OWNER)
+  const updated = await updateTask(DEFAULT_TENANT_ID, created.id, { notes: 'checked in' }, OWNER, undefined)
   assert(updated.history.length === 1, 'a plain notes edit with no logAction must not add a second history entry')
   assert(updated.notes === 'checked in', 'the patch is still applied')
 }
@@ -120,20 +121,20 @@ async function testUpdateWithoutLogActionDoesNotAppendHistory() {
 async function testDeleteTaskRemovesRecordAndReturnsBoolean() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  const created = await createTask(BASE_FIELDS, OWNER)
-  const deletedFirst = await deleteTask(created.id)
-  const deletedSecond = await deleteTask(created.id)
+  const created = await createTask(DEFAULT_TENANT_ID, BASE_FIELDS, OWNER)
+  const deletedFirst = await deleteTask(DEFAULT_TENANT_ID, created.id)
+  const deletedSecond = await deleteTask(DEFAULT_TENANT_ID, created.id)
   assert(deletedFirst === true, 'deleting an existing task returns true')
   assert(deletedSecond === false, 'deleting an already-deleted task returns false, not throw')
-  assert(await getTask(created.id) === null, 'the task is genuinely gone after deletion')
+  assert(await getTask(DEFAULT_TENANT_ID, created.id) === null, 'the task is genuinely gone after deletion')
 }
 
 async function testGetAllTasksReturnsEveryRecordIndependently() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  const a = await createTask({ ...BASE_FIELDS, title: 'Task A' }, OWNER)
-  const b = await createTask({ ...BASE_FIELDS, title: 'Task B', locationIds: '*' }, OWNER)
-  const all = await getAllTasks()
+  const a = await createTask(DEFAULT_TENANT_ID, { ...BASE_FIELDS, title: 'Task A' }, OWNER)
+  const b = await createTask(DEFAULT_TENANT_ID, { ...BASE_FIELDS, title: 'Task B', locationIds: '*' }, OWNER)
+  const all = await getAllTasks(DEFAULT_TENANT_ID)
   assert(Object.keys(all).length === 2, 'both records are returned')
   assert(all[a.id].title === 'Task A' && all[b.id].title === 'Task B', 'each record keeps its own fields')
 }
@@ -141,18 +142,18 @@ async function testGetAllTasksReturnsEveryRecordIndependently() {
 async function testReadAndWriteFailuresSurfaceAsUnavailable() {
   _setRedisClientForTests(() => ({ hgetall: async () => { throw new Error('ECONNREFUSED') } }))
   let threwRead = false
-  try { await getAllTasks() } catch (err) { threwRead = err instanceof TaskStoreUnavailableError }
+  try { await getAllTasks(DEFAULT_TENANT_ID) } catch (err) { threwRead = err instanceof TaskStoreUnavailableError }
   assert(threwRead, 'a Redis read failure must surface as TaskStoreUnavailableError')
 
   _setRedisClientForTests(() => ({ hget: async () => null, hset: async () => { throw new Error('ECONNREFUSED') } }))
   let threwWrite = false
-  try { await createTask(BASE_FIELDS, OWNER) } catch (err) { threwWrite = err instanceof TaskStoreUnavailableError }
+  try { await createTask(DEFAULT_TENANT_ID, BASE_FIELDS, OWNER) } catch (err) { threwWrite = err instanceof TaskStoreUnavailableError }
   assert(threwWrite, 'a Redis write failure must surface as TaskStoreUnavailableError')
 }
 
 async function testMalformedStoredValueIsSkippedNotThrown() {
   _setRedisClientForTests(() => fakeRedis({ task_bad: 'not valid json {{{' }))
-  const all = await getAllTasks()
+  const all = await getAllTasks(DEFAULT_TENANT_ID)
   assert(Object.keys(all).length === 0, 'a corrupted stored record is skipped rather than crashing the whole read')
 }
 

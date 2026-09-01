@@ -175,3 +175,30 @@ export function isPlatformOwnerEmail(email) {
   const allowlist = parsePlatformOwnerEmails(process.env.PLATFORM_OWNER_EMAILS)
   return allowlist.includes(email.trim().toLowerCase())
 }
+
+// --- Tenant resolution (Multi-Tenant Phase 2) --------------------------
+// The ONE function every server-side call site uses to answer "which
+// tenant is this request for" -- deliberately centralized so that
+// (a) no call site ever accepts a tenantId from req.query/req.body (an
+// attacker-controlled value would be a direct cross-tenant read/write
+// vector the moment a second tenant exists), and (b) Phase 3 (adding a
+// `tenantId` claim to the session token) is a ONE-FUNCTION change, not a
+// find-and-replace across every endpoint.
+//
+// Phase 2 behavior: always returns DEFAULT_TENANT_ID. There is no tenant
+// claim on the session yet (Phase 3's job), so every authenticated
+// account -- regardless of who they are -- resolves to the one tenant
+// that exists today. This is the explicit "compatibility bridge" the
+// Phase 2 brief calls for: external behavior is unchanged (there is only
+// one tenant), while every store call site is already passing a real,
+// non-optional tenantId, so Phase 3 only has to change what this function
+// returns, not who calls it or how.
+//
+// `account` is accepted (and will be read from, starting in Phase 3) so
+// this function's call sites never have to change shape later -- passing
+// `null`/`undefined` (the pre-authentication case, e.g. resolving a login
+// attempt before an account is known) is valid and still returns
+// DEFAULT_TENANT_ID today.
+export function resolveTenantId(_account) {
+  return DEFAULT_TENANT_ID
+}
