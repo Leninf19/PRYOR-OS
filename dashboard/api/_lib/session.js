@@ -9,11 +9,25 @@
 // same verification logic run in both places without duplication.
 //
 // Claims are intentionally minimal: userId, email, role, locationIds,
-// issuedAt/expiresAt (handled by jose as iat/exp), and sessionVersion (lets
-// _lib/auth.js invalidate every outstanding token for an account the moment
-// its role/password/disabled state changes, by bumping the account's
-// sessionVersion in the account directory -- a token signed against the old
-// version is rejected even though its signature is still valid).
+// tenantId, issuedAt/expiresAt (handled by jose as iat/exp), and
+// sessionVersion (lets _lib/auth.js invalidate every outstanding token for
+// an account the moment its role/password/disabled state changes, by
+// bumping the account's sessionVersion in the account directory -- a token
+// signed against the old version is rejected even though its signature is
+// still valid).
+//
+// Multi-Tenant Phase 3: `tenantId` is now a REQUIRED claim, the same tier
+// as userId/email/role -- verifySession() rejects (returns null) any
+// token missing it or carrying a non-string value, exactly like every
+// other required claim below. The claim's value is never trusted as
+// authoritative on its own: dashboard/api/_lib/auth.js's evaluateSession()
+// re-derives the account's CURRENT tenant from a fresh server-side lookup
+// on every request and rejects the whole session if the two disagree --
+// the same "claim is checked against fresh server state, never trusted
+// alone" pattern sessionVersion already established. This claim only ever
+// carries a value this codebase's own signSession() callers set, which in
+// turn always comes from resolveTenantId(account) (dashboard/api/_lib/
+// tenants.js) -- never from request input.
 
 import { SignJWT, jwtVerify } from 'jose'
 
@@ -30,8 +44,11 @@ function getSecret() {
   return new TextEncoder().encode(secret)
 }
 
-// claims: { userId, email, role, locationIds, sessionVersion }
+// claims: { userId, email, role, locationIds, tenantId, sessionVersion }
 export async function signSession(claims, { expiresInSeconds = 12 * 60 * 60 } = {}) {
+  if (typeof claims.tenantId !== 'string' || !claims.tenantId) {
+    throw new Error('signSession: tenantId is required and must be a non-empty string')
+  }
   const secret = getSecret()
   const now = Math.floor(Date.now() / 1000)
   return new SignJWT({
@@ -39,6 +56,7 @@ export async function signSession(claims, { expiresInSeconds = 12 * 60 * 60 } = 
     email: claims.email,
     role: claims.role,
     locationIds: claims.locationIds,
+    tenantId: claims.tenantId,
     sessionVersion: claims.sessionVersion,
   })
     .setProtectedHeader({ alg: ALG })
@@ -59,6 +77,7 @@ export async function verifySession(token) {
       typeof payload.userId !== 'string' ||
       typeof payload.email !== 'string' ||
       typeof payload.role !== 'string' ||
+      typeof payload.tenantId !== 'string' || !payload.tenantId ||
       typeof payload.sessionVersion !== 'number'
     ) {
       return null
@@ -68,6 +87,7 @@ export async function verifySession(token) {
       email: payload.email,
       role: payload.role,
       locationIds: payload.locationIds ?? '*',
+      tenantId: payload.tenantId,
       sessionVersion: payload.sessionVersion,
       issuedAt: payload.iat,
       expiresAt: payload.exp,

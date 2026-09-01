@@ -28,6 +28,7 @@
 import { readFile } from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { isWildcardGrant } from './auth.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const INDEX_PATH = path.resolve(__dirname, '..', '..', 'private-data', '_internal', 'review-location-index.json')
@@ -99,5 +100,5 @@ const UNRESOLVABLE_LOCATION_SENTINEL = -1
 export async function resolveLocationIdForReviewOrDeny(localReviewId, account) {
   const locationId = await resolveLocationIdForReview(localReviewId)
   if (locationId !== null) return locationId
-  return account.locationIds === '*' ? null : UNRESOLVABLE_LOCATION_SENTINEL
+  return isWildcardGrant(account) ? null : UNRESOLVABLE_LOCATION_SENTINEL
 }

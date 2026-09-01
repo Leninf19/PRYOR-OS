@@ -115,13 +115,13 @@ async function bcryptHash() {
 }
 
 async function ownerToken() {
-  return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 async function adminToken() {
-  return signSession({ userId: 'usr_admin', email: 'admin@example.com', role: 'admin', locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId: 'usr_admin', email: 'admin@example.com', role: 'admin', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 async function marketingToken() {
-  return signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 
 async function seedStaticDirectory() {

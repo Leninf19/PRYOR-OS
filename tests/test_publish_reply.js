@@ -15,6 +15,7 @@ import {
   _setRedisClientForTests as _setBridgeRedisForTests,
   _resetRedisClientForTests as _resetBridgeRedisForTests,
 } from '../dashboard/api/_lib/publishBridgeStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 // publish.js was merged into the consolidated dispatch file (Phase 8,
 // Milestone 8.2) -- this wrapper keeps every call site below exactly as it
@@ -68,7 +69,7 @@ process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
     role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false,
   }],
 })
-const AUTH_COOKIE = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+const AUTH_COOKIE = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 
 function fakeRes() {
   const res = { statusCode: null, body: null }

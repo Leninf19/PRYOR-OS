@@ -17,6 +17,7 @@ import rewriteHandler from '../dashboard/api/rewrite.js'
 import executiveBriefHandler from '../dashboard/api/executive-brief.js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests as _setCredentialRedisForTests, _resetRedisClientForTests as _resetCredentialRedisForTests, setStoredCredential } from '../dashboard/api/_lib/credentialStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 // All google/*.js files below were merged into the consolidated dispatch
 // file (Phase 8, Milestone 8.2) -- these wrappers keep every call site
@@ -81,7 +82,7 @@ async function ownerDirectory() {
   process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
     accounts: [{ userId: 'usr_owner', email: 'owner@example.com', passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false }],
   })
-  return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 
 async function testTriggerImportApplyRequiresConfirmPhrase() {

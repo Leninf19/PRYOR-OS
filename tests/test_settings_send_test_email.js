@@ -87,7 +87,7 @@ async function setDirectory() {
 }
 
 async function tokenFor(userId, email, role, locationIds) {
-  return signSession({ userId, email, role, locationIds, sessionVersion: 1 })
+  return signSession({ userId, email, role, locationIds, tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 const ownerToken = () => tokenFor('usr_owner', 'owner@example.com', 'owner', '*')
 const managerToken = () => tokenFor('usr_lm', 'lm@example.com', 'location_manager', [9])

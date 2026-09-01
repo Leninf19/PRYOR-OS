@@ -17,7 +17,7 @@ import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError } from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
-import { resolveTenantId } from '../_lib/tenants.js'
+import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError } from '../_lib/tenants.js'
 import {
   consumeInviteToken, markInviteConsumedPending, clearInviteConsumedPending, peekInviteToken,
   createResetToken, consumeResetToken, markResetConsumedPending, clearResetConsumedPending, peekResetToken,
@@ -77,7 +77,15 @@ async function login(req, res) {
     // logging the distinction internally would just move the same
     // information into a second, easier-to-overlook surface. Never logs the
     // attempted password itself.
-    await appendAuditEntry(resolveTenantId(account), {
+    //
+    // resolveTenantId() now fails closed for a null account (Phase 3
+    // hardening) -- there is no real account here to attribute this failed
+    // attempt to in the unknown-email case, so this best-effort audit entry
+    // (never a security decision -- it never gates access) files under the
+    // bootstrap tenant instead of routing `null` through the strict
+    // resolver. A real-but-disabled/wrong-password account still resolves
+    // its own genuine tenant normally.
+    await appendAuditEntry(account ? resolveTenantId(account) : resolveBootstrapTenantId(), {
       actorId: account?.userId ?? null, actorEmail: email, ip: clientIp(req),
       action: 'user.login_failed', entity: 'user', entityId: account?.userId ?? null,
       result: 'failure', message: 'Sign-in attempt failed.',
@@ -86,19 +94,24 @@ async function login(req, res) {
   }
 
   let token
+  let tenantId
   try {
+    tenantId = resolveTenantId(account)
     token = await signSession({
       userId: account.userId,
       email: account.email,
       role: account.role,
       locationIds: account.locationIds,
+      tenantId,
       sessionVersion: account.sessionVersion,
     }, { expiresInSeconds: SESSION_TTL_SECONDS })
   } catch (err) {
-    // Only reachable if SESSION_SIGNING_SECRET itself is missing/invalid --
-    // signSession()'s error text includes setup instructions meant for an
-    // administrator reading server logs, not a caller's response body.
-    console.error(`[login] could not sign a session token: ${err.message}`)
+    // Reachable if SESSION_SIGNING_SECRET itself is missing/invalid, OR
+    // (Phase 3 hardening) if resolveTenantId() could not safely establish
+    // this account's tenant (TenantResolutionError) -- both fail the same
+    // way: a generic, no-detail 503, never the underlying error's own
+    // message (which may name the offending field) in the response body.
+    console.error(`[login] could not establish a session: ${err.message}`)
     return res.status(503).json({ error: 'service_unavailable', message: 'Sign-in is temporarily unavailable. Please try again shortly.' })
   }
 
@@ -108,8 +121,8 @@ async function login(req, res) {
   // no-op for static-directory-only accounts (no Redis record to update),
   // and swallows its own Redis errors -- a bookkeeping-field write must
   // never turn a successful login into a failed one.
-  await touchLastLogin(resolveTenantId(account), account.userId)
-  await appendAuditEntry(resolveTenantId(account), {
+  await touchLastLogin(tenantId, account.userId)
+  await appendAuditEntry(tenantId, {
     actorId: account.userId, actorEmail: account.email, ip: clientIp(req),
     action: 'user.login', entity: 'user', entityId: account.userId,
     result: 'success', message: 'Signed in.',
@@ -250,7 +263,11 @@ async function acceptInvite(req, res) {
   try {
     const passwordHash = await hashPassword(password)
     const now = new Date().toISOString()
-    const updated = await updateUser(resolveTenantId(null), userId, {
+    // No account is known yet at this point (only a bare userId from the
+    // validated token payload) -- this is exactly the pre-authentication
+    // search-scope question resolveBootstrapTenantId() exists for, not an
+    // access-control decision (see tenants.js's header comment).
+    const updated = await updateUser(resolveBootstrapTenantId(), userId, {
       passwordHash, passwordSetAt: now,
       ...(isValidDisplayName(name) ? { displayName: name.trim() } : {}),
     })
@@ -261,14 +278,15 @@ async function acceptInvite(req, res) {
       return res.status(404).json({ error: 'not_found', message: 'This account no longer exists.' })
     }
 
+    const tenantId = resolveTenantId(updated)
     const sessionToken = await signSession({
       userId: updated.userId, email: updated.email, role: updated.role,
-      locationIds: updated.locationIds, sessionVersion: updated.sessionVersion,
+      locationIds: updated.locationIds, tenantId, sessionVersion: updated.sessionVersion,
     }, { expiresInSeconds: SESSION_TTL_SECONDS })
     setCookie(res, SESSION_COOKIE, sessionToken, { maxAgeSeconds: SESSION_TTL_SECONDS })
 
     await clearInviteConsumedPending(tokenHash)
-    await appendAuditEntry(resolveTenantId(null), {
+    await appendAuditEntry(tenantId, {
       actorId: userId, actorEmail: updated.email, ip: clientIp(req),
       action: 'invitation.accepted', entity: 'user', entityId: userId,
       result: 'success', message: 'Invitation accepted, account activated.',
@@ -282,6 +300,16 @@ async function acceptInvite(req, res) {
       // The pending safety-net record is untouched -- the client can
       // resubmit the identical token+password once the store recovers and
       // this will retry idempotently via the fromPending fallback above.
+      console.error(`[session/accept-invite] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not finish setting up your account. Please try this link again in a moment.' })
+    }
+    if (err instanceof TenantResolutionError) {
+      // Phase 3 hardening: the freshly-updated user record could not be
+      // safely resolved to a tenant -- reject generically, never leak the
+      // underlying reason (which field was invalid) in the response body.
+      // The pending safety-net record is left untouched, same as above --
+      // this is not retryable by the client without an operator fixing the
+      // underlying account record.
       console.error(`[session/accept-invite] ${err.message}`)
       return res.status(503).json({ error: 'service_unavailable', message: 'Could not finish setting up your account. Please try this link again in a moment.' })
     }
@@ -337,11 +365,14 @@ async function forgotPassword(req, res) {
       })
     }
   } catch (err) {
-    if (!(err instanceof TokenStoreUnavailableError)) throw err
+    if (!(err instanceof TokenStoreUnavailableError) && !(err instanceof TenantResolutionError)) throw err
+    // A TenantResolutionError here (Phase 3 hardening -- an account that
+    // exists but could not be safely resolved to a tenant) gets the exact
+    // same treatment as a token-store outage: logged server-side, never
+    // surfaced. Still returns the generic response below -- a failure of
+    // either kind must not turn into a different response shape that could
+    // hint at account existence via a distinguishable failure mode.
     console.error(`[session/forgot-password] ${err.message}`)
-    // Still returns the generic response below -- a store outage must not
-    // turn into a different response shape that could hint at account
-    // existence via a distinguishable failure mode.
   }
 
   return res.status(200).json(GENERIC_FORGOT_PASSWORD_RESPONSE)
@@ -426,9 +457,15 @@ async function resetPassword(req, res) {
       return res.status(404).json({ error: 'not_found', message: 'This account is no longer available.' })
     }
 
+    // `current` (the account this reset token was issued for) is already
+    // known here, so this resolves its real tenant -- never routes through
+    // resolveBootstrapTenantId(), which is reserved for the genuinely
+    // pre-account-lookup case (see acceptInvite() above).
+    const resolvedTenantId = resolveTenantId(current)
+
     const passwordHash = await hashPassword(password)
     const now = new Date().toISOString()
-    const updated = await upsertUser(resolveTenantId(null), {
+    const updated = await upsertUser(resolvedTenantId, {
       // Base fields present on either a static or an already-Redis account;
       // Redis-specific bookkeeping fields default sensibly the first time a
       // static account is promoted (never known/never happened for it).
@@ -439,14 +476,15 @@ async function resetPassword(req, res) {
       sessionVersion: (Number.isInteger(current.sessionVersion) ? current.sessionVersion : 1) + 1,
     })
 
+    const tenantId = resolveTenantId(updated)
     const sessionToken = await signSession({
       userId: updated.userId, email: updated.email, role: updated.role,
-      locationIds: updated.locationIds, sessionVersion: updated.sessionVersion,
+      locationIds: updated.locationIds, tenantId, sessionVersion: updated.sessionVersion,
     }, { expiresInSeconds: SESSION_TTL_SECONDS })
     setCookie(res, SESSION_COOKIE, sessionToken, { maxAgeSeconds: SESSION_TTL_SECONDS })
 
     await clearResetConsumedPending(tokenHash)
-    await appendAuditEntry(resolveTenantId(null), {
+    await appendAuditEntry(tenantId, {
       actorId: userId, actorEmail: updated.email, ip: clientIp(req),
       action: 'password_reset.completed', entity: 'user', entityId: userId,
       result: 'success', message: 'Password reset completed; all prior sessions invalidated.',
@@ -457,6 +495,12 @@ async function resetPassword(req, res) {
     })
   } catch (err) {
     if (err instanceof UserStoreUnavailableError) {
+      console.error(`[session/reset-password] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not finish resetting your password. Please try this link again in a moment.' })
+    }
+    if (err instanceof TenantResolutionError) {
+      // Phase 3 hardening: same generic, no-detail rejection as
+      // accept-invite's equivalent catch -- see its comment.
       console.error(`[session/reset-password] ${err.message}`)
       return res.status(503).json({ error: 'service_unavailable', message: 'Could not finish resetting your password. Please try this link again in a moment.' })
     }

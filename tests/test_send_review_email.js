@@ -17,6 +17,7 @@ import { _setContactsForTests, _resetContactsForTests } from '../dashboard/api/_
 import { _setTransportForTests, _resetTransportForTests } from '../dashboard/api/_lib/emailSender.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
 import { _setReviewLocationIndexForTests, _resetReviewLocationIndexForTests } from '../dashboard/api/_lib/reviewLocationIndex.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -88,7 +89,7 @@ async function setDirectory() {
 }
 
 async function tokenFor(userId, email, role) {
-  return signSession({ userId, email, role, locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId, email, role, locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 
 async function invoke({ action, method = 'GET', token, body, query = {} }) {

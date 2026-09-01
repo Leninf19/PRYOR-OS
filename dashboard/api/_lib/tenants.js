@@ -176,29 +176,155 @@ export function isPlatformOwnerEmail(email) {
   return allowlist.includes(email.trim().toLowerCase())
 }
 
-// --- Tenant resolution (Multi-Tenant Phase 2) --------------------------
+// --- Tenant membership resolution (Multi-Tenant Phase 3) ----------------
+// Returns every TenantMembership an account holds, as an ARRAY -- even
+// though, today, that array always has exactly one entry. The array shape
+// is deliberate and forward-looking: a later phase that looks up real
+// per-user memberships from a durable multi-tenant membership store can
+// change only this function's internals (querying that store instead of
+// calling buildLosTresAmigosMembership()) without changing what any caller
+// expects back. Returns [] for a falsy account (nothing to resolve).
+export function resolveTenantMembershipsForAccount(account) {
+  if (!account) return []
+  return [buildLosTresAmigosMembership(account)]
+}
+
+export class AmbiguousTenantMembershipError extends Error {}
+
+// The membership Phase 3's login/token-issuance flow uses to decide which
+// tenant a session is issued for. Phase 3 never builds a tenant-picker UI --
+// if an account ever resolved to more than one membership, this throws
+// rather than silently guessing one, so a future phase is forced to add
+// the picker before that state can ever reach a real user. Every account
+// today resolves to exactly one membership (Los Tres Amigos), so this
+// never throws in practice yet.
+export function resolveSingleTenantMembershipForLogin(account) {
+  const memberships = resolveTenantMembershipsForAccount(account)
+  if (memberships.length === 0) return null
+  if (memberships.length > 1) {
+    throw new AmbiguousTenantMembershipError(
+      `account ${JSON.stringify(account?.userId)} resolves to ${memberships.length} tenant memberships -- a tenant-picker UI is required and does not exist yet`
+    )
+  }
+  return memberships[0]
+}
+
+// Thrown by resolveTenantId() below whenever a tenant cannot be safely
+// established for an account -- callers on the authentication/session path
+// (auth.js's evaluateSession(), session/[action].js's login/accept-invite/
+// reset-password) MUST catch this and reject the request (401/503, a
+// generic message), never let it propagate as an unhandled error, and
+// never include this error's own message (which may name the offending
+// field) in a response body.
+export class TenantResolutionError extends Error {}
+
+// --- Tenant resolution (Multi-Tenant Phase 3, hardened) -------------------
 // The ONE function every server-side call site uses to answer "which
 // tenant is this request for" -- deliberately centralized so that
 // (a) no call site ever accepts a tenantId from req.query/req.body (an
 // attacker-controlled value would be a direct cross-tenant read/write
-// vector the moment a second tenant exists), and (b) Phase 3 (adding a
-// `tenantId` claim to the session token) is a ONE-FUNCTION change, not a
-// find-and-replace across every endpoint.
+// vector the moment a second tenant exists), and (b) Phase 3's session
+// tenant claim is a ONE-FUNCTION change, not a find-and-replace across
+// every endpoint.
 //
-// Phase 2 behavior: always returns DEFAULT_TENANT_ID. There is no tenant
-// claim on the session yet (Phase 3's job), so every authenticated
-// account -- regardless of who they are -- resolves to the one tenant
-// that exists today. This is the explicit "compatibility bridge" the
-// Phase 2 brief calls for: external behavior is unchanged (there is only
-// one tenant), while every store call site is already passing a real,
-// non-optional tenantId, so Phase 3 only has to change what this function
-// returns, not who calls it or how.
+// FAIL-CLOSED, by design: this function THROWS TenantResolutionError
+// rather than returning DEFAULT_TENANT_ID for anything it cannot
+// positively resolve -- a null account, a non-object, an account with an
+// explicit-but-invalid tenantId, an unrecognized legacy role, or an
+// invalid location grant. Falling back to the default tenant for any of
+// those would mean "we don't know who this is, so let's assume Los Tres
+// Amigos" -- exactly the permissive behavior a security boundary must not
+// have. There is no silent, permissive path here anymore.
 //
-// `account` is accepted (and will be read from, starting in Phase 3) so
-// this function's call sites never have to change shape later -- passing
-// `null`/`undefined` (the pre-authentication case, e.g. resolving a login
-// attempt before an account is known) is valid and still returns
-// DEFAULT_TENANT_ID today.
-export function resolveTenantId(_account) {
+// Resolution order:
+//   1. If `account` carries an explicit `tenantId` key at all, it MUST be a
+//      valid tenant id string, or this throws immediately -- an explicit
+//      but malformed/invalid tenantId is never silently ignored in favor
+//      of re-deriving one a different way. The valid case is the path
+//      every REAL request takes: dashboard/api/_lib/auth.js's
+//      evaluateSession() is the ONLY place that ever attaches `tenantId`
+//      to an account object, and it does so from a freshly SERVER-side
+//      re-derived value (never from the raw, client-controlled JWT claim
+//      directly -- see evaluateSession()'s own header comment) -- so by
+//      the time any endpoint/store call site sees `account.tenantId`, it
+//      has already been proven to match the account's real membership.
+//      This is also the seam a future multi-tenant phase's account objects
+//      (or this file's own unit tests, constructing a synthetic account
+//      shape directly) use to exercise a hypothetical non-default tenant
+//      without needing a real second tenant to exist.
+//   2. Otherwise (a raw account record fresh from accountStore.js/
+//      userStore.js, which never carries a `tenantId` field itself), this
+//      requires `account` to be a valid legacy PRYOR/LTA account that
+//      buildLosTresAmigosMembership() can successfully transform into a
+//      real TenantMembership (valid recognized role, valid location
+//      grant, non-empty userId) -- every account that was ever actually
+//      written by this codebase's own validated writers (accounts.js's
+//      loadAccountDirectory(), userStore.js's upsertUser()) satisfies
+//      this, so every genuine Los Tres Amigos account still resolves to
+//      DEFAULT_TENANT_ID exactly as before. Anything else throws.
+//
+// There is deliberately NO tolerant path for `account === null`. A
+// pre-authentication caller that genuinely has no account yet (e.g.
+// accountStore.js deciding which tenant's store to search BEFORE the
+// account is known) must use resolveBootstrapTenantId() below instead --
+// a distinctly-named function that makes that "not yet identified" search
+// scope explicit rather than routing it through the same function that
+// makes access-control decisions for an (attempted) identity.
+export function resolveTenantId(account) {
+  if (!account || typeof account !== 'object') {
+    throw new TenantResolutionError('resolveTenantId: cannot resolve a tenant for a null or non-object account')
+  }
+  if ('tenantId' in account) {
+    if (typeof account.tenantId !== 'string' || !isValidTenantId(account.tenantId)) {
+      throw new TenantResolutionError('resolveTenantId: account.tenantId is present but is not a valid tenant id')
+    }
+    return account.tenantId
+  }
+  let membership
+  try {
+    membership = resolveSingleTenantMembershipForLogin(account)
+  } catch (err) {
+    throw new TenantResolutionError(`resolveTenantId: account could not be resolved to a tenant membership (${err.message})`)
+  }
+  if (!membership) {
+    throw new TenantResolutionError('resolveTenantId: account resolved to no tenant membership')
+  }
+  return membership.tenantId
+}
+
+// The tenant to search BEFORE an account is known at all -- e.g.
+// accountStore.js's getAccountById()/getAccountByEmail()/listAccounts()
+// need to pick which tenant's Redis-backed user store to query before they
+// have found (or ruled out) any account. This is NOT a security decision
+// (it grants nothing by itself -- the account found, if any, still has its
+// own disabled/sessionVersion/credential checks applied afterward) and is
+// NOT the same question resolveTenantId() answers ("which tenant does this
+// [already-identified-or-attempted] account belong to") -- it exists
+// specifically so that question is never silently answered by passing
+// `null` into resolveTenantId(), which would defeat the fail-closed
+// guarantee above. Always returns DEFAULT_TENANT_ID today, since Phase 3
+// onboards no second tenant and therefore has only one store to search.
+export function resolveBootstrapTenantId() {
   return DEFAULT_TENANT_ID
+}
+
+// --- Tenant location catalog ownership (Multi-Tenant Phase 3) -----------
+// Every location this deployment knows about (dashboard/private-data's
+// meta.json and everything keyed off it -- reviews, per-location
+// intelligence, the review-to-location internal index) belongs to
+// DEFAULT_TENANT_ID: it is a single shared filesystem export, not a
+// Redis store partitioned by tenantId the way the 9 stores Phase 2
+// tenantized are. Phase 3 onboards no second tenant, so no location data
+// exists anywhere for any other tenantId. This is the explicit,
+// centralized statement of that fact -- any location-authorization check
+// (see auth.js's requireLocationAccess/isWildcardGrant) MUST consult this
+// before trusting an account's own locationIds grant, so a hypothetical
+// future or synthetic tenant can never be authorized against a location
+// that doesn't actually belong to it, even if its grant is '*' or an
+// explicit array that happens to numerically collide with a Los Tres
+// Amigos locationId. When a second tenant is actually onboarded (a later,
+// separately reviewed phase, once per-tenant location data exists), this
+// function -- not each call site -- is what will change.
+export function tenantOwnsLocationCatalog(tenantId) {
+  return tenantId === DEFAULT_TENANT_ID
 }

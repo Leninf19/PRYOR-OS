@@ -20,7 +20,7 @@
 import { readFile } from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { requireLocationAccess } from './auth.js'
+import { requireLocationAccess, isWildcardGrant } from './auth.js'
 import { getAllActions, ActionStoreUnavailableError } from './actionStore.js'
 import { getStoredCredential } from './credentialStore.js'
 import { listReplyFailures } from './notificationStore.js'
@@ -94,7 +94,7 @@ async function readJsonFile(relPath) {
 async function loadAuthorizedReviews(account) {
   const meta = await readJsonFile('meta.json')
   if (!meta?.locations) return []
-  const locations = account.locationIds === '*'
+  const locations = isWildcardGrant(account)
     ? meta.locations
     : meta.locations.filter(l => requireLocationAccess(account, l.locationId))
 
@@ -155,7 +155,7 @@ function reviewNotificationCandidates(reviews) {
 // the existing record rather than creating a second one.
 function replyFailureCandidates(failures, account) {
   return failures
-    .filter(f => account.locationIds === '*' || requireLocationAccess(account, f.locationId))
+    .filter(f => isWildcardGrant(account) || requireLocationAccess(account, f.locationId))
     .map(f => ({
       key: `reply_failed:${f.reviewId}`, type: 'reply_failed', severity: 'critical',
       title: 'Reply failed to publish', location: f.locationName ?? null,

@@ -21,6 +21,7 @@ process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xy
 import bcrypt from 'bcryptjs'
 import middleware from '../dashboard/middleware.js'
 import { signSession } from '../dashboard/api/_lib/session.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -61,7 +62,7 @@ async function testLegacyDataPathAlways404() {
 
 async function testLegacyDataPath404EvenWithValidSession() {
   await setDirectory()
-  const token = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const res = await middleware(fakeRequest('/data/meta.json', token))
   assert(res.status === 404, `legacy path must 404 regardless of auth, got ${res.status}`)
 }
@@ -74,7 +75,7 @@ async function testApiDataUnauthenticatedRejected() {
 
 async function testApiDataAuthenticatedContinues() {
   await setDirectory()
-  const token = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const res = await middleware(fakeRequest('/api/data?file=meta.json', token))
   // next() from @vercel/functions returns a Response whose presence signals
   // "continue" to the platform -- what matters here is it did NOT
@@ -90,7 +91,7 @@ async function testApiDataNonOwnerRoleAlsoContinues() {
       { userId: 'usr_lm', email: 'lm@example.com', passwordHash: hash, role: 'location_manager', locationIds: [7], sessionVersion: 1, disabled: false },
     ],
   })
-  const token = await signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7], sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const res = await middleware(fakeRequest('/api/data?file=meta.json', token))
   assert(res && ![401, 403, 404].includes(res.status), `a location_manager (or any authenticated role) must reach the Node layer, which makes the real per-file decision -- got status ${res?.status}`)
 }

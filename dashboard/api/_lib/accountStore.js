@@ -36,18 +36,23 @@
 
 import { loadAccountDirectory, findAccountById, findAccountByEmail, normalizeEmail } from './accounts.js'
 import { getUserById, getUserByEmail, listUsers, UserStoreUnavailableError } from './userStore.js'
-import { resolveTenantId } from './tenants.js'
+import { resolveBootstrapTenantId } from './tenants.js'
 
-// Multi-Tenant Phase 2: userStore.js's functions now require a tenantId.
+// Multi-Tenant Phase 2/3: userStore.js's functions now require a tenantId.
 // This module is the account-RESOLUTION layer -- it runs before any
 // session/account is known (that's the whole point of "find the account
 // behind this id/email"), so there is no `account` yet to resolve a
-// tenant from. Every call below passes resolveTenantId(null), which
-// (Phase 2) always returns DEFAULT_TENANT_ID -- identical behavior to
-// today, since Los Tres Amigos is still the only tenant. Phase 3 (adding
-// a tenant claim to the session) does not change this file: by
-// definition, discovering "which account" still has to happen before
-// "which tenant" can be read off anything account-shaped.
+// tenant from. Every call below passes resolveBootstrapTenantId(), which
+// always returns DEFAULT_TENANT_ID -- identical behavior to today, since
+// Los Tres Amigos is still the only tenant, and this is a search-scope
+// decision, not an access-control one (the account found, if any, still
+// gets its own disabled/sessionVersion/credential checks afterward).
+// Phase 3 hardening pass: this deliberately does NOT call
+// resolveTenantId(null) any more -- that function now fails closed
+// (throws) for a null account, by design, since it IS an access-control
+// decision everywhere else it's used. resolveBootstrapTenantId() is the
+// distinctly-named escape hatch for this one legitimately-different
+// pre-authentication question.
 
 // A missing/invalid ACCOUNT_DIRECTORY_JSON is a whole-app misconfiguration
 // (every static-directory account lookup fails, not just this one), so it's
@@ -79,7 +84,7 @@ async function tryRedisLookup(fn, label) {
 }
 
 export async function getAccountById(userId) {
-  const redisUser = await tryRedisLookup(() => getUserById(resolveTenantId(null), userId), `getAccountById(${userId})`)
+  const redisUser = await tryRedisLookup(() => getUserById(resolveBootstrapTenantId(), userId), `getAccountById(${userId})`)
   if (redisUser) return redisUser
   const accounts = loadDirectoryOrWarn()
   if (!accounts) return null
@@ -87,7 +92,7 @@ export async function getAccountById(userId) {
 }
 
 export async function getAccountByEmail(email) {
-  const redisUser = await tryRedisLookup(() => getUserByEmail(resolveTenantId(null), email), `getAccountByEmail`)
+  const redisUser = await tryRedisLookup(() => getUserByEmail(resolveBootstrapTenantId(), email), `getAccountByEmail`)
   if (redisUser) return redisUser
   const accounts = loadDirectoryOrWarn()
   if (!accounts) return null
@@ -103,7 +108,7 @@ export async function getAccountByEmail(email) {
 // the Users & Access admin listing/last-Owner counting -- both need the
 // same de-duplicated view.
 export async function listAccounts() {
-  const redisUsers = await tryRedisLookup(() => listUsers(resolveTenantId(null)), 'listAccounts') ?? []
+  const redisUsers = await tryRedisLookup(() => listUsers(resolveBootstrapTenantId()), 'listAccounts') ?? []
   const redisEmails = new Set(redisUsers.map(u => normalizeEmail(u.email)))
 
   const staticAccounts = loadDirectoryOrWarn() ?? []

@@ -139,8 +139,19 @@ function testOwnerWildcardBypassesEveryNewLocationCheck() {
   const authSrc = readApi('_lib/auth.js')
   assert(/if \(locationIds === '\*'\) return true/.test(authSrc), 'requireLocationAccess must short-circuit true for a wildcard account -- this is what every other check in this milestone ultimately relies on')
 
+  // Multi-Tenant Phase 3, reviewed update: the literal wildcard check this
+  // assertion originally matched (`account.locationIds !== '*'`) was
+  // replaced by the centralized, tenant-aware isWildcardGrant(account)
+  // helper (dashboard/api/_lib/auth.js) -- a wildcard grant now only
+  // shortcuts to "sees everything" when the account's own tenant actually
+  // owns a location catalog (see tenants.js's tenantOwnsLocationCatalog()),
+  // which is true for every real Los Tres Amigos account today, so a real
+  // Owner's behavior is unchanged. The structural guarantee this test
+  // exists to protect -- data.js gates its entire per-file/per-location
+  // branch behind a wildcard check, never running it for a genuinely
+  // company-wide account -- still holds, just via the new helper name.
   const dataSrc = readApi('data.js')
-  assert(/if \(account\.locationIds !== '\*'\)/.test(dataSrc), 'data.js must gate its entire per-file/per-location branch behind a non-wildcard check, leaving a wildcard account\'s existing behavior completely untouched')
+  assert(/if \(!isWildcardGrant\(account\)\)/.test(dataSrc), 'data.js must gate its entire per-file/per-location branch behind a non-wildcard (tenant-aware) check, leaving a genuinely company-wide account\'s existing behavior completely untouched')
 
   const publishSrc = readApi('google/[action].js')
   assert(/account\.locationIds !== '\*' && !reviewName/.test(publishSrc), 'publish()\'s fuzzy-fallback restriction must only apply to a non-wildcard account')

@@ -49,6 +49,7 @@
 import { next } from '@vercel/functions'
 import { verifySession, SESSION_COOKIE } from './api/_lib/session.js'
 import { getAccountById } from './api/_lib/accountStore.js'
+import { resolveTenantId } from './api/_lib/tenants.js'
 
 function parseCookieHeader(header) {
   const out = {}
@@ -83,6 +84,23 @@ export default async function middleware(request) {
   const account = await getAccountById(claims.userId)
   if (!account || account.disabled) return json(401, { error: 'unauthenticated', message: 'Sign in required.' })
   if (account.sessionVersion !== claims.sessionVersion) {
+    return json(401, { error: 'session_expired', message: 'Your session is no longer valid. Please sign in again.' })
+  }
+  // Multi-Tenant Phase 3: same tenant-claim verification as _lib/auth.js's
+  // evaluateSession() -- a claim that doesn't match the account's freshly
+  // re-derived current tenant is rejected here too, at the Edge, for the
+  // same defense-in-depth reason this file duplicates the sessionVersion
+  // check rather than trusting the Node layer alone. resolveTenantId() now
+  // fails closed (throws) rather than defaulting to DEFAULT_TENANT_ID for
+  // anything it cannot positively resolve (Phase 3 hardening) -- caught
+  // here and treated as the same safe rejection, never an unhandled error.
+  let currentTenantId
+  try {
+    currentTenantId = resolveTenantId(account)
+  } catch {
+    return json(401, { error: 'session_expired', message: 'Your session is no longer valid. Please sign in again.' })
+  }
+  if (claims.tenantId !== currentTenantId) {
     return json(401, { error: 'session_expired', message: 'Your session is no longer valid. Please sign in again.' })
   }
 

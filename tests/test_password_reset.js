@@ -95,10 +95,10 @@ function extractTokenFromEmailBody(sentEmail, paramName = 'token') {
 async function bcryptHash() { return bcrypt.hash('correct-horse-battery-staple', 12) }
 
 async function ownerToken() {
-  return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 async function marketingToken() {
-  return signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 
 async function seedStaticDirectory(overrides = {}) {
@@ -202,7 +202,7 @@ async function testResetPasswordSucceedsAndBumpsSessionVersion() {
 
 async function testOldSessionInvalidAfterReset() {
   const { rawToken } = await requestResetAndExtractToken('owner@example.com')
-  const oldSessionToken = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  const oldSessionToken = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 
   const reqBefore = { headers: { cookie: `${SESSION_COOKIE}=${oldSessionToken}` } }
   const accountBefore = await requireAuth(reqBefore, fakeRes(), null)

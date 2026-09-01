@@ -48,6 +48,7 @@ import settingsHandler from '../dashboard/api/settings/[action].js'
 import notificationsHandler from '../dashboard/api/notifications/[action].js'
 import tasksHandler from '../dashboard/api/tasks/[action].js'
 import contentHandler from '../dashboard/api/content/[action].js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -108,7 +109,7 @@ async function setDirectory(overrides = {}) {
 async function tokenFor(account, overrides = {}) {
   return signSession({
     userId: account.userId, email: account.email, role: account.role,
-    locationIds: account.locationIds, sessionVersion: account.sessionVersion,
+    locationIds: account.locationIds, tenantId: DEFAULT_TENANT_ID, sessionVersion: account.sessionVersion,
     ...overrides,
   })
 }
@@ -827,7 +828,7 @@ async function testExpiredSessionReturns401() {
   // Sign a second, already-expired token rather than waiting -- expiresInSeconds
   // accepts a negative value to simulate a token whose exp already passed.
   const expired = await signSession(
-    { userId: fixtures.owner.userId, email: fixtures.owner.email, role: fixtures.owner.role, locationIds: fixtures.owner.locationIds, sessionVersion: fixtures.owner.sessionVersion },
+    { userId: fixtures.owner.userId, email: fixtures.owner.email, role: fixtures.owner.role, locationIds: fixtures.owner.locationIds, tenantId: DEFAULT_TENANT_ID, sessionVersion: fixtures.owner.sessionVersion },
     { expiresInSeconds: -10 },
   )
   const req = { headers: { cookie: `lta_session=${expired}` } }
@@ -1157,23 +1158,40 @@ async function testAdminRetainsOperationalCapabilitiesButNotInfrastructureAdmin(
 // ===========================================================================
 // SECTION 4 -- LOCATION-SCOPE INVARIANTS
 // ===========================================================================
+//
+// Multi-Tenant Phase 3 hardening: requireLocationAccess() now requires a
+// resolvable tenant (resolveTenantId(account) -- fail-closed for anything
+// it can't positively resolve, see tenants.js) before ever consulting the
+// location grant itself. Every fixture in this section that is meant to
+// exercise the GRANT logic (not the account-shape/tenant-resolution logic)
+// now needs a valid, resolvable role/userId alongside whatever locationIds
+// shape is actually under test -- a bare `{ locationIds }` object has no
+// role, so it can no longer resolve to any tenant and would (correctly,
+// but for the wrong reason as far as THESE tests are concerned) always
+// return false. The fail-closed behavior for a genuinely malformed
+// account is covered on its own terms further below
+// (testMalformedAccountShapeFailsClosedNotThrows).
+
+function validAccountWith(locationIds) {
+  return { userId: 'usr_fixture', role: 'owner', locationIds }
+}
 
 async function testWildcardGrantsAllValidLocationIds() {
-  const account = { locationIds: '*' }
+  const account = validAccountWith('*')
   for (const id of [1, 3, 7, 12, 9999, 1000000]) {
     assert(requireLocationAccess(account, id) === true, `wildcard must grant location ${id}`)
   }
 }
 
 async function testAssignedNumericIdsAllowed() {
-  const account = { locationIds: [3, 7, 12] }
+  const account = validAccountWith([3, 7, 12])
   for (const id of [3, 7, 12]) {
     assert(requireLocationAccess(account, id) === true, `assigned id ${id} must be allowed`)
   }
 }
 
 async function testUnassignedIdsDenied() {
-  const account = { locationIds: [3, 7, 12] }
+  const account = validAccountWith([3, 7, 12])
   for (const id of [1, 2, 4, 99, 0, -1]) {
     assert(requireLocationAccess(account, id) === false, `unassigned id ${id} must be denied`)
   }
@@ -1185,7 +1203,7 @@ async function testStringNumberMismatchDoesNotAccidentallyPass() {
   // of an assigned id must NOT match. No normalization is designed or
   // implemented; this proves that's still true rather than silently
   // broadening what "matches" means.
-  const account = { locationIds: [7] }
+  const account = validAccountWith([7])
   assert(requireLocationAccess(account, '7') === false, 'string "7" must not match numeric 7 -- no implicit normalization exists')
   assert(requireLocationAccess(account, 7) === true, 'sanity: numeric 7 does match')
 }
@@ -1194,7 +1212,7 @@ async function testMalformedLocationIdRequestedFailsClosed() {
   // The REQUESTED locationId being malformed (as opposed to the account
   // shape) safely returns false in every case -- Array.includes never
   // throws for these inputs, it simply never matches.
-  const account = { locationIds: [3, 7, 12] }
+  const account = validAccountWith([3, 7, 12])
   for (const badId of [null, undefined, NaN, 0, -1, {}, []]) {
     assert(requireLocationAccess(account, badId) === false, `requested locationId ${JSON.stringify(badId)} must fail closed (false), not match`)
   }
@@ -1234,11 +1252,12 @@ async function testMalformedAccountShapeFailsClosedNotThrows() {
   }
 
   // The two cases that must still WORK, unchanged, alongside the new
-  // defensive checks: '*' remains unrestricted, and a valid array of
+  // defensive checks: '*' remains unrestricted (for a resolvable account --
+  // see validAccountWith()'s header comment above), and a valid array of
   // positive numeric ids continues to grant access to a matching id.
-  assert(requireLocationAccess({ locationIds: '*' }, 7) === true, 'wildcard must remain unrestricted')
-  assert(requireLocationAccess({ locationIds: [3, 7, 12] }, 7) === true, 'a valid array must still grant an assigned id')
-  assert(requireLocationAccess({ locationIds: [3, 7, 12] }, 99) === false, 'a valid array must still deny an unassigned id')
+  assert(requireLocationAccess(validAccountWith('*'), 7) === true, 'wildcard must remain unrestricted')
+  assert(requireLocationAccess(validAccountWith([3, 7, 12]), 7) === true, 'a valid array must still grant an assigned id')
+  assert(requireLocationAccess(validAccountWith([3, 7, 12]), 99) === false, 'a valid array must still deny an unassigned id')
 }
 
 // requireOwnership must retain identical fail-closed behavior purely
@@ -1256,15 +1275,15 @@ async function testRequireOwnershipFailsClosedThroughDelegation() {
     assert(!threw, `requireOwnership must never throw for malformed account ${JSON.stringify(account)}`)
     assert(result === false, `requireOwnership must fail closed (false) for malformed account ${JSON.stringify(account)}`)
   }
-  assert(requireOwnership({ locationIds: '*' }, 7) === true, 'requireOwnership wildcard passthrough must still work')
+  assert(requireOwnership(validAccountWith('*'), 7) === true, 'requireOwnership wildcard passthrough must still work')
 }
 
 async function testRequireOwnershipEquivalentToRequireLocationAccess() {
   const cases = [
-    [{ locationIds: '*' }, 42, true],
-    [{ locationIds: [7] }, 7, true],
-    [{ locationIds: [7] }, 8, false],
-    [{ locationIds: [3, 7, 12] }, 12, true],
+    [validAccountWith('*'), 42, true],
+    [validAccountWith([7]), 7, true],
+    [validAccountWith([7]), 8, false],
+    [validAccountWith([3, 7, 12]), 12, true],
   ]
   for (const [account, locationId, expected] of cases) {
     assert(requireOwnership(account, locationId) === requireLocationAccess(account, locationId), 'requireOwnership must always agree with requireLocationAccess')

@@ -9,6 +9,7 @@ process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xy
 import bcrypt from 'bcryptjs'
 import handler from '../dashboard/api/session/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -47,7 +48,7 @@ async function setDirectory() {
 }
 
 async function tokenFor(userId, email, role) {
-  return signSession({ userId, email, role, locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId, email, role, locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 
 async function invoke(token, method = 'GET') {

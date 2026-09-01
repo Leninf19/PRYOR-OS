@@ -43,7 +43,7 @@
 import { readFile } from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { requireAuth, requireLocationAccess } from './_lib/auth.js'
+import { requireAuth, requireLocationAccess, isWildcardGrant } from './_lib/auth.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PRIVATE_ROOT = path.resolve(__dirname, '..', 'private-data')
@@ -193,7 +193,7 @@ export default async function handler(req, res) {
   }
 
   let requestedLocationId = null // only meaningful for the 'per-location' category
-  if (account.locationIds !== '*') {
+  if (!isWildcardGrant(account)) {
     const category = categorizeRelPath(relPath)
     if (category === 'company-wide') {
       return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to view company-wide data.' })
@@ -257,7 +257,7 @@ export default async function handler(req, res) {
   // location's own review file. The frontend must derive a scoped
   // account's review counts from the (already location-scoped) review
   // data it fetches, never from meta.totalReviews.
-  if (account.locationIds !== '*' && relPath === 'meta.json') {
+  if (!isWildcardGrant(account) && relPath === 'meta.json') {
     parsed = {
       ...parsed,
       locations: (parsed.locations ?? []).filter(l => requireLocationAccess(account, l.locationId)),

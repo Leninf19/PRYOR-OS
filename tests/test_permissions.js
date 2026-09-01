@@ -19,6 +19,7 @@ import { fileURLToPath } from 'url'
 import { signSession, SESSION_COOKIE } from '../dashboard/api/_lib/session.js'
 import { requireAuth, requireLocationAccess, requireOwnership, requireScopedAuth } from '../dashboard/api/_lib/auth.js'
 import { Permission, ROLE_PERMISSIONS, roleHasPermission } from '../dashboard/api/_lib/permissions.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DASHBOARD_DIR = path.resolve(__dirname, '..', 'dashboard')
@@ -184,31 +185,43 @@ async function testRoleHasPermissionFailsClosedForUnknownInputs() {
 }
 
 // --- requireLocationAccess / requireOwnership ---------------------------
+//
+// Multi-Tenant Phase 3 hardening: requireLocationAccess() now requires a
+// resolvable tenant (resolveTenantId(account), fail-closed for anything it
+// can't positively resolve -- see tenants.js) before ever consulting the
+// location grant itself, so every fixture below needs a valid role/userId
+// (a real, resolvable Los Tres Amigos account), not just a bare
+// `{ locationIds }` shape -- the location-grant logic under test is
+// otherwise unchanged.
+
+function validAccountWith(locationIds) {
+  return { userId: 'usr_fixture', role: 'owner', locationIds }
+}
 
 async function testWildcardLocationAccessGrantsAnyLocation() {
-  const account = { locationIds: '*' }
+  const account = validAccountWith('*')
   for (const locationId of [1, 7, 12, 9999]) {
     assert(requireLocationAccess(account, locationId) === true, `wildcard account must access location ${locationId}`)
   }
 }
 
 async function testExplicitArrayLocationAccessPositive() {
-  const account = { locationIds: [3, 7, 12] }
+  const account = validAccountWith([3, 7, 12])
   for (const locationId of [3, 7, 12]) {
     assert(requireLocationAccess(account, locationId) === true, `account with [3,7,12] must access location ${locationId}`)
   }
 }
 
 async function testExplicitArrayLocationAccessNegative() {
-  const account = { locationIds: [3, 7, 12] }
+  const account = validAccountWith([3, 7, 12])
   for (const locationId of [1, 99, 0]) {
     assert(requireLocationAccess(account, locationId) === false, `account with [3,7,12] must NOT access location ${locationId}`)
   }
 }
 
 async function testRequireOwnershipMatchesRequireLocationAccess() {
-  const wildcard = { locationIds: '*' }
-  const scoped = { locationIds: [7] }
+  const wildcard = validAccountWith('*')
+  const scoped = validAccountWith([7])
   assert(requireOwnership(wildcard, 42) === true, 'requireOwnership must allow wildcard accounts any location')
   assert(requireOwnership(scoped, 7) === true, 'requireOwnership positive case: location in grant')
   assert(requireOwnership(scoped, 8) === false, 'requireOwnership negative case: location not in grant')
@@ -217,7 +230,7 @@ async function testRequireOwnershipMatchesRequireLocationAccess() {
 // --- requireScopedAuth ---------------------------------------------------
 
 async function tokenFor(userId, role, locationIds) {
-  return signSession({ userId, email: `${userId}@example.com`, role, locationIds, sessionVersion: 1 })
+  return signSession({ userId, email: `${userId}@example.com`, role, locationIds, tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 
 async function testRequireScopedAuthUnauthenticated() {

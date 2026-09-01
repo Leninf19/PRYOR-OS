@@ -79,10 +79,10 @@ async function seedDirectory() {
 }
 
 async function lmToken() {
-  return signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7], sessionVersion: 1 })
+  return signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 async function roToken() {
-  return signSession({ userId: 'usr_ro', email: 'ro@example.com', role: 'read_only', locationIds: [7], sessionVersion: 1 })
+  return signSession({ userId: 'usr_ro', email: 'ro@example.com', role: 'read_only', locationIds: [7], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 
 function fakeRes() {

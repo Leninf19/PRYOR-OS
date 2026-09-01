@@ -15,6 +15,7 @@ import { fileURLToPath } from 'url'
 import { readFile, writeFile, unlink } from 'fs/promises'
 import handler from '../dashboard/api/data.js'
 import { signSession } from '../dashboard/api/_lib/session.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -70,7 +71,7 @@ async function invoke(pathSegments, token) {
 }
 
 async function ownerToken() {
-  return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 
 async function testUnauthenticatedReturns401() {
@@ -90,7 +91,7 @@ async function testOwnerCanReadMeta() {
 
 async function testMarketingCanReadMeta() {
   await setDirectory()
-  const token = await signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const res = await invoke(['meta.json'], token)
   assert(res.statusCode === 200, `expected 200, got ${res.statusCode}`)
 }
@@ -104,7 +105,7 @@ async function testMarketingCanReadMeta() {
 // casa-tequila-brighton) -- usr_locmgr above is scoped to [3] only.
 async function testReadOnlyWildcardNowFullyAllowed() {
   await setDirectory()
-  const roToken = await signSession({ userId: 'usr_readonly', email: 'readonly@example.com', role: 'read_only', locationIds: '*', sessionVersion: 1 })
+  const roToken = await signSession({ userId: 'usr_readonly', email: 'readonly@example.com', role: 'read_only', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const roRes = await invoke(['meta.json'], roToken)
   assert(roRes.statusCode === 200, `a company-wide (locationIds: '*') read_only account must now be fully allowed, got ${roRes.statusCode}`)
   assert(Number.isInteger(JSON.parse(roRes.body).totalReviews), 'a wildcard account must still see the real, unfiltered totalReviews')
@@ -112,7 +113,7 @@ async function testReadOnlyWildcardNowFullyAllowed() {
 
 async function testLocationManagerMetaJsonFilteredToOwnLocationOnly() {
   await setDirectory()
-  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], sessionVersion: 1 })
+  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const res = await invoke(['meta.json'], lmToken)
   assert(res.statusCode === 200, `meta.json itself must never be blocked outright for a scoped account, got ${res.statusCode}`)
   const body = JSON.parse(res.body)
@@ -122,21 +123,21 @@ async function testLocationManagerMetaJsonFilteredToOwnLocationOnly() {
 
 async function testLocationManagerCanReadItsOwnLocationReviews() {
   await setDirectory()
-  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], sessionVersion: 1 })
+  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const res = await invoke(['reviews', 'by-location', 'los-tres-amigos-owosso.json'], lmToken)
   assert(res.statusCode === 200, `expected 200 for the account's own location, got ${res.statusCode}`)
 }
 
 async function testLocationManagerCannotReadAForeignLocationReviews() {
   await setDirectory()
-  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], sessionVersion: 1 })
+  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const res = await invoke(['reviews', 'by-location', 'casa-tequila-brighton.json'], lmToken)
   assert(res.statusCode === 404, `expected 404 (never 403, existence-hiding) for a foreign location, got ${res.statusCode}`)
 }
 
 async function testLocationManagerBlockedFromCompanyWideAggregates() {
   await setDirectory()
-  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], sessionVersion: 1 })
+  const lmToken = await signSession({ userId: 'usr_locmgr', email: 'locmgr@example.com', role: 'location_manager', locationIds: [3], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   for (const file of ['analytics/kpis.json', 'action-items.json', 'intelligence/company-summary.json']) {
     const res = await invoke(file.split('/'), lmToken)
     assert(res.statusCode === 403, `${file}: a company-wide aggregate must be permanently blocked (403) for a scoped account, got ${res.statusCode}`)

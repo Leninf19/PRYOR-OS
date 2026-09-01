@@ -18,6 +18,7 @@ import { _setRedisClientForTests as setActionRedis, _resetRedisClientForTests as
 import { _setRedisClientForTests as setCredentialRedis, _resetRedisClientForTests as resetCredentialRedis } from '../dashboard/api/_lib/credentialStore.js'
 import { _setRedisClientForTests as setNotifRedis, _resetRedisClientForTests as resetNotifRedis } from '../dashboard/api/_lib/notificationStore.js'
 import { _setReviewLocationIndexForTests, _resetReviewLocationIndexForTests } from '../dashboard/api/_lib/reviewLocationIndex.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -72,7 +73,7 @@ async function setDirectory() {
 }
 
 async function tokenFor(userId, email, role, locationIds) {
-  return signSession({ userId, email, role, locationIds, sessionVersion: 1 })
+  return signSession({ userId, email, role, locationIds, tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 const ownerToken = () => tokenFor('usr_owner', 'owner@example.com', 'owner', '*')
 const lmToken = () => tokenFor('usr_lm', 'lm@example.com', 'location_manager', [1])

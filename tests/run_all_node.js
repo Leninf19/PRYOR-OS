@@ -94,6 +94,7 @@ const TESTS = [
   'test_content_endpoint.js',
   'test_tenant_model.js',
   'test_tenant_migration_policy.js',
+  'test_tenant_session_authorization.js',
 ]
 
 const results = {}
