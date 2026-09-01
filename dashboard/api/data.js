@@ -42,11 +42,9 @@
 
 import { readFile } from 'fs/promises'
 import path from 'path'
-import { fileURLToPath } from 'url'
 import { requireAuth, requireLocationAccess, isWildcardGrant } from './_lib/auth.js'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PRIVATE_ROOT = path.resolve(__dirname, '..', 'private-data')
+import { resolveTenantId } from './_lib/tenants.js'
+import { resolvePrivateDataRoot, UnknownTenantError } from './_lib/reviewDataPaths.js'
 
 // Every static file export_chunks.py writes (see its main()/export_* calls).
 const EXACT_ALLOWLIST = new Set([
@@ -114,42 +112,48 @@ function extractSlugFromRelPath(relPath) {
   return last.replace(/\.json$/, '')
 }
 
-let metaLocationsCache = null
+// Multi-Tenant Phase 4D: keyed per tenantId -- before this fix this was a
+// single, shared module-level cache, meaning a Tenant B caller could have
+// been served Tenant A's meta.json locations from a warm cache Tenant A's
+// own earlier request had already populated.
+const metaLocationsCacheByTenant = new Map()
 let metaLocationsTestOverride = null
 
 // Test-only seam, same pattern as reviewLocationIndex.js's own
 // _setReviewLocationIndexForTests.
 export function _setMetaLocationsForTests(locations) {
   metaLocationsTestOverride = locations
-  metaLocationsCache = null
+  metaLocationsCacheByTenant.clear()
 }
 export function _resetMetaLocationsForTests() {
   metaLocationsTestOverride = null
-  metaLocationsCache = null
+  metaLocationsCacheByTenant.clear()
 }
 
-// Returns meta.json's `locations` array (cached per warm instance -- see
-// reviewLocationIndex.js's identical reasoning). Used both to resolve a
-// requested slug's locationId (per-location files) and to filter the
-// locations list itself (meta.json requests). Reads directly off disk,
+// Returns meta.json's `locations` array (cached per warm instance, per
+// tenant -- see reviewLocationIndex.js's identical reasoning). Used both to
+// resolve a requested slug's locationId (per-location files) and to filter
+// the locations list itself (meta.json requests). Reads directly off disk,
 // independent of isAllowed()/EXACT_ALLOWLIST -- meta.json is always
 // allowlisted for every role, so this never bypasses anything the
 // allowlist itself wouldn't already permit.
-async function loadMetaLocations() {
+async function loadMetaLocations(tenantId, privateRoot) {
   if (metaLocationsTestOverride !== null) return metaLocationsTestOverride
-  if (metaLocationsCache !== null) return metaLocationsCache
+  if (metaLocationsCacheByTenant.has(tenantId)) return metaLocationsCacheByTenant.get(tenantId)
+  let locations
   try {
-    const raw = await readFile(path.join(PRIVATE_ROOT, 'meta.json'), 'utf-8')
-    metaLocationsCache = JSON.parse(raw).locations ?? []
+    const raw = await readFile(path.join(privateRoot, 'meta.json'), 'utf-8')
+    locations = JSON.parse(raw).locations ?? []
   } catch (err) {
-    console.error(`[api/data] could not load meta.json for location resolution: ${err.message}`)
-    metaLocationsCache = []
+    console.error(`[api/data] could not load meta.json for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+    locations = []
   }
-  return metaLocationsCache
+  metaLocationsCacheByTenant.set(tenantId, locations)
+  return locations
 }
 
-async function resolveLocationIdForSlug(slug) {
-  const locations = await loadMetaLocations()
+async function resolveLocationIdForSlug(tenantId, privateRoot, slug) {
+  const locations = await loadMetaLocations(tenantId, privateRoot)
   const match = locations.find(l => l.slug === slug)
   return match ? match.locationId : null
 }
@@ -187,6 +191,26 @@ export default async function handler(req, res) {
   const account = await requireAuth(req, res, null)
   if (!account) return
 
+  // Multi-Tenant Phase 4D: tenantId is derived EXCLUSIVELY from the
+  // authenticated, server-side account -- never from req.query/req.body/
+  // any header. The private-data root is then resolved through the
+  // server-controlled registry (reviewDataPaths.js), never built from
+  // caller input. A tenant with no registered private-data root (missing/
+  // unknown/unconfigured) fails closed with 404 here, before the
+  // filesystem is ever touched -- it can never fall through to another
+  // tenant's (e.g. Los Tres Amigos's) directory.
+  const tenantId = resolveTenantId(account)
+  let privateRoot
+  try {
+    privateRoot = resolvePrivateDataRoot(tenantId)
+  } catch (err) {
+    if (err instanceof UnknownTenantError) {
+      console.error(`[api/data] ${err.message}`)
+      return res.status(404).json({ error: 'not_found' })
+    }
+    throw err
+  }
+
   const relPath = buildRequestedRelPath(req.query.file)
   if (!relPath || !isAllowed(relPath)) {
     return res.status(404).json({ error: 'not_found' })
@@ -200,7 +224,7 @@ export default async function handler(req, res) {
     }
     if (category === 'per-location') {
       const slug = extractSlugFromRelPath(relPath)
-      requestedLocationId = await resolveLocationIdForSlug(slug)
+      requestedLocationId = await resolveLocationIdForSlug(tenantId, privateRoot, slug)
       if (requestedLocationId === null || !requireLocationAccess(account, requestedLocationId)) {
         // Existence-hiding, matching the frozen §6 error contract every
         // other location-scope check in this codebase uses -- never 403
@@ -211,11 +235,12 @@ export default async function handler(req, res) {
     // category === 'meta' falls through -- read + filtered after parsing.
   }
 
-  const resolved = path.resolve(PRIVATE_ROOT, relPath)
+  const resolved = path.resolve(privateRoot, relPath)
   // Defense in depth, not the primary check -- the allowlist above already
   // guarantees this, but a future edit to the allowlist regexes shouldn't
-  // be able to silently escape PRIVATE_ROOT without this also catching it.
-  if (resolved !== PRIVATE_ROOT && !resolved.startsWith(PRIVATE_ROOT + path.sep)) {
+  // be able to silently escape this tenant's own privateRoot without this
+  // also catching it.
+  if (resolved !== privateRoot && !resolved.startsWith(privateRoot + path.sep)) {
     return res.status(404).json({ error: 'not_found' })
   }
 

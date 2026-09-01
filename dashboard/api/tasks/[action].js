@@ -192,7 +192,7 @@ function validateCreateFields(body) {
 // widen a task's location scope by attaching an out-of-scope review to it.
 async function validateReviewAssignmentLocations(relatedReviewIds, account, taskLocationIds) {
   for (const id of relatedReviewIds ?? []) {
-    const locationId = await resolveLocationIdForReview(id)
+    const locationId = await resolveLocationIdForReview(id, resolveTenantId(account))
     if (locationId === null) return { valid: false, message: `Review "${id}" could not be resolved to a known location.` }
     if (!requireLocationAccess(account, locationId)) {
       return { valid: false, message: `Review "${id}" belongs to a location outside your authorization.` }
@@ -232,7 +232,7 @@ async function list(req, res) {
 
     const withProgress = await Promise.all(visible.map(async task => {
       if (task.type !== 'review_assignment') return task
-      const progress = await computeReviewAssignmentProgress(task.relatedReviewIds)
+      const progress = await computeReviewAssignmentProgress(task.relatedReviewIds, resolveTenantId(account))
       return progress ? { ...task, reviewProgress: progress } : task
     }))
 
@@ -271,7 +271,7 @@ async function get(req, res) {
 
     let result = task
     if (task.type === 'review_assignment') {
-      const progress = await computeReviewAssignmentProgress(task.relatedReviewIds)
+      const progress = await computeReviewAssignmentProgress(task.relatedReviewIds, resolveTenantId(account))
       if (progress) result = { ...task, reviewProgress: progress }
     }
     return res.status(200).json({ task: result })

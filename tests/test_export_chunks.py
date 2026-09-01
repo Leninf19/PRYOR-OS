@@ -23,6 +23,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import export_chunks
+import tenant_keys
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 results = []
 
@@ -311,7 +314,7 @@ def test_export_provider_health_does_not_change_scraper_status_json_shape():
     with ScratchExport() as ex:
         _add_run(ex.conn, "cloud")
         export_chunks.export_scraper_status(ex.conn)
-        export_chunks.export_provider_health(ex.conn)
+        export_chunks.export_provider_health(ex.conn, TEST_TENANT_ID)
         payload = ex.read_json("scraper-status.json")
         assert isinstance(payload, list), "scraper-status.json must remain a bare array, not be wrapped into an object"
 
@@ -322,7 +325,7 @@ def test_export_provider_health_groups_by_explicit_provider_column():
         _add_run(ex.conn, "cloud", provider="scraper", status="ok")
         with mock.patch("provider_gbp.GBPProvider.is_configured", return_value=True), \
              mock.patch("provider_scraper.ScraperProvider.is_configured", return_value=True):
-            export_chunks.export_provider_health(ex.conn)
+            export_chunks.export_provider_health(ex.conn, TEST_TENANT_ID)
         payload = ex.read_json("provider-health.json")
         assert set(payload.keys()) == {"gbp", "scraper"}
         assert payload["gbp"]["state"] == "healthy"
@@ -337,7 +340,7 @@ def test_export_provider_health_infers_scraper_for_legacy_null_provider_rows():
         _add_run(ex.conn, "cloud", provider=None, status="failed", succeeded=0, failed=1)
         with mock.patch("provider_gbp.GBPProvider.is_configured", return_value=True), \
              mock.patch("provider_scraper.ScraperProvider.is_configured", return_value=True):
-            export_chunks.export_provider_health(ex.conn)
+            export_chunks.export_provider_health(ex.conn, TEST_TENANT_ID)
         payload = ex.read_json("provider-health.json")
         assert payload["scraper"]["state"] == "failed"
         assert payload["gbp"]["state"] == "offline", "no gbp run exists -- must not be contaminated by the scraper's legacy row"
@@ -352,7 +355,7 @@ def test_export_provider_health_infers_gbp_for_legacy_null_provider_api_sync_row
         _add_run(ex.conn, "api_sync", provider=None, status="ok")
         with mock.patch("provider_gbp.GBPProvider.is_configured", return_value=True), \
              mock.patch("provider_scraper.ScraperProvider.is_configured", return_value=True):
-            export_chunks.export_provider_health(ex.conn)
+            export_chunks.export_provider_health(ex.conn, TEST_TENANT_ID)
         payload = ex.read_json("provider-health.json")
         assert payload["gbp"]["state"] == "healthy"
         assert payload["scraper"]["state"] == "offline", "no scraper run exists -- must not be contaminated by the gbp legacy row"
@@ -363,7 +366,7 @@ def test_export_provider_health_offline_when_not_configured():
         _add_run(ex.conn, "cloud", provider="scraper", status="ok")
         with mock.patch("provider_gbp.GBPProvider.is_configured", return_value=False), \
              mock.patch("provider_scraper.ScraperProvider.is_configured", return_value=False):
-            export_chunks.export_provider_health(ex.conn)
+            export_chunks.export_provider_health(ex.conn, TEST_TENANT_ID)
         payload = ex.read_json("provider-health.json")
         assert payload["gbp"]["state"] == "offline"
         assert payload["scraper"]["state"] == "offline"
@@ -380,7 +383,7 @@ def test_export_provider_health_result_matches_compute_health_directly():
         _add_run(ex.conn, "cloud", provider="scraper", status="partial", attempted=10, succeeded=6, failed=4)
         with mock.patch("provider_gbp.GBPProvider.is_configured", return_value=True), \
              mock.patch("provider_scraper.ScraperProvider.is_configured", return_value=True):
-            export_chunks.export_provider_health(ex.conn)
+            export_chunks.export_provider_health(ex.conn, TEST_TENANT_ID)
         payload = ex.read_json("provider-health.json")
 
         runs = [dict(r) for r in ex.conn.execute("SELECT * FROM scraper_runs ORDER BY id DESC").fetchall()]

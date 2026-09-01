@@ -16,17 +16,23 @@ deletes, merges, or guesses -- if any collision would make that backfill
 itself violate dedup_key's own UNIQUE constraint, it stops and reports the
 exact rows involved instead of choosing one automatically.
 
+Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED. --db still exists
+to point at a scratch copy for a safe first dry-run, but its default is now
+the tenant's own registered database (tenant_paths.py), never a bare
+db.DB_PATH global.
+
 Usage:
-    py repair_review_identity.py                       # preflight report only (dry run)
-    py repair_review_identity.py --apply                # actually runs the backfill
-    py repair_review_identity.py --db path/to/scratch.db [--apply]
+    py repair_review_identity.py --tenant-id t_los-tres-amigos                # preflight report only (dry run)
+    py repair_review_identity.py --tenant-id t_los-tres-amigos --apply        # actually runs the backfill
+    py repair_review_identity.py --tenant-id t_los-tres-amigos --db path/to/scratch.db [--apply]
 """
 import argparse
 import sqlite3
 import sys
 from pathlib import Path
 
-import db
+import tenant_keys
+import tenant_paths
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -135,12 +141,24 @@ def run_backfill(conn: sqlite3.Connection) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=None,
-                         help="Path to the SQLite DB to operate on (default: db.DB_PATH, the real dashboard/reviews.db)")
+                         help="Path to the SQLite DB to operate on (default: the --tenant-id's own "
+                              "registered review database -- see tenant_paths.py). Use this to point "
+                              "at a SCRATCH COPY, never the real database, for a first dry-run.")
     parser.add_argument("--apply", action="store_true",
                          help="Actually run the backfill (default: preflight report only, no writes)")
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to repair. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
     args = parser.parse_args()
 
-    db_path = args.db or db.DB_PATH
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::repair_review_identity.py: invalid --tenant-id {args.tenant_id!r}")
+        return 1
+    try:
+        db_path = args.db or tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::repair_review_identity.py: {e}")
+        return 1
     if not db_path.exists():
         print(f"::error::repair_review_identity.py: no database at {db_path}")
         return 1

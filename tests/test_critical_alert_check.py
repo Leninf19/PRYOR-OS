@@ -19,11 +19,16 @@ import critical_alert_check as cac
 import db
 import digest_filters
 import gbp_sync
+import tenant_keys
+import tenant_paths
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 
 def _fresh_db():
     tmpdir = tempfile.mkdtemp(prefix="critical_alert_test_")
     db.DB_PATH = Path(tmpdir) / "reviews.db"
+    tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, db.DB_PATH)
     conn = db.get_connection()
     db.init_schema(conn)
     conn.execute("INSERT INTO locations (name, city, brand) VALUES ('Test Loc', 'Testville', 'Casa Tequila')")
@@ -116,7 +121,7 @@ def test_sync_failure_still_checks_existing_critical_reviews():
     with mock.patch.object(gbp_sync, "sync_all", return_value={"status": "failed", "reason": "Google API 429: Quota exceeded"}), \
          mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-app-password"), \
          mock.patch("critical_alert_check._send_email") as mock_send:
-        result = cac.run()
+        result = cac.run(TEST_TENANT_ID)
 
     assert result["status"] == "ok", result
     assert result["sent"] == 1, f"expected the pre-existing critical review to be found and sent, got {result}"
@@ -209,7 +214,7 @@ def test_fallback_database_check_still_runs_for_every_failure_classification():
         with mock.patch.object(gbp_sync, "sync_all", return_value=sync_result), \
              mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-app-password"), \
              mock.patch("critical_alert_check._send_email") as mock_send:
-            result = cac.run()
+            result = cac.run(TEST_TENANT_ID)
 
         assert result["status"] == "ok", f"{sync_result['error_type']}: {result}"
         assert result["sent"] == 1, f"{sync_result['error_type']}: expected the pre-existing critical review still found, got {result}"

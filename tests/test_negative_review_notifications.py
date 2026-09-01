@@ -31,11 +31,16 @@ import digest_filters
 import gbp_sync
 import google_api as ga
 import notify
+import tenant_keys
+import tenant_paths
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 
 def _fresh_db():
     tmpdir = tempfile.mkdtemp(prefix="negreview_test_")
     db.DB_PATH = Path(tmpdir) / "reviews.db"
+    tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, db.DB_PATH)
     conn = db.get_connection()
     db.init_schema(conn)
     conn.execute("INSERT INTO locations (name, city, brand) VALUES ('Test Loc', 'Testville', 'Casa Tequila')")
@@ -143,7 +148,7 @@ def test_previously_seen_review_not_resent():
          mock.patch.object(ga, "list_accounts", return_value=[account]), \
          mock.patch.object(ga, "list_locations", return_value=[location]), \
          mock.patch.object(ga, "list_reviews", return_value=[review]):
-        first = gbp_sync.sync_all(fast=False)
+        first = gbp_sync.sync_all(tenant_id=TEST_TENANT_ID, fast=False)
     first_negative = digest_filters.get_new_negative_reviews(first["new_reviews"])
     assert len(first_negative) == 1, f"expected the 1-star review to be new+negative on first sync, got {first_negative}"
 
@@ -151,7 +156,7 @@ def test_previously_seen_review_not_resent():
          mock.patch.object(ga, "list_accounts", return_value=[account]), \
          mock.patch.object(ga, "list_locations", return_value=[location]), \
          mock.patch.object(ga, "list_reviews", return_value=[review]):
-        second = gbp_sync.sync_all(fast=False)
+        second = gbp_sync.sync_all(tenant_id=TEST_TENANT_ID, fast=False)
     second_negative = digest_filters.get_new_negative_reviews(second["new_reviews"])
     assert second_negative == [], f"the same review must not appear as new/negative again, got {second_negative}"
 
@@ -201,7 +206,7 @@ def test_global_429_preserves_data_and_correct_alert():
     )
     with mock.patch.object(ga, "is_configured", return_value=True), \
          mock.patch.object(ga, "list_accounts", side_effect=quota_error):
-        result = gbp_sync.sync_all(fast=False)
+        result = gbp_sync.sync_all(tenant_id=TEST_TENANT_ID, fast=False)
     assert result["status"] == "failed"
 
     conn = db.get_connection()
@@ -241,7 +246,7 @@ def test_successful_scrape_no_negative_reviews_no_email():
          mock.patch.object(ga, "list_accounts", return_value=[account]), \
          mock.patch.object(ga, "list_locations", return_value=[location]), \
          mock.patch.object(ga, "list_reviews", return_value=[review]):
-        result = gbp_sync.sync_all(fast=False)
+        result = gbp_sync.sync_all(tenant_id=TEST_TENANT_ID, fast=False)
 
     assert result["status"] == "ok", f"a legitimate all-positive scrape must succeed cleanly, got {result}"
     negative = digest_filters.get_new_negative_reviews(result["new_reviews"])

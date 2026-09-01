@@ -21,6 +21,17 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: write
+    # Multi-Tenant Phase 4C revision: the tenant-aware Python entrypoints
+    # invoked below now REQUIRE an explicit --tenant-id -- there is no
+    # default anywhere in that code, so a workflow that omitted it would
+    # simply fail, not silently assume a tenant. This single, reviewed,
+    # version-controlled value is this pipeline's explicit statement of
+    # which tenant it runs for -- it is never derived from any
+    # user-controlled input. This repo (and its one tenant's Google/data
+    # pipeline) is Los Tres Amigos-only today; see the Multi-Tenant Phase
+    # 4C report for the eventual multi-tenant workflow design.
+    env:
+      TENANT_ID: t_los-tres-amigos
 
     steps:
       - name: Checkout repo
@@ -55,7 +66,7 @@ jobs:
       - name: Sync reviews (GBP provider)
         id: scrape
         timeout-minutes: 30
-        run: python sync_reviews.py
+        run: python sync_reviews.py --tenant-id "$TENANT_ID"
         env:
           REVIEW_PROVIDER: gbp
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -78,29 +89,29 @@ jobs:
 
       - name: Validate data
         if: always()
-        run: python validate.py
+        run: python validate.py --tenant-id "$TENANT_ID"
 
       - name: Refresh analytics
         if: always()
-        run: python refresh_analytics.py
+        run: python refresh_analytics.py --tenant-id "$TENANT_ID"
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
       - name: Send alert notifications
         if: always()
-        run: python notify.py
+        run: python notify.py --tenant-id "$TENANT_ID"
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
 
       - name: Export intelligence data
         if: always()
-        run: python export_chunks.py
+        run: python export_chunks.py --tenant-id "$TENANT_ID"
 
       - name: Verify database integrity before commit
         if: always()
         id: integrity
-        run: python check_db_integrity.py
+        run: python check_db_integrity.py --tenant-id "$TENANT_ID"
 
       - name: Commit updated data
         if: always() && steps.integrity.outcome == 'success'

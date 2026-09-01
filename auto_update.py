@@ -17,11 +17,25 @@ import db
 import digest_filters
 import local_safety
 import check_db_integrity
+import tenant_keys
+import tenant_paths
 
 BASE_DIR      = Path(__file__).parent
-REVIEWS_CSV   = BASE_DIR / "dashboard" / "reviews.csv"
 LOGS_DIR      = BASE_DIR / "logs"
 GITHUB_OUTPUT = os.environ.get("GITHUB_OUTPUT", "")
+
+
+def _extract_argv_value(flag: str) -> str | None:
+    """Same raw-sys.argv style this file already uses for --local/--debug
+    (no argparse here), extended to a value-bearing flag: returns the token
+    immediately after `flag`, or None if `flag` isn't present or has
+    nothing after it."""
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return None
+
 
 # --local: headed browser, full 3000-review scroll, git push + Vercel deploy
 # --debug: save screenshots + HTML snapshots on failure (auto-enabled in cloud CI)
@@ -29,6 +43,21 @@ LOCAL_MODE = "--local" in sys.argv
 DEBUG_MODE = "--debug" in sys.argv or bool(GITHUB_OUTPUT)  # always on in CI
 MAX_SCROLL    = 3000 if LOCAL_MODE else 300
 EXTRACT_EVERY = 50
+
+# Multi-Tenant Phase 4D: --tenant-id is REQUIRED (validated in main(), not
+# here -- raising at import time would break `import auto_update` from
+# tests/other modules that never intend to run this file's scrape). Left
+# unvalidated/possibly-None here purely as raw argv extraction, matching
+# this file's existing --local/--debug style. REVIEWS_CSV is a mutable
+# module global (like export_chunks.py's PRIVATE_DATA_DIR) -- main()
+# reassigns it from tenant_paths.resolve_review_csv_path() before any
+# scrape/read/write runs; the hardcoded default below is intentionally
+# whatever Los Tres Amigos already resolves to, purely so
+# `import auto_update` and any code that reads this constant before
+# main() runs sees a sane path, never used as a silent fallback for an
+# actual scrape.
+TENANT_ID_ARG = _extract_argv_value("--tenant-id")
+REVIEWS_CSV = BASE_DIR / "dashboard" / "reviews.csv"
 
 # "Reviews" button label in every language Google Maps might show
 REVIEW_TAB_LABELS = {
@@ -1431,7 +1460,27 @@ def _git_commit_push_deploy(new_rows: list) -> None:
 
 
 async def main():
-    print(f"Starting scrape: {datetime.now()} | LOCAL={LOCAL_MODE} | DEBUG={DEBUG_MODE}")
+    """Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED, no default,
+    for both the cloud/CI path and --local -- validated and resolved
+    (db.DB_PATH, REVIEWS_CSV) FIRST, before load_existing() or any other
+    file/DB access. This is the dormant fallback scraper (no current
+    workflow invokes it -- sync_reviews.py/gbp_sync.py are the active
+    path), but it remains genuinely capable of writing to a tenant's real
+    review database if manually run, so it gets the same fail-closed
+    treatment as every other entrypoint."""
+    global REVIEWS_CSV
+    if not tenant_keys.is_valid_tenant_id(TENANT_ID_ARG):
+        print(f"::error::auto_update.py: --tenant-id is required and must be valid (got {TENANT_ID_ARG!r}). "
+              f"Pass it as: python auto_update.py --tenant-id t_los-tres-amigos [--local]")
+        sys.exit(1)
+    try:
+        db.DB_PATH = tenant_paths.resolve_review_db_path(TENANT_ID_ARG)
+        REVIEWS_CSV = tenant_paths.resolve_review_csv_path(TENANT_ID_ARG)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::auto_update.py: {e}")
+        sys.exit(1)
+
+    print(f"Starting scrape: {datetime.now()} | LOCAL={LOCAL_MODE} | DEBUG={DEBUG_MODE} | TENANT={TENANT_ID_ARG}")
     if DEBUG_MODE:
         LOGS_DIR.mkdir(exist_ok=True)
         print(f"Debug snapshots → {LOGS_DIR}")
@@ -1450,7 +1499,7 @@ async def main():
 
     # --- --local only, from here down ---
     local_safety.ensure_safe_for_local_mode()
-    local_safety.ensure_expected_db_path(db.DB_PATH, BASE_DIR)
+    local_safety.ensure_expected_db_path(db.DB_PATH, tenant_paths.resolve_review_db_path(TENANT_ID_ARG))
 
     lock_path = BASE_DIR / local_safety.LOCAL_LOCK_FILENAME
     local_safety.acquire(lock_path)

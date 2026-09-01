@@ -19,6 +19,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import gbp_import
 import google_api as ga
+import tenant_keys
+import tenant_paths
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 SAMPLE_ACCOUNT = {"name": "accounts/123", "accountName": "Test Account"}
 SAMPLE_LOCATION = {"name": "accounts/123/locations/456", "locationName": "Casa Tequila Testtown"}
@@ -27,6 +31,7 @@ SAMPLE_LOCATION = {"name": "accounts/123/locations/456", "locationName": "Casa T
 def _fresh_env():
     tmpdir = tempfile.mkdtemp(prefix="gbp_import_test_")
     db.DB_PATH = Path(tmpdir) / "reviews.db"
+    tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, db.DB_PATH)
     gbp_import.REPORT_PATH = Path(tmpdir) / "gbp_import_report.json"  # never the real repo-root file
     conn = db.get_connection()
     db.init_schema(conn)
@@ -81,7 +86,7 @@ def test_dry_run_writes_nothing():
 
     review = _api_review("rev1", "FOUR", "2026-07-10", "Jane Doe", "Great food")
     with _mocked([review])[0], _mocked([review])[1], _mocked([review])[2], _mocked([review])[3]:
-        gbp_import.run(apply=False)
+        gbp_import.run(tenant_id=TEST_TENANT_ID, apply=False)
 
     conn = db.get_connection()
     row = conn.execute("SELECT gbp_review_name FROM reviews").fetchone()
@@ -111,7 +116,7 @@ def test_matched_review_is_linked_not_duplicated():
     review = _api_review("rev1", "FOUR", "2026-07-10", "Jane Doe", "Great food")
     p1, p2, p3, p4 = _mocked([review])
     with p1, p2, p3, p4:
-        gbp_import.run(apply=True)
+        gbp_import.run(tenant_id=TEST_TENANT_ID, apply=True)
 
     conn = db.get_connection()
     count = conn.execute("SELECT COUNT(*) c FROM reviews").fetchone()["c"]
@@ -127,14 +132,14 @@ def test_unmatched_api_review_inserted_only_on_apply():
     p1, p2, p3, p4 = _mocked([review])
 
     with p1, p2, p3, p4:
-        gbp_import.run(apply=False)
+        gbp_import.run(tenant_id=TEST_TENANT_ID, apply=False)
     conn = db.get_connection()
     assert conn.execute("SELECT COUNT(*) c FROM reviews").fetchone()["c"] == 0, "dry-run must not insert the unmatched review"
     conn.close()
 
     p1, p2, p3, p4 = _mocked([review])
     with p1, p2, p3, p4:
-        gbp_import.run(apply=True)
+        gbp_import.run(tenant_id=TEST_TENANT_ID, apply=True)
     conn = db.get_connection()
     count = conn.execute("SELECT COUNT(*) c FROM reviews").fetchone()["c"]
     conn.close()

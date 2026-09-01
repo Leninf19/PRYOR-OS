@@ -14,14 +14,19 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import nightly_digest as nd
+import tenant_keys
+import tenant_paths
 
 nd.FROM_ADDR = ""
 nd.APP_PASS = ""
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 
 def _fresh_db():
     tmpdir = tempfile.mkdtemp(prefix="nightly_digest_test_")
     db.DB_PATH = Path(tmpdir) / "reviews.db"
+    tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, db.DB_PATH)
     conn = db.get_connection()
     db.init_schema(conn)
     conn.execute("INSERT INTO locations (name, city, brand) VALUES ('Test Loc', 'Testville', 'Casa Tequila')")
@@ -102,8 +107,8 @@ def test_dedup_across_runs():
     _add_review(loc_id, "Waited over an hour and the food was still wrong when it arrived", 2, "medium")
 
     with mock.patch.object(nd, "FROM_ADDR", ""), mock.patch.object(nd, "APP_PASS", ""):
-        first = nd.run(force=True)
-        second = nd.run(force=True)
+        first = nd.run(TEST_TENANT_ID, force=True)
+        second = nd.run(TEST_TENANT_ID, force=True)
 
     assert first["status"] == "ready_no_credentials"
     assert first["count"] == 1, first
@@ -113,7 +118,7 @@ def test_dedup_across_runs():
 def test_zero_qualifying_reviews_sends_no_email():
     _fresh_db()
     with mock.patch.object(nd, "send_email") as mock_send:
-        result = nd.run(force=True)
+        result = nd.run(TEST_TENANT_ID, force=True)
     assert result["status"] == "no_qualifying_reviews"
     assert not mock_send.called, "must never call send_email when nothing qualifies"
 
@@ -132,7 +137,7 @@ def test_dst_hour_gate_skips_outside_10pm_et():
             return fake_now if tz else fake_now.replace(tzinfo=None)
 
     with mock.patch.object(nd, "datetime", FakeDatetime):
-        result = nd.run(force=False)
+        result = nd.run(TEST_TENANT_ID, force=False)
     assert result["status"] == "skipped_wrong_hour", result
     assert result["hour_et"] == 14, result
 
@@ -152,7 +157,7 @@ def test_dst_hour_gate_proceeds_at_10pm_et():
             return fake_now if tz else fake_now.replace(tzinfo=None)
 
     with mock.patch.object(nd, "datetime", FakeDatetime):
-        result = nd.run(force=False)
+        result = nd.run(TEST_TENANT_ID, force=False)
     assert result["status"] == "ready_no_credentials", result
     assert result["count"] == 1, result
 

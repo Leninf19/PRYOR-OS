@@ -34,6 +34,7 @@ import urllib.parse
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import retry as retry_lib
+import tenant_keys
 from provider_base import ProviderError
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -45,7 +46,13 @@ LOCATIONS_READ_MASK = "name,title,storefrontAddress,metadata"
 _MAX_RETRIES = 5
 _BASE_BACKOFF_SECONDS = 1.0
 
-_access_token_cache = {"token": None, "expires_at": 0}
+# Multi-Tenant Phase 4C: keyed by tenantId -- a single shared cache (as this
+# was before) would let one tenant's cached access token be handed out for
+# a DIFFERENT tenant's request the moment two tenants are ever active in
+# the same process, which a long-lived GitHub Actions job could plausibly
+# do in a future multi-tenant run. Each tenant gets its own independent
+# {"token", "expires_at"} entry.
+_access_token_cache: dict[str, dict] = {}
 
 
 class GBPError(ProviderError):
@@ -92,11 +99,28 @@ def _env(name: str) -> str:
 # (Settings -> Google Business Profile, Milestone 8.7) never reached the
 # scheduled Python pipeline -- the two ran on completely separate
 # credential stores (Redis vs. this GitHub Actions secret). This module
-# now tries the SAME live Redis-backed credential store the dashboard
-# writes to first; GOOGLE_REFRESH_TOKEN remains a permanent fallback (not
-# scheduled for removal) for whenever Redis is unreachable or this
-# one-time setup (UPSTASH_REDIS_REST_URL/_TOKEN, CREDENTIAL_ENCRYPTION_KEY
-# as GitHub Actions secrets) hasn't been done in a given environment.
+# tries the SAME live Redis-backed credential store the dashboard writes
+# to; GOOGLE_REFRESH_TOKEN remains a permanent fallback (not scheduled for
+# removal) for whenever Redis is unreachable or this one-time setup
+# (UPSTASH_REDIS_REST_URL/_TOKEN, CREDENTIAL_ENCRYPTION_KEY as GitHub
+# Actions secrets) hasn't been done in a given environment.
+#
+# Multi-Tenant Phase 4C: `tenant_id` is now REQUIRED (no default anywhere
+# in this module) and the Redis key is resolved via
+# tenant_keys.resolve_credential_key(tenant_id) -- the SAME fixed,
+# explicit, code-reviewed migration-mode lookup dashboard/api/_lib/
+# credentialStore.js now uses (Phase 4C also updated that file to match --
+# see the Phase 4C report's "critical compatibility" finding). For
+# Los Tres Amigos (LEGACY mode), this resolves to exactly
+# gbp_credentials:v1, byte-for-byte the same key this function always
+# read -- existing production behavior for the one tenant that exists
+# today is completely unchanged. For any other tenantId (CUTOVER mode,
+# the default for a tenant not explicitly pinned to LEGACY), this resolves
+# to gbp_credentials:v2:{tenantId} and NEVER falls back to v1, even if the
+# v2 key is empty/missing -- the fallback to GOOGLE_REFRESH_TOKEN below is
+# the only fallback that exists for a CUTOVER tenant, and that env var is
+# itself a single, explicit, operator-managed value, never a cross-tenant
+# credential.
 #
 # Ciphertext format must match dashboard/api/_lib/credentialStore.js
 # exactly: AES-256-GCM, key = SHA-256(CREDENTIAL_ENCRYPTION_KEY as UTF-8
@@ -105,16 +129,18 @@ def _env(name: str) -> str:
 # ciphertext; Python's high-level AESGCM.decrypt() wants them concatenated
 # -- ciphertext + tag -- so that concatenation happens here, not a format
 # difference between the two implementations).
-def _fetch_refresh_token_from_redis() -> str | None:
+def _fetch_refresh_token_from_redis(tenant_id: str) -> str | None:
+    tenant_keys.assert_valid_tenant_id(tenant_id, "_fetch_refresh_token_from_redis")
     url = os.environ.get("UPSTASH_REDIS_REST_URL")
     rest_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
     encryption_key = os.environ.get("CREDENTIAL_ENCRYPTION_KEY")
     if not url or not rest_token or not encryption_key:
         return None
 
+    redis_key = tenant_keys.resolve_credential_key(tenant_id)
     try:
         req = urllib.request.Request(
-            f"{url.rstrip('/')}/get/gbp_credentials:v1",
+            f"{url.rstrip('/')}/get/{urllib.parse.quote(redis_key, safe='')}",
             headers={"Authorization": f"Bearer {rest_token}"},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -131,22 +157,30 @@ def _fetch_refresh_token_from_redis() -> str | None:
         plaintext = AESGCM(key).decrypt(iv, ciphertext + auth_tag, None)
         return plaintext.decode("utf-8")
     except Exception as e:  # noqa: BLE001 -- any failure here must fall back, never crash the pipeline
-        print(f"[google_api] Redis-stored credential unavailable, falling back to GOOGLE_REFRESH_TOKEN: {e}")
+        print(f"[google_api] Redis-stored credential unavailable for tenant {tenant_id!r}, "
+              f"falling back to GOOGLE_REFRESH_TOKEN: {e}")
         return None
 
 
-def get_access_token(force_refresh: bool = False) -> str:
+def get_access_token(tenant_id: str, force_refresh: bool = False) -> str:
     """Exchanges the refresh token (Redis-backed store first, then
     GOOGLE_REFRESH_TOKEN) for a short-lived access token, cached in-process
-    for the remainder of its lifetime (minus a safety margin) so a single
-    script run doesn't re-exchange it on every API call."""
+    per tenant for the remainder of its lifetime (minus a safety margin) so
+    a single script run doesn't re-exchange it on every API call.
+
+    tenant_id is REQUIRED and validated before anything else runs -- there
+    is no default tenant here (see tenant_keys.py's header comment); every
+    caller must supply an explicit, validated tenantId of its own."""
+    tenant_keys.assert_valid_tenant_id(tenant_id, "get_access_token")
+    cache = _access_token_cache.setdefault(tenant_id, {"token": None, "expires_at": 0})
+
     now = time.time()
-    if not force_refresh and _access_token_cache["token"] and now < _access_token_cache["expires_at"]:
-        return _access_token_cache["token"]
+    if not force_refresh and cache["token"] and now < cache["expires_at"]:
+        return cache["token"]
 
     client_id = _env("GOOGLE_CLIENT_ID")
     client_secret = _env("GOOGLE_CLIENT_SECRET")
-    refresh_token = _fetch_refresh_token_from_redis() or _env("GOOGLE_REFRESH_TOKEN")
+    refresh_token = _fetch_refresh_token_from_redis(tenant_id) or _env("GOOGLE_REFRESH_TOKEN")
 
     body = urllib.parse.urlencode({
         "client_id": client_id,
@@ -173,28 +207,36 @@ def get_access_token(force_refresh: bool = False) -> str:
         raise GBPAuthError(f"Google did not return an access_token: {data.get('error_description', data)}")
 
     expires_in = data.get("expires_in", 3600)
-    _access_token_cache["token"] = token
-    _access_token_cache["expires_at"] = now + expires_in - 60  # 60s safety margin
+    cache["token"] = token
+    cache["expires_at"] = now + expires_in - 60  # 60s safety margin
     return token
 
 
-def _request(method: str, url: str, body: dict | None = None, params: dict | None = None) -> dict:
+def _request(tenant_id: str, method: str, url: str, body: dict | None = None, params: dict | None = None) -> dict:
     """Single authenticated request against the GBP v4 API, with exponential
     backoff on 429/5xx and typed exceptions on every failure path.
 
-    The retry loop itself now lives in retry.py (Phase 3 Milestone 1) --
-    this function only builds one attempt (_do_request) and classifies each
+    Multi-Tenant Phase 4C: tenant_id is REQUIRED -- every public function
+    below (list_accounts/list_locations/list_reviews/reply_to_review/
+    get_review) takes it as its first argument and threads it through to
+    here, so the access token used for this specific request always comes
+    from the caller's own explicit, validated tenant, never an implicit
+    default.
+
+    The retry loop itself lives in retry.py (Phase 3 Milestone 1) -- this
+    function only builds one attempt (_do_request) and classifies each
     failure into the right typed exception, exactly as it did inline
     before. Retry/backoff behavior is unchanged: same attempt count, same
     exponential formula, same Retry-After honoring on 429/5xx, and a 401
     still forces a fresh token and retries immediately with no backoff
     (via retry_after_seconds returning 0 for that case specifically --
     0 and "not specified" are deliberately different in retry.py)."""
+    tenant_keys.assert_valid_tenant_id(tenant_id, "_request")
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
 
     def _do_request():
-        token = get_access_token()
+        token = get_access_token(tenant_id)
         headers = {"Authorization": f"Bearer {token}"}
         data = None
         if body is not None:
@@ -241,7 +283,7 @@ def _request(method: str, url: str, body: dict | None = None, params: dict | Non
         # Access token expired/revoked mid-run -- force a fresh one before
         # the next attempt (which will call get_access_token() again).
         if isinstance(err, GBPAuthError):
-            get_access_token(force_refresh=True)
+            get_access_token(tenant_id, force_refresh=True)
 
     def _retry_after(err):
         return getattr(err, "retry_after_override", None)
@@ -255,8 +297,8 @@ def _request(method: str, url: str, body: dict | None = None, params: dict | Non
     )
 
 
-def list_accounts() -> list:
-    data = _request("GET", f"{ACCOUNTS_BASE}/accounts")
+def list_accounts(tenant_id: str) -> list:
+    data = _request(tenant_id, "GET", f"{ACCOUNTS_BASE}/accounts")
     return data.get("accounts", [])
 
 
@@ -270,7 +312,7 @@ def _v4_location_path(account_name: str, location_api_name: str) -> str:
     return f"{account_name}/locations/{tail}"
 
 
-def list_locations(account_name: str) -> list:
+def list_locations(tenant_id: str, account_name: str) -> list:
     """Paginates through ALL locations for an account (publish.js today stops
     at page 1/100 -- this follows nextPageToken to completion). Normalizes
     each location dict back into the old v4 shape (name as the full
@@ -282,7 +324,7 @@ def list_locations(account_name: str) -> list:
         params = {"pageSize": 100, "readMask": LOCATIONS_READ_MASK}
         if page_token:
             params["pageToken"] = page_token
-        data = _request("GET", f"{LOCATIONS_BASE}/{account_name}/locations", params=params)
+        data = _request(tenant_id, "GET", f"{LOCATIONS_BASE}/{account_name}/locations", params=params)
         for loc in data.get("locations", []):
             address = loc.get("storefrontAddress") or {}
             locations.append({
@@ -302,7 +344,7 @@ def list_locations(account_name: str) -> list:
     return locations
 
 
-def list_reviews(location_name: str, page_size: int = 50, max_pages: int | None = None) -> list:
+def list_reviews(tenant_id: str, location_name: str, page_size: int = 50, max_pages: int | None = None) -> list:
     """Paginates through reviews for a location (publish.js today stops at the
     first 50 -- this follows nextPageToken, optionally capped via max_pages for
     the fast/incremental path where only the newest page or two is needed)."""
@@ -313,7 +355,7 @@ def list_reviews(location_name: str, page_size: int = 50, max_pages: int | None 
         params = {"pageSize": page_size}
         if page_token:
             params["pageToken"] = page_token
-        data = _request("GET", f"{API_BASE}/{location_name}/reviews", params=params)
+        data = _request(tenant_id, "GET", f"{API_BASE}/{location_name}/reviews", params=params)
         reviews.extend(data.get("reviews", []))
         pages_fetched += 1
         page_token = data.get("nextPageToken")
@@ -322,18 +364,18 @@ def list_reviews(location_name: str, page_size: int = 50, max_pages: int | None 
     return reviews
 
 
-def reply_to_review(review_name: str, comment: str) -> None:
-    _request("PUT", f"{API_BASE}/{review_name}/reply", body={"comment": comment})
+def reply_to_review(tenant_id: str, review_name: str, comment: str) -> None:
+    _request(tenant_id, "PUT", f"{API_BASE}/{review_name}/reply", body={"comment": comment})
 
 
-def get_review(review_name: str) -> dict:
+def get_review(tenant_id: str, review_name: str) -> dict:
     """Fetches a single review by its exact resource name (accounts/*/
     locations/*/reviews/*) -- used by reconcile_gbp_replies.py to re-check
     one specific review rather than re-paginating a whole location. Raises
     GBPNotFoundError (a GBPError/ProviderError) if the review no longer
     exists; callers decide how to handle that (reconcile_gbp_replies.py
     reports it as an unresolved fetch error, never invents a result)."""
-    return _request("GET", f"{API_BASE}/{review_name}")
+    return _request(tenant_id, "GET", f"{API_BASE}/{review_name}")
 
 
 def is_configured() -> bool:

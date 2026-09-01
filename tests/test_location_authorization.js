@@ -33,7 +33,7 @@ function fakeCredentialRedis(initial = null) {
 }
 const credentialClient = fakeCredentialRedis()
 setCredentialRedis(() => credentialClient) // same instance every call -- getClient() has no caching for the test-factory path
-await setStoredCredential({ refreshToken: 'fake-refresh-token', connectedAccountName: null })
+await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'fake-refresh-token', connectedAccountName: null })
 
 function fakeBridgeRedis(initial = {}) {
   const store = { ...initial }

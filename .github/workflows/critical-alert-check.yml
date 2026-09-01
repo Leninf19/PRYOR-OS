@@ -22,6 +22,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Multi-Tenant Phase 4C revision: critical_alert_check.py and
+    # gbp_reply_bridge_reconcile.py both REQUIRE an explicit --tenant-id --
+    # neither has a default. This single, reviewed, version-controlled
+    # value is this pipeline's explicit statement of which tenant it runs
+    # for; it is never derived from any user-controlled input.
+    env:
+      TENANT_ID: t_los-tres-amigos
 
     steps:
       - name: Checkout repo
@@ -42,7 +49,7 @@ jobs:
         run: pip install anthropic cryptography
 
       - name: Check for critical reviews
-        run: python critical_alert_check.py
+        run: python critical_alert_check.py --tenant-id "$TENANT_ID"
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
@@ -72,7 +79,7 @@ jobs:
       # recent publish activity), never a full all-pages sync.
       - name: Reconcile pending publish-bridge records
         if: always()
-        run: python gbp_reply_bridge_reconcile.py
+        run: python gbp_reply_bridge_reconcile.py --tenant-id "$TENANT_ID"
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
@@ -84,7 +91,7 @@ jobs:
       - name: Verify database integrity before commit
         if: always()
         id: integrity
-        run: python check_db_integrity.py
+        run: python check_db_integrity.py --tenant-id "$TENANT_ID"
 
       - name: Commit updated data
         if: always() && steps.integrity.outcome == 'success'

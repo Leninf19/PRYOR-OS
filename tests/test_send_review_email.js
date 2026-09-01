@@ -130,7 +130,7 @@ async function testSendUnauthenticatedRejected() {
 async function testSendOwnerAllowed() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer())
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
   assert(res.statusCode === 200, `owner: expected 200, got ${res.statusCode}, body=${JSON.stringify(res.body)}`)
@@ -139,7 +139,7 @@ async function testSendOwnerAllowed() {
 async function testSendMarketingAllowed() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer())
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_marketing', 'marketing@example.com', 'marketing'), body: sendBody() })
   assert(res.statusCode === 200, `marketing: expected 200, got ${res.statusCode}`)
@@ -155,7 +155,7 @@ async function testSendMarketingAllowed() {
 async function testSendLocationManagerAllowedForOwnLocation() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer())
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_locmgr', 'locmgr@example.com', 'location_manager'), body: sendBody() })
   assert(res.statusCode === 200, `location_manager must be able to send for its own location (3), got ${res.statusCode}, body=${JSON.stringify(res.body)}`)
@@ -164,7 +164,7 @@ async function testSendLocationManagerAllowedForOwnLocation() {
 async function testSendLocationManagerDeniedForForeignLocation() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_locmgr', 'locmgr@example.com', 'location_manager'), body: sendBody({ locationId: 99 }) })
   assert(res.statusCode === 404, `location_manager must be denied (404, not 403) for a location outside its grant, got ${res.statusCode}`)
 }
@@ -180,7 +180,7 @@ async function testSendReadOnlyRejected() {
 async function testRecipientResolvedFromLocationIdNotClient() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'real-restaurant@example.com', name: 'Real Contact' } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'real-restaurant@example.com', name: 'Real Contact' } })
   let capturedTo = null
   _setTransportForTests(() => ({ sendMail: async (msg) => { capturedTo = msg.to; return { messageId: 'x' } } }))
 
@@ -196,7 +196,7 @@ async function testCcCannotBeOverriddenByClient() {
   await setDirectory()
   process.env.REVIEW_ESCALATION_CC_EMAILS = 'martin@example.com,ruffy@example.com'
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   let capturedCc = null
   _setTransportForTests(() => ({ sendMail: async (msg) => { capturedCc = msg.cc; return { messageId: 'x' } } }))
 
@@ -213,7 +213,7 @@ async function testReplyToConfiguredFromEnv() {
   await setDirectory()
   process.env.REVIEW_REPLY_TO_EMAIL = 'custom-reply@example.com'
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   let capturedReplyTo = null
   _setTransportForTests(() => ({ sendMail: async (msg) => { capturedReplyTo = msg.replyTo; return { messageId: 'x' } } }))
 
@@ -227,7 +227,7 @@ async function testReplyToConfiguredFromEnv() {
 async function testMissingContactPreventsSending() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({}) // no location configured
+  _setContactsForTests(DEFAULT_TENANT_ID, {}) // no location configured
   _setTransportForTests(fakeMailer())
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody({ locationId: 999 }) })
   assert(res.statusCode === 400, `expected 400, got ${res.statusCode}`)
@@ -242,7 +242,7 @@ async function testSendFailsWhenCcNotConfigured() {
   await setDirectory()
   delete process.env.REVIEW_ESCALATION_CC_EMAILS
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer())
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
   assert(res.statusCode === 503, `expected 503 when CC is unconfigured, got ${res.statusCode}`)
@@ -255,7 +255,7 @@ async function testSendWithNoRecordWrittenWhenCcNotConfigured() {
   delete process.env.REVIEW_ESCALATION_CC_EMAILS
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer())
   await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
   const stored = await client.hget('action_workspace:v1', 'review-1')
@@ -266,7 +266,7 @@ async function testPreviewFailsWhenCcNotConfigured() {
   await setDirectory()
   delete process.env.REVIEW_ESCALATION_CC_EMAILS
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   const res = await invoke({ action: 'preview-review-email', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), query: { id: 'review-1', locationId: '3' } })
   assert(res.statusCode === 503, `expected 503 when CC is unconfigured, got ${res.statusCode}`)
   assert(res.body.message === 'Review escalation recipients are not configured.', `expected the exact required message, got "${res.body.message}"`)
@@ -277,7 +277,7 @@ async function testPreviewFailsWhenCcNotConfigured() {
 async function testHeaderInjectionInSubjectRejectedStripped() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   let capturedSubject = null
   _setTransportForTests(() => ({ sendMail: async (msg) => { capturedSubject = msg.subject; return { messageId: 'x' } } }))
 
@@ -291,7 +291,7 @@ async function testHeaderInjectionInSubjectRejectedStripped() {
 async function testHtmlAndPlainTextBothGenerated() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   let captured = null
   _setTransportForTests(() => ({ sendMail: async (msg) => { captured = msg; return { messageId: 'x' } } }))
 
@@ -303,7 +303,7 @@ async function testHtmlAndPlainTextBothGenerated() {
 async function testInvalidReviewSnapshotRejected() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   const res = await invoke({
     action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'),
     body: sendBody({ review: { locationName: 'X', starRating: 7 } }), // out-of-range rating
@@ -317,7 +317,7 @@ async function testSuccessfulSendUpdatesRedisWithSentStatus() {
   await setDirectory()
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer({ ok: true, messageId: 'msg-42' }))
 
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
@@ -338,7 +338,7 @@ async function testSuccessfulSendUpdatesRedisWithSentStatus() {
 async function testFailedSendDoesNotClaimSent() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer({ ok: false, error: '550 mailbox unavailable' }))
 
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
@@ -353,7 +353,7 @@ async function testAuthenticationFailureIsSanitizedAndNeverMarksSent() {
   process.env.SMTP_PASSWORD = 'super-secret-m365-password'
   process.env.SMTP_USER = 'advertising@l3amigos.com'
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   // Simulates a realistic Microsoft 365 SMTP AUTH failure whose raw error
   // text happens to echo back the configured credentials (defense in depth
   // -- real M365/nodemailer errors don't actually do this, but the
@@ -378,7 +378,7 @@ async function testUnconfiguredEmailSubsystemReturns503NoRecordWritten() {
   await setDirectory()
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   // No test transport factory and no SMTP_* env vars -- emailSender is unconfigured.
   const res = await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
   assert(res.statusCode === 503, `expected 503, got ${res.statusCode}`)
@@ -392,7 +392,7 @@ async function testRepeatedSendWithoutConfirmResendReturns409() {
   await setDirectory()
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer())
 
   const token = await tokenFor('usr_owner', 'owner@example.com', 'owner')
@@ -408,7 +408,7 @@ async function testResendWithConfirmResendCreatesOneAdditionalHistoryEntry() {
   await setDirectory()
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer())
 
   const token = await tokenFor('usr_owner', 'owner@example.com', 'owner')
@@ -423,7 +423,7 @@ async function testFailedSendIsNotTreatedAsDuplicateOnRetry() {
   await setDirectory()
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
 
   const token = await tokenFor('usr_owner', 'owner@example.com', 'owner')
   _setTransportForTests(fakeMailer({ ok: false, error: 'temporary failure' }))
@@ -439,7 +439,7 @@ async function testRateLimitingEnforced() {
   await setDirectory()
   process.env.VERCEL_ENV = 'production'
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer())
   const { _setLimiterFactoryForTests } = await import('../dashboard/api/_lib/rateLimit.js')
   _setLimiterFactoryForTests(() => ({ limit: async () => ({ success: false, remaining: 0 }) }))
@@ -454,7 +454,7 @@ async function testPreviewReturnsRecipientCcReplyTo() {
   await setDirectory()
   process.env.REVIEW_ESCALATION_CC_EMAILS = 'martin@example.com,ruffy@example.com'
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: 'Manager Name' } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: 'Manager Name' } })
 
   const res = await invoke({ action: 'preview-review-email', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), query: { id: 'review-1', locationId: '3' } })
   assert(res.statusCode === 200, `expected 200, got ${res.statusCode}`)
@@ -468,7 +468,7 @@ async function testPreviewReturnsRecipientCcReplyTo() {
 async function testPreviewReturnsNullRecipientWhenUnconfigured() {
   await setDirectory()
   _setRedisClientForTests(() => fakeRedis())
-  _setContactsForTests({})
+  _setContactsForTests(DEFAULT_TENANT_ID, {})
   const res = await invoke({ action: 'preview-review-email', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), query: { id: 'review-1', locationId: '999' } })
   assert(res.statusCode === 200)
   assert(res.body.recipient === null, 'recipient must be null (not a guessed value) when unconfigured')
@@ -494,7 +494,7 @@ async function testUpdateEmailStatusHappyPath() {
   await setDirectory()
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer())
   const token = await tokenFor('usr_owner', 'owner@example.com', 'owner')
   await invoke({ action: 'send-review-email', method: 'POST', token, body: sendBody() })
@@ -510,7 +510,7 @@ async function testUpdateEmailStatusRejectsAfterFailedSend() {
   await setDirectory()
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer({ ok: false, error: 'bounced' }))
   const token = await tokenFor('usr_owner', 'owner@example.com', 'owner')
   await invoke({ action: 'send-review-email', method: 'POST', token, body: sendBody() })
@@ -528,7 +528,7 @@ async function testUpdateEmailStatusLocationManagerAllowedForOwnLocation() {
   await setDirectory()
   const client = fakeRedis()
   _setRedisClientForTests(() => client)
-  _setContactsForTests({ '3': { email: 'restaurant@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'restaurant@example.com', name: null } })
   _setTransportForTests(fakeMailer())
   _setReviewLocationIndexForTests({ 'review-1': 3 })
   const ownerT = await tokenFor('usr_owner', 'owner@example.com', 'owner')

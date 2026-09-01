@@ -19,11 +19,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import gbp_sync
 import google_api as ga
+import tenant_keys
+import tenant_paths
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 
 def _fresh_db():
     tmpdir = tempfile.mkdtemp(prefix="gbp_sync_test_")
     db.DB_PATH = Path(tmpdir) / "reviews.db"
+    tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, db.DB_PATH)
     conn = db.get_connection()
     db.init_schema(conn)
     conn.execute("INSERT INTO locations (name, city, brand) VALUES ('Casa Tequila Testtown', 'Testtown', 'Casa Tequila')")
@@ -63,7 +68,7 @@ def test_new_review_syncs_once():
          mock.patch.object(ga, "list_accounts", return_value=[SAMPLE_ACCOUNT]), \
          mock.patch.object(ga, "list_locations", return_value=[SAMPLE_LOCATION]), \
          mock.patch.object(ga, "list_reviews", return_value=[_review("rev1", "Great food and fast service every visit", "FOUR", "2026-07-10T12:00:00Z")]):
-        result = gbp_sync.sync_all(fast=False)
+        result = gbp_sync.sync_all(tenant_id=TEST_TENANT_ID, fast=False)
 
     assert result["status"] == "ok", result
     assert result["new"] == 1, result
@@ -81,8 +86,8 @@ def test_resync_is_idempotent_no_duplicates():
          mock.patch.object(ga, "list_accounts", return_value=[SAMPLE_ACCOUNT]), \
          mock.patch.object(ga, "list_locations", return_value=[SAMPLE_LOCATION]), \
          mock.patch.object(ga, "list_reviews", return_value=[review]):
-        gbp_sync.sync_all(fast=False)
-        second = gbp_sync.sync_all(fast=False)
+        gbp_sync.sync_all(tenant_id=TEST_TENANT_ID, fast=False)
+        second = gbp_sync.sync_all(tenant_id=TEST_TENANT_ID, fast=False)
 
     assert second["new"] == 0, f"re-sync of identical data should add 0 new reviews, got {second['new']}"
 
@@ -101,13 +106,13 @@ def test_edited_review_is_detected():
          mock.patch.object(ga, "list_accounts", return_value=[SAMPLE_ACCOUNT]), \
          mock.patch.object(ga, "list_locations", return_value=[SAMPLE_LOCATION]), \
          mock.patch.object(ga, "list_reviews", return_value=[original]):
-        gbp_sync.sync_all(fast=False)
+        gbp_sync.sync_all(tenant_id=TEST_TENANT_ID, fast=False)
 
     with mock.patch.object(ga, "is_configured", return_value=True), \
          mock.patch.object(ga, "list_accounts", return_value=[SAMPLE_ACCOUNT]), \
          mock.patch.object(ga, "list_locations", return_value=[SAMPLE_LOCATION]), \
          mock.patch.object(ga, "list_reviews", return_value=[edited]):
-        result = gbp_sync.sync_all(fast=False)
+        result = gbp_sync.sync_all(tenant_id=TEST_TENANT_ID, fast=False)
 
     assert result["edited"] == 1, result
 
@@ -128,7 +133,7 @@ def test_quota_failure_is_graceful_no_partial_writes():
          mock.patch.object(ga, "list_accounts", side_effect=ga.GBPRateLimitError(
              "Google API 429: Quota exceeded for quota metric 'Requests' and limit "
              "'Requests per minute' of service 'mybusinessaccountmanagement.googleapis.com'", status=429)):
-        result = gbp_sync.sync_all(fast=False)
+        result = gbp_sync.sync_all(tenant_id=TEST_TENANT_ID, fast=False)
 
     assert result["status"] == "failed", result
     assert "429" in result["reason"], result

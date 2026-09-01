@@ -423,7 +423,7 @@ async function list(req, res) {
     }
     const scoped = {}
     for (const [id, record] of Object.entries(all)) {
-      const locationId = await resolveLocationIdForReview(id)
+      const locationId = await resolveLocationIdForReview(id, resolveTenantId(account))
       if (locationId !== null && requireLocationAccess(account, locationId)) {
         scoped[id] = record
       }

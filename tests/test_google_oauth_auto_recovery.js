@@ -79,9 +79,9 @@ async function testStatusFlipsToReconnectRequiredOnInvalidGrant() {
   await setDirectory()
   const client = fakeCredentialRedis()
   _setRedisClientForTests(() => client)
-  await setStoredCredential({ refreshToken: 'now-revoked-token', connectedAccountName: 'Los Tres Amigos' })
+  await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'now-revoked-token', connectedAccountName: 'Los Tres Amigos' })
 
-  const before = await getStoredCredential()
+  const before = await getStoredCredential(DEFAULT_TENANT_ID)
   assert(before.health === GoogleHealth.CONNECTED, 'sanity check: starts connected')
 
   const res = await invokeStatus(await ownerToken())
@@ -92,7 +92,7 @@ async function testStatusFlipsToReconnectRequiredOnInvalidGrant() {
   // The critical assertion: the health flip must already be PERSISTED by
   // the time this response is sent -- the very next independent read must
   // see it too, without needing a second manual check.
-  const after = await getStoredCredential()
+  const after = await getStoredCredential(DEFAULT_TENANT_ID)
   assert(after.health === GoogleHealth.TOKEN_REVOKED, 'the stored health must be updated BEFORE the response is sent, not lazily on a later request')
   assert(after.lastFailedSyncAt !== null, 'lastFailedSyncAt must be stamped')
   assert(after.lastFailureReason === 'invalid_grant', 'the failure reason must be recorded')
@@ -102,11 +102,11 @@ async function testSubsequentSuccessfulStatusRestoresConnected() {
   await setDirectory()
   const client = fakeCredentialRedis()
   _setRedisClientForTests(() => client)
-  await setStoredCredential({ refreshToken: 'a-token', connectedAccountName: null })
+  await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'a-token', connectedAccountName: null })
 
   // First: simulate the failure.
   await invokeStatus(await ownerToken())
-  assert((await getStoredCredential()).health === GoogleHealth.TOKEN_REVOKED, 'sanity check: failed first')
+  assert((await getStoredCredential(DEFAULT_TENANT_ID)).health === GoogleHealth.TOKEN_REVOKED, 'sanity check: failed first')
 
   // Then: simulate a successful reconnect (as if the Owner reconnected and
   // the token now works) -- fetch is remocked for a passing exchange.
@@ -124,7 +124,7 @@ async function testSubsequentSuccessfulStatusRestoresConnected() {
   await handler(req, res)
 
   assert(res.body.connected === true && res.body.state === GoogleHealth.CONNECTED, 'a subsequent successful check must restore Connected')
-  const after = await getStoredCredential()
+  const after = await getStoredCredential(DEFAULT_TENANT_ID)
   assert(after.health === GoogleHealth.CONNECTED, 'the stored health must also be restored to connected')
   assert(after.lastFailureReason === null, 'the prior failure reason must be cleared on success')
 }
@@ -146,7 +146,7 @@ async function testFailedPublishAlsoTriggersAutomaticRecovery() {
   await setDirectory()
   const client = fakeCredentialRedis()
   _setRedisClientForTests(() => client)
-  await setStoredCredential({ refreshToken: 'now-revoked-token', connectedAccountName: null })
+  await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'now-revoked-token', connectedAccountName: null })
 
   globalThis.fetch = async (url) => {
     if (url.includes('oauth2.googleapis.com/token')) {
@@ -163,7 +163,7 @@ async function testFailedPublishAlsoTriggersAutomaticRecovery() {
   await handler(req, res)
   assert(res.statusCode === 503, `a publish attempt with a revoked token must fail with 503 not_connected, got ${res.statusCode}`)
 
-  const after = await getStoredCredential()
+  const after = await getStoredCredential(DEFAULT_TENANT_ID)
   assert(after.health === GoogleHealth.TOKEN_REVOKED, 'a failed publish must also flip the stored connection health, not just status/test-connection checks')
 }
 

@@ -21,13 +21,17 @@ ReviewExplorer/LocationDetail) and a few derived views (action items,
 scraper status, validation summary) the frontend still needs in row form
 rather than pre-aggregated form.
 """
+import argparse
 import csv
 import json
 import re
+import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import db
+import tenant_keys
+import tenant_paths
 
 STOP_WORDS = {
     'a','an','the','is','are','was','were','be','been','have','has','had',
@@ -75,12 +79,23 @@ def review_to_dict(r, loc) -> dict:
 
 
 def export_reviews_csv(conn, out_path=None) -> None:
-    """Regenerates dashboard/reviews.csv from the database. weekly_report.py
-    reads this file directly (no DB access) -- it used to be written by
+    """Regenerates reviews.csv from the database. weekly_report.py reads
+    this file directly (no DB access) -- it used to be written by
     auto_update.py's scraper as a side effect of scraping; now that
     gbp_sync.py is the active sync path and writes only to the SQLite DB,
-    this keeps that CSV (and weekly_report.py) working unchanged."""
-    path = out_path or (db.BASE_DIR / "dashboard" / "reviews.csv")
+    this keeps that CSV (and weekly_report.py) working unchanged.
+
+    Multi-Tenant Phase 4D fix: the default path used to be the hardcoded
+    db.BASE_DIR / "dashboard" / "reviews.csv" -- unlike every other export
+    in this file, it never went through PRIVATE_DATA_DIR, so it was not
+    actually tenant-scoped at all; a second tenant's export_chunks.py run
+    would have silently overwritten Los Tres Amigos's own reviews.csv (or
+    vice versa). Deriving it from PRIVATE_DATA_DIR's own parent directory
+    instead keeps this byte-for-byte the same physical path for Los Tres
+    Amigos today (PRIVATE_DATA_DIR is dashboard/private-data, so .parent is
+    dashboard/) while correctly moving with PRIVATE_DATA_DIR for any future
+    tenant, exactly like every other artifact this file writes."""
+    path = out_path or (PRIVATE_DATA_DIR.parent / "reviews.csv")
     rows = conn.execute(
         """SELECT r.reviewer_name, r.review_date, r.star_rating, r.review_text,
                   r.owner_response, r.review_url, l.name AS location_name, l.city AS city
@@ -472,7 +487,7 @@ def export_scraper_status(conn) -> None:
     write_json("scraper-status.json", run_list)
 
 
-def export_provider_health(conn) -> None:
+def export_provider_health(conn, tenant_id: str) -> None:
     """Phase 3 Milestone 2: a provider-neutral health snapshot (healthy/
     warning/degraded/failed/offline per provider), computed by
     provider_health.compute_health() from the same scraper_runs rows
@@ -485,10 +500,19 @@ def export_provider_health(conn) -> None:
     breaking change existing consumers could not simply ignore. A separate
     file keeps scraper-status.json byte-for-byte untouched while still
     giving the future Provider Health Center milestone real data to build
-    against from day one."""
+    against from day one.
+
+    Multi-Tenant Phase 4C revision: tenant_id is REQUIRED, with no default,
+    for the GBPProvider() constructed below -- even though this call site
+    only ever invokes is_configured() (a static env-var check that touches
+    no tenant-scoped credential or data), GBPProvider itself accepts no
+    implicit tenant anywhere in this codebase now, so this call site must
+    supply one explicitly like every other."""
     from provider_gbp import GBPProvider
     from provider_scraper import ScraperProvider
     import provider_health
+    import tenant_keys
+    tenant_keys.assert_valid_tenant_id(tenant_id, "export_chunks.export_provider_health")
 
     runs = [dict(r) for r in conn.execute(
         "SELECT * FROM scraper_runs ORDER BY id DESC LIMIT 30"
@@ -504,7 +528,7 @@ def export_provider_health(conn) -> None:
         provider_name = run.get("provider") or ("gbp" if run.get("mode") == "api_sync" else "scraper")
         by_provider.setdefault(provider_name, []).append(run)
 
-    providers = {"gbp": GBPProvider(), "scraper": ScraperProvider()}
+    providers = {"gbp": GBPProvider(tenant_id=tenant_id), "scraper": ScraperProvider()}
     health = {
         name: provider_health.compute_health(
             name, provider.is_configured(), by_provider.get(name, []), provider.expected_cadence_minutes,
@@ -671,7 +695,20 @@ def export_review_location_index(conn, locations: dict) -> None:
     write_json("_internal/review-location-index.json", index)
 
 
-def main():
+def main(tenant_id: str):
+    """Multi-Tenant Phase 4C/4D revision: tenant_id is REQUIRED, with no
+    default -- validated up front, before any export runs. Phase 4D also
+    resolves THIS tenant's own review database (db.DB_PATH) and export
+    directory (PRIVATE_DATA_DIR, module-global, same pattern tests already
+    override) here -- every write_json() call below writes only into that
+    resolved directory, and every export_*() read comes only from that
+    resolved database, so Tenant A's export can never read from or write
+    into Tenant B's data."""
+    global PRIVATE_DATA_DIR
+    tenant_keys.assert_valid_tenant_id(tenant_id, "export_chunks.main")
+    db.DB_PATH = tenant_paths.resolve_review_db_path(tenant_id)
+    PRIVATE_DATA_DIR = tenant_paths.resolve_export_dir(tenant_id)
+
     conn = db.get_connection()
     db.init_schema(conn)
     locations = {row["id"]: dict(row) for row in conn.execute("SELECT * FROM locations").fetchall()}
@@ -686,7 +723,7 @@ def main():
     export_action_items(conn, locations)
     export_validation(conn)
     export_scraper_status(conn)
-    export_provider_health(conn)
+    export_provider_health(conn, tenant_id)
     export_gbp_sync_status(conn, locations)
     export_weekly_report(conn, locations)
     export_intelligence(conn, locations)
@@ -709,4 +746,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose data to export. REQUIRED -- no default. This "
+                              "script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::export_chunks.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        main(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::export_chunks.py: {e}")
+        sys.exit(1)

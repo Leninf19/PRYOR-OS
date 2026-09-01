@@ -43,6 +43,14 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
+    # Multi-Tenant Phase 4C revision: gbp_reply_reconciliation_diagnostic.py's
+    # --tenant-id is REQUIRED, no default. This single, reviewed,
+    # version-controlled value is this diagnostic's explicit statement of
+    # which tenant's credential it uses -- deliberately NOT one of this
+    # workflow's own user-controlled dispatch inputs (location/window_days
+    # above), so a caller can never smuggle a different tenant through them.
+    env:
+      TENANT_ID: t_los-tres-amigos
 
     steps:
       - name: Checkout repo
@@ -66,6 +74,7 @@ jobs:
           python gbp_reply_reconciliation_diagnostic.py
           --location "${{ inputs.location }}"
           --window-days "${{ inputs.window_days }}"
+          --tenant-id "$TENANT_ID"
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}

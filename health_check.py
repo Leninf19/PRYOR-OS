@@ -40,8 +40,13 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import argparse
+import sys
+
 import db
 import provider_sync
+import tenant_keys
+import tenant_paths
 
 TO_ADDR = "advertising@l3amigos.com"
 FROM_ADDR = os.environ.get("GMAIL_USER", "")
@@ -145,6 +150,23 @@ def send_email(subject, html):
 
 
 def main():
+    """Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED, no default.
+    Resolved before any DB connection, so a missing/invalid/unregistered
+    tenant fails closed before touching anything."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to check. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::health_check.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        db.DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::health_check.py: {e}")
+        sys.exit(1)
+
     conn = db.get_connection()
     db.init_schema(conn)
     now = datetime.now(timezone.utc)

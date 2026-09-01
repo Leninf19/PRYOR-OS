@@ -33,8 +33,12 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import google_api as ga
+import tenant_keys
+import tenant_paths
 
-DB_PATH = Path(__file__).resolve().parent / "dashboard" / "reviews.db"
+# Multi-Tenant Phase 4D: resolved in main() from --tenant-id via
+# tenant_paths.resolve_review_db_path() -- never a hardcoded default.
+DB_PATH: Path | None = None
 
 
 def load_actionable_reviews(location_name: str) -> list[dict]:
@@ -62,11 +66,11 @@ def abbreviate(gbp_review_name: str | None) -> str:
     return "..." + gbp_review_name[-24:]
 
 
-def check_google_state(gbp_review_name: str) -> dict:
+def check_google_state(tenant_id: str, gbp_review_name: str) -> dict:
     """Single read-only GET. Never writes, never replies. Returns a dict
     describing what Google currently reports for this exact review."""
     try:
-        api_review = ga.get_review(gbp_review_name)
+        api_review = ga.get_review(tenant_id, gbp_review_name)
     except Exception as e:
         return {"verifiable": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -99,12 +103,25 @@ def identity_sanity_check(local_row: dict, google_state: dict) -> str:
 
 
 def main() -> int:
+    global DB_PATH
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--location", required=True, help="Exact locations.name to diagnose")
     parser.add_argument("--window-days", type=int, default=7,
                          help="Reviews within this many days of today are reported as the "
                               "'default dashboard window' set, separately from older actionable reviews")
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose credential to use. REQUIRED -- no default. This "
+                              "script never infers a tenant on its own.")
     args = parser.parse_args()
+
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::gbp_reply_reconciliation_diagnostic.py: invalid --tenant-id {args.tenant_id!r}")
+        return 1
+    try:
+        DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::gbp_reply_reconciliation_diagnostic.py: {e}")
+        return 1
 
     print(f"=== gbp_reply_reconciliation_diagnostic.py -- READ-ONLY, one-time run ===")
     print(f"Location: {args.location!r}")
@@ -142,7 +159,7 @@ def main() -> int:
             results.append(row)
             continue
 
-        google_state = check_google_state(r["gbp_review_name"])
+        google_state = check_google_state(args.tenant_id, r["gbp_review_name"])
         row["google"] = google_state
         if not google_state.get("verifiable"):
             row["recommended_state"] = "unable to verify"

@@ -12,6 +12,11 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Multi-Tenant Phase 4C revision: export_chunks.py's --tenant-id is
+    # REQUIRED, no default. This single, reviewed, version-controlled value
+    # is this pipeline's explicit statement of which tenant it exports for.
+    env:
+      TENANT_ID: t_los-tres-amigos
     steps:
       - uses: actions/checkout@v6
 
@@ -44,12 +49,12 @@ jobs:
       # here makes this workflow self-sufficient, matching update-reviews.yml's
       # own guaranteed order (refresh before export).
       - name: Refresh analytics
-        run: python refresh_analytics.py
+        run: python refresh_analytics.py --tenant-id "$TENANT_ID"
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
       - name: Export data chunks
-        run: python export_chunks.py
+        run: python export_chunks.py --tenant-id "$TENANT_ID"
 
       - uses: actions/setup-node@v6
         with:

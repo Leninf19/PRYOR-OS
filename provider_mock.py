@@ -10,6 +10,20 @@ dashboard/api/ references this module. It is exercised only by a developer
 directly (Python REPL / scratch script) or by its own tests, which build a
 tiny scratch snapshot DB -- never the real, gitignored, full-size snapshot
 this class reads by default.
+
+Multi-Tenant Phase 4D classification: EXEMPT from --tenant-id enforcement,
+by explicit audit finding, not by omission. This class never touches
+db.DB_PATH or any tenant's real reviews.db at all -- it reads exclusively
+from DEFAULT_SNAPSHOT_PATH (dashboard/reviews.snapshot.db), a separate,
+gitignored, read-only replica file that only ever gets created locally by
+bootstrap_mock_snapshot.py (itself tenant-aware as of this phase, since
+IT reads the real database as its copy source). MockProvider itself is
+read-only (reply_to_review() is unimplemented) and is selectable as
+sync_reviews.py's --provider mock, but sync_reviews.py's own tenant-scoped
+db.DB_PATH resolution (Phase 4D) still governs where any review data a
+mock sync produces gets WRITTEN -- MockProvider supplies synthetic read
+data, it never decides a write destination. It therefore provably cannot
+read or write any tenant's real review data under any invocation.
 """
 import os
 import sqlite3

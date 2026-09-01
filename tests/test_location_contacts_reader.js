@@ -53,20 +53,20 @@ async function run(name, fn) {
 }
 
 async function testReturnsConfiguredContact() {
-  _setContactsForTests({ '3': { email: 'manager@example.com', name: 'Jane' } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'manager@example.com', name: 'Jane' } })
   const contact = await getLocationContact(DEFAULT_TENANT_ID, 3)
   assert(contact.email === 'manager@example.com', 'expected the configured contact to be returned')
   assert(contact.name === 'Jane')
 }
 
 async function testReturnsNullForUnconfiguredLocation() {
-  _setContactsForTests({ '3': { email: 'manager@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '3': { email: 'manager@example.com', name: null } })
   const contact = await getLocationContact(DEFAULT_TENANT_ID, 999)
   assert(contact === null, 'a location absent from the map must resolve to null, never a guessed value')
 }
 
 async function testCoercesNumericLocationIdToStringKey() {
-  _setContactsForTests({ '42': { email: 'x@example.com', name: null } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '42': { email: 'x@example.com', name: null } })
   const byNumber = await getLocationContact(DEFAULT_TENANT_ID, 42)
   const byString = await getLocationContact(DEFAULT_TENANT_ID, '42')
   assert(byNumber?.email === 'x@example.com', 'a numeric locationId must match the string-keyed map')
@@ -85,7 +85,7 @@ async function testMissingRealFileFallsBackGracefully() {
 }
 
 async function testRedisContactTakesPriorityOverLegacyFile() {
-  _setContactsForTests({ '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
   _setRedisClientForTests(() => fakeRedis({ 9: JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', managerName: 'Redis Name', active: true }) }))
   const contact = await getLocationContact(DEFAULT_TENANT_ID, 9)
   assert(contact.email === 'redis@example.com', 'a Redis-configured contact must win over the legacy file')
@@ -93,7 +93,7 @@ async function testRedisContactTakesPriorityOverLegacyFile() {
 }
 
 async function testRedisUnavailableFallsBackToLegacyFile() {
-  _setContactsForTests({ '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
   _setRedisClientForTests(() => ({ hget: async () => { throw new Error('ECONNREFUSED fake-upstash-outage') } }))
   const contact = await getLocationContact(DEFAULT_TENANT_ID, 9)
   assert(contact.email === 'legacy@example.com', 'a Redis outage must fall back to the legacy file, not fail the whole lookup')
@@ -103,7 +103,7 @@ async function testRedisContactExplicitlyDisabledNeverFallsBackToLegacy() {
   // A contact that exists in Redis but is explicitly disabled must resolve
   // to null -- never silently fall back to a stale legacy entry, which
   // would resurrect an intentionally-disabled contact.
-  _setContactsForTests({ '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
+  _setContactsForTests(DEFAULT_TENANT_ID, { '9': { email: 'legacy@example.com', name: 'Legacy Name' } })
   _setRedisClientForTests(() => fakeRedis({ 9: JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', active: false }) }))
   const contact = await getLocationContact(DEFAULT_TENANT_ID, 9)
   assert(contact === null, 'an explicitly disabled Redis contact must resolve to null, never the legacy fallback')

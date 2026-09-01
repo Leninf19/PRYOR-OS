@@ -22,6 +22,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Multi-Tenant Phase 4D revision: check_db_integrity.py's --tenant-id
+    # is REQUIRED, no default. nightly_digest.py itself is not yet
+    # tenant-aware (see the Phase 4D report) -- it still operates against
+    # db.py's hardcoded default path, which for Los Tres Amigos is
+    # byte-for-byte the same file this TENANT_ID resolves to, so there is
+    # no behavior change for LTA today, but this must be revisited before
+    # a second tenant runs this workflow.
+    env:
+      TENANT_ID: t_los-tres-amigos
 
     steps:
       - name: Checkout repo
@@ -36,7 +45,7 @@ jobs:
         run: pip install tzdata
 
       - name: Run nightly digest
-        run: python nightly_digest.py
+        run: python nightly_digest.py --tenant-id "$TENANT_ID"
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -44,7 +53,7 @@ jobs:
       - name: Verify database integrity before commit
         if: always()
         id: integrity
-        run: python check_db_integrity.py
+        run: python check_db_integrity.py --tenant-id "$TENANT_ID"
 
       - name: Commit updated data
         if: always() && steps.integrity.outcome == 'success'

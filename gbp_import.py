@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 
 import db
 import google_api as ga
+import tenant_keys
+import tenant_paths
 
 STAR_MAP = {"ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5}
 REPORT_PATH = db.BASE_DIR / "gbp_import_report.json"
@@ -74,7 +76,14 @@ def _find_scraped_match(candidates: list, row: dict, consumed_ids: set):
     return None
 
 
-def run(apply: bool = False):
+def run(tenant_id: str, apply: bool = False):
+    """Multi-Tenant Phase 4C/4D revision: tenant_id is REQUIRED, with no
+    default. Validated first, then this tenant's own review database is
+    resolved (Phase 4D) -- both happen before the DB connection is even
+    opened, so an invalid or unregistered tenant can never cause an import
+    to run against the wrong (or default) database."""
+    tenant_keys.assert_valid_tenant_id(tenant_id, "gbp_import.run")
+    db.DB_PATH = tenant_paths.resolve_review_db_path(tenant_id)
     conn = db.get_connection()
     db.init_schema(conn)
 
@@ -84,7 +93,7 @@ def run(apply: bool = False):
 
     locations = conn.execute("SELECT * FROM locations WHERE is_active = 1").fetchall()
     try:
-        accounts = ga.list_accounts()
+        accounts = ga.list_accounts(tenant_id)
     except ga.GBPError as e:
         print(f"gbp_import.py: could not list Google accounts -- {e}")
         sys.exit(1)
@@ -101,7 +110,7 @@ def run(apply: bool = False):
     all_api_locations = []  # list of (account, gbp_location)
     for account in accounts:
         try:
-            for gloc in ga.list_locations(account["name"]):
+            for gloc in ga.list_locations(tenant_id, account["name"]):
                 all_api_locations.append((account, gloc))
         except ga.GBPError as e:
             print(f"gbp_import.py: could not list locations for account {account.get('name')}: {e}")
@@ -134,7 +143,7 @@ def run(apply: bool = False):
             )
 
         try:
-            api_reviews = ga.list_reviews(api_location["name"])
+            api_reviews = ga.list_reviews(tenant_id, api_location["name"])
         except ga.GBPError as e:
             loc_report["error"] = f"Could not list reviews: {e}"
             report["locations"].append(loc_report)
@@ -206,5 +215,16 @@ def run(apply: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="Actually write changes (default: dry-run report only)")
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant to import. REQUIRED -- no default. The calling workflow "
+                              "must pass this explicitly (e.g. --tenant-id t_los-tres-amigos); this "
+                              "script never infers a tenant on its own. See the Multi-Tenant Phase 4C report.")
     args = parser.parse_args()
-    run(apply=args.apply)
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::gbp_import.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        run(tenant_id=args.tenant_id, apply=args.apply)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::gbp_import.py: {e}")
+        sys.exit(1)

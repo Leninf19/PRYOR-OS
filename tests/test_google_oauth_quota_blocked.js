@@ -78,7 +78,7 @@ async function invokeStatus(accountsResponse) {
   await setDirectory()
   const client = fakeCredentialRedis()
   _setRedisClientForTests(() => client)
-  await setStoredCredential({ refreshToken: 'a-valid-refresh-token', connectedAccountName: 'Los Tres Amigos' })
+  await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'a-valid-refresh-token', connectedAccountName: 'Los Tres Amigos' })
 
   globalThis.fetch = async (url) => {
     if (url.includes('oauth2.googleapis.com/token')) {

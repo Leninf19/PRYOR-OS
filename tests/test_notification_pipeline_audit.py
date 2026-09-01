@@ -45,7 +45,11 @@ import critical_alert_check as cac
 import nightly_digest as nd
 import gbp_sync
 import provider_sync
+import tenant_keys
+import tenant_paths
 from provider_base import Provider, ProviderLocation, ProviderReview
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 nd.FROM_ADDR = ""
 nd.APP_PASS = ""
@@ -54,6 +58,7 @@ nd.APP_PASS = ""
 def _fresh_db():
     tmpdir = tempfile.mkdtemp(prefix="notification_audit_test_")
     db.DB_PATH = Path(tmpdir) / "reviews.db"
+    tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, db.DB_PATH)
     conn = db.get_connection()
     db.init_schema(conn)
     conn.execute("INSERT INTO locations (name, city, brand) VALUES ('Test Loc', 'Testville', 'Casa Tequila')")
@@ -98,7 +103,7 @@ def test_new_bad_review_triggers_immediate_alert():
     with mock.patch.object(gbp_sync, "sync_all", return_value={"status": "skipped", "reason": "not configured"}), \
          mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-pass"), \
          mock.patch("critical_alert_check._send_email") as mock_send:
-        result = cac.run()
+        result = cac.run(TEST_TENANT_ID)
 
     assert result["status"] == "ok", result
     assert result["sent"] == 1, result
@@ -114,8 +119,8 @@ def test_duplicate_review_never_re_alerts():
     with mock.patch.object(gbp_sync, "sync_all", return_value={"status": "skipped", "reason": "not configured"}), \
          mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-pass"), \
          mock.patch("critical_alert_check._send_email") as mock_send:
-        first = cac.run()
-        second = cac.run()
+        first = cac.run(TEST_TENANT_ID)
+        second = cac.run(TEST_TENANT_ID)
 
     assert first["status"] == "ok" and first["sent"] == 1, first
     assert second["status"] == "ok" and second["sent"] == 0, \
@@ -134,7 +139,7 @@ def test_multiple_bad_reviews_all_included_in_one_alert():
     with mock.patch.object(gbp_sync, "sync_all", return_value={"status": "skipped", "reason": "not configured"}), \
          mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-pass"), \
          mock.patch("critical_alert_check._send_email") as mock_send:
-        result = cac.run()
+        result = cac.run(TEST_TENANT_ID)
 
     assert result["status"] == "ok", result
     assert result["sent"] == 3, f"all three genuinely new critical reviews must be included, got {result}"
@@ -149,7 +154,7 @@ def test_nightly_digest_with_qualifying_reviews_sends():
 
     with mock.patch.object(nd, "FROM_ADDR", "sender@example.com"), mock.patch.object(nd, "APP_PASS", "test-pass"), \
          mock.patch.object(nd, "send_email") as mock_send:
-        result = nd.run(force=True)
+        result = nd.run(TEST_TENANT_ID, force=True)
 
     assert result["status"] == "sent", result
     assert result["count"] == 1, result
@@ -162,7 +167,7 @@ def test_nightly_digest_with_no_qualifying_reviews_sends_nothing():
     _fresh_db()  # no reviews at all
     with mock.patch.object(nd, "FROM_ADDR", "sender@example.com"), mock.patch.object(nd, "APP_PASS", "test-pass"), \
          mock.patch.object(nd, "send_email") as mock_send:
-        result = nd.run(force=True)
+        result = nd.run(TEST_TENANT_ID, force=True)
 
     assert result["status"] == "no_qualifying_reviews", result
     assert not mock_send.called, "must never attempt a send when there is nothing to digest"
@@ -228,7 +233,7 @@ def test_gbp_failure_never_suppresses_a_genuinely_new_critical_alert():
     with mock.patch.object(gbp_sync, "sync_all", return_value=gbp_failure), \
          mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-pass"), \
          mock.patch("critical_alert_check._send_email") as mock_send:
-        result = cac.run()
+        result = cac.run(TEST_TENANT_ID)
 
     assert result["status"] == "ok", f"a GBP quota/auth failure must never prevent the scraper-based DB check, got {result}"
     assert result["sent"] == 1, result
@@ -249,7 +254,7 @@ def test_missing_credentials_never_permanently_suppresses_a_critical_alert():
 
     with mock.patch.object(gbp_sync, "sync_all", return_value={"status": "skipped", "reason": "not configured"}), \
          mock.patch.object(cac, "FROM_ADDR", ""), mock.patch.object(cac, "APP_PASS", ""):
-        blocked = cac.run()
+        blocked = cac.run(TEST_TENANT_ID)
     assert blocked["status"] == "ready_no_credentials", blocked
     assert blocked["pending"] == 1, blocked
 
@@ -263,7 +268,7 @@ def test_missing_credentials_never_permanently_suppresses_a_critical_alert():
     with mock.patch.object(gbp_sync, "sync_all", return_value={"status": "skipped", "reason": "not configured"}), \
          mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-pass"), \
          mock.patch("critical_alert_check._send_email") as mock_send:
-        recovered = cac.run()
+        recovered = cac.run(TEST_TENANT_ID)
 
     assert recovered["status"] == "ok" and recovered["sent"] == 1, \
         f"once credentials are available, the SAME review must still be found and sent, got {recovered}"
@@ -280,7 +285,7 @@ def test_nightly_digest_send_failure_does_not_permanently_suppress_review():
     with mock.patch.object(nd, "FROM_ADDR", "sender@example.com"), mock.patch.object(nd, "APP_PASS", "test-pass"), \
          mock.patch.object(nd, "send_email", side_effect=Exception("simulated SMTP failure")):
         try:
-            nd.run(force=True)
+            nd.run(TEST_TENANT_ID, force=True)
             raised = False
         except Exception:
             raised = True
@@ -296,7 +301,7 @@ def test_nightly_digest_send_failure_does_not_permanently_suppress_review():
     # Retrying (send now succeeding) must still find and send the same review.
     with mock.patch.object(nd, "FROM_ADDR", "sender@example.com"), mock.patch.object(nd, "APP_PASS", "test-pass"), \
          mock.patch.object(nd, "send_email") as mock_send:
-        retried = nd.run(force=True)
+        retried = nd.run(TEST_TENANT_ID, force=True)
     assert retried["status"] == "sent" and retried["count"] == 1, retried
     assert mock_send.called
 

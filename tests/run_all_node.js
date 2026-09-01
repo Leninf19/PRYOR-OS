@@ -24,6 +24,8 @@ const TESTS = [
   'test_endpoint_auth.js',
   'test_oauth_safety.js',
   'test_google_oauth_error_contract.js',
+  'test_google_oauth_tenant_scoping.js',
+  'test_phase4b_cross_tenant_adversarial.js',
   'test_http_methods.js',
   'test_workflow_concurrency.js',
   'test_no_direct_data_fetches.js',
@@ -95,6 +97,7 @@ const TESTS = [
   'test_tenant_model.js',
   'test_tenant_migration_policy.js',
   'test_tenant_session_authorization.js',
+  'test_tenant_private_data_isolation.js',
 ]
 
 const results = {}

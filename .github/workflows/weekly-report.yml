@@ -8,6 +8,12 @@ on:
 jobs:
   report:
     runs-on: ubuntu-latest
+    # Multi-Tenant Phase 4D revision: weekly_report.py's --tenant-id is
+    # REQUIRED, no default. This single, reviewed, version-controlled
+    # value is this workflow's explicit statement of which tenant's
+    # reviews.csv it reports on.
+    env:
+      TENANT_ID: t_los-tres-amigos
     steps:
       - uses: actions/checkout@v6
 
@@ -16,7 +22,7 @@ jobs:
           python-version: '3.11'
 
       - name: Send weekly report
-        run: python weekly_report.py
+        run: python weekly_report.py --tenant-id "$TENANT_ID"
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}

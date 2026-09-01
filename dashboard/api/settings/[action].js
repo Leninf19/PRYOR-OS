@@ -34,7 +34,6 @@
 
 import { readFile } from 'fs/promises'
 import path from 'path'
-import { fileURLToPath } from 'url'
 import { requireAuth, requireScopedAuth } from '../_lib/auth.js'
 import { roleHasPermission, Permission } from '../_lib/permissions.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
@@ -43,6 +42,7 @@ import {
 } from '../_lib/contactStore.js'
 import { appendAuditEntry, listAuditEntries, clientIp, AuditLogUnavailableError } from '../_lib/auditLog.js'
 import { resolveTenantId } from '../_lib/tenants.js'
+import { resolvePrivateDataRoot } from '../_lib/reviewDataPaths.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
 import { getAccountByEmail, getAccountById, listAccounts } from '../_lib/accountStore.js'
@@ -71,10 +71,6 @@ function sanitizeErrorMessage(message) {
   if (process.env.MICROSOFT_CLIENT_SECRET) out = out.split(process.env.MICROSOFT_CLIENT_SECRET).join('[redacted]')
   return out.slice(0, 300)
 }
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const LEGACY_CONTACTS_PATH = path.resolve(__dirname, '..', '..', 'private-data', 'location-contacts.json')
-const META_PATH = path.resolve(__dirname, '..', '..', 'private-data', 'meta.json')
 
 // Test-only seam for the backfill action below -- lets tests inject fixed
 // legacy-contacts/meta content without touching the real filesystem path,
@@ -106,14 +102,17 @@ function isPlainObject(v) {
 
 // Best-effort, cosmetic-only: resolves location ids to display names for
 // the invitation email's copy (never for authorization -- reuses the same
-// META_PATH/metaOverride seam the contacts-backfill action already has).
-// Returns [] on any failure or for '*' -- callers already handle an empty
-// list as "names unavailable, use a generic scoped phrase" (see
-// accountEmailTemplate.js's buildInviteEmail).
-async function resolveLocationNames(locationIds) {
+// metaOverride seam the contacts-backfill action already has). Returns []
+// on any failure or for '*' -- callers already handle an empty list as
+// "names unavailable, use a generic scoped phrase" (see
+// accountEmailTemplate.js's buildInviteEmail). tenantId is REQUIRED --
+// derived by the caller from the authenticated account, never from
+// request input.
+async function resolveLocationNames(tenantId, locationIds) {
   if (locationIds === '*' || !Array.isArray(locationIds)) return []
   try {
-    const meta = metaOverride ?? JSON.parse(await readFile(META_PATH, 'utf-8'))
+    const metaPath = path.join(resolvePrivateDataRoot(tenantId), 'meta.json')
+    const meta = metaOverride ?? JSON.parse(await readFile(metaPath, 'utf-8'))
     const byId = new Map((meta.locations ?? []).map(l => [l.locationId, l.name]))
     return locationIds.map(id => byId.get(id)).filter(Boolean)
   } catch {
@@ -363,10 +362,15 @@ async function backfillContactsFromLegacyAction(req, res) {
   const allowed = await enforceRateLimit(req, res, `settings:contacts-backfill:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
   if (!allowed) return
 
+  // Multi-Tenant Phase 4D: tenantId derived exclusively from the
+  // authenticated account -- both legacy files are read from THIS
+  // tenant's own private-data root, never a hardcoded/shared path.
+  const tenantId = resolveTenantId(account)
   let legacy = legacyContactsOverride
   if (legacy === null) {
     try {
-      legacy = JSON.parse(await readFile(LEGACY_CONTACTS_PATH, 'utf-8'))
+      const legacyContactsPath = path.join(resolvePrivateDataRoot(tenantId), 'location-contacts.json')
+      legacy = JSON.parse(await readFile(legacyContactsPath, 'utf-8'))
     } catch {
       legacy = {}
     }
@@ -374,7 +378,8 @@ async function backfillContactsFromLegacyAction(req, res) {
   let meta = metaOverride
   if (meta === null) {
     try {
-      meta = JSON.parse(await readFile(META_PATH, 'utf-8'))
+      const metaPath = path.join(resolvePrivateDataRoot(tenantId), 'meta.json')
+      meta = JSON.parse(await readFile(metaPath, 'utf-8'))
     } catch {
       meta = { locations: [] }
     }
@@ -668,7 +673,7 @@ async function inviteUserAction(req, res) {
     const inviteUrl = buildInviteUrl(req, rawToken)
     let emailWarning = null
     try {
-      const locationNames = await resolveLocationNames(locationIds)
+      const locationNames = await resolveLocationNames(resolveTenantId(account), locationIds)
       const subject = buildInviteEmailSubject()
       const { html, text } = buildInviteEmail({ name: trimmedName, role, locationIds, locationNames, inviteUrl, expiresAt })
       await sendReviewEmail({ to: email, cc: [], replyTo: undefined, subject, html, text })
@@ -741,7 +746,7 @@ async function resendInviteAction(req, res) {
     const inviteUrl = buildInviteUrl(req, rawToken)
     let emailWarning = null
     try {
-      const locationNames = await resolveLocationNames(target.locationIds)
+      const locationNames = await resolveLocationNames(resolveTenantId(account), target.locationIds)
       const subject = buildInviteEmailSubject()
       const { html, text } = buildInviteEmail({ name: target.displayName, role: target.role, locationIds: target.locationIds, locationNames, inviteUrl, expiresAt })
       await sendReviewEmail({ to: target.email, cc: [], replyTo: undefined, subject, html, text })

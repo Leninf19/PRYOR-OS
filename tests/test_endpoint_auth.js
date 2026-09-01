@@ -139,7 +139,7 @@ async function testDisconnectWithConfirmPhraseSucceeds() {
   const client = fakeCredentialRedis()
   _setCredentialRedisForTests(() => client)
   try {
-    await setStoredCredential({ refreshToken: 'x', connectedAccountName: 'Los Tres Amigos' })
+    await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'x', connectedAccountName: 'Los Tres Amigos' })
     const req = { method: 'POST', body: { confirm: 'DISCONNECT' }, headers: { cookie: `lta_session=${token}` } }
     const res = fakeRes()
     await disconnectHandler(req, res)

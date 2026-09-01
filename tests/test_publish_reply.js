@@ -36,7 +36,7 @@ function fakeCredentialRedis(initial = null) {
 }
 const credentialClient = fakeCredentialRedis()
 _setCredentialRedisForTests(() => credentialClient)
-await setStoredCredential({ refreshToken: 'fake-refresh-token', connectedAccountName: null })
+await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'fake-refresh-token', connectedAccountName: null })
 
 // Recovery Milestone 6B: publishBridgeStore.js's own Redis client -- a
 // separate fake from the credential one above, matching the real app

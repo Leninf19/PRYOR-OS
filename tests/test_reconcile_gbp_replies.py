@@ -22,11 +22,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import reconcile_gbp_replies as reconcile
+import tenant_keys
+import tenant_paths
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 
 def _fresh_db():
     tmpdir = tempfile.mkdtemp(prefix="test_reconcile_")
     db.DB_PATH = Path(tmpdir) / "reviews.db"
+    tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, db.DB_PATH)
     conn = db.get_connection()
     db.init_schema(conn)
     return db.DB_PATH, conn
@@ -97,7 +102,7 @@ def test_backfills_from_a_real_reply():
         return {"reviewReply": {"comment": "Sorry about that -- please call us.",
                                  "updateTime": "2026-06-01T00:00:00Z"}}
 
-    result = reconcile.run_reconcile(conn, fetch_review=fake_fetch)
+    result = reconcile.run_reconcile(conn, TEST_TENANT_ID, fetch_review=fake_fetch)
     assert len(result["backfilled"]) == 1
     assert result["unresolved"] == []
     assert result["failed"] == []
@@ -120,7 +125,7 @@ def test_no_reply_returned_leaves_row_unchanged_and_unresolved():
     def fake_fetch(name):
         return {"reviewReply": {}}  # Google genuinely has no reply on this review
 
-    result = reconcile.run_reconcile(conn, fetch_review=fake_fetch)
+    result = reconcile.run_reconcile(conn, TEST_TENANT_ID, fetch_review=fake_fetch)
     assert result["backfilled"] == []
     assert len(result["unresolved"]) == 1
     assert result["unresolved"][0]["id"] == review_id
@@ -143,7 +148,7 @@ def test_fetch_failure_leaves_row_unchanged_and_reports_error():
     def failing_fetch(name):
         raise RuntimeError("404: review not found")
 
-    result = reconcile.run_reconcile(conn, fetch_review=failing_fetch)
+    result = reconcile.run_reconcile(conn, TEST_TENANT_ID, fetch_review=failing_fetch)
     assert result["backfilled"] == []
     assert result["unresolved"] == []
     assert len(result["failed"]) == 1
@@ -184,7 +189,7 @@ def test_only_matching_rows_are_touched():
     def fake_fetch(name):
         return {"reviewReply": {"comment": "Fixed now", "updateTime": "2026-06-01T00:00:00Z"}}
 
-    result = reconcile.run_reconcile(conn, fetch_review=fake_fetch)
+    result = reconcile.run_reconcile(conn, TEST_TENANT_ID, fetch_review=fake_fetch)
     assert len(result["backfilled"]) == 1
     assert result["backfilled"][0]["id"] == anomaly_id
 
@@ -209,10 +214,10 @@ def test_rerun_is_idempotent():
     def fake_fetch(name):
         return {"reviewReply": {"comment": "All set", "updateTime": "2026-06-01T00:00:00Z"}}
 
-    first = reconcile.run_reconcile(conn, fetch_review=fake_fetch)
+    first = reconcile.run_reconcile(conn, TEST_TENANT_ID, fetch_review=fake_fetch)
     assert len(first["backfilled"]) == 1
 
-    second = reconcile.run_reconcile(conn, fetch_review=fake_fetch)
+    second = reconcile.run_reconcile(conn, TEST_TENANT_ID, fetch_review=fake_fetch)
     assert second["matched"] == 0, "a backfilled row must not match the predicate again"
     assert second["backfilled"] == []
 

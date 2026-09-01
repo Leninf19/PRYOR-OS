@@ -22,6 +22,12 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
+    # Multi-Tenant Phase 4C revision: gbp_location_diagnostic.py's
+    # --tenant-id is REQUIRED, no default. This single, reviewed,
+    # version-controlled value is this diagnostic's explicit statement of
+    # which tenant's credential it uses.
+    env:
+      TENANT_ID: t_los-tres-amigos
 
     steps:
       - name: Checkout repo
@@ -40,7 +46,7 @@ jobs:
         run: pip install cryptography
 
       - name: Run GBP location reconciliation diagnostic
-        run: python gbp_location_diagnostic.py
+        run: python gbp_location_diagnostic.py --tenant-id "$TENANT_ID"
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}

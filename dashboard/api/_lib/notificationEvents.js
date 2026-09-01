@@ -19,7 +19,6 @@
 
 import { readFile } from 'fs/promises'
 import path from 'path'
-import { fileURLToPath } from 'url'
 import { requireLocationAccess, isWildcardGrant } from './auth.js'
 import { getAllActions, ActionStoreUnavailableError } from './actionStore.js'
 import { getStoredCredential } from './credentialStore.js'
@@ -27,9 +26,7 @@ import { listReplyFailures } from './notificationStore.js'
 import { getAllTasks, TaskStoreUnavailableError } from './taskStore.js'
 import { getAllCampaigns, CampaignStoreUnavailableError } from './campaignStore.js'
 import { resolveTenantId } from './tenants.js'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PRIVATE_ROOT = path.resolve(__dirname, '..', '..', 'private-data')
+import { resolvePrivateDataRoot } from './reviewDataPaths.js'
 
 // Review-based notifications only ever look back this far -- see the
 // milestone report for the retention rationale (30 days, matching the
@@ -72,14 +69,15 @@ let privateDataTestOverride = null
 export function _setPrivateDataForTests(filesByRelPath) { privateDataTestOverride = filesByRelPath }
 export function _resetPrivateDataForTests() { privateDataTestOverride = null }
 
-async function readJsonFile(relPath) {
+async function readJsonFile(tenantId, relPath) {
   if (privateDataTestOverride !== null) {
     return Object.prototype.hasOwnProperty.call(privateDataTestOverride, relPath)
       ? privateDataTestOverride[relPath]
       : null
   }
   try {
-    const raw = await readFile(path.join(PRIVATE_ROOT, relPath), 'utf-8')
+    const root = resolvePrivateDataRoot(tenantId)
+    const raw = await readFile(path.join(root, relPath), 'utf-8')
     return JSON.parse(raw)
   } catch {
     return null
@@ -92,14 +90,15 @@ async function readJsonFile(relPath) {
 // review from an unauthorized location is never even READ, let alone
 // filtered client-side.
 async function loadAuthorizedReviews(account) {
-  const meta = await readJsonFile('meta.json')
+  const tenantId = resolveTenantId(account)
+  const meta = await readJsonFile(tenantId, 'meta.json')
   if (!meta?.locations) return []
   const locations = isWildcardGrant(account)
     ? meta.locations
     : meta.locations.filter(l => requireLocationAccess(account, l.locationId))
 
   const perLocation = await Promise.all(locations.map(async loc => {
-    const reviews = await readJsonFile(`reviews/by-location/${loc.slug}.json`)
+    const reviews = await readJsonFile(tenantId, `reviews/by-location/${loc.slug}.json`)
     return Array.isArray(reviews) ? reviews : []
   }))
   return perLocation.flat()
@@ -201,7 +200,9 @@ async function assignedActionCandidates(account) {
 // rules out.
 async function gbpDisconnectedCandidate(account) {
   if (account.role !== 'owner') return null
-  const credential = await getStoredCredential().catch(() => null)
+  // Multi-Tenant Phase 4A: credentialStore.js now requires an explicit
+  // tenantId -- this account's own, never any other tenant's.
+  const credential = await getStoredCredential(resolveTenantId(account)).catch(() => null)
   if (!credential || !credential.health) return null
   if (credential.health === 'connected' || credential.health === 'never_connected') return null
   const messages = {

@@ -6,13 +6,17 @@ categories, employee mentions, sentiment trends, predictions, AI summaries)
 and writes results to analytics_cache so export_chunks.py can ship
 precomputed JSON to the static frontend.
 """
+import argparse
 import json
 import re
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 import db
 import ai_engine
+import tenant_keys
+import tenant_paths
 
 # ---------------------------------------------------------------------------
 # Complaint / praise classification — 15 operational categories each
@@ -1918,6 +1922,23 @@ CLASSIFY_LIMIT_PER_RUN = 300
 
 
 def main():
+    """Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED, no default.
+    Resolved before any DB connection, so a missing/invalid/unregistered
+    tenant fails closed before touching anything."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to analyze. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::refresh_analytics.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        db.DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::refresh_analytics.py: {e}")
+        sys.exit(1)
+
     conn = db.get_connection()
     db.init_schema(conn)
 

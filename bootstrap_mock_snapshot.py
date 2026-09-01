@@ -10,9 +10,14 @@ env vars -- it's uncaught here deliberately, matching auto_update.py's own
 convention of letting an unsafe-environment failure crash loudly rather than
 being silently swallowed.
 
+Multi-Tenant Phase 4D revision: this script reads the REAL, tenant-owned
+review database as its copy source, so --tenant-id is REQUIRED -- the
+source path is resolved via tenant_paths.resolve_review_db_path(), never
+the old hardcoded SOURCE_DB_PATH constant (removed).
+
 Usage:
-    py bootstrap_mock_snapshot.py            # refuses if a snapshot already exists
-    py bootstrap_mock_snapshot.py --force     # overwrites an existing snapshot
+    py bootstrap_mock_snapshot.py --tenant-id t_los-tres-amigos             # refuses if a snapshot already exists
+    py bootstrap_mock_snapshot.py --tenant-id t_los-tres-amigos --force     # overwrites an existing snapshot
 """
 import argparse
 import shutil
@@ -20,13 +25,14 @@ import sqlite3
 from pathlib import Path
 
 import local_safety
+import tenant_keys
+import tenant_paths
 from provider_mock import DEFAULT_SNAPSHOT_PATH
 
 BASE_DIR = Path(__file__).parent
-SOURCE_DB_PATH = BASE_DIR / "dashboard" / "reviews.db"
 
 
-def bootstrap(source_path: Path = SOURCE_DB_PATH, snapshot_path: Path = DEFAULT_SNAPSHOT_PATH,
+def bootstrap(source_path: Path, snapshot_path: Path = DEFAULT_SNAPSHOT_PATH,
               force: bool = False) -> tuple[bool, str]:
     """Returns (ok, message). Never raises for an expected failure mode --
     every failure is reported through the return value, matching
@@ -54,15 +60,30 @@ def bootstrap(source_path: Path = SOURCE_DB_PATH, snapshot_path: Path = DEFAULT_
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--force", action="store_true", help="Overwrite an existing snapshot if one already exists")
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to snapshot. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
     args = parser.parse_args()
 
+    # The CI/production safety guard runs before anything tenant-related --
+    # this tool must never even attempt to resolve a tenant's database
+    # inside an automated environment, valid --tenant-id or not.
     local_safety.ensure_safe_for_local_mode()
 
-    # Looked up as module globals at call time (not passed via bootstrap()'s
-    # own default parameter values, which would otherwise be frozen at import
-    # time) so tests can monkeypatch SOURCE_DB_PATH/DEFAULT_SNAPSHOT_PATH and
-    # have main() actually honor the patched paths.
-    ok, message = bootstrap(SOURCE_DB_PATH, DEFAULT_SNAPSHOT_PATH, force=args.force)
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::bootstrap_mock_snapshot.py: invalid --tenant-id {args.tenant_id!r}")
+        return 1
+    try:
+        source_path = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::bootstrap_mock_snapshot.py: {e}")
+        return 1
+
+    # DEFAULT_SNAPSHOT_PATH looked up as a module global at call time (not
+    # passed via bootstrap()'s own default parameter value, which would
+    # otherwise be frozen at import time) so tests can monkeypatch it and
+    # have main() actually honor the patched path.
+    ok, message = bootstrap(source_path, DEFAULT_SNAPSHOT_PATH, force=args.force)
     print(message if ok else f"::error::{message}")
     return 0 if ok else 1
 

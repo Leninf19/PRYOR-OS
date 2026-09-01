@@ -80,8 +80,13 @@ def ensure_safe_for_local_mode(env: dict | None = None) -> None:
 # DB path validation
 # --------------------------------------------------------------------------
 
-def ensure_expected_db_path(db_path: Path, base_dir: Path) -> None:
-    expected = (base_dir / "dashboard" / "reviews.db").resolve()
+def ensure_expected_db_path(db_path: Path, expected_path: Path) -> None:
+    """Multi-Tenant Phase 4D revision: expected_path is now passed in
+    explicitly by the caller (resolved via tenant_paths.resolve_review_db_path()
+    for whichever tenant that caller is running as) rather than hardcoded
+    here to dashboard/reviews.db -- this guard must correctly validate
+    against ANY tenant's own database, not just Los Tres Amigos's."""
+    expected = Path(expected_path).resolve()
     actual = Path(db_path).resolve()
     if actual != expected:
         raise ValueError(

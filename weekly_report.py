@@ -1,19 +1,30 @@
 """
 Weekly review summary email. Runs every Monday via GitHub Actions.
-Reads dashboard/reviews.csv (no scraping needed).
+Reads a tenant's reviews.csv (no scraping needed).
+
+Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED. REVIEWS_CSV is no
+longer a hardcoded module constant -- it is resolved per-tenant via
+tenant_paths.resolve_review_csv_path(), the exact same derivation
+export_chunks.py's export_reviews_csv() writes through, so the two can
+never disagree about where this file lives. For Los Tres Amigos this
+remains byte-identical to the pre-Phase-4D dashboard/reviews.csv path.
 """
+import argparse
 import csv
 import os
 import re
 import smtplib
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
+import tenant_keys
+import tenant_paths
+
 BASE_DIR   = Path(__file__).parent
-REVIEWS_CSV = BASE_DIR / "dashboard" / "reviews.csv"
 TO_ADDR    = "advertising@l3amigos.com"
 FROM_ADDR  = os.environ.get("GMAIL_USER", "")
 APP_PASS   = os.environ.get("GMAIL_APP_PASSWORD", "")
@@ -29,8 +40,8 @@ STOP_WORDS = {
 }
 
 
-def load_reviews():
-    with REVIEWS_CSV.open(encoding="utf-8") as f:
+def load_reviews(csv_path: Path):
+    with csv_path.open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     for r in rows:
         try:
@@ -386,11 +397,25 @@ def send_email(subject, html, to_addr, from_addr, password):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose reviews.csv to report on. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::weekly_report.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        csv_path = tenant_paths.resolve_review_csv_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::weekly_report.py: {e}")
+        sys.exit(1)
+
     if not FROM_ADDR or not APP_PASS:
         print("Missing GMAIL_USER or GMAIL_APP_PASSWORD env vars")
         return
 
-    reviews = load_reviews()
+    reviews = load_reviews(csv_path)
     today   = datetime.now()
     d7      = (today - timedelta(days=7)).strftime("%Y-%m-%d")
     d30     = (today - timedelta(days=30)).strftime("%Y-%m-%d")

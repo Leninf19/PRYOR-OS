@@ -6,23 +6,144 @@
 // ~60s propagation window, no visible entry in Vercel's deployment history
 // for a routine credential rotation.
 //
-// Single Redis key (CREDENTIAL_KEY) holding one JSON blob (not a hash --
-// there is exactly one Google connection for the whole account, not a
-// per-id collection like actionStore.js/contactStore.js). The refresh
-// token itself is encrypted at rest with AES-256-GCM (Node's built-in
-// crypto, no new dependency) under CREDENTIAL_ENCRYPTION_KEY -- this is a
-// deliberate departure from Vercel's own env-var encryption, made so
-// reconnecting never touches Vercel again; the blast radius shifts to
-// CREDENTIAL_ENCRYPTION_KEY, the same class of risk GOOGLE_REFRESH_TOKEN
-// already was. Reading Upstash alone (e.g. from the Upstash console) is
-// not sufficient to recover the token without also holding this key.
+// Multi-Tenant Phase 4A: every public function below REQUIRES an explicit,
+// validated tenantId. There is exactly one Google connection per TENANT
+// now, not one for the whole application.
+//
+// Multi-Tenant Phase 4C -- CRITICAL COMPATIBILITY FIX, read this before
+// touching this file: Phase 4A made this module always read/write
+// gbp_credentials:v2:{tenantId} for every tenant, with zero exception for
+// Los Tres Amigos -- deliberately, per Phase 4A's "prefer no automatic
+// runtime fallback" instruction. The Phase 4C audit found this created an
+// immediate, severe split-brain the moment this code would ship: the
+// Python background pipeline (google_api.py, gbp_reply_bridge_reconcile.py
+// -- run by update-reviews.yml/critical-alert-check.yml) has ALWAYS read
+// gbp_credentials:v1 directly and was untouched by Phase 4A, so it would
+// keep working off the real, existing v1 credential -- while this Node
+// module would report "never_connected" for Los Tres Amigos (nothing
+// exists at v2 yet) and every dashboard feature that depends on it
+// (status, Connect, publish/reply) would break, DESPITE the background
+// sync/reconcile pipeline still running fine. Two credential systems
+// silently active and disagreeing about the same tenant.
+//
+// THE FIX: the exact same LEGACY/CUTOVER migration-mode system Phase 2's
+// tenantDualRead.js already established for the other 9 tenant-scoped
+// stores, applied here for the first time. A tenant's authoritative
+// credential key is a FIXED, explicit, code-reviewed setting
+// (CREDENTIAL_MIGRATION_MODE below) -- NEVER decided by whether v1 or v2
+// happens to exist or be populated at runtime (this is what makes it "not
+// an automatic runtime fallback": the mode is chosen by this file's own
+// source code, once, reviewed, not re-evaluated per-request against
+// Redis content). Los Tres Amigos is pinned to LEGACY: for that ONE
+// tenant, gbp_credentials:v1 is authoritative for BOTH reads and writes,
+// mirroring google_api.py's Python-side tenant_keys.py exactly, so Node
+// and Python agree on the same key and neither silently diverges from the
+// other. Every other tenant (none exist yet) defaults to CUTOVER: its own
+// gbp_credentials:v2:{tenantId}, with v1 never even consulted -- "do not
+// use the legacy credential as a fallback for arbitrary tenants" remains
+// fully intact, because CUTOVER-mode resolution never looks at v1Key at
+// all, for any reason.
+//
+// This is NOT "silently assigning the legacy credential to Los Tres
+// Amigos" -- it is the opposite: an explicit, visible, single-source-of-
+// truth code decision (this map), restoring the EXACT pre-Phase-4A
+// production behavior for the one tenant that already depends on it,
+// exactly as Phase 1/2 already did for the other 9 stores. A future,
+// separately reviewed cutover (once a real, controlled OAuth reconnect
+// establishes a v2 credential and the Python pipeline is updated to use
+// it) is a single-line change to CREDENTIAL_MIGRATION_MODE below -- see
+// the Phase 4C report's migration procedure for the exact steps.
+//
+// Single Redis key per tenant, each holding one JSON blob (not a hash --
+// there is exactly one Google connection per tenant, not a per-id
+// collection like actionStore.js/contactStore.js). The refresh token
+// itself is encrypted at rest with AES-256-GCM (Node's built-in crypto, no
+// new dependency) under CREDENTIAL_ENCRYPTION_KEY -- one securely managed
+// key encrypts every tenant's credential record; Phase 4A does not
+// introduce a per-tenant encryption key. Reading Upstash alone (e.g. from
+// the Upstash console) is not sufficient to recover any tenant's token
+// without also holding this key.
 //
 // Node-only, same as actionStore.js/contactStore.js.
 
 import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypto'
 import { Redis } from '@upstash/redis'
+import { credentialKeyV2 } from './tenantKeys.js'
+import { isValidTenantId, DEFAULT_TENANT_ID } from './tenants.js'
 
+// The legacy, single GLOBAL key production holds real data under --
+// authoritative ONLY for a tenant explicitly pinned to LEGACY mode below
+// (Los Tres Amigos, today). Never referenced outside resolveCredentialKey().
 const CREDENTIAL_KEY = 'gbp_credentials:v1'
+
+function assertValidTenantId(tenantId, fnName) {
+  if (!isValidTenantId(tenantId)) {
+    throw new TypeError(`${fnName}: invalid tenantId ${JSON.stringify(tenantId)}`)
+  }
+}
+
+// --- Migration mode (Multi-Tenant Phase 4C) -------------------------------
+// Mirrors dashboard/api/_lib/tenantDualRead.js's TenantMigrationMode
+// exactly (see this file's header comment for why credentials needed
+// their own copy rather than routing through that shared module directly
+// -- tenantDualRead.js's resolvers are shaped for the OTHER 9 stores'
+// v1-vs-v2 key PAIRS; a single-record-per-tenant store with a differently-
+// named legacy key benefits from its own small, equally-hardened version
+// rather than overloading that module's existing contract). Also mirrored
+// in this repo's Python pipeline as tenant_keys.py's
+// get_credential_migration_mode()/resolve_credential_key() -- the two
+// must stay in agreement for Los Tres Amigos, which is exactly the
+// critical compatibility fix this phase makes.
+export const CredentialMigrationMode = Object.freeze({
+  LEGACY: 'legacy',
+  CUTOVER: 'cutover',
+})
+
+// Single source of truth for every tenant's CREDENTIAL migration mode. A
+// plain object literal, not derived from any env var/request/runtime
+// state -- changing a tenant's mode is a reviewed source change, exactly
+// like tenantDualRead.js's own TENANT_MIGRATION_MODE map. Los Tres Amigos
+// stays LEGACY (gbp_credentials:v1 authoritative) until a separately
+// reviewed cutover -- see the Phase 4C report's migration procedure.
+//
+// TODO(multi-tenant-cutover): LEGACY mode exists ONLY as a transitional
+// bridge for Los Tres Amigos's controlled migration off the pre-Phase-4A
+// single global credential -- it is not a general "grandfather this
+// tenant" mechanism and must not be extended to any other tenant. Once
+// migrate-tenant-backfill.js has copied gbp_credentials:v1 to
+// gbp_credentials:v2:t_los-tres-amigos, the Python pipeline's matching
+// tenant_keys.py entry has been flipped in the same reviewed change, and a
+// controlled OAuth reconnect has confirmed v2 is live, remove this entry
+// (and the one in tenant_keys.py) so every tenant is CUTOVER-only and this
+// LEGACY branch can be deleted entirely.
+const CREDENTIAL_MIGRATION_MODE = Object.freeze({
+  [DEFAULT_TENANT_ID]: CredentialMigrationMode.LEGACY,
+})
+
+// Any tenantId not explicitly listed defaults to CUTOVER -- a new tenant
+// (none onboarded yet) has no legacy credential to be compatible with, so
+// it is v2-only from the moment it exists, with legacy fallback
+// structurally impossible (resolveCredentialKey() never even evaluates
+// CREDENTIAL_KEY in this branch).
+export function getCredentialMigrationMode(tenantId) {
+  assertValidTenantId(tenantId, 'getCredentialMigrationMode')
+  return CREDENTIAL_MIGRATION_MODE[tenantId] ?? CredentialMigrationMode.CUTOVER
+}
+
+// THE one function that decides which physical key is authoritative for a
+// tenant's Google credential -- synchronous, side-effect-free, and never
+// consults Redis to decide (authority is a property of the tenant's
+// migration mode alone). Every read AND write below calls this exact
+// function, which is what makes it structurally impossible for a read to
+// resolve one key while a write resolves another (the split-brain
+// tenantDualRead.js's own hardening pass eliminated for the other 9
+// stores, applied here for the first time).
+function resolveCredentialKey(tenantId) {
+  assertValidTenantId(tenantId, 'resolveCredentialKey')
+  return getCredentialMigrationMode(tenantId) === CredentialMigrationMode.LEGACY
+    ? CREDENTIAL_KEY
+    : credentialKeyV2(tenantId)
+}
 
 let redisClient = null
 let testClientFactory = null
@@ -157,31 +278,39 @@ function parseRecord(value) {
   }
 }
 
-async function readRaw(client) {
+// Both helpers derive the tenant's key via resolveCredentialKey() -- which
+// itself validates tenantId -- so the tenant is validated as an
+// inseparable part of deriving the key, never after. assertValidTenantId()
+// is ALSO called at the top of every public function below, before even
+// checking Redis configuration, so an invalid tenantId fails immediately
+// and identically regardless of runtime/store state.
+async function readRaw(client, tenantId) {
   try {
-    return parseRecord(await client.get(CREDENTIAL_KEY))
+    return parseRecord(await client.get(resolveCredentialKey(tenantId)))
   } catch (err) {
     throw new CredentialStoreUnavailableError(`credential store unreachable: ${err.message}`)
   }
 }
 
-async function writeRaw(client, record) {
+async function writeRaw(client, tenantId, record) {
   try {
-    await client.set(CREDENTIAL_KEY, JSON.stringify(record))
+    await client.set(resolveCredentialKey(tenantId), JSON.stringify(record))
   } catch (err) {
     throw new CredentialStoreUnavailableError(`credential store unreachable: ${err.message}`)
   }
 }
 
-// Returns the decrypted credential + all stored metadata, or null if never
-// connected. Throws CredentialStoreUnavailableError if Redis itself is
-// unreachable/unconfigured (never silently reports "not connected" for an
-// outage -- that would misrepresent a real problem as "never connected").
-export async function getStoredCredential() {
+// Returns the decrypted credential + all stored metadata, or null if this
+// tenant has never connected. Throws CredentialStoreUnavailableError if
+// Redis itself is unreachable/unconfigured (never silently reports "not
+// connected" for an outage -- that would misrepresent a real problem as
+// "never connected").
+export async function getStoredCredential(tenantId) {
+  assertValidTenantId(tenantId, 'getStoredCredential')
   const client = getClient()
   if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
 
-  const record = await readRaw(client)
+  const record = await readRaw(client, tenantId)
   if (!record) return null
 
   let refreshToken = null
@@ -213,16 +342,18 @@ export async function getStoredCredential() {
   }
 }
 
-// Writes a brand-new connection (Connect/Reconnect) -- always supersedes
-// whatever was there before, resetting failure state, since a successful
-// OAuth round trip proves the new token is good right now.
-export async function setStoredCredential({ refreshToken, connectedAccountName }) {
+// Writes a brand-new connection (Connect/Reconnect) for `tenantId` --
+// always supersedes whatever was there before FOR THAT TENANT ONLY,
+// resetting failure state, since a successful OAuth round trip proves the
+// new token is good right now. Never touches any other tenant's key.
+export async function setStoredCredential(tenantId, { refreshToken, connectedAccountName }) {
+  assertValidTenantId(tenantId, 'setStoredCredential')
   const client = getClient()
   if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
 
   const { ciphertext, iv, authTag } = encrypt(refreshToken)
   const now = new Date().toISOString()
-  await writeRaw(client, {
+  await writeRaw(client, tenantId, {
     refreshTokenCiphertext: ciphertext,
     refreshTokenIv: iv,
     refreshTokenAuthTag: authTag,
@@ -238,16 +369,19 @@ export async function setStoredCredential({ refreshToken, connectedAccountName }
 
 // Records the outcome of any live Google API interaction that exercises
 // the stored refresh token (a status check, test-connection, or a
-// publish/reply attempt) -- this is the "automatic recovery" mechanism:
-// call this the MOMENT a Google auth failure is detected, from any of
-// those call sites, so the very next status read reflects "Reconnect
-// Required" immediately, never waiting for a separate user-initiated check.
-export async function recordSyncOutcome({ success, reason, errorDescription } = {}) {
+// publish/reply attempt) for `tenantId` -- this is the "automatic
+// recovery" mechanism: call this the MOMENT a Google auth failure is
+// detected, from any of those call sites, so the very next status read
+// for THIS tenant reflects "Reconnect Required" immediately, never
+// waiting for a separate user-initiated check. Never affects any other
+// tenant's stored health.
+export async function recordSyncOutcome(tenantId, { success, reason, errorDescription } = {}) {
+  assertValidTenantId(tenantId, 'recordSyncOutcome')
   const client = getClient()
   if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
 
-  const record = await readRaw(client)
-  if (!record) return // nothing connected to update
+  const record = await readRaw(client, tenantId)
+  if (!record) return // nothing connected for this tenant to update
 
   const now = new Date().toISOString()
   if (success) {
@@ -259,31 +393,36 @@ export async function recordSyncOutcome({ success, reason, errorDescription } = 
     record.lastFailureReason = reason ?? 'unknown'
     record.health = healthForFailure(reason, errorDescription)
   }
-  await writeRaw(client, record)
+  await writeRaw(client, tenantId, record)
 }
 
-// Records a successful access-token exchange (a refresh actually happened),
-// independent of whether the SUBSEQUENT API call using that token
-// succeeded -- "Last OAuth Refresh" tracks token minting, "Last Successful
-// Sync"/"Last Failed Sync" (recordSyncOutcome above) track what was DONE
-// with it.
-export async function recordOAuthRefresh() {
+// Records a successful access-token exchange (a refresh actually happened)
+// for `tenantId`, independent of whether the SUBSEQUENT API call using
+// that token succeeded -- "Last OAuth Refresh" tracks token minting, "Last
+// Successful Sync"/"Last Failed Sync" (recordSyncOutcome above) track what
+// was DONE with it. Never affects any other tenant's record.
+export async function recordOAuthRefresh(tenantId) {
+  assertValidTenantId(tenantId, 'recordOAuthRefresh')
   const client = getClient()
   if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
 
-  const record = await readRaw(client)
+  const record = await readRaw(client, tenantId)
   if (!record) return
   record.lastOAuthRefreshAt = new Date().toISOString()
-  await writeRaw(client, record)
+  await writeRaw(client, tenantId, record)
 }
 
 // Disconnect -- genuine removal, not a soft "disabled" flag; a fresh
 // Connect afterward is indistinguishable from a first-time connection.
-export async function clearStoredCredential() {
+// Deletes ONLY `tenantId`'s own authoritative key (v1 for a LEGACY-mode
+// tenant, its own v2 key otherwise) -- structurally cannot reach, and
+// never touches, any other tenant's credential.
+export async function clearStoredCredential(tenantId) {
+  assertValidTenantId(tenantId, 'clearStoredCredential')
   const client = getClient()
   if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
   try {
-    await client.del(CREDENTIAL_KEY)
+    await client.del(resolveCredentialKey(tenantId))
   } catch (err) {
     throw new CredentialStoreUnavailableError(`credential store unreachable: ${err.message}`)
   }

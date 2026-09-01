@@ -25,6 +25,7 @@ from provider_base import (
     CAP_READ_REVIEWS, CAP_REPLY,
 )
 import google_api as ga
+import tenant_keys
 
 # Moved here from gbp_sync.py (Phase 3 Milestone 1) along with the review
 # conversion logic that uses it. Kept in sync with
@@ -49,6 +50,21 @@ class GBPProvider(Provider):
     # a full sync is blocked on Google's quota issue.
     expected_cadence_minutes = 15
 
+    def __init__(self, tenant_id: str):
+        """Multi-Tenant Phase 4C revision: every GBPProvider instance is
+        bound to exactly one, validated tenant at construction -- every
+        method below threads self.tenant_id into google_api.py, which
+        requires it on every call. There is NO default here (there was one,
+        briefly, in the original Phase 4C pass -- removed per review: a
+        default silently made every caller that forgot to pass a tenant
+        operate as Los Tres Amigos, which is exactly the implicit-tenant
+        behavior this architecture is required to prevent). Every caller
+        (gbp_sync.py, gbp_location_diagnostic.py, export_chunks.py,
+        sync_reviews.py, critical_alert_check.py) must resolve and pass its
+        own explicit tenant_id -- see each file's own --tenant-id handling."""
+        tenant_keys.assert_valid_tenant_id(tenant_id, "GBPProvider.__init__")
+        self.tenant_id = tenant_id
+
     def is_configured(self) -> bool:
         return ga.is_configured()
 
@@ -56,14 +72,14 @@ class GBPProvider(Provider):
         if not self.is_configured():
             raise ProviderConfigError("Google credentials not configured (GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN)")
 
-        accounts = ga.list_accounts()  # a hard failure here raises ga.GBPError, a ProviderError -- propagates unchanged
+        accounts = ga.list_accounts(self.tenant_id)  # a hard failure here raises ga.GBPError, a ProviderError -- propagates unchanged
         if not accounts:
             raise ProviderAuthError("No Google Business Profile accounts found for this token")
 
         locations = []
         for account in accounts:
             try:
-                api_locations = ga.list_locations(account["name"])
+                api_locations = ga.list_locations(self.tenant_id, account["name"])
             except ga.GBPError as e:
                 # Preserves gbp_sync.py's original per-account skip-and-continue
                 # behavior exactly -- one account's failure never aborts
@@ -86,7 +102,7 @@ class GBPProvider(Provider):
 
     def fetch_reviews(self, location: ProviderLocation, *, fast: bool = False) -> list[ProviderReview]:
         max_pages = 1 if fast else None
-        api_reviews = ga.list_reviews(location.external_id, max_pages=max_pages)
+        api_reviews = ga.list_reviews(self.tenant_id, location.external_id, max_pages=max_pages)
         return [self._to_provider_review(r) for r in api_reviews]
 
     @staticmethod
@@ -110,4 +126,4 @@ class GBPProvider(Provider):
         )
 
     def reply_to_review(self, gbp_review_name: str, comment: str) -> None:
-        ga.reply_to_review(gbp_review_name, comment)
+        ga.reply_to_review(self.tenant_id, gbp_review_name, comment)

@@ -17,10 +17,15 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import argparse
+import sys
+
 import ai_engine
 import db
 import digest_filters
 import gbp_sync
+import tenant_keys
+import tenant_paths
 
 TO_ADDR = "advertising@l3amigos.com"
 FROM_ADDR = os.environ.get("GMAIL_USER", "")
@@ -112,7 +117,15 @@ def _build_html(reviews: list) -> str:
     </body></html>"""
 
 
-def run() -> dict:
+def run(tenant_id: str) -> dict:
+    """Multi-Tenant Phase 4C/4D revision: tenant_id is REQUIRED -- no
+    default. Validated before any DB connection or GBP sync call, then
+    this tenant's own review database is resolved (Phase 4D), so a
+    missing/invalid/unregistered tenant fails closed before touching
+    anything."""
+    tenant_keys.assert_valid_tenant_id(tenant_id, "critical_alert_check.run")
+    db.DB_PATH = tenant_paths.resolve_review_db_path(tenant_id)
+
     conn = db.get_connection()
     db.init_schema(conn)
     print("[critical_alert_check] stage=start")
@@ -127,7 +140,7 @@ def run() -> dict:
     # never ran at all. sync_reviews.py's own scraper-provider run
     # (update-reviews.yml) is what actually populates new reviews; this
     # GBP attempt is a secondary, optional source for this specific check.
-    sync_result = gbp_sync.sync_all(fast=True)
+    sync_result = gbp_sync.sync_all(tenant_id=tenant_id, fast=True)
     status = sync_result.get("status")
     if status == "skipped":
         print(f"[critical_alert_check] stage=gbp_sync result=skipped reason={sync_result.get('reason')}")
@@ -187,4 +200,17 @@ def run() -> dict:
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant to check. REQUIRED -- no default. The calling workflow "
+                              "must pass this explicitly (e.g. --tenant-id t_los-tres-amigos); this "
+                              "script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::critical_alert_check.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        run(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::critical_alert_check.py: {e}")
+        sys.exit(1)

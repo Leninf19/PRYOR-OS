@@ -23,23 +23,27 @@
 
 import { readFile } from 'fs/promises'
 import path from 'path'
-import { fileURLToPath } from 'url'
 import { getContact as getRedisContact, ContactStoreUnavailableError } from './contactStore.js'
+import { resolvePrivateDataRoot } from './reviewDataPaths.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const CONTACTS_PATH = path.resolve(__dirname, '..', '..', 'private-data', 'location-contacts.json')
+// Multi-Tenant Phase 4D: keyed per tenantId -- before this fix this was a
+// single, shared module-level cache read from a single hardcoded path,
+// meaning EVERY tenant's legacy-fallback contact lookup would have been
+// served from Los Tres Amigos's own location-contacts.json.
+const legacyCacheByTenant = new Map()
 
-let legacyCache = null
-
-async function getLegacyContact(locationId) {
-  if (!legacyCache) {
+async function getLegacyContact(tenantId, locationId) {
+  if (!legacyCacheByTenant.has(tenantId)) {
+    let contacts
     try {
-      legacyCache = JSON.parse(await readFile(CONTACTS_PATH, 'utf-8'))
+      const contactsPath = path.join(resolvePrivateDataRoot(tenantId), 'location-contacts.json')
+      contacts = JSON.parse(await readFile(contactsPath, 'utf-8'))
     } catch {
-      legacyCache = {}
+      contacts = {}
     }
+    legacyCacheByTenant.set(tenantId, contacts)
   }
-  return legacyCache[String(locationId)] ?? null
+  return legacyCacheByTenant.get(tenantId)[String(locationId)] ?? null
 }
 
 // Returns { email, name } or null (no configured contact anywhere). Tries
@@ -58,16 +62,16 @@ export async function getLocationContact(tenantId, locationId) {
     if (!(err instanceof ContactStoreUnavailableError)) throw err
     // fall through to the legacy path below
   }
-  return getLegacyContact(locationId)
+  return getLegacyContact(tenantId, locationId)
 }
 
 // Test-only seam -- lets tests inject a fixed legacy-fallback contact map
-// without touching the real filesystem path or dashboard/private-data/.
-// Redis itself is mocked independently via contactStore.js's own
-// _setRedisClientForTests seam.
-export function _setContactsForTests(map) {
-  legacyCache = map
+// (for the given tenantId) without touching the real filesystem path or
+// dashboard/private-data/. Redis itself is mocked independently via
+// contactStore.js's own _setRedisClientForTests seam.
+export function _setContactsForTests(tenantId, map) {
+  legacyCacheByTenant.set(tenantId, map)
 }
 export function _resetContactsForTests() {
-  legacyCache = null
+  legacyCacheByTenant.clear()
 }

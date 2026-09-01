@@ -17,7 +17,11 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import local_safety
+import tenant_keys
+import tenant_paths
 import bootstrap_mock_snapshot as bms
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 results = []
 
@@ -121,15 +125,18 @@ def test_ci_environment_rejects_bootstrap_before_any_file_is_touched():
         snapshot = Path(tmp) / "snapshot.db"
         _make_scratch_source_db(source)
 
-        with mock.patch.object(bms, "SOURCE_DB_PATH", source), \
-             mock.patch.object(bms, "DEFAULT_SNAPSHOT_PATH", snapshot), \
-             mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), \
-             mock.patch.object(sys, "argv", ["bootstrap_mock_snapshot.py"]):
-            try:
-                bms.main()
-                raise AssertionError("main() must refuse to run under GITHUB_ACTIONS=true")
-            except local_safety.UnsafeEnvironmentError:
-                pass
+        tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, source)
+        try:
+            with mock.patch.object(bms, "DEFAULT_SNAPSHOT_PATH", snapshot), \
+                 mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), \
+                 mock.patch.object(sys, "argv", ["bootstrap_mock_snapshot.py", "--tenant-id", TEST_TENANT_ID]):
+                try:
+                    bms.main()
+                    raise AssertionError("main() must refuse to run under GITHUB_ACTIONS=true")
+                except local_safety.UnsafeEnvironmentError:
+                    pass
+        finally:
+            tenant_paths._reset_review_db_paths_for_tests()
         assert not snapshot.exists(), "the guard must fire before any file is touched"
 
 
@@ -139,11 +146,14 @@ def test_main_succeeds_end_to_end_outside_ci():
         snapshot = Path(tmp) / "snapshot.db"
         _make_scratch_source_db(source)
 
-        with mock.patch.object(bms, "SOURCE_DB_PATH", source), \
-             mock.patch.object(bms, "DEFAULT_SNAPSHOT_PATH", snapshot), \
-             mock.patch.dict(os.environ, {}, clear=True), \
-             mock.patch.object(sys, "argv", ["bootstrap_mock_snapshot.py"]):
-            exit_code = bms.main()
+        tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, source)
+        try:
+            with mock.patch.object(bms, "DEFAULT_SNAPSHOT_PATH", snapshot), \
+                 mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(sys, "argv", ["bootstrap_mock_snapshot.py", "--tenant-id", TEST_TENANT_ID]):
+                exit_code = bms.main()
+        finally:
+            tenant_paths._reset_review_db_paths_for_tests()
         assert exit_code == 0
         assert snapshot.exists()
 

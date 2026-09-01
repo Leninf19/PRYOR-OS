@@ -23,12 +23,15 @@ import html as _html
 import os
 import re
 import smtplib
+import sys
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
 import db
+import tenant_keys
+import tenant_paths
 from digest_filters import already_notified, is_meaningful_review, is_already_escalated, log_notification
 
 TO_ADDR = "advertising@l3amigos.com"
@@ -352,7 +355,12 @@ def send_email(subject, html):
         smtp.sendmail(FROM_ADDR, TO_ADDR, msg.as_string())
 
 
-def run(force: bool = False) -> dict:
+def run(tenant_id: str, force: bool = False) -> dict:
+    """Multi-Tenant Phase 4D revision: tenant_id is REQUIRED, no default.
+    Validated and resolved before any DB connection."""
+    tenant_keys.assert_valid_tenant_id(tenant_id, "nightly_digest.run")
+    db.DB_PATH = tenant_paths.resolve_review_db_path(tenant_id)
+
     conn = db.get_connection()
     db.init_schema(conn)
     print(f"[nightly_digest] stage=start force={force}")
@@ -422,8 +430,18 @@ def run(force: bool = False) -> dict:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="Bypass the 10pm ET hour gate (manual/test runs).")
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to check. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
     args = parser.parse_args()
-    result = run(force=args.force)
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::nightly_digest.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        result = run(args.tenant_id, force=args.force)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::nightly_digest.py: {e}")
+        sys.exit(1)
     print(f"nightly_digest.py: {result}")
 
 

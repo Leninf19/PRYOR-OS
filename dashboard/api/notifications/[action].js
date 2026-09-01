@@ -81,7 +81,7 @@ async function callerMayMarkKeyRead(key, account) {
 
   if (type === 'critical_review' || type === 'low_star_review' || type === 'reply_failed') {
     if (account.locationIds === '*') return true
-    const locationId = await resolveLocationIdForReview(id)
+    const locationId = await resolveLocationIdForReview(id, resolveTenantId(account))
     return locationId !== null && requireLocationAccess(account, locationId)
   }
   if (type === 'assigned_action') {

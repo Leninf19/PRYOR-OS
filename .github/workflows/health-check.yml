@@ -20,6 +20,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Multi-Tenant Phase 4D revision: check_db_integrity.py's --tenant-id
+    # is REQUIRED, no default. This single, reviewed, version-controlled
+    # value is this workflow's explicit statement of which tenant's review
+    # database it verifies before committing. health_check.py itself is
+    # not yet tenant-aware (see the Phase 4D report) -- it still operates
+    # against db.py's hardcoded default path, which for Los Tres Amigos is
+    # byte-for-byte the same file this TENANT_ID resolves to, so there is
+    # no behavior change for LTA today, but this must be revisited before
+    # a second tenant runs this workflow.
+    env:
+      TENANT_ID: t_los-tres-amigos
 
     steps:
       - name: Checkout repo
@@ -31,7 +42,7 @@ jobs:
           python-version: '3.11'
 
       - name: Run health check
-        run: python health_check.py
+        run: python health_check.py --tenant-id "$TENANT_ID"
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -39,7 +50,7 @@ jobs:
       - name: Verify database integrity before commit
         if: always()
         id: integrity
-        run: python check_db_integrity.py
+        run: python check_db_integrity.py --tenant-id "$TENANT_ID"
 
       - name: Commit notification log
         if: always() && steps.integrity.outcome == 'success'

@@ -1,23 +1,53 @@
 """
-One-time backfill: load dashboard/reviews.csv into dashboard/reviews.db.
+One-time backfill: load a tenant's reviews.csv into its reviews.db. This
+was the ORIGINAL bootstrap of dashboard/reviews.db itself, run once, years
+before the SQLite-first architecture (sync_reviews.py/gbp_sync.py) existed
+-- it has no ongoing operational role today (the database has been the
+source of truth ever since), is not invoked by any current workflow, and
+exists in the repo purely as a historical record of how the original
+database was created.
 
-Run once: python migrate_csv_to_sqlite.py
+Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED. Not classified as
+an inert/exempt migration (unlike, say, a completed Redis key migration)
+because it is still genuinely capable of writing to db.DB_PATH's real,
+tenant-owned review database if manually re-run -- it gets the same
+fail-closed treatment as every other production-capable entrypoint.
+
+Run once: python migrate_csv_to_sqlite.py --tenant-id t_los-tres-amigos
 Safe to re-run -- upsert_review() is idempotent per dedup_key, so re-running
 this after auto_update.py has already started dual-writing just re-confirms
 the same rows rather than duplicating them.
 """
+import argparse
 import csv
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import db
+import tenant_keys
+import tenant_paths
 from auto_update import LOCATIONS
 
 BASE_DIR = Path(__file__).parent
-REVIEWS_CSV = BASE_DIR / "dashboard" / "reviews.csv"
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose reviews.csv/reviews.db to backfill. REQUIRED -- "
+                              "no default. This script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::migrate_csv_to_sqlite.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        db.DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+        REVIEWS_CSV = tenant_paths.resolve_review_csv_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::migrate_csv_to_sqlite.py: {e}")
+        sys.exit(1)
+
     if not REVIEWS_CSV.exists():
         print(f"ERROR: {REVIEWS_CSV} not found")
         return

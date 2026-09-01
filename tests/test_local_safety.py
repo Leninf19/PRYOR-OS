@@ -189,20 +189,25 @@ def test_environment_guard_exact_override_value_works():
 
 
 def test_db_path_validation_accepts_expected_path():
+    # Multi-Tenant Phase 4D revision: ensure_expected_db_path()'s second
+    # argument is now the caller's own resolved expected path directly
+    # (e.g. tenant_paths.resolve_review_db_path(tenant_id)'s result), not a
+    # base directory this function derives dashboard/reviews.db from.
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
         expected = base / "dashboard" / "reviews.db"
         expected.parent.mkdir(parents=True)
         expected.touch()
-        local_safety.ensure_expected_db_path(expected, base)  # must not raise
+        local_safety.ensure_expected_db_path(expected, expected)  # must not raise
 
 
 def test_db_path_validation_rejects_unexpected_path():
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
         wrong = base / "somewhere-else.db"
+        expected = base / "dashboard" / "reviews.db"
         try:
-            local_safety.ensure_expected_db_path(wrong, base)
+            local_safety.ensure_expected_db_path(wrong, expected)
             raise AssertionError("must raise ValueError for an unexpected DB path")
         except ValueError:
             pass
