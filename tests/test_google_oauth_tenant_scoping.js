@@ -100,6 +100,24 @@ function fakeCredentialRedis(initial = {}) {
     get: async (key) => (key in store ? store[key] : null),
     set: async (key, value) => { store[key] = value },
     del: async (key) => { delete store[key] },
+    // Multi-Tenant Phase 4I.2: callback() now writes via
+    // setStoredCredentialIfVersion()'s CAS EVAL, not a plain set() --
+    // faithfully emulated here (single-threaded JS, so trivially atomic).
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [expectedVersionStr, nextJson] = args
+      const raw = key in store ? store[key] : null
+      let currentVersion = '0'
+      if (raw) {
+        try {
+          const decoded = JSON.parse(raw)
+          if (decoded && decoded.credentialVersion !== undefined) currentVersion = String(decoded.credentialVersion)
+        } catch { /* treat as version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return raw ?? false
+      store[key] = nextJson
+      return true
+    },
     _store: store,
   }
 }

@@ -94,6 +94,28 @@ function fakeKeyValueRedis() {
     get: async (key) => store[key] ?? null,
     set: async (key, value) => { store[key] = value },
     del: async (key) => { delete store[key] },
+    // Multi-Tenant Phase 4I.2 -- faithfully emulates
+    // credentialStore.js's CREDENTIAL_CAS_SCRIPT (GET/compare
+    // credentialVersion/SET) for setStoredCredentialIfVersion()/
+    // recordSyncOutcome()/recordOAuthRefresh(). A plain synchronous
+    // function body is trivially atomic with respect to any other code in
+    // this single-threaded test process, exactly as the real Lua script is
+    // atomic with respect to any other Redis client.
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [expectedVersionStr, nextJson] = args
+      const raw = key in store ? store[key] : null
+      let currentVersion = '0'
+      if (raw) {
+        try {
+          const decoded = JSON.parse(raw)
+          if (decoded && decoded.credentialVersion !== undefined) currentVersion = String(decoded.credentialVersion)
+        } catch { /* treat as version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return raw ?? false
+      store[key] = nextJson
+      return true
+    },
   }
 }
 
@@ -419,7 +441,7 @@ async function testForgedTenantIdCannotRedirectReconnect() {
 async function testStaleConcurrentReconnectCannotOverwriteNewerCredential() {
   wireSharedStores()
   await setupOwner(TENANT_A)
-  await commitTenant(TENANT_A, ['accounts/1/locations/A'])
+  const beforeConfig = await commitTenant(TENANT_A, ['accounts/1/locations/A'])
   await setStoredCredential(TENANT_A, { refreshToken: 'original-token', connectedAccountName: 'Original' })
 
   let injected = false
@@ -429,8 +451,12 @@ async function testStaleConcurrentReconnectCannotOverwriteNewerCredential() {
       if (!injected) {
         injected = true
         // Simulates a DIFFERENT, concurrent reconnect request completing
-        // entirely while THIS request's own token exchange is in flight --
-        // exactly the race the race-guard exists to catch.
+        // ENTIRELY (its own atomic credentialVersion CAS-write) while THIS
+        // request's own token exchange is in flight -- exactly the race
+        // credentialStore.js's CREDENTIAL_CAS_SCRIPT exists to catch. This
+        // request captured its own expectedCredentialVersion BEFORE this
+        // point, so its later CAS-write (below) is now built on a version
+        // that has already moved on.
         await setStoredCredential(TENANT_A, { refreshToken: 'concurrent-winner-token', connectedAccountName: 'Concurrent Winner' })
       }
       return { ok: true, status: 200, json: async () => ({ access_token: 'fake-access-token', refresh_token: 'stale-candidate-token', expires_in: 3600 }) }
@@ -445,9 +471,18 @@ async function testStaleConcurrentReconnectCannotOverwriteNewerCredential() {
   }
 
   const res = await connectViaCallback(TENANT_A)
-  assert(res.statusCode === 409, `a stale reconnect (its race-guard snapshot outdated by a concurrently-completed reconnect) must be rejected, got ${res.statusCode}`)
+  assert(res.statusCode === 409, `a stale reconnect (its captured credentialVersion superseded by a concurrently-completed reconnect) must be rejected atomically, got ${res.statusCode}`)
   const stored = await getStoredCredential(TENANT_A)
   assert(stored.refreshToken === 'concurrent-winner-token', 'the concurrently-completed, newer credential must remain in effect -- a stale attempt must never clobber it')
+
+  // The CAS conflict must never have touched entitlements or the stable
+  // location-id map -- the credential CAS and tenantConfigStore's own
+  // configVersion CAS are entirely separate mechanisms; a failure in one
+  // must never leave a mark in the other.
+  const afterConfig = await getTenantConfig(TENANT_A)
+  assert(JSON.stringify(afterConfig.approvedLocations) === JSON.stringify(beforeConfig.approvedLocations), 'a rejected (CAS-conflicting) reconnect must never mutate approvedLocations')
+  assert(JSON.stringify(afterConfig.locationIdMap) === JSON.stringify(beforeConfig.locationIdMap), 'a rejected (CAS-conflicting) reconnect must never mutate the stable locationIdMap')
+  assert(afterConfig.configVersion === beforeConfig.configVersion, 'a rejected (CAS-conflicting) reconnect must never write tenant_config at all')
 }
 
 // ===========================================================================

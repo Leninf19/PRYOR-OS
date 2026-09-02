@@ -29,7 +29,28 @@ process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xy
 
 function fakeCredentialRedis(initial = null) {
   let value = initial
-  return { get: async () => value, set: async (_key, v) => { value = v }, del: async () => { value = null } }
+  return {
+    get: async () => value,
+    set: async (_key, v) => { value = v },
+    del: async () => { value = null },
+    // Multi-Tenant Phase 4I.2: recordSyncOutcome()/recordOAuthRefresh() now
+    // write via a CAS EVAL, not a plain set() -- see credentialStore.js's
+    // CREDENTIAL_CAS_SCRIPT. Faithfully emulated here (single-threaded JS,
+    // so trivially atomic).
+    eval: async (_script, _keys, args) => {
+      const [expectedVersionStr, nextJson] = args
+      let currentVersion = '0'
+      if (value) {
+        try {
+          const decoded = JSON.parse(value)
+          if (decoded && decoded.credentialVersion !== undefined) currentVersion = String(decoded.credentialVersion)
+        } catch { /* treat as version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return value ?? false
+      value = nextJson
+      return true
+    },
+  }
 }
 const credentialClient = fakeCredentialRedis()
 setCredentialRedis(() => credentialClient) // same instance every call -- getClient() has no caching for the test-factory path

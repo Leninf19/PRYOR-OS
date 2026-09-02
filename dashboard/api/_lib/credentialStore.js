@@ -300,6 +300,57 @@ async function writeRaw(client, tenantId, record) {
   }
 }
 
+// --- Credential CAS (Multi-Tenant Phase 4I.2 concurrency closure) ---------
+// Every stored record carries `credentialVersion`, a monotonically
+// increasing integer bumped on every mutation (the credential-record
+// equivalent of tenantConfigStore.js's configVersion, and the SAME CAS
+// discipline -- a Lua script executed server-side via Redis EVAL, atomic
+// end to end, never a GET-then-compare-in-JS-then-SET). A never-connected
+// tenant's implicit version is 0 (mirrors tenantConfigStore's CAS_UPSERT_SCRIPT
+// treating a missing hash field the same way), so setStoredCredentialIfVersion()
+// below can express "install this candidate only if nothing has connected
+// since I last read this tenant's version" identically to "only if version N
+// is still current."
+//
+// WHY THIS WAS NECESSARY (not merely "narrowing a window"): a JS-level
+// read -> compare -> write, no matter how close together the read and write
+// are, still has a real gap two concurrent requests can land inside --
+// both can observe the same "current" state and then both proceed to write,
+// sequentially, with the second (chronologically) call silently overwriting
+// the first. Only pushing the compare-and-write into ONE atomic Redis
+// operation removes that gap entirely, the same reasoning tenantConfigStore.js's
+// own CAS_UPSERT_SCRIPT is built on.
+const CREDENTIAL_CAS_SCRIPT = `
+local raw = redis.call('GET', KEYS[1])
+local currentVersion = '0'
+if raw then
+  local ok, decoded = pcall(cjson.decode, raw)
+  if ok and decoded and decoded.credentialVersion then
+    currentVersion = tostring(decoded.credentialVersion)
+  end
+end
+if currentVersion ~= ARGV[1] then
+  return raw or false
+end
+redis.call('SET', KEYS[1], ARGV[2])
+return true
+`
+
+// Thrown by setStoredCredentialIfVersion() when the atomic version check
+// fails -- something else (a concurrently-completed reconnect, most likely)
+// wrote this tenant's credential after the caller captured expectedVersion.
+// Carries the CURRENT raw record (parsed from what the Lua script itself
+// read, the same atomic read used for the comparison -- never a second,
+// separate, racy GET), or null if the credential was deleted (disconnected)
+// in the interim. Never carries a decrypted token -- callers that need the
+// current state call getStoredCredential() themselves.
+export class CredentialVersionConflictError extends Error {
+  constructor(message, currentRecord) {
+    super(message)
+    this.currentRecord = currentRecord ?? null
+  }
+}
+
 // Returns the decrypted credential + all stored metadata, or null if this
 // tenant has never connected. Throws CredentialStoreUnavailableError if
 // Redis itself is unreachable/unconfigured (never silently reports "not
@@ -312,6 +363,8 @@ export async function getStoredCredential(tenantId) {
 
   const record = await readRaw(client, tenantId)
   if (!record) return null
+
+  const credentialVersion = Number.isInteger(record.credentialVersion) ? record.credentialVersion : 0
 
   let refreshToken = null
   if (record.refreshTokenCiphertext) {
@@ -326,7 +379,7 @@ export async function getStoredCredential(tenantId) {
       // caller -- surface it as an auth failure the dashboard can display
       // and recover from via reconnect, not an unhandled exception.
       console.error(`[credentialStore] failed to decrypt stored refresh token: ${err.message}`)
-      return { ...record, refreshToken: null, health: GoogleHealth.AUTH_FAILED, lastFailureReason: 'decryption_failed' }
+      return { ...record, refreshToken: null, health: GoogleHealth.AUTH_FAILED, lastFailureReason: 'decryption_failed', credentialVersion }
     }
   }
 
@@ -339,21 +392,14 @@ export async function getStoredCredential(tenantId) {
     lastFailedSyncAt: record.lastFailedSyncAt ?? null,
     lastFailureReason: record.lastFailureReason ?? null,
     health: record.health ?? GoogleHealth.CONNECTED,
+    credentialVersion,
   }
 }
 
-// Writes a brand-new connection (Connect/Reconnect) for `tenantId` --
-// always supersedes whatever was there before FOR THAT TENANT ONLY,
-// resetting failure state, since a successful OAuth round trip proves the
-// new token is good right now. Never touches any other tenant's key.
-export async function setStoredCredential(tenantId, { refreshToken, connectedAccountName }) {
-  assertValidTenantId(tenantId, 'setStoredCredential')
-  const client = getClient()
-  if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
-
+function buildFreshRecord({ refreshToken, connectedAccountName }, credentialVersion) {
   const { ciphertext, iv, authTag } = encrypt(refreshToken)
   const now = new Date().toISOString()
-  await writeRaw(client, tenantId, {
+  return {
     refreshTokenCiphertext: ciphertext,
     refreshTokenIv: iv,
     refreshTokenAuthTag: authTag,
@@ -364,7 +410,79 @@ export async function setStoredCredential(tenantId, { refreshToken, connectedAcc
     lastFailedSyncAt: null,
     lastFailureReason: null,
     health: GoogleHealth.CONNECTED,
-  })
+    credentialVersion,
+  }
+}
+
+// Writes a brand-new connection UNCONDITIONALLY -- always supersedes
+// whatever was there before FOR THAT TENANT ONLY, resetting failure state,
+// since a successful OAuth round trip proves the new token is good right
+// now. Never touches any other tenant's key.
+//
+// Multi-Tenant Phase 4I.2: no LONGER the production Connect/Reconnect write
+// path -- google/[action].js's callback() uses setStoredCredentialIfVersion()
+// below exclusively, so a reconnect can never race another reconnect for
+// the same tenant. This plain, unconditional form remains exported for
+// test fixtures and any future one-shot seeding use (it still correctly
+// stamps credentialVersion, incrementing from whatever was there, so a
+// record it creates is fully compatible with a subsequent CAS call against
+// it) but production code no longer calls it as of this phase.
+export async function setStoredCredential(tenantId, { refreshToken, connectedAccountName }) {
+  assertValidTenantId(tenantId, 'setStoredCredential')
+  const client = getClient()
+  if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
+
+  const existing = await readRaw(client, tenantId)
+  const nextVersion = (Number.isInteger(existing?.credentialVersion) ? existing.credentialVersion : 0) + 1
+  await writeRaw(client, tenantId, buildFreshRecord({ refreshToken, connectedAccountName }, nextVersion))
+}
+
+// THE production Connect/Reconnect write path (Multi-Tenant Phase 4I.2).
+// Installs a brand-new connection ONLY IF this tenant's credential is still
+// at exactly `expectedVersion` -- checked and applied in ONE atomic Redis
+// EVAL, never as a separate read-then-write pair. Throws
+// CredentialVersionConflictError (fail closed, no retry -- see this file's
+// header) if the version has moved on: another reconnect for this SAME
+// tenant completed between the caller capturing expectedVersion and this
+// call. The caller (google/[action].js's callback()) must NOT retry
+// automatically on this error -- the user explicitly reconnects again if
+// they still want to.
+//
+// expectedVersion 0 means "install only if nothing has ever connected, or
+// the tenant's credential is still at its NEVER-EXPLICITLY-VERSIONED
+// baseline" -- mirrors getStoredCredential()'s own `?? 0` default for a
+// missing/legacy record, so a first-ever connect (captured expectedVersion
+// via getStoredCredential() returning null, i.e. version 0) and a genuine
+// version-0 record behave identically.
+export async function setStoredCredentialIfVersion(tenantId, { refreshToken, connectedAccountName }, expectedVersion) {
+  assertValidTenantId(tenantId, 'setStoredCredentialIfVersion')
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+    throw new TypeError('setStoredCredentialIfVersion: expectedVersion must be a non-negative integer')
+  }
+  const client = getClient()
+  if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
+
+  const next = buildFreshRecord({ refreshToken, connectedAccountName }, expectedVersion + 1)
+
+  let evalResult
+  try {
+    evalResult = await client.eval(CREDENTIAL_CAS_SCRIPT, [resolveCredentialKey(tenantId)], [String(expectedVersion), JSON.stringify(next)])
+  } catch (err) {
+    throw new CredentialStoreUnavailableError(`credential store unreachable: ${err.message}`)
+  }
+  if (evalResult !== true && evalResult !== 1) {
+    // The script's own atomic check failed (a writer -- almost certainly a
+    // concurrent reconnect for this same tenant -- committed between our
+    // caller's read and this EVAL) -- evalResult is the CURRENT raw record
+    // the script itself read, or false/null if the credential was deleted
+    // (disconnected) in the interim.
+    const currentRecord = typeof evalResult === 'string' ? parseRecord(evalResult) : null
+    throw new CredentialVersionConflictError(
+      `setStoredCredentialIfVersion: version conflict for tenant ${JSON.stringify(tenantId)} -- expected ${expectedVersion}, credential has moved on`,
+      currentRecord,
+    )
+  }
+  return { credentialVersion: next.credentialVersion }
 }
 
 // Records the outcome of any live Google API interaction that exercises
@@ -375,6 +493,20 @@ export async function setStoredCredential(tenantId, { refreshToken, connectedAcc
 // for THIS tenant reflects "Reconnect Required" immediately, never
 // waiting for a separate user-initiated check. Never affects any other
 // tenant's stored health.
+//
+// Multi-Tenant Phase 4I.2: this is a read-then-write, same shape as
+// before, but the write is now a CAS against the version this call itself
+// just read -- if a reconnect for this SAME tenant completes in the gap
+// between that read and this write, the CAS fails and this update is
+// SILENTLY SKIPPED rather than retried or forced through. This is a
+// deliberate, safe trade-off: without the CAS, this call would otherwise
+// write back the ENTIRE previously-read record (a stale, whole-object
+// read-modify-write) with only its own field changed -- silently
+// resurrecting the OLD encrypted refresh token over a credential a
+// reconnect just replaced. Losing one observability timestamp to a
+// genuine race is acceptable; reverting a newer credential to an older one
+// is not. Never throws on a conflict -- every existing call site treats
+// this as fire-and-forget and must keep doing so.
 export async function recordSyncOutcome(tenantId, { success, reason, errorDescription } = {}) {
   assertValidTenantId(tenantId, 'recordSyncOutcome')
   const client = getClient()
@@ -382,18 +514,25 @@ export async function recordSyncOutcome(tenantId, { success, reason, errorDescri
 
   const record = await readRaw(client, tenantId)
   if (!record) return // nothing connected for this tenant to update
+  const currentVersion = Number.isInteger(record.credentialVersion) ? record.credentialVersion : 0
 
   const now = new Date().toISOString()
+  const next = { ...record, credentialVersion: currentVersion + 1 }
   if (success) {
-    record.lastSuccessfulSyncAt = now
-    record.lastFailureReason = null
-    record.health = GoogleHealth.CONNECTED
+    next.lastSuccessfulSyncAt = now
+    next.lastFailureReason = null
+    next.health = GoogleHealth.CONNECTED
   } else {
-    record.lastFailedSyncAt = now
-    record.lastFailureReason = reason ?? 'unknown'
-    record.health = healthForFailure(reason, errorDescription)
+    next.lastFailedSyncAt = now
+    next.lastFailureReason = reason ?? 'unknown'
+    next.health = healthForFailure(reason, errorDescription)
   }
-  await writeRaw(client, tenantId, record)
+
+  try {
+    await client.eval(CREDENTIAL_CAS_SCRIPT, [resolveCredentialKey(tenantId)], [String(currentVersion), JSON.stringify(next)])
+  } catch (err) {
+    throw new CredentialStoreUnavailableError(`credential store unreachable: ${err.message}`)
+  }
 }
 
 // Records a successful access-token exchange (a refresh actually happened)
@@ -401,6 +540,11 @@ export async function recordSyncOutcome(tenantId, { success, reason, errorDescri
 // that token succeeded -- "Last OAuth Refresh" tracks token minting, "Last
 // Successful Sync"/"Last Failed Sync" (recordSyncOutcome above) track what
 // was DONE with it. Never affects any other tenant's record.
+//
+// Multi-Tenant Phase 4I.2: same CAS-protected, silently-skip-on-conflict
+// discipline as recordSyncOutcome() above, and for the identical reason --
+// a stale refresh-token-exchange record must never revert a newer
+// reconnect's credential.
 export async function recordOAuthRefresh(tenantId) {
   assertValidTenantId(tenantId, 'recordOAuthRefresh')
   const client = getClient()
@@ -408,8 +552,14 @@ export async function recordOAuthRefresh(tenantId) {
 
   const record = await readRaw(client, tenantId)
   if (!record) return
-  record.lastOAuthRefreshAt = new Date().toISOString()
-  await writeRaw(client, tenantId, record)
+  const currentVersion = Number.isInteger(record.credentialVersion) ? record.credentialVersion : 0
+  const next = { ...record, lastOAuthRefreshAt: new Date().toISOString(), credentialVersion: currentVersion + 1 }
+
+  try {
+    await client.eval(CREDENTIAL_CAS_SCRIPT, [resolveCredentialKey(tenantId)], [String(currentVersion), JSON.stringify(next)])
+  } catch (err) {
+    throw new CredentialStoreUnavailableError(`credential store unreachable: ${err.message}`)
+  }
 }
 
 // Disconnect -- genuine removal, not a soft "disabled" flag; a fresh
@@ -417,6 +567,29 @@ export async function recordOAuthRefresh(tenantId) {
 // Deletes ONLY `tenantId`'s own authoritative key (v1 for a LEGACY-mode
 // tenant, its own v2 key otherwise) -- structurally cannot reach, and
 // never touches, any other tenant's credential.
+//
+// Multi-Tenant Phase 4I.2 -- DISCONNECT vs. RECONNECT RACE, DEFINED: this
+// is deliberately NOT version-gated -- Disconnect is an explicit user
+// action ("remove Google access now") that must always win outright
+// against whatever credential currently exists, never conditioned on a
+// version it didn't capture. The two possible orderings against a
+// concurrent reconnect are both already safe by construction, with no
+// extra code needed here:
+//   Reconnect completes, THEN Disconnect runs -- the key is deleted
+//     unconditionally; final state is "not connected," exactly what
+//     clicking Disconnect means, regardless of how recently a reconnect
+//     finished.
+//   Disconnect runs, THEN Reconnect's OWN CAS-write executes -- the
+//     reconnect captured its expectedVersion BEFORE the disconnect
+//     happened, so setStoredCredentialIfVersion()'s atomic check finds no
+//     record at the expected version (or no record at all) and throws
+//     CredentialVersionConflictError, exactly as it would for any other
+//     concurrent write. The reconnect is rejected as "connection changed,"
+//     the user reconnects again, and that fresh attempt reads reality (no
+//     credential) and proceeds as a genuine first-time connect.
+// Both outcomes are deterministic and safe; only reconnect-vs-reconnect
+// needed a version to compare against, since only that case can otherwise
+// silently choose the "wrong" (chronologically earlier) winner.
 export async function clearStoredCredential(tenantId) {
   assertValidTenantId(tenantId, 'clearStoredCredential')
   const client = getClient()

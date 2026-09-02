@@ -31,8 +31,8 @@ import { Permission, roleHasPermission } from '../_lib/permissions.js'
 import { resolveLocationIdForReview, resolveLocationIdForReviewOrDeny } from '../_lib/reviewLocationIndex.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import {
-  getStoredCredential, setStoredCredential, recordSyncOutcome, recordOAuthRefresh,
-  clearStoredCredential, GoogleHealth, CredentialStoreUnavailableError,
+  getStoredCredential, setStoredCredentialIfVersion, recordSyncOutcome, recordOAuthRefresh,
+  clearStoredCredential, GoogleHealth, CredentialStoreUnavailableError, CredentialVersionConflictError,
   isQuotaExceededError, extractQuotaProjectNumber,
 } from '../_lib/credentialStore.js'
 import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
@@ -276,25 +276,23 @@ async function callback(req, res) {
   const host        = req.headers['x-forwarded-host'] || req.headers.host
   const redirectUri = `${proto}://${host}/api/google/callback`
 
-  // Multi-Tenant Phase 4I.2 -- RACE GUARD, captured now, BEFORE the token
-  // exchange and every Google round trip below: a snapshot of what this
-  // tenant's stored credential's `connectedAt` currently is (null if never
-  // connected). Re-checked immediately before this attempt is ever allowed
-  // to persist (see the end of this function) -- if it has changed by
-  // then, some OTHER reconnect for this SAME tenant completed in between,
-  // and THIS attempt (which started its own external round trips against
-  // an OLDER snapshot of the world) must never overwrite that newer result
-  // purely because it happens to finish second. credentialStore.js has no
-  // per-write CAS of its own; this narrows the unguarded race window from
-  // "this whole function's several-second external round trip" down to
-  // "the few Redis operations between the re-check and the write," reusing
-  // data the store already records rather than adding new schema.
-  // Fail closed if we can't even read current state -- proceeding blind
-  // would defeat the guard's whole purpose.
-  let raceGuardConnectedAt
+  // Multi-Tenant Phase 4I.2 -- expectedCredentialVersion, captured now,
+  // BEFORE the token exchange and every Google round trip below: this
+  // tenant's current credentialVersion (0 if never connected). Passed to
+  // setStoredCredentialIfVersion() at the end of this function, which
+  // checks it and applies the write in ONE ATOMIC Redis operation --
+  // credentialStore.js's own CAS discipline (mirroring
+  // tenantConfigStore.js's configVersion), not a JS-level read-then-compare-
+  // then-write. A read-then-compare-in-JS-then-write ALWAYS has a gap two
+  // concurrent requests can both observe the same state inside, no matter
+  // how small that gap is narrowed; only pushing the compare into the same
+  // atomic operation as the write removes it entirely. Fail closed if we
+  // can't even read current state -- proceeding blind would defeat the
+  // whole point of capturing a version to check against.
+  let expectedCredentialVersion
   try {
     const currentCredentialBeforeExchange = await getStoredCredential(verifiedTenantId)
-    raceGuardConnectedAt = currentCredentialBeforeExchange?.connectedAt ?? null
+    expectedCredentialVersion = currentCredentialBeforeExchange?.credentialVersion ?? 0
   } catch (err) {
     return res.status(503).send(page('Connection temporarily unavailable', `
       <p>Could not read this tenant's current Google connection state: <strong>${err instanceof CredentialStoreUnavailableError ? 'the credential store is temporarily unavailable' : err.message}</strong></p>
@@ -434,39 +432,38 @@ async function callback(req, res) {
     }
   }
 
-  // Multi-Tenant Phase 4I.2 -- RACE GUARD re-check, immediately before the
-  // only write in this whole function. If another reconnect for this SAME
-  // tenant completed anywhere between the snapshot captured above and now,
-  // that newer result must win -- this attempt (built on stale state) is
-  // discarded rather than clobbering it, regardless of which HTTP request
-  // happens to reach this line first.
   try {
-    const currentCredentialBeforeWrite = await getStoredCredential(verifiedTenantId)
-    if ((currentCredentialBeforeWrite?.connectedAt ?? null) !== raceGuardConnectedAt) {
+    // Multi-Tenant Phase 4A/4C: verifiedTenantId came from the
+    // just-validated OAuth state (never re-derived from anything else at
+    // this point) and is the ONLY tenant this write can ever target.
+    // setStoredCredentialIfVersion() resolves the physical key via the same
+    // LEGACY/CUTOVER migration mode credentialStore.js's reads use --
+    // gbp_credentials:v1 for the one tenant explicitly pinned to LEGACY
+    // (Los Tres Amigos, to stay in sync with the Python background
+    // pipeline), gbp_credentials:v2:{tenantId} for every other tenant.
+    //
+    // Multi-Tenant Phase 4I.2: this single call both CHECKS
+    // expectedCredentialVersion and WRITES the candidate, atomically, in
+    // one Redis EVAL -- no separate re-check step exists anymore because
+    // none is needed; the atomicity IS the guarantee. On a version
+    // conflict this throws CredentialVersionConflictError below instead of
+    // writing anything, and this function does NOT retry -- a stale
+    // candidate is discarded outright, never automatically re-attempted;
+    // the user explicitly reconnects again if they still want to.
+    await setStoredCredentialIfVersion(verifiedTenantId, { refreshToken: tokens.refresh_token, connectedAccountName }, expectedCredentialVersion)
+  } catch (err) {
+    if (err instanceof CredentialVersionConflictError) {
+      await appendAuditEntry(verifiedTenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'google_oauth', entityId: null, action: 'google.reconnect_rejected_stale_version', changes: { expectedCredentialVersion }, result: 'denied',
+        message: `Reconnect rejected: this tenant's Google connection changed while this request was being processed (expected credential version ${expectedCredentialVersion}). Nothing further was changed by this request.`,
+      })
       return res.status(409).send(page('Connection changed', `
         <p>This tenant's Google connection was updated by another request while this one was being processed.</p>
         <p style="color:#16a34a">The most recent connection is the one now in effect; nothing further has been changed by this request.</p>
         <p><a href="/settings/google">← Back to Settings</a></p>
       `))
     }
-  } catch (err) {
-    return res.status(503).send(page('Connection temporarily unavailable', `
-      <p>Could not confirm this tenant's current connection state: <strong>${err instanceof CredentialStoreUnavailableError ? 'the credential store is temporarily unavailable' : err.message}</strong></p>
-      <p>Please try again shortly.</p>
-    `))
-  }
-
-  try {
-    // Multi-Tenant Phase 4A/4C: verifiedTenantId came from the
-    // just-validated OAuth state (never re-derived from anything else at
-    // this point) and is the ONLY tenant this write can ever target.
-    // setStoredCredential() resolves the physical key via the same
-    // LEGACY/CUTOVER migration mode credentialStore.js's reads use --
-    // gbp_credentials:v1 for the one tenant explicitly pinned to LEGACY
-    // (Los Tres Amigos, to stay in sync with the Python background
-    // pipeline), gbp_credentials:v2:{tenantId} for every other tenant.
-    await setStoredCredential(verifiedTenantId, { refreshToken: tokens.refresh_token, connectedAccountName })
-  } catch (err) {
     // The refresh token is NEVER displayed, logged, or put in a URL even
     // on this failure path -- `tokens` goes out of scope when this
     // function returns and is not persisted anywhere else.

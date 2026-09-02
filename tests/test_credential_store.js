@@ -68,6 +68,26 @@ function fakeRedis(initial = {}) {
     get: async (key) => (key in store ? store[key] : null),
     set: async (key, value) => { store[key] = value },
     del: async (key) => { delete store[key] },
+    // Multi-Tenant Phase 4I.2: faithfully emulates CREDENTIAL_CAS_SCRIPT's
+    // GET/compare-credentialVersion/SET logic -- correct because a plain
+    // synchronous JS function body is trivially atomic with respect to any
+    // other code in this single-threaded test process, exactly like the
+    // real Lua script is atomic with respect to any other Redis client.
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [expectedVersionStr, nextJson] = args
+      const raw = key in store ? store[key] : null
+      let currentVersion = '0'
+      if (raw) {
+        try {
+          const decoded = JSON.parse(raw)
+          if (decoded && decoded.credentialVersion !== undefined) currentVersion = String(decoded.credentialVersion)
+        } catch { /* malformed stored value -- treat as version 0, same as the real script */ }
+      }
+      if (currentVersion !== expectedVersionStr) return raw ?? false
+      store[key] = nextJson
+      return true
+    },
     _store: store,
   }
 }
