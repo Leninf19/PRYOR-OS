@@ -13,10 +13,8 @@
 // Same fs.readFile-at-request-time pattern reviewLocationIndex.js/data.js
 // already use, cached in-module per warm serverless instance.
 
-import { readFile } from 'fs/promises'
-import path from 'path'
 import { resolveLocationIdForReview } from './reviewLocationIndex.js'
-import { resolvePrivateDataRoot } from './reviewDataPaths.js'
+import { readPrivateDataFile } from './reviewDataPaths.js'
 
 // Multi-Tenant Phase 4D: metaCache is now keyed per tenantId -- before this
 // fix it was a single, shared module-level value, meaning a Tenant B
@@ -39,8 +37,7 @@ async function loadMeta(tenantId) {
   if (metaCacheByTenant.has(tenantId)) return metaCacheByTenant.get(tenantId)
   let meta
   try {
-    const root = resolvePrivateDataRoot(tenantId)
-    const raw = await readFile(path.join(root, 'meta.json'), 'utf-8')
+    const raw = await readPrivateDataFile(tenantId, 'meta.json')
     meta = JSON.parse(raw)
   } catch (err) {
     console.error(`[reviewAssignmentProgress] could not load meta.json for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
@@ -53,8 +50,7 @@ async function loadMeta(tenantId) {
 async function loadReviewsForLocation(tenantId, locationId, slug) {
   if (testOverrides) return testOverrides.reviewsByLocationId?.[locationId] ?? []
   try {
-    const root = resolvePrivateDataRoot(tenantId)
-    const raw = await readFile(path.join(root, 'reviews', 'by-location', `${slug}.json`), 'utf-8')
+    const raw = await readPrivateDataFile(tenantId, `reviews/by-location/${slug}.json`)
     return JSON.parse(raw)
   } catch {
     return []

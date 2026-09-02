@@ -1,0 +1,18 @@
+{
+  "description": "Multi-Tenant Phase 4F.1 -- the canonical Blob key layout for a BLOB-mode tenant's durable storage. Both dashboard/api/_lib/tenantBlobKeys.js (Node) and tenant_blob_keys.py (Python) must compute the LITERAL SAME keys from the same tenantId -- this fixture is the shared contract both languages' test suites validate their own formula against.",
+  "exampleTenantId": "t_example-restaurant",
+  "expected": {
+    "tenantBlobRoot": "tenant-data/t_example-restaurant",
+    "reviewDbBlobKey": "tenant-data/t_example-restaurant/reviews.db",
+    "privateDataPrefix": "tenant-data/t_example-restaurant/private-data/",
+    "privateDataBlobKeys": {
+      "meta.json": "tenant-data/t_example-restaurant/private-data/meta.json",
+      "action-items.json": "tenant-data/t_example-restaurant/private-data/action-items.json",
+      "gbp-sync.json": "tenant-data/t_example-restaurant/private-data/gbp-sync.json",
+      "_internal/review-location-index.json": "tenant-data/t_example-restaurant/private-data/_internal/review-location-index.json",
+      "reviews/by-location/casa-tequila-prime.json": "tenant-data/t_example-restaurant/private-data/reviews/by-location/casa-tequila-prime.json"
+    }
+  },
+  "invalidRelPaths": ["", "../escape.json", "a/../b.json", "a/./b.json", "/absolute.json"],
+  "notes": "relPath validation is defense-in-depth only -- the primary guard against a malformed relPath is each caller's own allowlist (e.g. data.js's buildRequestedRelPath())."
+}

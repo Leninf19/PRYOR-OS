@@ -35,7 +35,7 @@ import {
 } from '../dashboard/api/_lib/tenants.js'
 import { _setRedisClientForTests as setUserRedis, _resetRedisClientForTests as resetUserRedis } from '../dashboard/api/_lib/userStore.js'
 import { setStoredCredential, _setRedisClientForTests as setCredentialRedis, _resetRedisClientForTests as resetCredentialRedis } from '../dashboard/api/_lib/credentialStore.js'
-import { getTenantConfig, upsertTenantConfig, _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis } from '../dashboard/api/_lib/tenantConfigStore.js'
+import { getTenantConfig, upsertTenantConfig, markTenantProvisioned, _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis } from '../dashboard/api/_lib/tenantConfigStore.js'
 import { createDiscoverySession, _setRedisClientForTests as setDiscoveryRedis, _resetRedisClientForTests as resetDiscoveryRedis } from '../dashboard/api/_lib/locationDiscoveryStore.js'
 
 const TENANT_B = 't_synthetic-activation-tenant'
@@ -223,10 +223,34 @@ async function testTenantCanBecomeCatalogEnabledWithoutSourceChange() {
   assert(approveRes.statusCode === 200, `approve-locations must succeed, got ${approveRes.statusCode} ${JSON.stringify(approveRes.body)}`)
   assert(approveRes.body.activatedLocationCount === 1, 'exactly one location must be recorded as activated')
 
-  // No _setLocationCatalogRegistryForTests call anywhere in this test --
-  // this is entirely a runtime/Redis-backed activation, exactly what a
-  // real deploy with zero source changes would produce.
-  assert(await ownsCatalog(TENANT_B), 'TENANT_B must now own a location catalog, purely from runtime state')
+  // Multi-Tenant Phase 4F: approval alone reaches 'locations_approved', not
+  // 'active' -- a tenant must not appear ready merely because Google
+  // locations were approved (see tenants.js's tenantOwnsLocationCatalog()).
+  assert(!(await ownsCatalog(TENANT_B)), 'approval alone must NOT yet grant catalog ownership -- provisioning is a separate, later step')
+  const configAfterApproval = await getTenantConfig(TENANT_B)
+  assert(configAfterApproval.status === 'locations_approved', `expected status 'locations_approved' after approval, got ${configAfterApproval.status}`)
+
+  // Simulates provision_tenant.py (Python) completing successfully -- the
+  // real provisioning logic and its own adversarial suite live in
+  // tests/test_provision_tenant.py; this file only proves the Node-side
+  // activation transaction feeds it correctly.
+  await markTenantProvisioned(TENANT_B, {
+    reviewDbBlobKey: 'tenant-data/t_synthetic-activation-tenant/reviews.db',
+    privateDataPrefix: 'tenant-data/t_synthetic-activation-tenant/private-data/',
+    provisionedLocationIds: [1],
+  })
+  // Multi-Tenant Phase 4F closure: successful provisioning alone still
+  // must NOT grant catalog ownership -- 'provisioned' is a distinct status
+  // from 'active', reserved for Phase 4G's (not yet built) Initial Sync
+  // completion. See test_provisioned_not_active.js for the dedicated suite.
+  assert(!(await ownsCatalog(TENANT_B)), 'a successfully provisioned but not-yet-synced tenant must NOT yet own its catalog')
+  const configAfterProvisioning = await getTenantConfig(TENANT_B)
+  assert(configAfterProvisioning.status === 'provisioned', `expected status 'provisioned' after successful provisioning, got ${configAfterProvisioning.status}`)
+
+  // Simulates Phase 4G's (not yet built) Initial Sync completion -- the
+  // only path allowed to write 'active'.
+  await upsertTenantConfig(TENANT_B, { status: 'active' })
+  assert(await ownsCatalog(TENANT_B), 'TENANT_B must own a location catalog once genuinely active, purely from runtime state, no source-code edit anywhere in this flow')
 
   const config = await getTenantConfig(TENANT_B)
   assert(config.status === 'active' && config.locationCatalogEnabled === true, 'the persisted tenant config record must reflect activation')
@@ -300,7 +324,8 @@ async function testForgedTenantIdCannotActivateAnotherTenant() {
   assert(approveRes.statusCode === 200, `Tenant B's own legitimate approval must still succeed despite the forged fields, got ${approveRes.statusCode}`)
   assert(approveRes.body.tenantId === TENANT_B, 'activation must be recorded against the AUTHENTICATED tenant, never the forged one')
 
-  assert(await ownsCatalog(TENANT_B), 'TENANT_B must be the one actually activated')
+  const tenantBConfig = await getTenantConfig(TENANT_B)
+  assert(tenantBConfig.status === 'locations_approved', 'TENANT_B must be the one whose approval was actually recorded')
   const ltaConfig = await getTenantConfig(DEFAULT_TENANT_ID)
   assert(ltaConfig === null, 'Los Tres Amigos\'s config record must be completely untouched by a forged tenantId in Tenant B\'s request')
 }
@@ -400,6 +425,17 @@ async function testActivationDoesNotGrantAccessBeyondApprovedLocations() {
   const approveRes = await approve(tokenB, { discoverySessionId: discoverB.body.discoverySessionId, selectedGoogleLocationIds: [approvedId] })
   assert(approveRes.statusCode === 200, 'sanity: activation must succeed')
 
+  // Simulates provision_tenant.py (Python) completing successfully, THEN
+  // Phase 4G's (not yet built) Initial Sync completion -- this test is
+  // about the ACCESS-SCOPE boundary once a tenant is truly active, not
+  // about the provisioning-vs-active distinction itself (see
+  // test_provisioned_not_active.js/test_provision_tenant.py for that).
+  await markTenantProvisioned(TENANT_B, {
+    reviewDbBlobKey: 'tenant-data/t_synthetic-activation-tenant/reviews.db',
+    privateDataPrefix: 'tenant-data/t_synthetic-activation-tenant/private-data/',
+    provisionedLocationIds: [1],
+  })
+  await upsertTenantConfig(TENANT_B, { status: 'active' })
   assert(await ownsCatalog(TENANT_B), 'sanity: the tenant now owns a catalog')
 
   // Activation flips the TENANT-level gate open -- it must never act as a

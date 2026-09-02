@@ -35,7 +35,7 @@ import {
   _resetLocationCatalogRegistryForTests,
 } from '../dashboard/api/_lib/tenants.js'
 import {
-  activateLocationCatalog, upsertTenantConfig,
+  recordLocationApproval, upsertTenantConfig, markTenantProvisioned,
   _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis,
 } from '../dashboard/api/_lib/tenantConfigStore.js'
 
@@ -121,11 +121,24 @@ function wireConfigRedis() {
   return client
 }
 
+// Multi-Tenant Phase 4F closure: recordLocationApproval() reaches
+// 'locations_approved', markTenantProvisioned() reaches 'provisioned' --
+// neither is 'active' (see tenantConfigStore.js's isValidStatus()). This
+// helper also simulates Phase 4G's (not yet built) Initial Sync
+// completion directly, since this file's tests are about concurrency of
+// the authorization snapshot for a genuinely active tenant, not about the
+// provisioning-vs-active distinction itself.
 async function activateWithApprovedCount(tenantId, count) {
   const selectedLocations = Array.from({ length: count }, (_, i) => ({
     googleLocationId: `accounts/${tenantId}/locations/${i + 1}`, title: `Location ${i + 1}`, address: '',
   }))
-  await activateLocationCatalog(tenantId, selectedLocations)
+  const config = await recordLocationApproval(tenantId, selectedLocations)
+  await markTenantProvisioned(tenantId, {
+    reviewDbBlobKey: `tenant-data/${tenantId}/reviews.db`,
+    privateDataPrefix: `tenant-data/${tenantId}/private-data/`,
+    provisionedLocationIds: config.approvedLocations.map(l => l.locationId),
+  })
+  await upsertTenantConfig(tenantId, { status: 'active' })
 }
 
 // ===========================================================================
@@ -136,7 +149,13 @@ async function activateWithApprovedCount(tenantId, count) {
 async function testOlderActiveReadFinishingLateCannotRestoreAuthorization() {
   const gated = makeGatedHashRedis()
   setConfigRedis(() => gated.client)
-  await activateLocationCatalog(TENANT_A, [{ googleLocationId: 'accounts/x/locations/1', title: 'X', address: '' }])
+  await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/x/locations/1', title: 'X', address: '' }])
+  await markTenantProvisioned(TENANT_A, {
+    reviewDbBlobKey: 'tenant-data/t_synthetic-concurrency-tenant-a/reviews.db',
+    privateDataPrefix: 'tenant-data/t_synthetic-concurrency-tenant-a/private-data/',
+    provisionedLocationIds: [1],
+  })
+  await upsertTenantConfig(TENANT_A, { status: 'active' }) // simulates Phase 4G's Initial Sync completion
 
   // Arm the gate, then start the OLDER resolve -- its hget() call captures
   // today's "active" value immediately but will not RETURN until we open

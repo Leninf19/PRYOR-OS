@@ -42,7 +42,7 @@ import {
 import { recordReplyFailure, clearReplyFailure } from '../_lib/notificationStore.js'
 import { resolveTenantId, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
 import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDiscoveryStore.js'
-import { activateLocationCatalog } from '../_lib/tenantConfigStore.js'
+import { recordLocationApproval } from '../_lib/tenantConfigStore.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -1442,7 +1442,7 @@ async function approveLocations(req, res) {
   }
 
   // Numeric locationId assignment is NOT done here -- tenantConfigStore.js's
-  // activateLocationCatalog() reconciles against this tenant's own
+  // recordLocationApproval() reconciles against this tenant's own
   // persistent googleLocationId -> localLocationId map (locationIdMap) and
   // monotonic nextLocationId counter, so a location keeps the same stable
   // id across re-approvals regardless of array order or which other
@@ -1454,7 +1454,7 @@ async function approveLocations(req, res) {
 
   let config
   try {
-    config = await activateLocationCatalog(tenantId, selectedLocations)
+    config = await recordLocationApproval(tenantId, selectedLocations)
   } catch {
     return res.status(503).json({ error: 'service_unavailable', message: 'Could not activate the location catalog. Please try again shortly.' })
   }

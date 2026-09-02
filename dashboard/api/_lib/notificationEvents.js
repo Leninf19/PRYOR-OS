@@ -17,8 +17,6 @@
 // division of labor dashboard/api/data.js already has with
 // reviewLocationIndex.js.
 
-import { readFile } from 'fs/promises'
-import path from 'path'
 import { requireLocationAccess, isWildcardGrant } from './auth.js'
 import { getAllActions, ActionStoreUnavailableError } from './actionStore.js'
 import { getStoredCredential } from './credentialStore.js'
@@ -26,7 +24,7 @@ import { listReplyFailures } from './notificationStore.js'
 import { getAllTasks, TaskStoreUnavailableError } from './taskStore.js'
 import { getAllCampaigns, CampaignStoreUnavailableError } from './campaignStore.js'
 import { resolveTenantId } from './tenants.js'
-import { resolvePrivateDataRoot } from './reviewDataPaths.js'
+import { readPrivateDataFile } from './reviewDataPaths.js'
 
 // Review-based notifications only ever look back this far -- see the
 // milestone report for the retention rationale (30 days, matching the
@@ -76,8 +74,7 @@ async function readJsonFile(tenantId, relPath) {
       : null
   }
   try {
-    const root = resolvePrivateDataRoot(tenantId)
-    const raw = await readFile(path.join(root, relPath), 'utf-8')
+    const raw = await readPrivateDataFile(tenantId, relPath)
     return JSON.parse(raw)
   } catch {
     return null

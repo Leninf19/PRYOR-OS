@@ -1,0 +1,38 @@
+{
+  "description": "Multi-Tenant Phase 4F (revised in Phase 4F.1 for Blob-backed storage) -- the canonical tenant_config:v1 record shape. Both dashboard/api/_lib/tenantConfigStore.js (Node) and tenant_config_store.py (Python) write and read the literal SAME Upstash Redis hash; this fixture is the shared contract both languages' test suites (tests/test_tenant_config_store.js and tests/test_tenant_config_store.py) validate their own default-producing function against, so the two can never silently drift apart without a test failing on whichever side changed.",
+  "topLevelFields": [
+    "tenantId", "displayName", "status", "locationCatalogEnabled",
+    "approvedLocations", "locationIdMap", "nextLocationId",
+    "brands", "logoUrl", "storageMode", "provisioning", "configVersion", "createdAt", "updatedAt"
+  ],
+  "provisioningFields": [
+    "status", "reviewDbBlobKey", "privateDataPrefix", "reviewDbEtag",
+    "provisionedLocationIds", "lastAttemptAt", "lastError"
+  ],
+  "validStatuses": [
+    "onboarding", "locations_approved", "provisioning", "provisioned",
+    "active", "provisioning_failed", "suspended"
+  ],
+  "validStorageModes": ["LEGACY_REPO", "BLOB"],
+  "validProvisioningStatuses": ["none", "in_progress", "provisioned", "failed"],
+  "defaultValues": {
+    "status": "onboarding",
+    "locationCatalogEnabled": false,
+    "approvedLocations": [],
+    "locationIdMap": {},
+    "nextLocationId": 1,
+    "brands": [],
+    "logoUrl": null,
+    "storageMode": "BLOB",
+    "provisioning": {
+      "status": "none",
+      "reviewDbBlobKey": null,
+      "privateDataPrefix": null,
+      "reviewDbEtag": null,
+      "provisionedLocationIds": [],
+      "lastAttemptAt": null,
+      "lastError": null
+    }
+  },
+  "notes": "configVersion starts at 1 after the first write (0 means 'no record exists yet') and is not listed in defaultValues because its value depends on write count, not a fixed default -- see each language's own upsert function. storageMode defaults to 'BLOB' because every tenant getting its FIRST record via either language's upsert function is a new, self-service tenant -- the only architecture new tenants are provisioned under (Phase 4F.1). LEGACY_REPO is reserved for Los Tres Amigos's pre-existing, git-committed/bundled data and is never assigned by either language's default-record logic."
+}

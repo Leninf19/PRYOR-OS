@@ -25,11 +25,9 @@
 // minutes -- re-reading it on every single request would be pure waste on
 // a warm Lambda). A cold start or a fresh deploy always re-reads.
 
-import { readFile } from 'fs/promises'
-import path from 'path'
 import { isWildcardGrant } from './auth.js'
 import { resolveTenantId } from './tenants.js'
-import { resolvePrivateDataRoot } from './reviewDataPaths.js'
+import { readPrivateDataFile } from './reviewDataPaths.js'
 
 // Multi-Tenant Phase 4D: the index path and its cache are now PER TENANT --
 // before this fix, both were single, shared, module-level values, meaning
@@ -41,10 +39,6 @@ import { resolvePrivateDataRoot } from './reviewDataPaths.js'
 // index.
 const cacheByTenant = new Map()
 let testOverride = null
-
-function indexPathFor(tenantId) {
-  return path.join(resolvePrivateDataRoot(tenantId), '_internal', 'review-location-index.json')
-}
 
 // Test-only seam -- lets tests inject a fixed index without touching the
 // real filesystem path, same pattern settings/[action].js's
@@ -63,8 +57,7 @@ async function loadIndex(tenantId) {
   if (cacheByTenant.has(tenantId)) return cacheByTenant.get(tenantId)
   let index
   try {
-    const indexPath = indexPathFor(tenantId)
-    const raw = await readFile(indexPath, 'utf-8')
+    const raw = await readPrivateDataFile(tenantId, '_internal/review-location-index.json')
     index = JSON.parse(raw)
   } catch (err) {
     // Missing/corrupted index (including an UnknownTenantError from an

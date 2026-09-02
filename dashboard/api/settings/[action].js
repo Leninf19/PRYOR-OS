@@ -32,8 +32,6 @@
 // POST /api/settings/disable-user           -- immediate; blocked for the last active Owner
 // POST /api/settings/enable-user            -- re-enable a disabled account
 
-import { readFile } from 'fs/promises'
-import path from 'path'
 import { requireAuth, requireScopedAuth } from '../_lib/auth.js'
 import { roleHasPermission, Permission } from '../_lib/permissions.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
@@ -42,7 +40,7 @@ import {
 } from '../_lib/contactStore.js'
 import { appendAuditEntry, listAuditEntries, clientIp, AuditLogUnavailableError } from '../_lib/auditLog.js'
 import { resolveTenantId } from '../_lib/tenants.js'
-import { resolvePrivateDataRoot } from '../_lib/reviewDataPaths.js'
+import { readPrivateDataFile } from '../_lib/reviewDataPaths.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
 import { getAccountByEmail, getAccountById, listAccounts } from '../_lib/accountStore.js'
@@ -111,8 +109,7 @@ function isPlainObject(v) {
 async function resolveLocationNames(tenantId, locationIds) {
   if (locationIds === '*' || !Array.isArray(locationIds)) return []
   try {
-    const metaPath = path.join(resolvePrivateDataRoot(tenantId), 'meta.json')
-    const meta = metaOverride ?? JSON.parse(await readFile(metaPath, 'utf-8'))
+    const meta = metaOverride ?? JSON.parse(await readPrivateDataFile(tenantId, 'meta.json'))
     const byId = new Map((meta.locations ?? []).map(l => [l.locationId, l.name]))
     return locationIds.map(id => byId.get(id)).filter(Boolean)
   } catch {
@@ -369,8 +366,7 @@ async function backfillContactsFromLegacyAction(req, res) {
   let legacy = legacyContactsOverride
   if (legacy === null) {
     try {
-      const legacyContactsPath = path.join(resolvePrivateDataRoot(tenantId), 'location-contacts.json')
-      legacy = JSON.parse(await readFile(legacyContactsPath, 'utf-8'))
+      legacy = JSON.parse(await readPrivateDataFile(tenantId, 'location-contacts.json'))
     } catch {
       legacy = {}
     }
@@ -378,8 +374,7 @@ async function backfillContactsFromLegacyAction(req, res) {
   let meta = metaOverride
   if (meta === null) {
     try {
-      const metaPath = path.join(resolvePrivateDataRoot(tenantId), 'meta.json')
-      meta = JSON.parse(await readFile(metaPath, 'utf-8'))
+      meta = JSON.parse(await readPrivateDataFile(tenantId, 'meta.json'))
     } catch {
       meta = { locations: [] }
     }

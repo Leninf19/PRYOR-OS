@@ -39,7 +39,7 @@ import {
   _resetLocationCatalogRegistryForTests,
 } from '../dashboard/api/_lib/tenants.js'
 import {
-  activateLocationCatalog, upsertTenantConfig,
+  recordLocationApproval, upsertTenantConfig, markTenantProvisioned,
   _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis,
 } from '../dashboard/api/_lib/tenantConfigStore.js'
 
@@ -86,16 +86,36 @@ function wireConfigRedis() {
 
 // Activates tenantId with N synthetic Google-discovered locations. Since
 // each test uses a FRESH tenant (no prior approval), tenantConfigStore.js's
-// reconciliation (see activateLocationCatalog()) assigns stable ids 1..N in
+// reconciliation (see recordLocationApproval()) assigns stable ids 1..N in
 // encounter order -- the same result a hand-assigned sequential scheme
 // would produce for a first-ever approval, but arrived at via the real,
 // persistent googleLocationId -> localLocationId mechanism, not array
 // position.
+// Multi-Tenant Phase 4F: recordLocationApproval() alone only reaches
+// 'locations_approved' -- this helper ALSO simulates provision_tenant.py
+// (Python) completing successfully, since this file's tests are about the
+// ownership/status boundary once a tenant is genuinely active, not about
+// the approval transaction itself (test_tenant_location_catalog_activation.js)
+// or the provisioning script (test_provision_tenant.py).
+// Multi-Tenant Phase 4F closure: markTenantProvisioned() now only reaches
+// 'provisioned' (successful filesystem/DB creation), never 'active' --
+// Phase 4G's (not yet built) Initial Sync completion is the only path
+// allowed to write 'active'. This helper simulates that future step
+// directly, since this file's tests are about the ownership/status
+// boundary once a tenant is genuinely operational, not about the
+// provisioning-vs-active distinction itself (see
+// test_provisioned_not_active.js for that).
 async function activateWithApprovedCount(tenantId, count) {
   const selectedLocations = Array.from({ length: count }, (_, i) => ({
     googleLocationId: `accounts/${tenantId}/locations/${i + 1}`, title: `Location ${i + 1}`, address: '',
   }))
-  await activateLocationCatalog(tenantId, selectedLocations)
+  const config = await recordLocationApproval(tenantId, selectedLocations)
+  await markTenantProvisioned(tenantId, {
+    reviewDbBlobKey: `tenant-data/${tenantId}/reviews.db`,
+    privateDataPrefix: `tenant-data/${tenantId}/private-data/`,
+    provisionedLocationIds: config.approvedLocations.map(l => l.locationId),
+  })
+  await upsertTenantConfig(tenantId, { status: 'active' }) // simulates Phase 4G's Initial Sync completion
 }
 
 async function wildcardAccount(tenantId) {

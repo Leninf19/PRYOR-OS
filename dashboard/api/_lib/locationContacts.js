@@ -21,10 +21,8 @@
 // in dashboard/vercel.json (already added) -- Vercel's static dependency
 // tracer cannot discover a fs.readFile path built at request time.
 
-import { readFile } from 'fs/promises'
-import path from 'path'
 import { getContact as getRedisContact, ContactStoreUnavailableError } from './contactStore.js'
-import { resolvePrivateDataRoot } from './reviewDataPaths.js'
+import { readPrivateDataFile } from './reviewDataPaths.js'
 
 // Multi-Tenant Phase 4D: keyed per tenantId -- before this fix this was a
 // single, shared module-level cache read from a single hardcoded path,
@@ -36,8 +34,7 @@ async function getLegacyContact(tenantId, locationId) {
   if (!legacyCacheByTenant.has(tenantId)) {
     let contacts
     try {
-      const contactsPath = path.join(resolvePrivateDataRoot(tenantId), 'location-contacts.json')
-      contacts = JSON.parse(await readFile(contactsPath, 'utf-8'))
+      contacts = JSON.parse(await readPrivateDataFile(tenantId, 'location-contacts.json'))
     } catch {
       contacts = {}
     }

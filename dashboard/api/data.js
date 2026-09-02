@@ -40,11 +40,9 @@
 // dashboard/private-data/** included in this function's deployment bundle.
 // Do not assume runtime fs access "just works" without that entry.
 
-import { readFile } from 'fs/promises'
-import path from 'path'
 import { requireAuth, requireLocationAccess, isWildcardGrant } from './_lib/auth.js'
 import { resolveTenantId } from './_lib/tenants.js'
-import { resolvePrivateDataRoot, UnknownTenantError } from './_lib/reviewDataPaths.js'
+import { readPrivateDataFile, UnknownTenantError } from './_lib/reviewDataPaths.js'
 
 // Every static file export_chunks.py writes (see its main()/export_* calls).
 const EXACT_ALLOWLIST = new Set([
@@ -137,12 +135,12 @@ export function _resetMetaLocationsForTests() {
 // independent of isAllowed()/EXACT_ALLOWLIST -- meta.json is always
 // allowlisted for every role, so this never bypasses anything the
 // allowlist itself wouldn't already permit.
-async function loadMetaLocations(tenantId, privateRoot) {
+async function loadMetaLocations(tenantId) {
   if (metaLocationsTestOverride !== null) return metaLocationsTestOverride
   if (metaLocationsCacheByTenant.has(tenantId)) return metaLocationsCacheByTenant.get(tenantId)
   let locations
   try {
-    const raw = await readFile(path.join(privateRoot, 'meta.json'), 'utf-8')
+    const raw = await readPrivateDataFile(tenantId, 'meta.json')
     locations = JSON.parse(raw).locations ?? []
   } catch (err) {
     console.error(`[api/data] could not load meta.json for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
@@ -152,8 +150,8 @@ async function loadMetaLocations(tenantId, privateRoot) {
   return locations
 }
 
-async function resolveLocationIdForSlug(tenantId, privateRoot, slug) {
-  const locations = await loadMetaLocations(tenantId, privateRoot)
+async function resolveLocationIdForSlug(tenantId, slug) {
+  const locations = await loadMetaLocations(tenantId)
   const match = locations.find(l => l.slug === slug)
   return match ? match.locationId : null
 }
@@ -191,25 +189,15 @@ export default async function handler(req, res) {
   const account = await requireAuth(req, res, null)
   if (!account) return
 
-  // Multi-Tenant Phase 4D: tenantId is derived EXCLUSIVELY from the
+  // Multi-Tenant Phase 4D/4F.1: tenantId is derived EXCLUSIVELY from the
   // authenticated, server-side account -- never from req.query/req.body/
-  // any header. The private-data root is then resolved through the
-  // server-controlled registry (reviewDataPaths.js), never built from
-  // caller input. A tenant with no registered private-data root (missing/
-  // unknown/unconfigured) fails closed with 404 here, before the
-  // filesystem is ever touched -- it can never fall through to another
-  // tenant's (e.g. Los Tres Amigos's) directory.
+  // any header. The file is then read through the server-controlled
+  // resolver (reviewDataPaths.js's readPrivateDataFile(), which branches on
+  // storage mode internally), never a path/key built from caller input. A
+  // tenant with no registered/operational private-data storage fails
+  // closed with 404 here, before any read is attempted -- it can never
+  // fall through to another tenant's (e.g. Los Tres Amigos's) data.
   const tenantId = resolveTenantId(account)
-  let privateRoot
-  try {
-    privateRoot = resolvePrivateDataRoot(tenantId)
-  } catch (err) {
-    if (err instanceof UnknownTenantError) {
-      console.error(`[api/data] ${err.message}`)
-      return res.status(404).json({ error: 'not_found' })
-    }
-    throw err
-  }
 
   const relPath = buildRequestedRelPath(req.query.file)
   if (!relPath || !isAllowed(relPath)) {
@@ -224,7 +212,7 @@ export default async function handler(req, res) {
     }
     if (category === 'per-location') {
       const slug = extractSlugFromRelPath(relPath)
-      requestedLocationId = await resolveLocationIdForSlug(tenantId, privateRoot, slug)
+      requestedLocationId = await resolveLocationIdForSlug(tenantId, slug)
       if (requestedLocationId === null || !requireLocationAccess(account, requestedLocationId)) {
         // Existence-hiding, matching the frozen §6 error contract every
         // other location-scope check in this codebase uses -- never 403
@@ -235,27 +223,17 @@ export default async function handler(req, res) {
     // category === 'meta' falls through -- read + filtered after parsing.
   }
 
-  const resolved = path.resolve(privateRoot, relPath)
-  // Defense in depth, not the primary check -- the allowlist above already
-  // guarantees this, but a future edit to the allowlist regexes shouldn't
-  // be able to silently escape this tenant's own privateRoot without this
-  // also catching it.
-  if (resolved !== privateRoot && !resolved.startsWith(privateRoot + path.sep)) {
-    return res.status(404).json({ error: 'not_found' })
-  }
-
   let raw
   try {
-    raw = await readFile(resolved, 'utf-8')
+    raw = await readPrivateDataFile(tenantId, relPath)
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if (err instanceof UnknownTenantError || err.code === 'ENOENT') {
       // Legitimate empty state for files that only exist once a given
       // pipeline stage has run at least once (e.g. gbp-sync.json before
-      // the first API sync), OR a genuinely missing bundled artifact
-      // (export_chunks.py never generated it, or a vercel.json
-      // includeFiles misconfiguration left it out of the deployment) --
-      // callers already treat 404 as "not yet generated", not a hard
-      // error, and the response never distinguishes the two causes.
+      // the first API sync), a genuinely missing bundled/uploaded artifact,
+      // or an unknown/unprovisioned tenant -- callers already treat 404 as
+      // "not yet generated", not a hard error, and the response never
+      // distinguishes the causes.
       return res.status(404).json({ error: 'not_found' })
     }
     console.error(`[api/data] failed to read ${relPath}: ${err.message}`)

@@ -324,7 +324,7 @@ export function resolveBootstrapTenantId() {
 //     catalog (tenantConfigStore.js's approvedLocations, written by
 //     google/[action].js's approveLocations() via a STABLE, persistent
 //     googleLocationId -> localLocationId mapping -- see
-//     tenantConfigStore.js's activateLocationCatalog() for how ids never
+//     tenantConfigStore.js's recordLocationApproval() for how ids never
 //     drift or get reassigned across a re-approval)
 // requireLocationAccess() (below) requires BOTH of these AND the account's
 // own locationIds grant -- a location id or a wildcard grant alone can
@@ -538,7 +538,7 @@ export function tenantOwnsLocationCatalog(tenantId, authz) {
 // check against; this preserves its current, unconstrained behavior. For a
 // REDIS_ONLY tenant, ownership requires the id to appear in the STABLE
 // numeric locationId list recorded on that tenant's own config record
-// (see tenantConfigStore.js's activateLocationCatalog() for the persistent
+// (see tenantConfigStore.js's recordLocationApproval() for the persistent
 // googleLocationId -> localLocationId mapping that makes these ids never
 // drift across a re-approval) -- a location id existing in a reviews.db
 // row, or in another tenant's approvedLocations (even the identical
