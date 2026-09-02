@@ -454,6 +454,48 @@ export async function upsertTenantConfig(tenantId, patch, { expectedVersion } = 
 // (tenants.js) until provision_tenant.py (Python) successfully creates and
 // verifies that tenant's reviews.db/private-data root and calls
 // markTenantProvisioned() below.
+//
+// Multi-Tenant Phase 4I.1 -- ELIGIBILITY GATE (entitlement boundary): this
+// function REPLACES `approvedLocations` wholesale with whatever
+// `selectedLocations` contains -- correct for onboarding (where there is no
+// prior commercial commitment to protect), but if called again on a tenant
+// that has already started provisioning, it would let the caller (Owner-only
+// authenticated at google/[action].js's approveLocations()) silently
+// re-select an entirely different set of Google locations and have them
+// become the tenant's approved/licensed catalog -- exactly the "Google
+// authorization determines PRYOR access" conflation this phase exists to
+// prevent, and exactly the "Tenant Owner unilaterally expands their own
+// entitlement" path the phase's audit flagged as the one real gap in an
+// otherwise-correct authorization design (tenantOwnsLocation()/
+// requireLocationAccess() already correctly gate all DATA access on
+// whatever this array currently holds; nothing there stops this array
+// itself from being rewritten). LOCATION_APPROVAL_ELIGIBLE_STATUSES is
+// exactly the set of statuses that exist BEFORE any durable resource
+// (Blob storage, reviews.db, a published artifact generation) has been
+// provisioned against the current approvedLocations -- 'onboarding' (no
+// record yet, or approval never completed) and 'locations_approved' (an
+// approval exists but provisioning has not yet started, so revising the
+// selection before that happens is still just finishing onboarding, not
+// changing a live entitlement). A tenant in ANY OTHER status --
+// 'provisioning', 'provisioning_failed', 'provisioned', 'initial_sync',
+// 'initial_sync_failed', 'active', 'suspended' -- has already committed
+// durable resources and/or gone live against its current approvedLocations;
+// self-service re-approval is refused (LocationApprovalNotEligibleError,
+// fail closed) rather than silently accepted. There is deliberately no
+// super-admin bypass parameter here: per this phase's explicit scope, no
+// safe platform-super-admin mutation path is being built in this phase
+// either (see the Phase 4I.1 report) -- changing an already-committed
+// tenant's approved locations is intentionally left with NO mutation path
+// at all until a future, separately reviewed phase builds one.
+const LOCATION_APPROVAL_ELIGIBLE_STATUSES = new Set(['onboarding', 'locations_approved'])
+
+export class LocationApprovalNotEligibleError extends Error {
+  constructor(message, currentStatus) {
+    super(message)
+    this.currentStatus = currentStatus ?? null
+  }
+}
+
 export async function recordLocationApproval(tenantId, selectedLocations) {
   if (!Array.isArray(selectedLocations) || selectedLocations.length === 0) {
     throw new TypeError('recordLocationApproval: selectedLocations must be a non-empty array')
@@ -463,6 +505,12 @@ export async function recordLocationApproval(tenantId, selectedLocations) {
   }
 
   const existing = await getTenantConfig(tenantId)
+  if (existing && !LOCATION_APPROVAL_ELIGIBLE_STATUSES.has(existing.status)) {
+    throw new LocationApprovalNotEligibleError(
+      `recordLocationApproval: tenant ${tenantId} has status ${JSON.stringify(existing.status)} -- the location catalog can only be self-service (re-)approved during onboarding, before provisioning begins. Once a tenant has started provisioning, its approved locations are a committed entitlement and this endpoint cannot change them.`,
+      existing.status
+    )
+  }
   const locationIdMap = { ...(existing?.locationIdMap ?? {}) }
   let nextLocationId = Number.isInteger(existing?.nextLocationId) && existing.nextLocationId >= 1 ? existing.nextLocationId : 1
 

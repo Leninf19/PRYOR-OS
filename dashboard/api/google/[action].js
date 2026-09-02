@@ -42,7 +42,7 @@ import {
 import { recordReplyFailure, clearReplyFailure } from '../_lib/notificationStore.js'
 import { resolveTenantId, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
 import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDiscoveryStore.js'
-import { recordLocationApproval } from '../_lib/tenantConfigStore.js'
+import { recordLocationApproval, LocationApprovalNotEligibleError } from '../_lib/tenantConfigStore.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -1455,7 +1455,26 @@ async function approveLocations(req, res) {
   let config
   try {
     config = await recordLocationApproval(tenantId, selectedLocations)
-  } catch {
+  } catch (err) {
+    if (err instanceof LocationApprovalNotEligibleError) {
+      // Multi-Tenant Phase 4I.1: this tenant already has a committed
+      // entitlement (provisioning has started or completed) -- self-service
+      // re-approval is refused, fail closed, rather than silently replacing
+      // the tenant's approved/licensed location set. Logged as a denied
+      // privileged operation, same audit trail as a successful approval,
+      // so an unexpected wave of these is visible to whoever reviews
+      // tenant_audit_log -- never a token, credential, or raw Google
+      // response body, only the status/tenantId/actor already safe to log.
+      await appendAuditEntry(tenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'tenant_location_catalog', entityId: tenantId, action: 'location_catalog.approval_denied_not_eligible', changes: null, result: 'denied',
+        message: `Self-service location re-approval was denied: tenant status is ${JSON.stringify(err.currentStatus)}.`,
+      })
+      return res.status(409).json({
+        error: 'not_eligible',
+        message: 'This tenant\'s location catalog is already committed and can no longer be changed from Settings. Contact support to change approved locations.',
+      })
+    }
     return res.status(503).json({ error: 'service_unavailable', message: 'Could not activate the location catalog. Please try again shortly.' })
   }
 
