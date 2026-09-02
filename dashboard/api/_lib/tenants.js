@@ -16,6 +16,8 @@
 // self-service onboarding) gets a generated ID; this one is hand-assigned
 // once, here, and never regenerated.
 
+import { getTenantConfig, TenantConfigStoreUnavailableError } from './tenantConfigStore.js'
+
 export const DEFAULT_TENANT_ID = 't_los-tres-amigos'
 
 // --- Tenant -----------------------------------------------------------
@@ -308,23 +310,243 @@ export function resolveBootstrapTenantId() {
   return DEFAULT_TENANT_ID
 }
 
-// --- Tenant location catalog ownership (Multi-Tenant Phase 3) -----------
-// Every location this deployment knows about (dashboard/private-data's
-// meta.json and everything keyed off it -- reviews, per-location
-// intelligence, the review-to-location internal index) belongs to
-// DEFAULT_TENANT_ID: it is a single shared filesystem export, not a
-// Redis store partitioned by tenantId the way the 9 stores Phase 2
-// tenantized are. Phase 3 onboards no second tenant, so no location data
-// exists anywhere for any other tenantId. This is the explicit,
-// centralized statement of that fact -- any location-authorization check
-// (see auth.js's requireLocationAccess/isWildcardGrant) MUST consult this
-// before trusting an account's own locationIds grant, so a hypothetical
-// future or synthetic tenant can never be authorized against a location
-// that doesn't actually belong to it, even if its grant is '*' or an
-// explicit array that happens to numerically collide with a Los Tres
-// Amigos locationId. When a second tenant is actually onboarded (a later,
-// separately reviewed phase, once per-tenant location data exists), this
-// function -- not each call site -- is what will change.
-export function tenantOwnsLocationCatalog(tenantId) {
-  return tenantId === DEFAULT_TENANT_ID
+// --- Tenant location catalog ownership (Multi-Tenant Phase 4E, closure) --
+// Every location this deployment knows about lives under a tenant's own
+// filesystem export (dashboard/api/_lib/reviewDataPaths.js's per-tenant
+// private-data root, Phase 4D) and its own SQLite file (tenant_paths.py's
+// per-tenant reviews.db, also Phase 4D) -- reviews, per-location
+// intelligence, and the review-to-location internal index are all already
+// physically partitioned by tenant. Two separate questions build on that:
+//   tenantOwnsLocationCatalog(tenantId, authz)  -- is this TENANT active
+//     and activated at all (tenantConfigStore.js's status/locationCatalogEnabled)
+//   tenantOwnsLocation(tenantId, locationId, authz) -- does this SPECIFIC
+//     numeric location id actually belong to that tenant's own approved
+//     catalog (tenantConfigStore.js's approvedLocations, written by
+//     google/[action].js's approveLocations() via a STABLE, persistent
+//     googleLocationId -> localLocationId mapping -- see
+//     tenantConfigStore.js's activateLocationCatalog() for how ids never
+//     drift or get reassigned across a re-approval)
+// requireLocationAccess() (below) requires BOTH of these AND the account's
+// own locationIds grant -- a location id or a wildcard grant alone can
+// never establish ownership; only tenantOwnsLocation() can, and it is
+// never satisfied merely because a numeric id happens to already exist in
+// a reviews.db row somewhere (this project does not trust the future
+// review database's contents as a tenant boundary -- authorization
+// enforces ownership itself, from tenantConfigStore's own record).
+//
+// `authz` -- A REQUEST-BOUND AUTHORIZATION SNAPSHOT, NOT SHARED STATE
+// (final review closure): earlier revisions cached this same
+// {status, locationCatalogEnabled, approvedLocationIds} shape in a
+// process-global `Map` keyed by tenantId, "primed" once per request. That
+// was REJECTED on review: two concurrent requests for the SAME tenant can
+// interleave their own async work around the prime-then-read pair (a
+// rate-limit check, a credential-store read, anything else the handler
+// `await`s in between), so a slower, chronologically OLDER request's write
+// to that shared Map could still land AFTER a newer request's write and
+// silently clobber it -- an older "active" read finishing after a newer
+// "suspended" read could resurrect stale authorization for whichever
+// request (even a third, unrelated one) reads the Map next. A Map keyed by
+// tenantId is genuinely shared, persistent, cross-request module state; it
+// does not become "request-scoped" merely because each request happens to
+// write it right before reading it back.
+//
+// The fix: resolveLocationCatalogAuthz(tenantId) (below) is a pure
+// function that RETURNS a fresh, frozen snapshot object -- it writes to
+// NOTHING shared. auth.js's evaluateSession() calls it once per
+// authenticated request and attaches the result directly onto that
+// request's own, freshly-constructed account object (toSafeAccount()),
+// exactly how `tenantId` itself is already attached -- never into any
+// structure a second request could read or overwrite. tenantOwnsLocationCatalog()/
+// tenantOwnsLocation() take that snapshot as an explicit parameter and
+// consult NOTHING else; requireLocationAccess()/isWildcardGrant() read it
+// off `account.locationCatalogAuthz` (the same account object every
+// production call site already has in hand) and pass it through. Two
+// concurrent requests -- for the same tenant or different ones -- now
+// literally cannot interact: each holds its own snapshot object, on its
+// own account object, with no shared mutable location for one to clobber
+// the other's. See test_tenant_location_catalog_concurrency.js for the
+// adversarial proof (deliberately interleaved/delayed resolves, mutation
+// attempts on one snapshot checked against another, a failing resolve
+// racing a succeeding one).
+//
+// The client can never supply or influence this snapshot: it is built
+// exclusively from resolveTenantId(account) (server-derived, Phase 3) and
+// a fresh tenantConfigStore.js read keyed by that same server-derived
+// tenantId -- toSafeAccount() below never spreads or otherwise copies
+// arbitrary fields from the raw account record or from request input into
+// the safe account shape it returns.
+//
+// SYNC/ASYNC SEAM: every call site of these functions (auth.js and its 7
+// production callers -- data.js, google/[action].js, actions/[action].js,
+// tasks/[action].js, notifications/[action].js, reviewLocationIndex.js,
+// notificationEvents.js) stays synchronous by design and by now-extensive
+// precedent (test_authorization_matrix.js and test_permissions.js alone
+// have dozens of synchronous assertions against these functions) --
+// converting all of them to async would be a large, invasive change to
+// frozen regression baselines for a benefit this design achieves without
+// it. The one, single async step (the tenantConfigStore.js read) happens
+// exactly once per request, inside evaluateSession(), before any
+// synchronous authorization function is ever reached.
+//
+// TENANT STATUS SEMANTICS: a tenant owns its location catalog if and only
+// if status === 'active' AND locationCatalogEnabled === true, both read
+// fresh into the SAME snapshot on every resolve. A suspended tenant
+// (status: 'suspended') is denied even though locationCatalogEnabled may
+// still be true on the stored record -- suspension is a superseding
+// state, not a field that must be separately cleared. An 'onboarding'
+// tenant (approve-locations not yet completed) is denied. Any malformed
+// record (a status other than the three known values, or a non-boolean
+// locationCatalogEnabled) fails closed via plain strict equality -- there
+// is no separate "is this well-formed" pre-check because none is needed:
+// `status === 'active'` and `=== true` are already false for anything
+// that isn't exactly right.
+//
+// MIGRATION MODE (unchanged from the prior revision -- still explicit,
+// still not inferred from Redis contents): every tenant is in exactly one
+// reviewed LocationCatalogMigrationMode --
+//   BOOTSTRAP    -- ignores tenantConfigStore.js ENTIRELY; always owns its
+//                   catalog and every location id, unconditionally. Not a
+//                   fallback for "no record yet" -- a tenant in this mode
+//                   never consults Redis for this decision AT ALL, whether
+//                   or not a record exists, whether or not Redis is
+//                   reachable, whether or not a record exists that says
+//                   otherwise. This is what makes it a MODE, not a
+//                   fallback: Redis contents can never override it, and no
+//                   automatic transition out of it is possible.
+//   REDIS_ONLY   -- the real, self-service path: status/locationCatalogEnabled/
+//                   approvedLocations are read fresh from tenantConfigStore.js
+//                   on every resolve; missing, deleted, malformed, or
+//                   unreadable (Redis outage) config ALL fail closed to
+//                   false, with no fallback of any kind.
+// TENANT_LOCATION_CATALOG_MODE_REGISTRY below is the ONLY place a mode is
+// assigned, and it is a plain object literal committed with the
+// application -- not inferred, not defaulted from Redis state, not
+// changeable at runtime. Los Tres Amigos is the one tenant explicitly
+// registered as BOOTSTRAP today, preserving its current unconstrained
+// behavior without writing production Redis. Every other tenant --
+// including every future self-service tenant, which is never listed here
+// at all -- is REDIS_ONLY by construction (the lookup below defaults to
+// REDIS_ONLY for anything not explicitly registered as BOOTSTRAP), which
+// is exactly what keeps self-service onboarding free of any source change.
+//
+// THE FUTURE LTA MIGRATION (not performed by this or any prior phase) is,
+// in order: (1) create a verified, correct tenant_config record for
+// t_los-tres-amigos in production Redis (reflecting its real, existing
+// locations as approvedLocations); (2) change its entry below from
+// BOOTSTRAP to REDIS_ONLY, as its own separately reviewed code change;
+// (3) deploy that code+config transition together; (4) verify LTA's
+// production behavior is unchanged post-deploy; (5) once confident, delete
+// the BOOTSTRAP branch and TENANT_LOCATION_CATALOG_MODE_REGISTRY entirely,
+// since REDIS_ONLY-for-everyone is the only mode that should exist
+// long-term. There is no automatic transition between modes anywhere in
+// this file -- every step above is a deliberate, reviewed, deployed change.
+export const LocationCatalogMigrationMode = Object.freeze({
+  BOOTSTRAP:   'bootstrap',
+  REDIS_ONLY:  'redis_only',
+})
+
+const TENANT_LOCATION_CATALOG_MODE_REGISTRY = Object.freeze({
+  [DEFAULT_TENANT_ID]: LocationCatalogMigrationMode.BOOTSTRAP,
+})
+
+function locationCatalogModeFor(tenantId) {
+  return TENANT_LOCATION_CATALOG_MODE_REGISTRY[tenantId] ?? LocationCatalogMigrationMode.REDIS_ONLY
+}
+
+// Test-only seam, mirroring reviewDataPaths.js's _setPrivateDataRootForTests
+// -- lets a test register a synthetic tenant as owning a location catalog
+// AND every location id under it, directly (bypassing tenantConfigStore.js/
+// Redis and the migration-mode distinction entirely), without touching
+// production state. Existing tests written against earlier Phase 4E
+// passes use this exact seam and continue to pass unchanged. This is the
+// ONLY module-level mutable state left in this file for this feature, and
+// it is exclusively a test double, never consulted by, or reachable from,
+// any production request path (production code never calls the
+// `_set.../_reset...` pair below).
+let testRegistryOverride = null
+
+export function _setLocationCatalogRegistryForTests(tenantIds) {
+  testRegistryOverride = new Set(tenantIds)
+}
+
+export function _resetLocationCatalogRegistryForTests() {
+  testRegistryOverride = null
+}
+
+// Resolves a FRESH, FROZEN, request-scoped authorization snapshot for
+// tenantId -- called by auth.js's evaluateSession() exactly once per
+// authenticated request, immediately after the account's tenant has been
+// verified (never before -- an unverified/mismatched tenant claim must
+// never reach even a Redis read keyed by it), and attached directly onto
+// that request's own account object. Returns null for an invalid tenantId
+// or for a BOOTSTRAP-mode tenant (nothing to resolve -- see
+// tenantOwnsLocationCatalog()/tenantOwnsLocation() below, which answer
+// unconditionally for BOOTSTRAP without ever consulting a snapshot, which
+// is also what keeps this from ever issuing a Redis read for Los Tres
+// Amigos, let alone a write). Writes to NO shared variable of any kind --
+// every call produces an independent object; two concurrent calls (same
+// tenant or different) can never observe or influence each other's result.
+export async function resolveLocationCatalogAuthz(tenantId) {
+  if (typeof tenantId !== 'string' || !isValidTenantId(tenantId)) return null
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return null
+
+  let config = null
+  try {
+    config = await getTenantConfig(tenantId)
+  } catch (err) {
+    console.error(`[tenants] could not read tenant config for ${JSON.stringify(tenantId)}: ${err instanceof TenantConfigStoreUnavailableError ? err.message : err}`)
+    // REDIS_ONLY fails closed on a genuine store outage too -- there is no
+    // mode this tenant could fall back into.
+    return Object.freeze({ tenantId, status: null, locationCatalogEnabled: false, approvedLocationIds: [] })
+  }
+  if (config === null) {
+    // No tenant_config record exists (never created, or deleted) --
+    // REDIS_ONLY tenants fail closed.
+    return Object.freeze({ tenantId, status: null, locationCatalogEnabled: false, approvedLocationIds: [] })
+  }
+  return Object.freeze({
+    tenantId,
+    status: config.status,
+    locationCatalogEnabled: config.locationCatalogEnabled,
+    approvedLocationIds: Object.freeze(
+      Array.isArray(config.approvedLocations)
+        ? config.approvedLocations.map(l => l?.locationId).filter(id => Number.isInteger(id))
+        : []
+    ),
+  })
+}
+
+// `authz` must be the snapshot resolveLocationCatalogAuthz() produced FOR
+// THIS EXACT tenantId (checked below) -- omitted/undefined for a
+// BOOTSTRAP-mode tenant is fine (never consulted), but omitted for a
+// REDIS_ONLY tenant fails closed, exactly like a genuinely missing record.
+export function tenantOwnsLocationCatalog(tenantId, authz) {
+  if (typeof tenantId !== 'string' || !tenantId) return false
+  if (testRegistryOverride) return testRegistryOverride.has(tenantId)
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return true
+  if (!authz || authz.tenantId !== tenantId) return false
+  return authz.status === 'active' && authz.locationCatalogEnabled === true
+}
+
+// Does this SPECIFIC numeric locationId actually belong to this tenant's
+// own approved catalog. Requires tenantOwnsLocationCatalog() first (a
+// suspended/onboarding/never-activated tenant owns no individual location
+// either, regardless of what its approvedLocations list contains). For a
+// BOOTSTRAP-mode tenant (Los Tres Amigos), every location id is owned
+// unconditionally -- LTA's real locations were never run through the
+// approve-locations flow at all, so there is no approvedLocations list to
+// check against; this preserves its current, unconstrained behavior. For a
+// REDIS_ONLY tenant, ownership requires the id to appear in the STABLE
+// numeric locationId list recorded on that tenant's own config record
+// (see tenantConfigStore.js's activateLocationCatalog() for the persistent
+// googleLocationId -> localLocationId mapping that makes these ids never
+// drift across a re-approval) -- a location id existing in a reviews.db
+// row, or in another tenant's approvedLocations (even the identical
+// number), never counts.
+export function tenantOwnsLocation(tenantId, locationId, authz) {
+  if (!tenantOwnsLocationCatalog(tenantId, authz)) return false
+  if (testRegistryOverride) return true
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return true
+  if (!authz || authz.tenantId !== tenantId) return false
+  return Array.isArray(authz.approvedLocationIds) && authz.approvedLocationIds.includes(locationId)
 }

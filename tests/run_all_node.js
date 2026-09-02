@@ -98,6 +98,10 @@ const TESTS = [
   'test_tenant_migration_policy.js',
   'test_tenant_session_authorization.js',
   'test_tenant_private_data_isolation.js',
+  'test_tenant_location_catalog_isolation.js',
+  'test_tenant_location_catalog_activation.js',
+  'test_tenant_location_ownership.js',
+  'test_tenant_location_catalog_concurrency.js',
 ]
 
 const results = {}

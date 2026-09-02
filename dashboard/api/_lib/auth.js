@@ -21,7 +21,7 @@ import { parseCookies } from '../google/_lib/cookies.js'
 import { verifySession, SESSION_COOKIE } from './session.js'
 import { getAccountById } from './accountStore.js'
 import { Permission, roleHasPermission } from './permissions.js'
-import { resolveTenantId, tenantOwnsLocationCatalog } from './tenants.js'
+import { resolveTenantId, tenantOwnsLocationCatalog, tenantOwnsLocation, resolveLocationCatalogAuthz } from './tenants.js'
 
 // Never include passwordHash (or anything else not needed by the caller) in
 // data that might reach the frontend or a log line. The only caller is
@@ -37,7 +37,19 @@ import { resolveTenantId, tenantOwnsLocationCatalog } from './tenants.js'
 // authenticated account without re-deriving or re-verifying anything --
 // resolveTenantId() (tenants.js) trusts this field precisely because only
 // this one function ever attaches it.
-function toSafeAccount(account, tenantId) {
+// `locationCatalogAuthz` -- Multi-Tenant Phase 4E closure: a REQUEST-BOUND
+// authorization snapshot (tenants.js's resolveLocationCatalogAuthz()),
+// attached here exactly like `tenantId` already is -- always the value
+// evaluateSession() JUST resolved for this exact request from a fresh
+// tenantConfigStore.js read keyed by the server-derived tenantId above,
+// never from request input, and never written to any shared/module-level
+// location a second request could read or overwrite. requireLocationAccess()/
+// isWildcardGrant() (below) read it directly off this field. This function
+// never spreads `...account` -- every field on the object it returns is
+// explicitly named, so nothing from the raw account record (or, by
+// construction, from request input) can smuggle its own
+// locationCatalogAuthz-shaped value through.
+function toSafeAccount(account, tenantId, locationCatalogAuthz) {
   if (!account) return null
   return {
     userId: account.userId,
@@ -45,6 +57,7 @@ function toSafeAccount(account, tenantId) {
     role: account.role,
     locationIds: account.locationIds,
     tenantId,
+    locationCatalogAuthz,
     displayName: account.displayName ?? account.email,
     // Operations Calendar + Content Library milestone -- only meaningful
     // for role: 'location_manager' (see canCreateTask() below), but exposed
@@ -112,7 +125,16 @@ export async function evaluateSession(req, allowedRoles) {
     return { account: null, reason: 'forbidden' }
   }
 
-  return { account: toSafeAccount(account, currentTenantId), reason: null }
+  // Multi-Tenant Phase 4E closure: resolves a FRESH, request-bound
+  // authorization snapshot from tenantConfigStore.js (Redis) for THIS
+  // request's own, just-verified tenantId -- never a client-supplied one,
+  // and never written anywhere a second request could read or clobber it
+  // (see tenants.js's header comment for the concurrency reasoning this
+  // replaced a process-global Map to satisfy). Attached directly onto
+  // this request's own account object below.
+  const locationCatalogAuthz = await resolveLocationCatalogAuthz(currentTenantId)
+
+  return { account: toSafeAccount(account, currentTenantId, locationCatalogAuthz), reason: null }
 }
 
 // Maps an evaluateSession() failure `reason` to the correct HTTP status per
@@ -199,9 +221,29 @@ function tenantIdOrNull(account) {
   }
 }
 
+// Multi-Tenant Phase 4E (closure): requires BOTH conditions, in this order --
+// (1) tenantOwnsLocation(tenantId, locationId, account.locationCatalogAuthz):
+// this SPECIFIC numeric id actually belongs to the account's own tenant's
+// approved catalog (tenants.js -- backed by tenantConfigStore.js's
+// approvedLocations via a stable, persistent googleLocationId ->
+// localLocationId mapping, never by whether a matching row merely exists
+// in some reviews.db), and (2) the account's OWN locationIds grant
+// (wildcard or explicit array) covers it. Neither alone is sufficient: a
+// wildcard or explicit grant can never widen ownership beyond what the
+// tenant's own catalog contains, and the tenant owning a location can
+// never widen an individual non-wildcard account's own assignment beyond
+// its explicit array.
+//
+// account.locationCatalogAuthz is the request-bound snapshot
+// evaluateSession() attached to THIS account object -- never a
+// process-global lookup keyed by tenantId (see tenants.js's header
+// comment). A hand-built account object with no such field (every
+// pre-existing test in this codebase, and any account for a BOOTSTRAP-mode
+// tenant) is handled correctly by tenantOwnsLocation()'s own fail-closed/
+// BOOTSTRAP-unconditional handling of an absent snapshot.
 export function requireLocationAccess(account, locationId) {
   if (!account) return false
-  if (!tenantOwnsLocationCatalog(tenantIdOrNull(account))) return false
+  if (!tenantOwnsLocation(tenantIdOrNull(account), locationId, account.locationCatalogAuthz)) return false
   const { locationIds } = account
   if (locationIds === '*') return true
   if (!Array.isArray(locationIds)) return false
@@ -226,7 +268,7 @@ export function requireOwnership(account, resourceLocationId) {
 // that owns no locations (any tenant other than DEFAULT_TENANT_ID today)
 // must never be treated as "sees everything," only as "sees nothing."
 export function isWildcardGrant(account) {
-  return Boolean(account) && account.locationIds === '*' && tenantOwnsLocationCatalog(tenantIdOrNull(account))
+  return Boolean(account) && account.locationIds === '*' && tenantOwnsLocationCatalog(tenantIdOrNull(account), account?.locationCatalogAuthz)
 }
 
 // The composite most endpoints will eventually call: authenticate, check

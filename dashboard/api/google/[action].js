@@ -41,6 +41,8 @@ import {
 } from '../_lib/publishBridgeStore.js'
 import { recordReplyFailure, clearReplyFailure } from '../_lib/notificationStore.js'
 import { resolveTenantId, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
+import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDiscoveryStore.js'
+import { activateLocationCatalog } from '../_lib/tenantConfigStore.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -1260,18 +1262,227 @@ async function disconnect(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// POST /api/google/discover-locations -- Multi-Tenant Phase 4E, step 1 of
+// the self-service activation transaction:
+//   Connect Google -> DISCOVER LOCATIONS -> Approve Locations -> Ready.
+// Owner-only, tenantId derived exclusively from the authenticated session
+// (never request input). Lists this tenant's own real GBP locations using
+// this tenant's own stored credential (Phase 4A's per-tenant credential
+// store), then records exactly what was discovered in a short-lived,
+// tenant-and-user-bound locationDiscoveryStore.js record. This is what
+// lets approveLocations() below verify a later approval request only ever
+// approves locations PRYOR itself just discovered for THIS tenant -- a
+// client must never be able to submit an arbitrary Google location id and
+// thereby claim it.
+//
+// POST, not GET, DELIBERATELY (final review decision): this call has real
+// side effects -- it creates a new short-lived Redis record on every
+// invocation and spends a real call against Google's (quota-limited) API --
+// neither of which belongs behind a method HTTP treats as safe/cacheable/
+// prefetchable. Every other "do work" action in this file (trigger-sync,
+// trigger-import, publish, disconnect, approve-locations) is already POST
+// for the same reason; the handful of GETs (status, test-connection) are
+// pure reads that create no state. This was changed deliberately for this
+// reason, not merely for stylistic consistency.
+// ---------------------------------------------------------------------------
+
+async function discoverLocations(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed', message: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+  const tenantId = resolveTenantId(account)
+
+  const allowed = await enforceRateLimit(req, res, `discover-locations:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  let credential
+  try {
+    credential = await getStoredCredential(tenantId)
+  } catch {
+    return res.status(503).json({ error: 'not_connected', message: 'Google Business Profile connection is temporarily unavailable. Please try again shortly.' })
+  }
+  if (!credential || !credential.refreshToken) {
+    return res.status(503).json({
+      error:   'not_connected',
+      message: 'Google Business Profile is not connected. Complete setup in Settings → Google Business Profile.',
+    })
+  }
+
+  let token
+  try {
+    token = await getAccessToken(credential.refreshToken)
+  } catch (err) {
+    return res.status(503).json({ error: 'not_connected', message: err.description || err.message || 'Could not obtain a Google access token.' })
+  }
+  const auth = { Authorization: `Bearer ${token}` }
+
+  let accounts
+  try {
+    const r = await fetchWithRetry(`${ACCOUNTS_BASE}/accounts`, { headers: auth })
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}))
+      return res.status(502).json({ error: 'api_error', message: e.error?.message || `Google API returned status ${r.status}.` })
+    }
+    accounts = (await r.json()).accounts || []
+  } catch (err) {
+    return res.status(502).json({ error: 'api_error', message: `Request to Google failed: ${err.message}` })
+  }
+
+  let discoveredLocations = []
+  try {
+    for (const acct of accounts) {
+      const r = await fetchWithRetry(
+        `${LOCATIONS_BASE}/${acct.name}/locations?pageSize=100&readMask=${encodeURIComponent(LOCATIONS_READ_MASK)}`,
+        { headers: auth }
+      )
+      if (!r.ok) continue
+      const data = await r.json()
+      discoveredLocations = discoveredLocations.concat((data.locations || []).map(loc => ({
+        googleLocationId: v4LocationPath(acct.name, loc.name || ''),
+        title: loc.title || '',
+        address: loc.storefrontAddress
+          ? [loc.storefrontAddress.addressLines, loc.storefrontAddress.locality, loc.storefrontAddress.administrativeArea].flat().filter(Boolean).join(', ')
+          : '',
+      })))
+    }
+  } catch (err) {
+    return res.status(502).json({ error: 'api_error', message: `Request to Google failed: ${err.message}` })
+  }
+
+  if (!discoveredLocations.length) {
+    return res.status(200).json({ discoverySessionId: null, expiresAt: null, locations: [] })
+  }
+
+  let session
+  try {
+    session = await createDiscoverySession({ tenantId, userId: account.userId, discoveredLocations })
+  } catch {
+    return res.status(503).json({ error: 'service_unavailable', message: 'Could not start a discovery session. Please try again shortly.' })
+  }
+
+  return res.status(200).json({
+    discoverySessionId: session.discoverySessionId,
+    expiresAt: session.expiresAt,
+    locations: discoveredLocations,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/google/approve-locations -- step 2: { discoverySessionId,
+// selectedGoogleLocationIds }. Owner-only. Validates the selection against
+// the trusted discovery record created by discoverLocations() above --
+// never trusting a location list the browser sends back on its own -- then
+// writes the approved locations (each stamped with a tenant-local numeric
+// locationId, the same id space requireLocationAccess()/tenantOwnsLocation()
+// authorize against) to this tenant's own config record
+// (tenantConfigStore.js) and marks its location catalog active. That write
+// is exactly what tenants.js's tenantOwnsLocationCatalog()/tenantOwnsLocation()
+// read back (via primeLocationCatalogState(), starting with this tenant's
+// very next authenticated request) -- no source-code change or deploy
+// required.
+//
+// USER BINDING (final review decision): locationDiscoveryStore.js records
+// which Owner ran the discovery. This is ENFORCED, not just recorded --
+// only that same Owner may approve it. A discovery session is a bearer
+// capability over a real, quota-limited Google API call and directly
+// controls what a tenant's catalog gets activated with; if two Owners of
+// the same tenant were ever mid-onboarding at once, one silently approving
+// the other's unreviewed discovery result would be a surprising, hard-to-
+// audit outcome for a security-sensitive, one-time transaction. There is
+// no product requirement for cross-Owner handoff today, so the safer,
+// narrower default (this exact Owner, on this exact discovery) is chosen;
+// a future product need to let a DIFFERENT Owner approve could add an
+// explicit "hand off this discovery" step rather than silently allow it.
+// ---------------------------------------------------------------------------
+
+async function approveLocations(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed', message: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+  // SERVER-DERIVED ONLY -- a forged tenantId anywhere in the request
+  // (query, body, or a header) is never consulted for this or anything
+  // below; this is the one value that decides whose catalog gets activated.
+  const tenantId = resolveTenantId(account)
+
+  const allowed = await enforceRateLimit(req, res, `approve-locations:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { discoverySessionId, selectedGoogleLocationIds } = req.body ?? {}
+  if (typeof discoverySessionId !== 'string' || !discoverySessionId) {
+    return res.status(400).json({ error: 'api_error', message: 'discoverySessionId is required.' })
+  }
+  if (!Array.isArray(selectedGoogleLocationIds) || selectedGoogleLocationIds.length === 0 ||
+      !selectedGoogleLocationIds.every(id => typeof id === 'string' && id)) {
+    return res.status(400).json({ error: 'api_error', message: 'selectedGoogleLocationIds must be a non-empty array of location ids.' })
+  }
+
+  const session = await getDiscoverySession(discoverySessionId)
+  // A missing/expired session, a session belonging to a DIFFERENT tenant,
+  // and a session belonging to a different USER within the SAME tenant are
+  // all deliberately indistinguishable here (404 in every case) -- this is
+  // exactly what stops a Tenant A discovery session from being replayed
+  // under a Tenant B session (or vice versa), and what enforces the user
+  // binding above: a 403 would confirm "that session id is real, just not
+  // yours," which this response must never reveal. Same API-error-contract
+  // reasoning auth.js's requireScopedAuth() already uses for cross-tenant
+  // location lookups.
+  if (!session || session.tenantId !== tenantId || session.userId !== account.userId) {
+    return res.status(404).json({ error: 'not_found', message: 'This discovery session was not found or has expired. Please discover locations again.' })
+  }
+
+  const discoveredIds = new Set(session.discoveredLocations.map(l => l.googleLocationId))
+  const unapproved = selectedGoogleLocationIds.filter(id => !discoveredIds.has(id))
+  if (unapproved.length > 0) {
+    return res.status(400).json({
+      error:   'location_not_discovered',
+      message: 'One or more selected locations were not part of this tenant\'s own discovery result.',
+    })
+  }
+
+  // Numeric locationId assignment is NOT done here -- tenantConfigStore.js's
+  // activateLocationCatalog() reconciles against this tenant's own
+  // persistent googleLocationId -> localLocationId map (locationIdMap) and
+  // monotonic nextLocationId counter, so a location keeps the same stable
+  // id across re-approvals regardless of array order or which other
+  // locations are selected alongside it in this call. This endpoint only
+  // ever passes the CURRENT selection's raw Google fields.
+  const selectedLocations = session.discoveredLocations
+    .filter(l => selectedGoogleLocationIds.includes(l.googleLocationId))
+    .map(l => ({ googleLocationId: l.googleLocationId, title: l.title, address: l.address }))
+
+  let config
+  try {
+    config = await activateLocationCatalog(tenantId, selectedLocations)
+  } catch {
+    return res.status(503).json({ error: 'service_unavailable', message: 'Could not activate the location catalog. Please try again shortly.' })
+  }
+
+  await appendAuditEntry(tenantId, {
+    actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+    entity: 'tenant_location_catalog', entityId: tenantId, action: 'location_catalog.activated', changes: null, result: 'success',
+    message: `Activated the location catalog with ${config.approvedLocations.length} approved location(s).`,
+  })
+
+  return res.status(200).json({ success: true, tenantId, activatedLocationCount: config.approvedLocations.length, status: config.status })
+}
+
+// ---------------------------------------------------------------------------
 
 export default async function handler(req, res) {
   switch (req.query?.action) {
-    case 'auth':             return auth(req, res)
-    case 'callback':         return callback(req, res)
-    case 'status':           return status(req, res)
-    case 'test-connection':  return testConnection(req, res)
-    case 'trigger-sync':     return triggerSync(req, res)
-    case 'trigger-import':   return triggerImport(req, res)
-    case 'publish':          return publish(req, res)
-    case 'publish-bridge':   return publishBridge(req, res)
-    case 'disconnect':       return disconnect(req, res)
-    default:                 return res.status(404).json({ error: 'not_found' })
+    case 'auth':               return auth(req, res)
+    case 'callback':           return callback(req, res)
+    case 'status':             return status(req, res)
+    case 'test-connection':    return testConnection(req, res)
+    case 'trigger-sync':       return triggerSync(req, res)
+    case 'trigger-import':     return triggerImport(req, res)
+    case 'publish':            return publish(req, res)
+    case 'publish-bridge':     return publishBridge(req, res)
+    case 'disconnect':         return disconnect(req, res)
+    case 'discover-locations': return discoverLocations(req, res)
+    case 'approve-locations':  return approveLocations(req, res)
+    default:                   return res.status(404).json({ error: 'not_found' })
   }
 }

@@ -170,19 +170,24 @@ async function testTenantAReadsOnlyTenantAArtifacts() {
   assert(!names.includes('Tenant B Exclusive Location'), 'Tenant A must never see Tenant B\'s location in meta.json')
 }
 
-// KNOWN, PRE-EXISTING LIMITATION (not a Phase 4D regression -- documented
-// in the Phase 4D report): tenants.js's tenantOwnsLocationCatalog() is
-// hardcoded to Los Tres Amigos only (Phase 4B). isWildcardGrant()/
-// requireLocationAccess() both gate on it, which means EVERY location-
-// scoped and company-wide file request is denied (403/404) for any
-// account whose tenant isn't Los Tres Amigos, regardless of the Phase 4D
-// private-data boundary fix below. That gate is a separate, deliberate,
-// reviewed restriction outside Phase 4D's scope -- these tests prove what
-// Phase 4D IS responsible for (the underlying file read resolves to the
-// correct tenant's own root, and never falls back to another tenant's
-// data), using meta.json's distinctiveMarker field (which survives the
-// authorization-driven locations/totalReviews filtering) as an
-// independent signal of which physical file was actually read.
+// PRE-EXISTING, DELIBERATE SCOPING (not a Phase 4D regression -- documented
+// in the Phase 4D report, since resolved by Phase 4E): tenants.js's
+// tenantOwnsLocationCatalog() is now a registry (Phase 4E), not a hardcode,
+// but this file never registers TENANT_B in it (see
+// test_tenant_location_catalog_isolation.js for that), so TENANT_B here
+// remains a "not-yet-onboarded" tenant exactly as before this comment was
+// updated. isWildcardGrant()/requireLocationAccess() both gate on that
+// registry, which means EVERY location-scoped and company-wide file
+// request is still denied (403/404) for this specific unregistered
+// synthetic tenant, regardless of the Phase 4D private-data boundary fix
+// below. These tests prove what Phase 4D IS responsible for (the
+// underlying file read resolves to the correct tenant's own root, and
+// never falls back to another tenant's data), using meta.json's
+// distinctiveMarker field (which survives the authorization-driven
+// locations/totalReviews filtering) as an independent signal of which
+// physical file was actually read. See test_tenant_location_catalog_isolation.js
+// for the Phase 4E proof that a tenant genuinely REGISTERED as owning a
+// catalog gets correctly (and only) its own locations authorized.
 async function testTenantBMetaJsonReadsFromItsOwnRootNeverLta() {
   await setDirectory()
   setupTenantB()
