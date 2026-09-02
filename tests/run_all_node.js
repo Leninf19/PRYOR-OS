@@ -118,6 +118,7 @@ const TESTS = [
   'test_tenant_branding_ui.js',
   'test_approved_locations_panel_ui.js',
   'test_use_tenant_status_hook_ui.js',
+  'test_user_store_tenant_isolation.js',
 ]
 
 const results = {}

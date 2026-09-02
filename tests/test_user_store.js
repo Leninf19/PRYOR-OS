@@ -222,7 +222,7 @@ async function testListAccountsMergesWithoutDuplicatingSharedIdentity() {
   // and record -- simulates "this identity was promoted into Redis".
   await upsertUser(DEFAULT_TENANT_ID, { ...BASE_USER, userId: 'usr_redis_owner', email: 'owner@example.com', displayName: 'Redis Owner Copy', role: 'owner', locationIds: '*' })
 
-  const all = await listAccounts()
+  const all = await listAccounts(DEFAULT_TENANT_ID)
   const ownerEmailMatches = all.filter(a => a.email.toLowerCase() === 'owner@example.com')
   assert(ownerEmailMatches.length === 1, `a shared identity must appear exactly once in listAccounts(), found ${ownerEmailMatches.length}`)
   assert(ownerEmailMatches[0].displayName === 'Redis Owner Copy', 'the single merged entry must be the Redis record, not the static one')

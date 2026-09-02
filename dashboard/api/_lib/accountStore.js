@@ -35,24 +35,38 @@
 // client with no Node-only APIs, so it (unlike bcryptjs/fs) is safe here.
 
 import { loadAccountDirectory, findAccountById, findAccountByEmail, normalizeEmail } from './accounts.js'
-import { getUserById, getUserByEmail, listUsers, UserStoreUnavailableError } from './userStore.js'
-import { resolveBootstrapTenantId } from './tenants.js'
+import {
+  getUserById, getUserByEmail, listUsers, UserStoreUnavailableError,
+  lookupIdentityByEmail, lookupTenantIdForUserId,
+} from './userStore.js'
+import { resolveBootstrapTenantId, DEFAULT_TENANT_ID } from './tenants.js'
 
 // Multi-Tenant Phase 2/3: userStore.js's functions now require a tenantId.
 // This module is the account-RESOLUTION layer -- it runs before any
 // session/account is known (that's the whole point of "find the account
 // behind this id/email"), so there is no `account` yet to resolve a
-// tenant from. Every call below passes resolveBootstrapTenantId(), which
-// always returns DEFAULT_TENANT_ID -- identical behavior to today, since
-// Los Tres Amigos is still the only tenant, and this is a search-scope
-// decision, not an access-control one (the account found, if any, still
-// gets its own disabled/sessionVersion/credential checks afterward).
-// Phase 3 hardening pass: this deliberately does NOT call
-// resolveTenantId(null) any more -- that function now fails closed
-// (throws) for a null account, by design, since it IS an access-control
-// decision everywhere else it's used. resolveBootstrapTenantId() is the
-// distinctly-named escape hatch for this one legitimately-different
-// pre-authentication question.
+// tenant from.
+//
+// Multi-Tenant Phase 4K -- getAccountById()/getAccountByEmail() now consult
+// userStore.js's GLOBAL identity index FIRST to learn which tenant actually
+// owns a given userId/email, then perform a real, tenant-scoped read
+// against THAT tenant's own store -- no more assuming every identity lives
+// in the bootstrap tenant. An identity the index has never heard of (every
+// Los Tres Amigos account, by construction -- see userStore.js's
+// getUserIdentityMigrationMode()) falls back to EXACTLY today's LEGACY
+// path: resolveBootstrapTenantId()'s own Redis hash, then the static
+// ACCOUNT_DIRECTORY_JSON directory. This is a fallback for an unindexed
+// IDENTITY, never an inference about a TENANT's migration status -- which
+// tenants participate in the index at all is decided once, explicitly, by
+// userStore.js's own reviewed registry (delegated from
+// tenantDualRead.js's TENANT_MIGRATION_MODE), not by whether a lookup
+// happens to come back empty.
+//
+// listAccounts(tenantId) is likewise now tenant-scoped (tenantId is a
+// REQUIRED argument, no default) -- see its own header comment below for
+// why a global, unscoped listing was itself a latent cross-tenant bug for
+// every consumer (GET /api/session/accounts, the Users & Access admin
+// roster, last-active-Owner counting) the moment a second tenant existed.
 
 // A missing/invalid ACCOUNT_DIRECTORY_JSON is a whole-app misconfiguration
 // (every static-directory account lookup fails, not just this one), so it's
@@ -84,33 +98,89 @@ async function tryRedisLookup(fn, label) {
 }
 
 export async function getAccountById(userId) {
-  const redisUser = await tryRedisLookup(() => getUserById(resolveBootstrapTenantId(), userId), `getAccountById(${userId})`)
+  const indexedTenantId = await tryRedisLookup(() => lookupTenantIdForUserId(userId), `getAccountById(${userId}):identity-index`)
+  if (indexedTenantId) {
+    // Indexed identities are resolved EXCLUSIVELY within their own tenant --
+    // if the tenant's own hash doesn't have it (a genuine inconsistency),
+    // this does not fall through to the bootstrap hash; that would be a
+    // cross-tenant leak vector, not a helpful fallback.
+    return (await tryRedisLookup(() => getUserById(indexedTenantId, userId), `getAccountById(${userId}):indexed`)) ?? null
+  }
+  // LEGACY fallback -- exactly today's behavior, reached only for an
+  // identity the index has never heard of (every Los Tres Amigos account).
+  const redisUser = await tryRedisLookup(() => getUserById(resolveBootstrapTenantId(), userId), `getAccountById(${userId}):bootstrap`)
   if (redisUser) return redisUser
   const accounts = loadDirectoryOrWarn()
   if (!accounts) return null
   return findAccountById(accounts, userId)
 }
 
+// Multi-Tenant Phase 4K -- the lookup every TENANT-SCOPED user-management
+// MUTATION endpoint (update-user-role-locations, disable-user, enable-user,
+// update-user-can-create-tasks) must use instead of getAccountById() above.
+// getAccountById() is intentionally CROSS-TENANT-capable (via the global
+// identity index) -- exactly right for login/session re-validation, wrong
+// for a mutation endpoint, where a caller-supplied userId must never be
+// resolvable to a DIFFERENT tenant's account no matter what the identity
+// index says. This function looks ONLY within `tenantId`'s own store: a
+// direct, tenant-scoped Redis read (getUserById(tenantId, userId), never
+// consulting the identity index or any other tenant's hash at all), plus
+// -- ONLY when tenantId is DEFAULT_TENANT_ID -- the static
+// ACCOUNT_DIRECTORY_JSON directory, so Los Tres Amigos's original,
+// possibly-never-promoted-to-Redis accounts remain manageable through
+// these same endpoints exactly as before this phase. A userId that
+// genuinely belongs to a different tenant returns null here, structurally,
+// the same 404 an unknown userId would produce -- never distinguishable,
+// never a cross-tenant existence leak.
+export async function getAccountByIdForTenant(tenantId, userId) {
+  const redisUser = await tryRedisLookup(() => getUserById(tenantId, userId), `getAccountByIdForTenant(${userId})`)
+  if (redisUser) return redisUser
+  if (tenantId !== DEFAULT_TENANT_ID) return null
+  const accounts = loadDirectoryOrWarn()
+  if (!accounts) return null
+  return findAccountById(accounts, userId)
+}
+
 export async function getAccountByEmail(email) {
-  const redisUser = await tryRedisLookup(() => getUserByEmail(resolveBootstrapTenantId(), email), `getAccountByEmail`)
+  const indexed = await tryRedisLookup(() => lookupIdentityByEmail(email), 'getAccountByEmail:identity-index')
+  if (indexed?.tenantId && indexed?.userId) {
+    return (await tryRedisLookup(() => getUserById(indexed.tenantId, indexed.userId), 'getAccountByEmail:indexed')) ?? null
+  }
+  // LEGACY fallback -- exactly today's behavior.
+  const redisUser = await tryRedisLookup(() => getUserByEmail(resolveBootstrapTenantId(), email), `getAccountByEmail:bootstrap`)
   if (redisUser) return redisUser
   const accounts = loadDirectoryOrWarn()
   if (!accounts) return null
   return findAccountByEmail(accounts, email)
 }
 
-// Merged, de-duplicated listing: every Redis user, plus every static-
-// directory account whose normalized email is NOT already present in
-// Redis (Redis wins on precedence, same rule as the single-record lookups
-// above) -- so a legacy static account that has since been "promoted" into
-// Redis (e.g. re-provisioned through the same invite flow) is never listed
-// twice. Used by both auth-adjacent callers (GET /api/session/accounts) and
-// the Users & Access admin listing/last-Owner counting -- both need the
-// same de-duplicated view.
-export async function listAccounts() {
-  const redisUsers = await tryRedisLookup(() => listUsers(resolveBootstrapTenantId()), 'listAccounts') ?? []
-  const redisEmails = new Set(redisUsers.map(u => normalizeEmail(u.email)))
+// Merged, de-duplicated listing FOR ONE TENANT: every Redis user belonging
+// to `tenantId`, plus (ONLY for Los Tres Amigos, DEFAULT_TENANT_ID) every
+// static-directory account whose normalized email is NOT already present
+// in Redis (Redis wins on precedence, same rule as the single-record
+// lookups above) -- so a legacy static account that has since been
+// "promoted" into Redis (e.g. re-provisioned through the invite flow) is
+// never listed twice.
+//
+// `tenantId` is REQUIRED (Multi-Tenant Phase 4K) -- there is no such thing
+// as a meaningful global account listing in a multi-tenant system, and a
+// caller that genuinely needs cross-tenant discovery (platform-admin
+// tooling) must say so explicitly rather than getting it as this
+// function's default. The static ACCOUNT_DIRECTORY_JSON directory is
+// consulted ONLY when tenantId === DEFAULT_TENANT_ID -- every account it
+// can ever describe is implicitly Los Tres Amigos's own (it has no
+// tenantId field at all; see tenants.js's resolveTenantId(), which maps an
+// account with no explicit tenantId to DEFAULT_TENANT_ID via legacy role
+// mapping), so it would be actively wrong to merge it into any other
+// tenant's roster.
+export async function listAccounts(tenantId) {
+  if (typeof tenantId !== 'string' || !tenantId) {
+    throw new TypeError('listAccounts: tenantId is required')
+  }
+  const redisUsers = await tryRedisLookup(() => listUsers(tenantId), 'listAccounts') ?? []
+  if (tenantId !== DEFAULT_TENANT_ID) return redisUsers
 
+  const redisEmails = new Set(redisUsers.map(u => normalizeEmail(u.email)))
   const staticAccounts = loadDirectoryOrWarn() ?? []
   const staticOnly = staticAccounts.filter(a => !redisEmails.has(normalizeEmail(a.email)))
 

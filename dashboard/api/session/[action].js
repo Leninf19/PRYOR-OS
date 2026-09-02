@@ -15,7 +15,7 @@ import { verifyPassword, hashPassword, validatePasswordStrength } from '../_lib/
 import { requireAuth } from '../_lib/auth.js'
 import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
-import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError } from '../_lib/userStore.js'
+import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError, lookupTenantIdForUserId } from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
 import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
 import { getTenantConfig, TenantConfigStoreUnavailableError } from '../_lib/tenantConfigStore.js'
@@ -256,7 +256,7 @@ async function accounts(req, res) {
   const account = await requireAuth(req, res, null) // null = any authenticated role
   if (!account) return
 
-  const safeAccounts = (await listAccounts())
+  const safeAccounts = (await listAccounts(resolveTenantId(account)))
     .filter(a => !a.disabled)
     .map(a => ({
       userId: a.userId,
@@ -346,10 +346,15 @@ async function acceptInvite(req, res) {
     const passwordHash = await hashPassword(password)
     const now = new Date().toISOString()
     // No account is known yet at this point (only a bare userId from the
-    // validated token payload) -- this is exactly the pre-authentication
-    // search-scope question resolveBootstrapTenantId() exists for, not an
-    // access-control decision (see tenants.js's header comment).
-    const updated = await updateUser(resolveBootstrapTenantId(), userId, {
+    // validated token payload) -- Multi-Tenant Phase 4K: resolve which
+    // tenant actually owns this userId via the GLOBAL identity index
+    // (userStore.js), exactly the pre-identity lookup it exists for. An
+    // unindexed userId (every Los Tres Amigos account, by construction --
+    // see userStore.js's getUserIdentityMigrationMode()) falls back to
+    // the bootstrap tenant, identical to today's behavior.
+    const indexedTenantId = await lookupTenantIdForUserId(userId)
+    const targetTenantId = indexedTenantId ?? resolveBootstrapTenantId()
+    const updated = await updateUser(targetTenantId, userId, {
       passwordHash, passwordSetAt: now,
       ...(isValidDisplayName(name) ? { displayName: name.trim() } : {}),
     })

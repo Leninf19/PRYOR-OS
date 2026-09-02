@@ -33,7 +33,7 @@ import {
 import {
   getStoredCredential, setStoredCredential, _setRedisClientForTests as setCredentialRedis, _resetRedisClientForTests as resetCredentialRedis,
 } from '../dashboard/api/_lib/credentialStore.js'
-import { _setRedisClientForTests as setUserRedis, _resetRedisClientForTests as resetUserRedis, getUserById } from '../dashboard/api/_lib/userStore.js'
+import { _setRedisClientForTests as setUserRedis, _resetRedisClientForTests as resetUserRedis, getUserById, upsertUser } from '../dashboard/api/_lib/userStore.js'
 import { _setRedisClientForTests as setAuditRedis, _resetRedisClientForTests as resetAuditRedis, listAuditEntries } from '../dashboard/api/_lib/auditLog.js'
 
 const TENANT_A = 't_synthetic-entitlement-change-a'
@@ -154,16 +154,18 @@ const superAdminToken = () => signSession({ userId: 'usr_super', email: 'super@e
 
 async function setupTenantUser(tenantId, { userId, role = 'owner', locationIds = '*' }) {
   const hash = await passwordHash()
-  const record = { userId, email: `${userId}@example.com`, passwordHash: hash, role, locationIds, sessionVersion: 1, disabled: false, tenantId }
-  // accountStore.js's getAccountById() (requireAuth's account resolution)
-  // ALWAYS searches listUsers(resolveBootstrapTenantId()) -- Multi-Tenant
-  // Phase 3 has not yet built real per-tenant user-store partitioning, so
-  // EVERY account, regardless of its own claimed tenantId, lives in the
-  // ONE bootstrap tenant's hash ('users:v1', since the bootstrap tenant is
-  // LEGACY-mode) today, distinguished only by its own tenantId field once
-  // found. userStore.js's reconcileAccountGrantsAfterLocationRemoval()
-  // mirrors this exact pattern (see its own header comment).
-  await sharedUserClient.hset('users:v1', { [userId]: JSON.stringify(record) })
+  // Multi-Tenant Phase 4K: written via the REAL upsertUser(tenantId, ...) --
+  // for a TENANT_SCOPED-mode tenant (any synthetic tenant used in this
+  // file), this correctly writes to that tenant's OWN hash
+  // (usersKeyV2(tenantId)) AND populates the global identity index, so
+  // accountStore.js's getAccountById()/getAccountByEmail() (used by
+  // requireAuth() on every request) resolve it exactly the way a real
+  // invited/promoted user would be resolved in production -- not a
+  // hand-rolled write to the bootstrap hash.
+  await upsertUser(tenantId, {
+    userId, email: `${userId}@example.com`, passwordHash: hash, role, locationIds,
+    sessionVersion: 1, disabled: false, tenantId,
+  })
 }
 function tenantUserToken(tenantId, userId, role = 'owner', locationIds = '*') {
   return signSession({ userId, email: `${userId}@example.com`, role, locationIds, tenantId, sessionVersion: 1 })
@@ -535,10 +537,9 @@ async function testAccountGrantReconciliationNarrowsAndAudits() {
   assert(res.statusCode === 200, `expected success, got ${res.statusCode} ${JSON.stringify(res.body)}`)
   assert(res.body.accountReconciliation.narrowed.includes('usr_a_manager'), 'the affected account must be reported as narrowed')
 
-  // getUserById() resolves via the SAME bootstrap-tenant hash every
-  // account currently lives in, regardless of its own claimed tenantId --
-  // see reconcileAccountGrantsAfterLocationRemoval()'s own header comment.
-  const managerAfter = await getUserById(DEFAULT_TENANT_ID, 'usr_a_manager')
+  // Multi-Tenant Phase 4K: reconcileAccountGrantsAfterLocationRemoval() now
+  // reads/writes TENANT_A's own store directly -- no more bootstrap detour.
+  const managerAfter = await getUserById(TENANT_A, 'usr_a_manager')
   assert(JSON.stringify(managerAfter.locationIds) === JSON.stringify([locA.locationId]), `expected the manager's grant to be narrowed to [${locA.locationId}], got ${JSON.stringify(managerAfter.locationIds)}`)
   assert(managerAfter.sessionVersion === 2, 'the affected account\'s sessionVersion must be bumped to force re-auth')
 

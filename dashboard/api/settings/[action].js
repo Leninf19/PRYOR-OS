@@ -43,7 +43,7 @@ import { resolveTenantId } from '../_lib/tenants.js'
 import { readPrivateDataFile } from '../_lib/reviewDataPaths.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
-import { getAccountByEmail, getAccountById, listAccounts } from '../_lib/accountStore.js'
+import { getAccountByEmail, getAccountByIdForTenant, listAccounts } from '../_lib/accountStore.js'
 import { getUserById, upsertUser, updateUser, deriveUserStatus, UserStoreUnavailableError } from '../_lib/userStore.js'
 import { createInviteToken, revokeInviteToken, createResetToken, TokenStoreUnavailableError } from '../_lib/tokenStore.js'
 import { buildInviteEmail, buildInviteEmailSubject, buildResetEmail, buildResetEmailSubject } from '../_lib/accountEmailTemplate.js'
@@ -657,7 +657,17 @@ async function inviteUserAction(req, res) {
     })
 
     await upsertUser(resolveTenantId(account), {
-      userId, email, passwordHash: null, role, locationIds,
+      // Multi-Tenant Phase 4K: `tenantId` is now stamped EXPLICITLY on the
+      // record itself, not just implied by which physical hash it's
+      // written to. resolveTenantId() (tenants.js) resolves an account's
+      // tenant from this field FIRST, before ever falling back to legacy
+      // role-mapping (which always answers DEFAULT_TENANT_ID) -- without
+      // this, a non-LTA tenant's invited user would authenticate
+      // correctly (found via the identity index / their own tenant's
+      // hash) but then be silently treated as an LTA account by
+      // resolveTenantId(), since it has no way to tell tenants apart
+      // without an explicit field to read.
+      userId, email, passwordHash: null, role, locationIds, tenantId: resolveTenantId(account),
       sessionVersion: 1, disabled: false, displayName: trimmedName,
       createdAt: now, updatedAt: now, lastLoginAt: null,
       invitedAt: now, invitedBy: account.userId, lastInviteSentAt: now,
@@ -900,7 +910,7 @@ async function usersListAction(req, res) {
   const allowed = await enforceRateLimit(req, res, `settings:users-list:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
 
-  const all = await listAccounts()
+  const all = await listAccounts(resolveTenantId(account))
   const users = all
     .map(a => ({
       userId: a.userId,
@@ -954,11 +964,21 @@ async function updateUserRoleLocationsAction(req, res) {
   }
 
   try {
-    const target = await getAccountById(userId)
+    // Multi-Tenant Phase 4K: STRICTLY tenant-scoped lookup -- never
+    // accountStore.js's getAccountById() (which, as of this phase, can
+    // resolve an identity in a DIFFERENT tenant via the global identity
+    // index). A userId belonging to another tenant simply does not exist
+    // from THIS tenant's own store's point of view, so this call
+    // structurally cannot find (or mutate) a foreign tenant's user --
+    // never a check that could be forgotten, a fact enforced by which
+    // function is called. getAccountByIdForTenant() (not the plain,
+    // Redis-only getUserById()) so Los Tres Amigos's own possibly-still-
+    // static-directory-only accounts remain manageable here too.
+    const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
 
     if (target.role === 'owner' && role !== 'owner') {
-      const lastOwnerCheck = await assertNotLastActiveOwner(userId)
+      const lastOwnerCheck = await assertNotLastActiveOwner(resolveTenantId(account), userId)
       if (!lastOwnerCheck.safe) {
         return res.status(409).json({ error: 'last_owner', message: lastOwnerCheck.message })
       }
@@ -1018,11 +1038,14 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
   }
 
   try {
-    const target = await getAccountById(userId)
+    // Multi-Tenant Phase 4K: STRICTLY tenant-scoped lookup (with the
+    // static-directory fallback for Los Tres Amigos) -- see
+    // updateUserRoleLocationsAction()'s identical comment above.
+    const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
 
     if (disabled && target.role === 'owner') {
-      const lastOwnerCheck = await assertNotLastActiveOwner(userId)
+      const lastOwnerCheck = await assertNotLastActiveOwner(resolveTenantId(account), userId)
       if (!lastOwnerCheck.safe) {
         return res.status(409).json({ error: 'last_owner', message: lastOwnerCheck.message })
       }
@@ -1088,7 +1111,10 @@ async function updateUserCanCreateTasksAction(req, res) {
   }
 
   try {
-    const target = await getAccountById(userId)
+    // Multi-Tenant Phase 4K: STRICTLY tenant-scoped lookup (with the
+    // static-directory fallback for Los Tres Amigos) -- see
+    // updateUserRoleLocationsAction()'s identical comment above.
+    const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
 
     const now = new Date().toISOString()
