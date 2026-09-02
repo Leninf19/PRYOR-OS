@@ -49,6 +49,13 @@ TENANT_AWARE_SCRIPTS = (
 # scripts above (see test_every_workflow_is_accounted_for below).
 WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     "_scratch2.yml",
+    # Multi-Tenant Phase 4H.1: tenant-lifecycle.yml invokes
+    # provision_tenant.py/initial_sync.py, NEITHER of which is (or should
+    # ever be) in TENANT_AWARE_SCRIPTS above -- those two scripts are
+    # deliberately dispatch-driven, built to run for an operator-chosen
+    # tenant, unlike every script in that list (which must NEVER accept a
+    # dispatch-supplied tenant id). See that workflow's own header comment.
+    "tenant-lifecycle.yml",
 }
 
 results = []

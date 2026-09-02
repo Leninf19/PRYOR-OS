@@ -21,7 +21,7 @@ import { parseCookies } from '../google/_lib/cookies.js'
 import { verifySession, SESSION_COOKIE } from './session.js'
 import { getAccountById } from './accountStore.js'
 import { Permission, roleHasPermission } from './permissions.js'
-import { resolveTenantId, tenantOwnsLocationCatalog, tenantOwnsLocation, resolveLocationCatalogAuthz } from './tenants.js'
+import { resolveTenantId, tenantOwnsLocationCatalog, tenantOwnsLocation, resolveLocationCatalogAuthz, DEFAULT_TENANT_ID } from './tenants.js'
 
 // Never include passwordHash (or anything else not needed by the caller) in
 // data that might reach the frontend or a log line. The only caller is
@@ -168,6 +168,24 @@ export async function requireAuth(req, res, allowedRoles) {
     res.status(401).json({ error: 'unauthenticated', message: 'Sign in required.' })
   }
   return null
+}
+
+// Multi-Tenant Phase 4H.1 -- the authorization boundary for the new
+// cross-tenant tenant-operations status page (dashboard/api/tenant-ops/
+// [action].js). This is DELIBERATELY narrower than a per-tenant 'owner':
+// every other role/permission check in this codebase (roleHasPermission(),
+// tenantOwnsLocation(), etc.) is scoped to the CALLER'S OWN tenant, but the
+// tenant-ops page shows OTHER tenants' provisioning/sync state -- a real
+// Tenant B's own Owner must never see this, only the platform operator.
+// Los Tres Amigos is that operator (the business actually running this
+// codebase) -- reusing its own existing Owner accounts, rather than
+// inventing a new role or a new account flag, is the smallest change that
+// satisfies "super-admin-only" without adding a second, parallel
+// authorization system. If this platform ever needs a genuinely distinct
+// platform-operator identity (independent of any one tenant), that is a
+// separate, explicitly reviewed change -- not assumed here.
+export function isSuperAdmin(account) {
+  return Boolean(account) && account.role === 'owner' && resolveTenantId(account) === DEFAULT_TENANT_ID
 }
 
 // --- Phase 2 Milestone 2: composable, location-aware authorization -------

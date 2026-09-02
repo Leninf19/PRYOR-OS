@@ -1,0 +1,165 @@
+name: Tenant Lifecycle Operations
+
+# Multi-Tenant Phase 4H.1 -- the ONLY dispatch surface for provisioning or
+# Initial-Syncing a BLOB-mode tenant. This workflow does not implement
+# provisioning or synchronization itself -- it is a thin, validated
+# dispatch boundary around the SAME provision_tenant.py / initial_sync.py
+# Python entrypoints already reviewed and tested (Phase 4F.1/4G). Every
+# CAS, ETag, credential, approved-location, and status precondition those
+# scripts enforce is completely unchanged and untouched here; this
+# workflow never converts one of their failures into a successful
+# workflow result, and never retries a stale-CAS/stale-ETag race
+# automatically -- a human re-dispatches if a retry is warranted.
+#
+# "Retrying initial_sync after initial_sync_failed" is NOT a third
+# operation choice: initial_sync.py's own status gate already accepts
+# 'initial_sync_failed' as a valid starting state (see that script's
+# header) -- re-running the `initial_sync` operation IS the retry.
+#
+# Deliberately excluded from tests/test_workflow_tenant_ids.py's
+# TENANT_AWARE_SCRIPTS discipline (see WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT
+# in that file) -- unlike Los Tres Amigos's fixed pipeline scripts (which
+# must NEVER accept a dispatch-supplied tenant id), provision_tenant.py/
+# initial_sync.py are exactly the opposite: built to be invoked for an
+# operator-chosen NEW tenant. Los Tres Amigos itself can never be targeted
+# here -- see the "Validate inputs" step below (an explicit, redundant
+# refusal), AND provision_tenant.py's/initial_sync.py's own independent,
+# unconditional refusal of any non-BLOB storageMode tenant.
+#
+# No long-lived Vercel-to-GitHub token is introduced for this phase -- the
+# dashboard's new Tenant Operations status page (Settings -> Tenant
+# Operations, super-admin only) is read-only and links here; a human
+# operator fills in and submits this dispatch form directly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Which lifecycle operation to run"
+        required: true
+        type: choice
+        options:
+          - provision
+          - initial_sync
+      tenant_id:
+        description: "Tenant id, e.g. t_example-restaurant"
+        required: true
+        type: string
+      confirmation:
+        description: "Type the EXACT tenant id again to confirm"
+        required: true
+        type: string
+
+# Serializes operations for the SAME tenant (two dispatches for the same
+# tenant queue up rather than run concurrently, so the real defense --
+# provision_tenant.py's/initial_sync.py's own configVersion/ETag CAS --
+# is never even put under unnecessary pressure); different tenants still
+# run independently, in parallel. cancel-in-progress: false -- a run
+# already mutating this tenant's state must finish (or fail cleanly)
+# rather than being killed mid-write by a newer dispatch for the SAME
+# tenant; queued runs simply wait their turn -- matches
+# update-reviews.yml's own reviews-db-writer concurrency group discipline.
+concurrency:
+  group: tenant-lifecycle-${{ inputs.tenant_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  operate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      # Every value below is read from `inputs.*` ONLY into an `env:` var
+      # here, then referenced in the shell as a quoted "$VAR" -- never
+      # `${{ inputs.* }}` interpolated directly into a run: script's text,
+      # which would let a maliciously-crafted input inject arbitrary shell
+      # syntax. This is the ONLY place tenant_id/confirmation are validated
+      # before any later step ever touches a command, file path, Blob
+      # pathname, or Redis key with them.
+      - name: Validate inputs
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TENANT_ID" =~ ^t_[a-z0-9-]+$ ]]; then
+            echo "::error::tenant_id '$TENANT_ID' does not match the required format ^t_[a-z0-9-]+\$"
+            exit 1
+          fi
+          if [[ "$TENANT_ID" == "t_los-tres-amigos" ]]; then
+            echo "::error::Los Tres Amigos is not managed through this workflow -- it stays on its existing LEGACY_REPO pipeline (update-reviews.yml)"
+            exit 1
+          fi
+          if [[ "$CONFIRMATION" != "$TENANT_ID" ]]; then
+            echo "::error::confirmation must exactly match tenant_id -- refusing to proceed"
+            exit 1
+          fi
+          echo "Validated tenant_id=$TENANT_ID operation=$OPERATION"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      # cryptography is required by google_api.py's credential decrypt
+      # path (imported transitively by initial_sync.py, and by
+      # tenant_status_report.py's has_tenant_credential() check below) --
+      # same reasoning as update-reviews.yml's own install step.
+      - name: Install Python dependencies
+        run: pip install cryptography
+
+      # Fixed command entry point, tenant id passed as a single, quoted
+      # argument -- never string-built from operation/tenant_id. Only ONE
+      # of these two steps ever runs per dispatch (mutually exclusive
+      # `if:` conditions on the SAME, already-validated `inputs.operation`
+      # choice value), so there is no dynamic command construction here at
+      # all, just a fixed choice between two fixed commands.
+      - name: Run provisioning
+        if: inputs.operation == 'provision'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+        run: python provision_tenant.py --tenant-id "$TENANT_ID"
+
+      - name: Run Initial Sync
+        if: inputs.operation == 'initial_sync'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        # initial_sync.py's own precondition check (google_api.has_tenant_credential)
+        # requires a REAL, tenant-specific Redis-stored credential -- it
+        # never falls back to a global GOOGLE_REFRESH_TOKEN, and this step
+        # deliberately never sets that env var, so no such fallback is even
+        # reachable for a new tenant dispatched here.
+        run: python initial_sync.py --tenant-id "$TENANT_ID"
+
+      # Runs regardless of whether the step(s) above succeeded or failed
+      # (if: always()) purely so an operator can see the resulting state
+      # either way -- this does NOT change the job's own pass/fail
+      # conclusion: a prior step failing already marks the whole job
+      # 'failure', and nothing below can retroactively turn that into a
+      # success. Sanitized by construction -- see tenant_status_report.py's
+      # own header for exactly what it will and will not print.
+      - name: Write job summary
+        if: always()
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          OPERATION: ${{ inputs.operation }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+        run: python tenant_status_report.py --tenant-id "$TENANT_ID" --operation "$OPERATION" >> "$GITHUB_STEP_SUMMARY"

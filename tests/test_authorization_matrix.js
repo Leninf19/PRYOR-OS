@@ -48,6 +48,7 @@ import settingsHandler from '../dashboard/api/settings/[action].js'
 import notificationsHandler from '../dashboard/api/notifications/[action].js'
 import tasksHandler from '../dashboard/api/tasks/[action].js'
 import contentHandler from '../dashboard/api/content/[action].js'
+import tenantOpsHandler from '../dashboard/api/tenant-ops/[action].js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -615,6 +616,14 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Campaign CRUD bugfix: cascades to every asset\'s Blob object + metadata and unlinks (never deletes) any Calendar task referencing this campaignId. location_manager/read_only never hold CAMPAIGN_MANAGE via the role table; a direct-id attempt outside the caller\'s location grant returns 404, never 403.',
   },
+  {
+    route: 'GET /api/tenant-ops/list', file: 'api/tenant-ops/[action].js', method: 'GET', action: 'list',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-operator status only (Multi-Tenant Phase 4H.1) -- NOT a per-tenant-owner endpoint like every other entry in this registry. \'owner\' here is necessary but NOT sufficient: isSuperAdmin() (auth.js) additionally requires resolveTenantId(account) === DEFAULT_TENANT_ID, so a real future Tenant B\'s own Owner (role owner, currentAllowedRoles-eligible by role alone) still gets 403. Read-only: never mutates tenant_config, never dispatches provision_tenant.py/initial_sync.py -- see .github/workflows/tenant-lifecycle.yml for the actual (human-operated) mutation path.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Response is an explicit sanitized allowlist per tenant (status/storageMode/approvedLocationCount/provisioning/initialSync/hasGoogleCredential/eligibility) -- never a raw tenant_config spread, never approvedLocations/locationIdMap/reviewDbBlobKey, never a decrypted credential (getStoredCredential()\'s refreshToken is reduced to a boolean before it reaches the response). See test_tenant_ops_endpoint.js for the full authorization/sanitization/eligibility test suite.',
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -924,6 +933,7 @@ const HANDLERS = {
   'api/notifications/[action].js': notificationsHandler,
   'api/tasks/[action].js': tasksHandler,
   'api/content/[action].js': contentHandler,
+  'api/tenant-ops/[action].js': tenantOpsHandler,
 }
 
 function minimalReqFor(entry, token) {
