@@ -396,3 +396,21 @@ def is_configured() -> bool:
         and os.environ.get("CREDENTIAL_ENCRYPTION_KEY")
     )
     return has_client_creds and (has_env_refresh_token or has_redis_config)
+
+
+# Multi-Tenant Phase 4G: is_configured() above is deliberately generic (env-
+# var presence only, no network call) -- it cannot tell whether a SPECIFIC
+# tenant has ever connected Google, only whether the environment is capable
+# of running GBP sync for SOME tenant. initial_sync.py's precondition check
+# needs the stronger, tenant-specific question: "does a real credential
+# actually exist for THIS tenant in the Redis-backed store." Deliberately
+# does NOT accept GOOGLE_REFRESH_TOKEN as a substitute here, even though
+# get_access_token()/_fetch_refresh_token_from_redis() themselves fall back
+# to it -- that fallback exists solely for Los Tres Amigos's own legacy,
+# single-tenant compatibility (LEGACY credential migration mode), and must
+# never be treated as "tenant B has a credential" for any BLOB-mode tenant;
+# doing so would let a tenant with no credential of its own silently sync
+# using whichever credential GOOGLE_REFRESH_TOKEN happens to hold.
+def has_tenant_credential(tenant_id: str) -> bool:
+    tenant_keys.assert_valid_tenant_id(tenant_id, "has_tenant_credential")
+    return _fetch_refresh_token_from_redis(tenant_id) is not None

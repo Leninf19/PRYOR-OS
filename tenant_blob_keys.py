@@ -45,3 +45,40 @@ def private_data_blob_key(tenant_id: str, rel_path: str, prefix: str | None = No
     _assert_safe_rel_path(rel_path, "private_data_blob_key")
     base = prefix if prefix is not None else private_data_prefix(tenant_id)
     return f"{base}{rel_path}"
+
+
+def _assert_safe_generation(generation: str, fn_name: str) -> None:
+    if not isinstance(generation, str) or not generation or "/" in generation or generation in (".", ".."):
+        raise InvalidBlobKeyInputError(f"{fn_name}: invalid generation {generation!r}")
+
+
+def generation_root(tenant_id: str, generation: str) -> str:
+    _assert_safe_generation(generation, "generation_root")
+    return f"{tenant_blob_root(tenant_id)}/generations/{generation}"
+
+
+# Multi-Tenant Phase 4G -- the generation-versioned artifact namespace,
+# a SIBLING of reviews.db/the flat private-data prefix under the tenant's
+# root (tenant-data/{tenantId}/generations/{generation}/private-data/...),
+# not nested under private_data_prefix() -- a generation groups EVERY
+# artifact of one sync attempt under one id, so it must live at the same
+# level reviews.db does, not inside the (now legacy/provisioning-only)
+# flat prefix. A pure formula over (tenantId, generation, relPath) only --
+# deliberately takes no `prefix` override, unlike private_data_blob_key()
+# above, since a generation id is never a registry-stored value the way a
+# tenant's overall private-data root historically was; it is always
+# recomputed fresh from tenant_config's own recorded, trusted generation
+# id (see initial_sync.py's header and reviewDataPaths.js's
+# readPrivateDataFile()) plus this same deterministic formula.
+#
+# initial_sync.py uploads every private-data artifact for one sync attempt
+# under a SINGLE generation id, then (only after every upload succeeds)
+# CAS-writes tenant_config's provisioning.artifactGeneration to point at
+# it. reviewDataPaths.js's readPrivateDataFile() resolves every BLOB-mode
+# read through this SAME formula plus the tenant's currently PUBLISHED
+# generation id, so a reader can never observe a mix of an old and a new
+# sync's artifacts -- see initial_sync.py's header for the full
+# atomic-publication design.
+def generation_private_data_blob_key(tenant_id: str, generation: str, rel_path: str) -> str:
+    _assert_safe_rel_path(rel_path, "generation_private_data_blob_key")
+    return f"{generation_root(tenant_id, generation)}/private-data/{rel_path}"

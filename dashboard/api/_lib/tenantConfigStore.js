@@ -93,30 +93,47 @@ function parseRecord(value) {
 // (`status === 'active' && locationCatalogEnabled === true`, tenants.js)
 // completely unchanged -- only WHEN 'active' is reached moves later, from
 // approveLocations() to a successful provisioning run.
-//   onboarding          -- no locations approved yet (unchanged default)
-//   locations_approved  -- approveLocations() succeeded; review-storage
-//                          resources not yet (successfully) provisioned
-//   provisioning        -- a provisioning attempt is currently in progress
-//   active              -- provisioning succeeded and was verified; the
-//                          tenant is authorized (unchanged meaning/string)
-//   provisioning_failed -- the last provisioning attempt failed; a valid
-//                          retry starting point, distinct from
-//                          locations_approved so operators/logs can see
-//                          something went wrong
-//   suspended           -- unchanged, admin-superseding state
-// Multi-Tenant Phase 4F closure: 'provisioned' inserted between
-// 'provisioning' and 'active' -- successful filesystem/SQLite creation
-// (provision_tenant.py) now stops HERE, not at 'active'. 'active' is
-// reserved exclusively for Phase 4G's Initial Sync completion (not built
-// yet); nothing in this codebase writes it today. tenants.js's
-// tenantOwnsLocationCatalog() still checks `status === 'active'` verbatim
-// -- unchanged -- so a 'provisioned' tenant remains exactly as
-// unauthorized as 'locations_approved'/'provisioning' until that future
-// step runs. See provision_tenant.py's header for the full state machine.
+//   onboarding           -- no locations approved yet (unchanged default)
+//   locations_approved   -- approveLocations() succeeded; review-storage
+//                           resources not yet (successfully) provisioned
+//   provisioning         -- a provisioning attempt is currently in progress
+//   provisioned          -- review-storage (reviews.db + private-data)
+//                           exists and was verified; NOT yet operational
+//   initial_sync         -- Multi-Tenant Phase 4G: initial_sync.py (Python)
+//                           is currently running this tenant's first real
+//                           Google sync. A tenant may sit here across
+//                           multiple retries (see initial_sync.py's header)
+//                           -- it is never, by itself, treated as
+//                           operational.
+//   active               -- Phase 4G's Initial Sync completed successfully
+//                           and was verified (real Google data synced, a
+//                           new reviews.db Blob generation uploaded and
+//                           confirmed, a complete private-data artifact
+//                           generation published) -- the ONLY status
+//                           tenants.js's tenantOwnsLocationCatalog()
+//                           authorizes. This is the ONLY status transition
+//                           initial_sync.py is allowed to make; nothing
+//                           else in this codebase ever writes it.
+//   initial_sync_failed  -- the last Initial Sync attempt failed; a valid
+//                           retry starting point, distinct from
+//                           'provisioned' so operators/logs can see
+//                           something went wrong. Retrying re-enters
+//                           initial_sync.py exactly like retrying a failed
+//                           provisioning attempt re-enters provision_tenant.py.
+//   provisioning_failed  -- the last provisioning attempt failed; a valid
+//                           retry starting point, distinct from
+//                           locations_approved so operators/logs can see
+//                           something went wrong
+//   suspended            -- unchanged, admin-superseding state. A stale
+//                           Initial Sync attempt that started before a
+//                           suspension can never overwrite it -- see the
+//                           configVersion CAS discipline both
+//                           provision_tenant.py and initial_sync.py use for
+//                           every write.
 function isValidStatus(status) {
   return [
-    'onboarding', 'locations_approved', 'provisioning', 'provisioned', 'active',
-    'provisioning_failed', 'suspended',
+    'onboarding', 'locations_approved', 'provisioning', 'provisioned',
+    'initial_sync', 'active', 'initial_sync_failed', 'provisioning_failed', 'suspended',
   ].includes(status)
 }
 
@@ -285,13 +302,33 @@ export async function upsertTenantConfig(tenantId, patch, { expectedVersion } = 
     // filesystem paths -- non-portable across GitHub Actions / local /
     // Vercel, per the production-persistence audit) replaced with logical,
     // storage-mode-relative identifiers. reviewDbEtag records the Vercel
-    // Blob ETag of the most recently CONFIRMED reviews.db upload -- purely
-    // observational/diagnostic; the actual concurrency guarantee comes from
-    // Blob's own conditional-write (ifMatch) mechanism at write time (see
-    // provision_tenant.py), not from comparing this stored value.
+    // Blob ETag of the most recently CONFIRMED reviews.db upload -- the
+    // concurrency guarantee itself always comes from Blob's own
+    // conditional-write (ifMatch) mechanism at write time (see
+    // provision_tenant.py/initial_sync.py), never from comparing this
+    // stored value alone, but Multi-Tenant Phase 4G's initial_sync.py DOES
+    // read it as a precondition (its own head_blob() read must still match
+    // this recorded value before trusting the Blob as this tenant's own,
+    // un-tampered-with database).
+    // artifactGeneration (Phase 4G): the currently PUBLISHED private-data
+    // artifact generation id -- see tenantBlobKeys.js's
+    // generationPrivateDataBlobKey(). Every artifact read
+    // (reviewDataPaths.js's readPrivateDataFile()) resolves through this
+    // field, never a flat, non-generational key, so a reader can never
+    // observe a mix of an old and a new sync's artifacts (see
+    // initial_sync.py's header for the full atomic-publication design).
     provisioning: {
       status: 'none', reviewDbBlobKey: null, privateDataPrefix: null, reviewDbEtag: null,
-      provisionedLocationIds: [], lastAttemptAt: null, lastError: null,
+      artifactGeneration: null, provisionedLocationIds: [], lastAttemptAt: null, lastError: null,
+    },
+    // Multi-Tenant Phase 4G -- Initial Sync's OWN state, kept separate from
+    // `provisioning` (which only ever describes "does durable storage
+    // exist," not "has real data been synced into it"). See
+    // initial_sync.py's header for the full state machine.
+    initialSync: {
+      status: 'none', startedAt: null, completedAt: null, failedAt: null,
+      reviewDbEtag: null, artifactGeneration: null,
+      reviewCount: null, locationCount: null, lastError: null,
     },
     ...existing,
     createdAt: existing?.createdAt ?? now,
@@ -475,14 +512,15 @@ export async function recordLocationApproval(tenantId, selectedLocations) {
 // stale attempt (one where the record changed underneath it -- a
 // suspension, a locations change, a newer completed attempt) can never
 // publish itself as successful.
-export async function markTenantProvisioned(tenantId, { reviewDbBlobKey, privateDataPrefix, reviewDbEtag, provisionedLocationIds, expectedVersion } = {}) {
+export async function markTenantProvisioned(tenantId, { reviewDbBlobKey, privateDataPrefix, reviewDbEtag, artifactGeneration, provisionedLocationIds, expectedVersion } = {}) {
   if (typeof reviewDbBlobKey !== 'string' || !reviewDbBlobKey) throw new TypeError('markTenantProvisioned: reviewDbBlobKey is required')
   if (typeof privateDataPrefix !== 'string' || !privateDataPrefix) throw new TypeError('markTenantProvisioned: privateDataPrefix is required')
   if (!Array.isArray(provisionedLocationIds)) throw new TypeError('markTenantProvisioned: provisionedLocationIds must be an array')
   return upsertTenantConfig(tenantId, {
     status: 'provisioned',
     provisioning: {
-      status: 'provisioned', reviewDbBlobKey, privateDataPrefix, reviewDbEtag: reviewDbEtag ?? null, provisionedLocationIds,
+      status: 'provisioned', reviewDbBlobKey, privateDataPrefix, reviewDbEtag: reviewDbEtag ?? null,
+      artifactGeneration: artifactGeneration ?? null, provisionedLocationIds,
       lastAttemptAt: new Date().toISOString(), lastError: null,
     },
   }, expectedVersion === undefined ? {} : { expectedVersion })
@@ -497,6 +535,74 @@ export async function markTenantProvisioningFailed(tenantId, errorMessage, { exp
       status: 'failed',
       lastAttemptAt: new Date().toISOString(),
       lastError: String(errorMessage ?? 'unknown error'),
+    },
+  }, expectedVersion === undefined ? {} : { expectedVersion })
+}
+
+// Multi-Tenant Phase 4G -- the ONE place a tenant's status is allowed to
+// become 'initial_sync'. Mirrors markTenantProvisioned()'s CAS discipline
+// exactly; the actual Google sync/DB/artifact work happens in Python
+// (initial_sync.py), which writes this exact same tenant_config:v1 record
+// via tenant_config_store.py. This Node-side helper exists purely for
+// tests/a future admin status view -- initial_sync.py never calls it (it
+// writes tenant_config_store.upsert_tenant_config() directly, exactly like
+// provision_tenant.py already does).
+export async function markTenantInitialSyncStarted(tenantId, { expectedVersion } = {}) {
+  const existing = await getTenantConfig(tenantId)
+  return upsertTenantConfig(tenantId, {
+    status: 'initial_sync',
+    initialSync: {
+      ...(existing?.initialSync ?? {}),
+      status: 'in_progress',
+      startedAt: new Date().toISOString(),
+      completedAt: null, failedAt: null, lastError: null,
+    },
+  }, expectedVersion === undefined ? {} : { expectedVersion })
+}
+
+export async function markTenantInitialSyncFailed(tenantId, errorMessage, { expectedVersion } = {}) {
+  const existing = await getTenantConfig(tenantId)
+  return upsertTenantConfig(tenantId, {
+    status: 'initial_sync_failed',
+    initialSync: {
+      ...(existing?.initialSync ?? {}),
+      status: 'failed',
+      failedAt: new Date().toISOString(),
+      lastError: String(errorMessage ?? 'unknown error'),
+    },
+  }, expectedVersion === undefined ? {} : { expectedVersion })
+}
+
+// Multi-Tenant Phase 4G -- the ONLY place in this ENTIRE codebase allowed
+// to write the 'active' status. See isValidStatus()'s comment above and
+// initial_sync.py's header for the full set of preconditions that must
+// hold before this may ever be called (Google sync succeeded for every
+// approved location, the reviews.db Blob upload was confirmed via a
+// conditional write, a complete private-data artifact generation was fully
+// uploaded) -- this function itself does not re-verify any of that; it is
+// the final, narrow write step, not the decision-maker. tests/
+// test_provisioned_not_active.js's source-scan assertion is extended
+// (Phase 4G) to also confirm this is the only 'active' literal anywhere in
+// this file.
+export async function markTenantActive(tenantId, { reviewDbEtag, artifactGeneration, reviewCount, locationCount, expectedVersion } = {}) {
+  if (typeof reviewDbEtag !== 'string' || !reviewDbEtag) throw new TypeError('markTenantActive: reviewDbEtag is required')
+  if (typeof artifactGeneration !== 'string' || !artifactGeneration) throw new TypeError('markTenantActive: artifactGeneration is required')
+  const existing = await getTenantConfig(tenantId)
+  return upsertTenantConfig(tenantId, {
+    status: 'active',
+    provisioning: {
+      ...(existing?.provisioning ?? {}),
+      reviewDbEtag,
+      artifactGeneration,
+    },
+    initialSync: {
+      ...(existing?.initialSync ?? {}),
+      status: 'completed',
+      completedAt: new Date().toISOString(), failedAt: null,
+      reviewDbEtag, artifactGeneration,
+      reviewCount: Number.isInteger(reviewCount) ? reviewCount : null,
+      locationCount: Number.isInteger(locationCount) ? locationCount : null,
+      lastError: null,
     },
   }, expectedVersion === undefined ? {} : { expectedVersion })
 }

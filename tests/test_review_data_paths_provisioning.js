@@ -59,10 +59,25 @@ async function testProvisionedTenantResolves() {
   await upsertTenantConfig(TENANT_A, {
     status: 'active',
     storageMode: 'BLOB',
-    provisioning: { status: 'provisioned', reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', reviewDbEtag: 'etag-1', provisionedLocationIds: [1], lastAttemptAt: null, lastError: null },
+    provisioning: { status: 'provisioned', reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', reviewDbEtag: 'etag-1', artifactGeneration: 'gen-1', provisionedLocationIds: [1], lastAttemptAt: null, lastError: null },
   })
   const storage = await resolveProvisionedPrivateDataRoot(TENANT_A)
-  assert(storage !== null && storage.mode === 'BLOB' && storage.privateDataPrefix === 'tenant-data/x/private-data/', `expected the provisioned BLOB storage descriptor, got ${JSON.stringify(storage)}`)
+  assert(storage !== null && storage.mode === 'BLOB' && storage.artifactGeneration === 'gen-1', `expected the provisioned BLOB storage descriptor, got ${JSON.stringify(storage)}`)
+}
+
+// Multi-Tenant Phase 4G: a tenant that is 'active' and 'provisioned' but
+// has NO recorded artifactGeneration (a pre-Phase-4G record, or a
+// genuinely inconsistent one) must resolve to null -- never fall back to
+// an inferred/guessed/latest generation.
+async function testActiveProvisionedTenantWithNoRecordedGenerationResolvesToNull() {
+  wireConfigRedis()
+  await upsertTenantConfig(TENANT_A, {
+    status: 'active',
+    storageMode: 'BLOB',
+    provisioning: { status: 'provisioned', reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', reviewDbEtag: 'etag-1', artifactGeneration: null, provisionedLocationIds: [1], lastAttemptAt: null, lastError: null },
+  })
+  const storage = await resolveProvisionedPrivateDataRoot(TENANT_A)
+  assert(storage === null, 'a tenant with no recorded artifactGeneration must resolve to null, never guess one')
 }
 
 async function testLocationsApprovedButNotYetProvisionedReturnsNull() {
@@ -87,7 +102,7 @@ async function testSuspendedTenantReturnsNullEvenIfPreviouslyProvisioned() {
   await upsertTenantConfig(TENANT_A, {
     status: 'suspended',
     storageMode: 'BLOB',
-    provisioning: { status: 'provisioned', reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', reviewDbEtag: 'etag-1', provisionedLocationIds: [1], lastAttemptAt: null, lastError: null },
+    provisioning: { status: 'provisioned', reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', reviewDbEtag: 'etag-1', artifactGeneration: 'gen-1', provisionedLocationIds: [1], lastAttemptAt: null, lastError: null },
   })
   const root = await resolveProvisionedPrivateDataRoot(TENANT_A)
   assert(root === null, 'a suspended tenant must resolve to null even if its provisioning record is still marked provisioned')
@@ -107,6 +122,7 @@ async function testStoreOutageReturnsNullNeverThrows() {
 
 async function main() {
   await run('a genuinely provisioned tenant resolves its private-data root', testProvisionedTenantResolves)
+  await run('active+provisioned but no recorded artifactGeneration resolves to null', testActiveProvisionedTenantWithNoRecordedGenerationResolvesToNull)
   await run('locations approved but not yet provisioned resolves to null', testLocationsApprovedButNotYetProvisionedReturnsNull)
   await run('a failed provisioning attempt resolves to null', testProvisioningFailedReturnsNull)
   await run('a suspended tenant resolves to null even if previously provisioned', testSuspendedTenantReturnsNullEvenIfPreviouslyProvisioned)

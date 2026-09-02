@@ -1,6 +1,7 @@
 {
-  "description": "Multi-Tenant Phase 4F.1 -- the canonical Blob key layout for a BLOB-mode tenant's durable storage. Both dashboard/api/_lib/tenantBlobKeys.js (Node) and tenant_blob_keys.py (Python) must compute the LITERAL SAME keys from the same tenantId -- this fixture is the shared contract both languages' test suites validate their own formula against.",
+  "description": "Multi-Tenant Phase 4F.1 (extended in Phase 4G for generation-versioned artifacts) -- the canonical Blob key layout for a BLOB-mode tenant's durable storage. Both dashboard/api/_lib/tenantBlobKeys.js (Node) and tenant_blob_keys.py (Python) must compute the LITERAL SAME keys from the same tenantId -- this fixture is the shared contract both languages' test suites validate their own formula against.",
   "exampleTenantId": "t_example-restaurant",
+  "exampleGeneration": "20260901T000000000000-abc123",
   "expected": {
     "tenantBlobRoot": "tenant-data/t_example-restaurant",
     "reviewDbBlobKey": "tenant-data/t_example-restaurant/reviews.db",
@@ -11,8 +12,17 @@
       "gbp-sync.json": "tenant-data/t_example-restaurant/private-data/gbp-sync.json",
       "_internal/review-location-index.json": "tenant-data/t_example-restaurant/private-data/_internal/review-location-index.json",
       "reviews/by-location/casa-tequila-prime.json": "tenant-data/t_example-restaurant/private-data/reviews/by-location/casa-tequila-prime.json"
+    },
+    "generationRoot": "tenant-data/t_example-restaurant/generations/20260901T000000000000-abc123",
+    "generationPrivateDataBlobKeys": {
+      "meta.json": "tenant-data/t_example-restaurant/generations/20260901T000000000000-abc123/private-data/meta.json",
+      "action-items.json": "tenant-data/t_example-restaurant/generations/20260901T000000000000-abc123/private-data/action-items.json",
+      "gbp-sync.json": "tenant-data/t_example-restaurant/generations/20260901T000000000000-abc123/private-data/gbp-sync.json",
+      "_internal/review-location-index.json": "tenant-data/t_example-restaurant/generations/20260901T000000000000-abc123/private-data/_internal/review-location-index.json",
+      "reviews/by-location/casa-tequila-prime.json": "tenant-data/t_example-restaurant/generations/20260901T000000000000-abc123/private-data/reviews/by-location/casa-tequila-prime.json"
     }
   },
   "invalidRelPaths": ["", "../escape.json", "a/../b.json", "a/./b.json", "/absolute.json"],
-  "notes": "relPath validation is defense-in-depth only -- the primary guard against a malformed relPath is each caller's own allowlist (e.g. data.js's buildRequestedRelPath())."
+  "invalidGenerations": ["", "a/b", ".", ".."],
+  "notes": "relPath/generation validation is defense-in-depth only -- the primary guard against a malformed relPath is each caller's own allowlist (e.g. data.js's buildRequestedRelPath()), and generation ids are always server-computed (uuid4 hex, initial_sync.py), never caller-supplied. The generation namespace is a SIBLING of reviews.db/the flat private-data prefix under the tenant's root, not nested under it -- see generation_root()/generationRoot()."
 }

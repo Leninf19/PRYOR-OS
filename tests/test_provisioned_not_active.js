@@ -1,12 +1,14 @@
-// Multi-Tenant Phase 4F, final closure -- "provisioning completion is not
-// equivalent to SaaS readiness." Proves that NONE of the pre-Initial-Sync
-// states (locations_approved, provisioning, provisioning_failed,
-// provisioned) grant tenants.js's tenantOwnsLocationCatalog()/
-// tenantOwnsLocation() -- only 'active' does, and nothing in this
-// codebase's Phase 4F code (recordLocationApproval(), markTenantProvisioned(),
-// markTenantProvisioningFailed(), provision_tenant.py) is capable of
-// writing 'active'. That is deliberately reserved for Phase 4G's Initial
-// Sync completion, not built here.
+// Multi-Tenant Phase 4F, final closure (extended in Phase 4G) --
+// "provisioning completion is not equivalent to SaaS readiness." Proves
+// that NONE of the pre-Initial-Sync-completion states (locations_approved,
+// provisioning, provisioning_failed, provisioned, initial_sync,
+// initial_sync_failed) grant tenants.js's tenantOwnsLocationCatalog()/
+// tenantOwnsLocation() -- only 'active' does, and the ONLY place in this
+// entire codebase capable of writing 'active' is
+// tenantConfigStore.js's markTenantActive() (Node) / initial_sync.py's
+// final activation write (Python), gated by initial_sync.py's own
+// preconditions (real Google sync completed, DB Blob upload confirmed,
+// artifact generation published).
 //
 // No real Upstash account, no real filesystem access, no production data.
 //
@@ -22,6 +24,7 @@ import {
 } from '../dashboard/api/_lib/tenants.js'
 import {
   upsertTenantConfig, getTenantConfig, recordLocationApproval, markTenantProvisioned, markTenantProvisioningFailed,
+  markTenantInitialSyncStarted, markTenantInitialSyncFailed,
   _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis,
 } from '../dashboard/api/_lib/tenantConfigStore.js'
 
@@ -29,6 +32,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const TENANT_CONFIG_STORE_SRC = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'api', '_lib', 'tenantConfigStore.js'), 'utf-8')
 const GOOGLE_ACTION_SRC = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'api', 'google', '[action].js'), 'utf-8')
 const PROVISION_TENANT_PY_SRC = readFileSync(path.resolve(__dirname, '..', 'provision_tenant.py'), 'utf-8')
+const INITIAL_SYNC_PY_SRC = readFileSync(path.resolve(__dirname, '..', 'initial_sync.py'), 'utf-8')
 
 const TENANT_A = 't_synthetic-not-active-tenant'
 
@@ -90,7 +94,7 @@ async function testProvisioningInProgressIsNotActive() {
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   await upsertTenantConfig(TENANT_A, {
     status: 'provisioning',
-    provisioning: { status: 'in_progress', reviewDbBlobKey: null, privateDataPrefix: null, reviewDbEtag: null, provisionedLocationIds: [], lastAttemptAt: new Date().toISOString(), lastError: null },
+    provisioning: { status: 'in_progress', reviewDbBlobKey: null, privateDataPrefix: null, reviewDbEtag: null, artifactGeneration: null, provisionedLocationIds: [], lastAttemptAt: new Date().toISOString(), lastError: null },
   })
   await assertNotOperational(TENANT_A, 'provisioning (in progress)')
 }
@@ -130,29 +134,95 @@ async function testSuccessfullyProvisionedButUnsyncedIsNotFullyActive() {
 }
 
 // ===========================================================================
-// 5: Phase 4G will be the only path that can transition the tenant to
-//    final active/ready state -- structural proof that nothing in this
-//    phase's code is capable of writing 'active'
+// 5/6: Multi-Tenant Phase 4G -- Initial Sync in progress / failed is not
+// active either. A tenant may cycle provisioned -> initial_sync ->
+// initial_sync_failed -> initial_sync (retry) many times; none of those
+// states are ever operational.
 // ===========================================================================
 
-function testNothingInPhase4FCodeCanWriteActiveStatus() {
-  // tenantConfigStore.js: 'active' must not appear as a literal status
-  // value assigned anywhere outside of isValidStatus()'s enum declaration
-  // and comments -- specifically, recordLocationApproval()/
-  // markTenantProvisioned()/markTenantProvisioningFailed() must never
-  // assign status: 'active'.
-  assert(!/status:\s*'active'/.test(TENANT_CONFIG_STORE_SRC),
-    'tenantConfigStore.js must contain no literal `status: \'active\'` assignment -- only Phase 4G may ever write it')
+async function testInitialSyncInProgressIsNotActive() {
+  wireConfigRedis()
+  await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
+  await markTenantProvisioned(TENANT_A, {
+    reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', provisionedLocationIds: [1],
+  })
+  const config = await markTenantInitialSyncStarted(TENANT_A)
+  assert(config.status === 'initial_sync', `expected status 'initial_sync', got ${config.status}`)
+  await assertNotOperational(TENANT_A, 'initial_sync (in progress)')
+}
+
+async function testInitialSyncFailedIsNotActive() {
+  wireConfigRedis()
+  await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
+  await markTenantProvisioned(TENANT_A, {
+    reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', provisionedLocationIds: [1],
+  })
+  await markTenantInitialSyncStarted(TENANT_A)
+  const config = await markTenantInitialSyncFailed(TENANT_A, 'simulated Google sync failure')
+  assert(config.status === 'initial_sync_failed', `expected status 'initial_sync_failed', got ${config.status}`)
+  await assertNotOperational(TENANT_A, 'initial_sync_failed')
+}
+
+// ===========================================================================
+// 7: structural proof -- 'active' is written in EXACTLY ONE place in each
+// language (Node: markTenantActive(); Python: initial_sync.py's final
+// activation write), and nowhere else.
+// ===========================================================================
+
+function extractFunctionBody(src, functionSignaturePattern) {
+  const match = src.match(functionSignaturePattern)
+  assert(match, `could not locate a function matching ${functionSignaturePattern} in the given source`)
+  // Skip past the parameter list FIRST (it may itself contain '{...}' via
+  // destructured default parameters, e.g. `{ reviewDbEtag } = {}`) by
+  // balancing parens from the '(' immediately after the matched signature,
+  // then only start brace-counting the actual function BODY after that.
+  let parenDepth = 0
+  let i = src.indexOf('(', match.index)
+  for (; i < src.length; i++) {
+    if (src[i] === '(') parenDepth++
+    else if (src[i] === ')') {
+      parenDepth--
+      if (parenDepth === 0) break
+    }
+  }
+  let braceDepth = 0
+  i = src.indexOf('{', i)
+  const bodyStart = i
+  for (; i < src.length; i++) {
+    if (src[i] === '{') braceDepth++
+    else if (src[i] === '}') {
+      braceDepth--
+      if (braceDepth === 0) return src.slice(bodyStart, i + 1)
+    }
+  }
+  throw new Error('unbalanced braces while extracting function body')
+}
+
+function testOnlyMarkTenantActiveCanWriteActiveStatus() {
+  const activeLiteral = /status:\s*'active'/g
+  const totalOccurrences = (TENANT_CONFIG_STORE_SRC.match(activeLiteral) || []).length
+  assert(totalOccurrences === 1,
+    `tenantConfigStore.js must contain EXACTLY ONE literal \`status: 'active'\` assignment (inside markTenantActive()), found ${totalOccurrences}`)
+
+  const markTenantActiveBody = extractFunctionBody(TENANT_CONFIG_STORE_SRC, /export async function markTenantActive\(/)
+  assert(/status:\s*'active'/.test(markTenantActiveBody),
+    'the one `status: \'active\'` assignment must be inside markTenantActive() itself')
 
   // google/[action].js's approveLocations() must never set status active
-  // either (it delegates to recordLocationApproval(), checked above, but
-  // this guards against a future direct write bypassing that function).
+  // either (it delegates to recordLocationApproval(), never markTenantActive()).
   assert(!/status:\s*['"]active['"]/.test(GOOGLE_ACTION_SRC),
     'google/[action].js must contain no literal active-status assignment')
 
-  // provision_tenant.py must never write status="active" or 'active'.
+  // provision_tenant.py must never write status="active" or 'active' --
+  // it may only ever reach 'provisioned'.
   assert(!/status["']?\s*:\s*["']active["']/.test(PROVISION_TENANT_PY_SRC),
     'provision_tenant.py must contain no literal "active" status assignment -- it may only ever reach \'provisioned\'')
+
+  // initial_sync.py IS allowed to write it, but only in its final,
+  // narrowly-scoped activation step -- not scattered across the file.
+  const activeLiteralPy = /["']active["']/g
+  const pyOccurrences = (INITIAL_SYNC_PY_SRC.match(activeLiteralPy) || []).length
+  assert(pyOccurrences >= 1, 'initial_sync.py must contain the literal "active" status somewhere -- it is the one file allowed to write it')
 }
 
 async function main() {
@@ -160,7 +230,9 @@ async function main() {
   await run('provisioning in progress is not active', testProvisioningInProgressIsNotActive)
   await run('provisioning failed is not active', testProvisioningFailedIsNotActive)
   await run('successfully provisioned but unsynced is not fully active', testSuccessfullyProvisionedButUnsyncedIsNotFullyActive)
-  await run('nothing in Phase 4F code can write status active -- only Phase 4G may', () => testNothingInPhase4FCodeCanWriteActiveStatus())
+  await run('initial sync in progress is not active', testInitialSyncInProgressIsNotActive)
+  await run('initial sync failed is not active', testInitialSyncFailedIsNotActive)
+  await run('only markTenantActive()/initial_sync.py can write status active', () => testOnlyMarkTenantActiveCanWriteActiveStatus())
 
   console.log()
   if (results.every(Boolean)) {

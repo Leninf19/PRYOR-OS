@@ -97,6 +97,7 @@ import json
 import re
 import sqlite3
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -105,6 +106,7 @@ import tenant_blob_keys
 import tenant_blob_store
 import tenant_config_store
 import tenant_keys
+import tenant_location_mapping
 
 
 class ProvisioningError(Exception):
@@ -203,30 +205,18 @@ def _load_and_validate_config(tenant_id: str) -> dict:
 
 
 def _validate_stable_id_consistency(approved_locations: list[dict], location_id_map: dict) -> dict[int, str]:
-    """Cross-checks approvedLocations against locationIdMap BEFORE any Blob
-    action -- see this file's header. Returns {locationId: googleLocationId}
-    on success; raises LocationMappingConsistencyError on any inconsistency."""
-    by_location_id: dict[int, str] = {}
-    for loc in approved_locations:
-        google_id = loc.get("googleLocationId")
-        location_id = loc.get("locationId")
-        if not google_id or not isinstance(google_id, str):
-            raise LocationMappingConsistencyError(f"approved location has no valid googleLocationId: {loc!r}")
-        if not isinstance(location_id, int) or location_id < 1:
-            raise LocationMappingConsistencyError(f"approved location {google_id!r} has no valid stable locationId: {loc!r}")
-        mapped_id = location_id_map.get(google_id)
-        if mapped_id != location_id:
-            raise LocationMappingConsistencyError(
-                f"approvedLocations entry for {google_id!r} claims locationId {location_id}, but "
-                f"locationIdMap says {mapped_id!r} -- refusing to provision on inconsistent tenant_config state"
-            )
-        if location_id in by_location_id and by_location_id[location_id] != google_id:
-            raise LocationMappingConsistencyError(
-                f"locationId {location_id} is claimed by both {by_location_id[location_id]!r} and "
-                f"{google_id!r} -- duplicate/conflicting mapping, refusing to provision"
-            )
-        by_location_id[location_id] = google_id
-    return by_location_id
+    """Multi-Tenant Phase 4G: delegates to tenant_location_mapping.py (the
+    single, shared implementation initial_sync.py also uses) rather than
+    keeping a second, independently-maintained copy of this rule -- see
+    that module's header. Re-raises as THIS module's own
+    LocationMappingConsistencyError (a ProvisioningError subclass) so
+    existing callers/tests (main()'s `except ProvisioningError`,
+    test_provision_tenant.py's `pt.LocationMappingConsistencyError`)
+    continue to work unchanged."""
+    try:
+        return tenant_location_mapping.validate_stable_id_consistency(approved_locations, location_id_map)
+    except tenant_location_mapping.LocationMappingConsistencyError as e:
+        raise LocationMappingConsistencyError(str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -347,17 +337,30 @@ def _verify_staging(db_path: Path, artifacts: dict[str, bytes], expected: dict[i
 # Step 4: Blob upload helpers
 # ---------------------------------------------------------------------------
 
-def _upload_private_data_artifacts(tenant_id: str, private_data_prefix: str, artifacts: dict[str, bytes]) -> None:
-    """Uploads every private-data artifact fresh. Only ever called from
-    within the fresh-provisioning path, which is already exclusively held by
-    this attempt (guarded by the tenant_config 'provisioning' CAS write made
-    before this runs) -- no ifMatch/allowOverwrite guard is needed on these
-    individual JSON objects themselves, unlike the reviews.db upload below,
-    which must remain safe even outside that exclusive window (a later
-    reconciliation or sync run)."""
+def generate_new_artifact_generation_id() -> str:
+    """A fresh, unique-per-attempt generation id -- never coordinated with
+    any counter, since uniqueness (not ordering) is all correctness
+    requires: two concurrent attempts building DIFFERENT generations never
+    collide on a Blob key, and WHICH one becomes authoritative is decided
+    entirely by the tenant_config CAS write that points artifactGeneration
+    at it (see provision_tenant()/initial_sync.py)."""
+    return uuid.uuid4().hex
+
+
+def _upload_private_data_artifacts(tenant_id: str, generation: str, artifacts: dict[str, bytes]) -> None:
+    """Uploads every private-data artifact of ONE generation. Multi-Tenant
+    Phase 4G: artifacts are uploaded under a brand-new, never-before-used
+    generation id (see generate_new_artifact_generation_id() below) --
+    never overwritten in place at a flat key -- so a reader (Node's
+    readPrivateDataFile()) can never observe a mix of an old and new
+    generation's files; tenant_config's provisioning.artifactGeneration is
+    only ever pointed at a generation AFTER every one of its uploads here
+    has succeeded (see the CAS-confirm calls in provision_tenant()).
+    allow_overwrite=True is still safe per-object because a generation id
+    is unique per attempt -- two attempts never target the same key."""
     for rel_path, content in artifacts.items():
         tenant_blob_store.put_blob(
-            tenant_blob_keys.private_data_blob_key(tenant_id, rel_path, private_data_prefix),
+            tenant_blob_keys.generation_private_data_blob_key(tenant_id, generation, rel_path),
             content, content_type="application/json", allow_overwrite=True,
         )
 
@@ -394,16 +397,21 @@ def _upload_reconciled_database(review_db_blob_key: str, db_path: Path, expected
     return result["etag"]
 
 
-def _private_data_looks_complete(tenant_id: str, private_data_prefix: str) -> bool:
+def _private_data_looks_complete(tenant_id: str, generation: str | None) -> bool:
     """Cheap existence check (HEAD, no download) for the two artifacts
-    _verify_staging() requires -- used by the idempotency path to detect a
-    partial prior failure (reviews.db uploaded and confirmed by Blob, but
-    the private-data uploads that were supposed to follow never completed,
-    e.g. a network error between the two upload calls). Blob's own
-    per-object existence is independent of tenant_config's confirmation
-    state, so this is the ONLY reliable way to detect that gap on a retry."""
+    _verify_staging() requires, under the CURRENTLY RECORDED generation --
+    used by the idempotency path to detect a partial prior failure
+    (reviews.db uploaded and confirmed by Blob, but the private-data
+    uploads that were supposed to follow never completed, e.g. a network
+    error between the two upload calls, OR no generation was ever recorded
+    at all -- a pre-Phase-4G record). Blob's own per-object existence is
+    independent of tenant_config's confirmation state, so this is the ONLY
+    reliable way to detect that gap on a retry. A None generation is always
+    "not complete" -- there is nothing to check existence of."""
+    if generation is None:
+        return False
     for rel_path in ("meta.json", "_internal/review-location-index.json"):
-        key = tenant_blob_keys.private_data_blob_key(tenant_id, rel_path, private_data_prefix)
+        key = tenant_blob_keys.generation_private_data_blob_key(tenant_id, generation, rel_path)
         if tenant_blob_store.head_blob(key) is None:
             return False
     return True
@@ -503,7 +511,8 @@ def provision_tenant(tenant_id: str) -> dict:
     expected = _validate_stable_id_consistency(approved_locations, location_id_map)
 
     review_db_blob_key = tenant_blob_keys.review_db_blob_key(tenant_id)
-    private_data_prefix = tenant_blob_keys.private_data_prefix(tenant_id)
+    private_data_prefix = tenant_blob_keys.private_data_prefix(tenant_id)  # recorded for backward-compat/diagnostics only; reads resolve via artifactGeneration
+    recorded_generation = (config.get("provisioning") or {}).get("artifactGeneration")
 
     with tempfile.TemporaryDirectory(prefix=f"provision-{tenant_id}-") as tmp:
         tmp_db_path = Path(tmp) / "reviews.db"
@@ -517,20 +526,21 @@ def provision_tenant(tenant_id: str) -> dict:
                     f"DIFFERENT Google location than currently expected -- refusing to touch it; manual investigation required"
                 )
             if inspection["fully_consistent"]:
-                if not _private_data_looks_complete(tenant_id, private_data_prefix):
+                generation = recorded_generation
+                if not _private_data_looks_complete(tenant_id, generation):
                     # The reviews.db upload from a prior attempt was
                     # confirmed by Blob, but the private-data artifacts that
                     # were supposed to follow it never fully landed (e.g. a
-                    # network failure between the two upload calls) --
-                    # rebuild and reupload them from the CURRENT
-                    # approvedLocations. Safe and idempotent: these uploads
-                    # never touch reviews.db or any real review data, and
-                    # allow_overwrite=True on each individual JSON object is
-                    # exactly as safe to repeat as the very first attempt.
+                    # network failure between the two upload calls), or no
+                    # generation was ever recorded -- rebuild and republish
+                    # under a BRAND-NEW generation from the CURRENT
+                    # approvedLocations (never patch the old one in place --
+                    # see generate_new_artifact_generation_id()'s header).
+                    generation = generate_new_artifact_generation_id()
                     artifacts = _build_initial_artifacts(approved_locations)
-                    _upload_private_data_artifacts(tenant_id, private_data_prefix, artifacts)
-                _mark_provisioned_or_raise_stale(tenant_id, review_db_blob_key, private_data_prefix, current_etag, expected, expected_version)
-                return {"outcome": "already_provisioned", "reviewDbBlobKey": review_db_blob_key, "privateDataPrefix": private_data_prefix, "locationIds": sorted(expected.keys())}
+                    _upload_private_data_artifacts(tenant_id, generation, artifacts)
+                _mark_provisioned_or_raise_stale(tenant_id, review_db_blob_key, private_data_prefix, current_etag, generation, expected, expected_version)
+                return {"outcome": "already_provisioned", "reviewDbBlobKey": review_db_blob_key, "artifactGeneration": generation, "locationIds": sorted(expected.keys())}
             if inspection["review_count"] != 0:
                 raise ProvisioningRefusedError(
                     f"tenant {tenant_id!r}: existing database is missing locationId(s) {inspection['missing']} but already "
@@ -541,11 +551,13 @@ def provision_tenant(tenant_id: str) -> dict:
             # additive reconciliation. Existing rows are never touched.
             _reconcile_missing_locations(tmp_db_path, approved_locations, inspection["missing"])
             new_etag = _upload_reconciled_database(review_db_blob_key, tmp_db_path, current_etag)
-            if not _private_data_looks_complete(tenant_id, private_data_prefix):
+            generation = recorded_generation
+            if not _private_data_looks_complete(tenant_id, generation):
+                generation = generate_new_artifact_generation_id()
                 artifacts = _build_initial_artifacts(approved_locations)
-                _upload_private_data_artifacts(tenant_id, private_data_prefix, artifacts)
-            _mark_provisioned_or_raise_stale(tenant_id, review_db_blob_key, private_data_prefix, new_etag, expected, expected_version)
-            return {"outcome": "reconciled", "reviewDbBlobKey": review_db_blob_key, "privateDataPrefix": private_data_prefix, "locationIds": sorted(expected.keys())}
+                _upload_private_data_artifacts(tenant_id, generation, artifacts)
+            _mark_provisioned_or_raise_stale(tenant_id, review_db_blob_key, private_data_prefix, new_etag, generation, expected, expected_version)
+            return {"outcome": "reconciled", "reviewDbBlobKey": review_db_blob_key, "artifactGeneration": generation, "locationIds": sorted(expected.keys())}
 
         # --- Fresh provisioning ---
         try:
@@ -560,13 +572,14 @@ def provision_tenant(tenant_id: str) -> dict:
             ) from e
         expected_version += 1
 
+        generation = generate_new_artifact_generation_id()
         try:
             _build_database_file(tmp_db_path, approved_locations)
             artifacts = _build_initial_artifacts(approved_locations)
             _verify_staging(tmp_db_path, artifacts, expected)
 
             new_etag = _upload_fresh_database(review_db_blob_key, tmp_db_path)
-            _upload_private_data_artifacts(tenant_id, private_data_prefix, artifacts)
+            _upload_private_data_artifacts(tenant_id, generation, artifacts)
         except StaleProvisioningAttemptError:
             # The Blob-level race already leaves nothing for this attempt to
             # publish -- report it as a plain stale attempt, not a failure
@@ -579,7 +592,7 @@ def provision_tenant(tenant_id: str) -> dict:
                     "status": "provisioning_failed",
                     "provisioning": {
                         "status": "failed", "reviewDbBlobKey": None, "privateDataPrefix": None, "reviewDbEtag": None,
-                        "provisionedLocationIds": [], "lastAttemptAt": _now_iso(), "lastError": str(e),
+                        "artifactGeneration": None, "provisionedLocationIds": [], "lastAttemptAt": _now_iso(), "lastError": str(e),
                     },
                 }, expected_version=expected_version)
             except tenant_config_store.ConfigVersionConflictError:
@@ -593,7 +606,7 @@ def provision_tenant(tenant_id: str) -> dict:
             "status": "provisioned",
             "provisioning": {
                 "status": "provisioned", "reviewDbBlobKey": review_db_blob_key, "privateDataPrefix": private_data_prefix,
-                "reviewDbEtag": new_etag, "provisionedLocationIds": sorted(expected.keys()),
+                "reviewDbEtag": new_etag, "artifactGeneration": generation, "provisionedLocationIds": sorted(expected.keys()),
                 "lastAttemptAt": _now_iso(), "lastError": None,
             },
         }, expected_version=expected_version)
@@ -608,16 +621,16 @@ def provision_tenant(tenant_id: str) -> dict:
             f"re-evaluate them against current state"
         ) from e
 
-    return {"outcome": "provisioned", "reviewDbBlobKey": review_db_blob_key, "privateDataPrefix": private_data_prefix, "locationIds": sorted(expected.keys())}
+    return {"outcome": "provisioned", "reviewDbBlobKey": review_db_blob_key, "artifactGeneration": generation, "locationIds": sorted(expected.keys())}
 
 
-def _mark_provisioned_or_raise_stale(tenant_id: str, review_db_blob_key: str, private_data_prefix: str, review_db_etag: str, expected: dict[int, str], expected_version: int) -> None:
+def _mark_provisioned_or_raise_stale(tenant_id: str, review_db_blob_key: str, private_data_prefix: str, review_db_etag: str, artifact_generation: str, expected: dict[int, str], expected_version: int) -> None:
     try:
         tenant_config_store.upsert_tenant_config(tenant_id, {
             "status": "provisioned",
             "provisioning": {
                 "status": "provisioned", "reviewDbBlobKey": review_db_blob_key, "privateDataPrefix": private_data_prefix,
-                "reviewDbEtag": review_db_etag, "provisionedLocationIds": sorted(expected.keys()),
+                "reviewDbEtag": review_db_etag, "artifactGeneration": artifact_generation, "provisionedLocationIds": sorted(expected.keys()),
                 "lastAttemptAt": _now_iso(), "lastError": None,
             },
         }, expected_version=expected_version)

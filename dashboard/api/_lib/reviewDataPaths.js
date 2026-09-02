@@ -34,7 +34,7 @@ import { fileURLToPath } from 'url'
 import { DEFAULT_TENANT_ID, isValidTenantId } from './tenants.js'
 import { getTenantConfig } from './tenantConfigStore.js'
 import { getBlob } from './blobStore.js'
-import { privateDataBlobKey } from './tenantBlobKeys.js'
+import { generationPrivateDataBlobKey } from './tenantBlobKeys.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -80,29 +80,38 @@ let testOverrides = {}
 export function _setPrivateDataRootForTests(tenantId, rootPath) {
   testOverrides = { ...testOverrides, [tenantId]: { mode: 'LEGACY_REPO', root: rootPath } }
 }
-// Multi-Tenant Phase 4F.1: registers a synthetic BLOB storage descriptor for
-// a test tenant -- pairs with blobStore.js's own _setBlobClientForTests() to
-// exercise the BLOB read branch end-to-end with a fake in-memory client,
-// never a real Vercel Blob store or network call.
-export function _setBlobStorageForTests(tenantId, privateDataPrefix) {
-  testOverrides = { ...testOverrides, [tenantId]: { mode: 'BLOB', privateDataPrefix } }
+// Multi-Tenant Phase 4F.1 (updated Phase 4G for generation-aware keys):
+// registers a synthetic BLOB storage descriptor for a test tenant -- pairs
+// with blobStore.js's own _setBlobClientForTests() to exercise the BLOB
+// read branch end-to-end with a fake in-memory client, never a real Vercel
+// Blob store or network call.
+export function _setBlobStorageForTests(tenantId, artifactGeneration) {
+  testOverrides = { ...testOverrides, [tenantId]: { mode: 'BLOB', artifactGeneration } }
 }
 export function _resetPrivateDataRootsForTests() {
   testOverrides = {}
 }
 
-// Multi-Tenant Phase 4F closure / 4F.1 revision -- the dynamic,
-// provisioning-backed counterpart to the static registry above, for a
-// self-service tenant onboarded via Connect Google -> Discover -> Approve
-// -> provision_tenant.py (Python) rather than a source-code registry edit.
+// Multi-Tenant Phase 4F closure / 4F.1 revision (extended in Phase 4G for
+// generation-aware artifacts) -- the dynamic, provisioning-backed
+// counterpart to the static registry above, for a self-service tenant
+// onboarded via Connect Google -> Discover -> Approve -> provision_tenant.py
+// -> initial_sync.py (Python) rather than a source-code registry edit.
 //
-// Reads the SAME tenant_config:v1 record provision_tenant.py writes to, and
-// returns a storage descriptor ONLY IF the tenant is genuinely OPERATIONAL
-// -- status === 'active' (NOT 'provisioned' -- a tenant whose storage
-// exists but has not completed Phase 4G's Initial Sync is deliberately NOT
-// resolvable here) AND provisioning.status === 'provisioned' (the resources
-// actually exist and were verified). Returns null (never throws) for
-// anything short of that.
+// Reads the SAME tenant_config:v1 record provision_tenant.py/initial_sync.py
+// write to, and returns a storage descriptor ONLY IF the tenant is
+// genuinely OPERATIONAL -- status === 'active' (NOT 'provisioned' or
+// 'initial_sync' -- a tenant that has not completed Phase 4G's Initial
+// Sync is deliberately NOT resolvable here) AND provisioning.status ===
+// 'provisioned' (the resources actually exist and were verified). Returns
+// null (never throws) for anything short of that.
+//
+// artifactGeneration (Phase 4G): read HERE, fresh, from THIS request's own
+// tenant_config lookup -- never from query/body/header, never a "latest"
+// scan or a lexicographic-highest guess over Blob keys. A tenant with no
+// recorded generation (a pre-Phase-4G record, or a genuinely inconsistent
+// one) resolves to null just like a missing privateDataPrefix would --
+// fails closed, never falls back to an older/guessed generation.
 async function resolveProvisionedStorage(tenantId) {
   let config
   try {
@@ -114,9 +123,9 @@ async function resolveProvisionedStorage(tenantId) {
   const provisioning = config.provisioning ?? {}
   if (provisioning.status !== 'provisioned') return null
   if (config.storageMode === 'BLOB') {
-    const prefix = provisioning.privateDataPrefix
-    if (typeof prefix !== 'string' || !prefix) return null
-    return { mode: 'BLOB', privateDataPrefix: prefix }
+    const generation = provisioning.artifactGeneration
+    if (typeof generation !== 'string' || !generation) return null
+    return { mode: 'BLOB', artifactGeneration: generation }
   }
   // storageMode 'LEGACY_REPO' has no dynamic counterpart -- LTA (the only
   // LEGACY_REPO tenant) is served exclusively by the static registry above,
@@ -189,8 +198,11 @@ export async function readPrivateDataFile(tenantId, relPath) {
   // BLOB: getBlob() (blobStore.js) authenticates via Vercel OIDC at
   // runtime -- no credential handling needed here at all. Returns null for
   // a genuine 404 (per @vercel/blob's own get() contract), a
-  // {statusCode, stream, ...} result otherwise.
-  const key = privateDataBlobKey(tenantId, relPath, storage.privateDataPrefix)
+  // {statusCode, stream, ...} result otherwise. The key is built ONLY
+  // through generationPrivateDataBlobKey() (the trusted key helper) from
+  // this tenant's own resolved storage.artifactGeneration -- never any
+  // caller-supplied value, never a "highest"/"latest" scan.
+  const key = generationPrivateDataBlobKey(tenantId, storage.artifactGeneration, relPath)
   const result = await getBlob(key)
   if (result === null) {
     throw new PrivateDataFileNotFoundError(`private-data file not found in Blob: ${key}`)

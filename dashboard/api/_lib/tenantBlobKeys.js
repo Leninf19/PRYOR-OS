@@ -80,3 +80,41 @@ export function privateDataBlobKey(tenantId, relPath, prefix) {
   const base = prefix ?? privateDataPrefix(tenantId)
   return `${base}${relPath}`
 }
+
+function assertSafeGeneration(generation, fnName) {
+  if (typeof generation !== 'string' || !generation || generation.includes('/') || generation === '.' || generation === '..') {
+    throw new InvalidBlobKeyInputError(`${fnName}: invalid generation ${JSON.stringify(generation)}`)
+  }
+}
+
+export function generationRoot(tenantId, generation) {
+  assertSafeGeneration(generation, 'generationRoot')
+  return `${tenantBlobRoot(tenantId)}/generations/${generation}`
+}
+
+// Multi-Tenant Phase 4G -- the generation-versioned artifact namespace, a
+// SIBLING of reviews.db/the flat private-data prefix under the tenant's
+// root (tenant-data/{tenantId}/generations/{generation}/private-data/...),
+// not nested under privateDataPrefix() -- a generation groups EVERY
+// artifact of one sync attempt under one id, so it must live at the same
+// level reviews.db does. A pure formula over (tenantId, generation,
+// relPath) only -- deliberately takes no `prefix` override, unlike
+// privateDataBlobKey() above: a generation id is never a registry-stored
+// value the way a tenant's overall private-data root historically was; it
+// is always recomputed fresh from tenant_config's own recorded, trusted
+// generation id (see below and initial_sync.py's header) plus this same
+// deterministic formula.
+//
+// initial_sync.py (Python) uploads every private-data artifact for one
+// sync attempt under a SINGLE generation id, then (only after every
+// upload succeeds) CAS-writes tenant_config's provisioning.artifactGeneration
+// to point at it. reviewDataPaths.js's readPrivateDataFile() resolves
+// every BLOB-mode read through this SAME formula plus the tenant's
+// currently PUBLISHED generation id (read fresh from that request's own
+// tenant_config lookup, NEVER from query/body/header, and never a
+// "highest"/"latest" scan) -- so a reader can never observe a mix of an
+// old and a new sync's artifacts.
+export function generationPrivateDataBlobKey(tenantId, generation, relPath) {
+  assertSafeRelPath(relPath, 'generationPrivateDataBlobKey')
+  return `${generationRoot(tenantId, generation)}/private-data/${relPath}`
+}

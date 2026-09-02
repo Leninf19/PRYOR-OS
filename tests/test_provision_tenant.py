@@ -68,7 +68,12 @@ class FakeTenantConfigStore:
             "nextLocationId": 1, "brands": [], "logoUrl": None, "storageMode": "BLOB",
             "provisioning": {
                 "status": "none", "reviewDbBlobKey": None, "privateDataPrefix": None, "reviewDbEtag": None,
-                "provisionedLocationIds": [], "lastAttemptAt": None, "lastError": None,
+                "artifactGeneration": None, "provisionedLocationIds": [], "lastAttemptAt": None, "lastError": None,
+            },
+            "initialSync": {
+                "status": "none", "startedAt": None, "completedAt": None, "failedAt": None,
+                "reviewDbEtag": None, "artifactGeneration": None,
+                "reviewCount": None, "locationCount": None, "lastError": None,
             },
             **existing,
             **patch,
@@ -177,8 +182,8 @@ class ProvisionTenantTestCase(unittest.TestCase):
         self.addCleanup(lambda: os.path.exists(tmp_path) and os.remove(tmp_path))
         return Path(tmp_path)
 
-    def _private_data_json(self, private_data_prefix, tenant_id, rel_path):
-        key = tenant_blob_keys.private_data_blob_key(tenant_id, rel_path, private_data_prefix)
+    def _private_data_json(self, generation, tenant_id, rel_path):
+        key = tenant_blob_keys.generation_private_data_blob_key(tenant_id, generation, rel_path)
         data = self.fake_blob.get_blob(key)
         self.assertIsNotNone(data, f"expected a private-data Blob at {key!r}")
         return json.loads(data)
@@ -212,7 +217,7 @@ class ProvisionTenantTestCase(unittest.TestCase):
         self.assertEqual(result["locationIds"], [1, 2])
 
         db_path = self._download_db(result["reviewDbBlobKey"])
-        meta = self._private_data_json(result["privateDataPrefix"], TENANT_A, "meta.json")
+        meta = self._private_data_json(result["artifactGeneration"], TENANT_A, "meta.json")
 
         locations = self._locations_table(db_path)
         self.assertEqual(set(locations.keys()), {1, 2})
@@ -233,11 +238,11 @@ class ProvisionTenantTestCase(unittest.TestCase):
     def test_no_fabricated_review_statistics(self):
         self.fake_store.approve(TENANT_A, [("accounts/1/locations/1", "Restaurant A", "")])
         result = pt.provision_tenant(TENANT_A)
-        meta = self._private_data_json(result["privateDataPrefix"], TENANT_A, "meta.json")
+        meta = self._private_data_json(result["artifactGeneration"], TENANT_A, "meta.json")
         self.assertEqual(meta["totalReviews"], 0)
-        gbp_sync = self._private_data_json(result["privateDataPrefix"], TENANT_A, "gbp-sync.json")
+        gbp_sync = self._private_data_json(result["artifactGeneration"], TENANT_A, "gbp-sync.json")
         self.assertTrue(gbp_sync["neverSynced"])
-        action_items = self._private_data_json(result["privateDataPrefix"], TENANT_A, "action-items.json")
+        action_items = self._private_data_json(result["artifactGeneration"], TENANT_A, "action-items.json")
         self.assertEqual(action_items["items"], [])
 
     # -----------------------------------------------------------------
@@ -318,7 +323,7 @@ class ProvisionTenantTestCase(unittest.TestCase):
 
         result = pt.provision_tenant(TENANT_A)
         self.assertEqual(result["outcome"], "already_provisioned", "the retry finds the already-uploaded, consistent database")
-        meta = self._private_data_json(result["privateDataPrefix"], TENANT_A, "meta.json")
+        meta = self._private_data_json(result["artifactGeneration"], TENANT_A, "meta.json")
         self.assertEqual({l["locationId"] for l in meta["locations"]}, {1}, "the retry must repair the missing private-data artifacts")
         config = self.fake_store.get(TENANT_A)
         self.assertEqual(config["status"], "provisioned")
@@ -531,7 +536,7 @@ class ProvisionTenantTestCase(unittest.TestCase):
     def test_generated_artifacts_never_contain_lta_brand_or_location_names(self):
         self.fake_store.approve(TENANT_A, [("accounts/1/locations/a", "Tenant A's Own Restaurant", "")])
         result = pt.provision_tenant(TENANT_A)
-        meta_text = json.dumps(self._private_data_json(result["privateDataPrefix"], TENANT_A, "meta.json"))
+        meta_text = json.dumps(self._private_data_json(result["artifactGeneration"], TENANT_A, "meta.json"))
         for lta_brand in db.BRANDS:
             self.assertNotIn(lta_brand, meta_text, f"generated meta.json must never contain LTA's own brand name {lta_brand!r}")
 

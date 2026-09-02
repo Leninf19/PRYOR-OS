@@ -8,7 +8,8 @@ import { readFileSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import {
-  tenantBlobRoot, reviewDbBlobKey, privateDataPrefix, privateDataBlobKey, InvalidBlobKeyInputError,
+  tenantBlobRoot, reviewDbBlobKey, privateDataPrefix, privateDataBlobKey,
+  generationRoot, generationPrivateDataBlobKey, InvalidBlobKeyInputError,
 } from '../dashboard/api/_lib/tenantBlobKeys.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -76,6 +77,37 @@ run('an invalid tenantId is rejected before any key is computed', () => {
       threw = e instanceof InvalidBlobKeyInputError
     }
     assert(threw, `expected rejection for tenantId ${JSON.stringify(bad)}`)
+  }
+})
+
+run('generationRoot matches the fixture', () => {
+  const actual = generationRoot(fixture.exampleTenantId, fixture.exampleGeneration)
+  assert(actual === fixture.expected.generationRoot, `expected ${fixture.expected.generationRoot}, got ${actual}`)
+})
+
+run('generationPrivateDataBlobKey matches the fixture for every listed relPath', () => {
+  for (const [relPath, expectedKey] of Object.entries(fixture.expected.generationPrivateDataBlobKeys)) {
+    const actual = generationPrivateDataBlobKey(fixture.exampleTenantId, fixture.exampleGeneration, relPath)
+    assert(actual === expectedKey, `${relPath}: expected ${expectedKey}, got ${actual}`)
+  }
+})
+
+run('the generation namespace is a sibling of, not nested under, the flat private-data prefix', () => {
+  const flat = privateDataBlobKey(fixture.exampleTenantId, 'meta.json')
+  const generational = generationPrivateDataBlobKey(fixture.exampleTenantId, fixture.exampleGeneration, 'meta.json')
+  assert(!generational.startsWith(flat.replace('meta.json', '')), 'generation keys must not live inside the flat private-data prefix')
+  assert(generational.startsWith(tenantBlobRoot(fixture.exampleTenantId) + '/generations/'), 'generation keys must live directly under the tenant blob root')
+})
+
+run('every fixture-listed invalid generation is rejected', () => {
+  for (const bad of fixture.invalidGenerations) {
+    let threw = false
+    try {
+      generationPrivateDataBlobKey(fixture.exampleTenantId, bad, 'meta.json')
+    } catch (e) {
+      threw = e instanceof InvalidBlobKeyInputError
+    }
+    assert(threw, `expected rejection for generation ${JSON.stringify(bad)}`)
   }
 })
 

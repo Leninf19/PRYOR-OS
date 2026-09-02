@@ -31,7 +31,7 @@ import {
 } from '../dashboard/api/_lib/tenantConfigStore.js'
 import { _setRedisClientForTests as setUserRedis, _resetRedisClientForTests as resetUserRedis } from '../dashboard/api/_lib/userStore.js'
 import { _setBlobClientForTests as setBlobClient, _resetBlobClientForTests as resetBlobClient } from '../dashboard/api/_lib/blobStore.js'
-import { reviewDbBlobKey, privateDataPrefix as computePrivateDataPrefix, privateDataBlobKey } from '../dashboard/api/_lib/tenantBlobKeys.js'
+import { reviewDbBlobKey, generationPrivateDataBlobKey } from '../dashboard/api/_lib/tenantBlobKeys.js'
 import { _setMetaLocationsForTests, _resetMetaLocationsForTests } from '../dashboard/api/data.js'
 
 const TENANT_B = 't_synthetic-provisioned-api-tenant'
@@ -153,25 +153,27 @@ async function invoke(fileParam, token, extra = {}) {
 // status: 'active', with the exact empty-state artifacts provision_tenant.py
 // would produce uploaded to the fake Blob store at the exact keys
 // tenantBlobKeys.js's formula computes.
+const TEST_GENERATION = 'test-generation-1'
+
 async function provisionTenantBWithBlobArtifacts() {
   const blob = fakeBlobStore()
   setBlobClient(() => blob.client)
-  const prefix = computePrivateDataPrefix(TENANT_B)
 
-  blob.writeJson(privateDataBlobKey(TENANT_B, 'meta.json', prefix), {
+  blob.writeJson(generationPrivateDataBlobKey(TENANT_B, TEST_GENERATION, 'meta.json'), {
     distinctiveMarker: 'tenant-b-provisioned-meta',
     locations: [{ locationId: 1, name: 'Tenant B Restaurant', city: '', brand: 'Other', slug: 'tenant-b-restaurant', maps_url: '', hasContact: false }],
     brands: [], totalReviews: 0, generatedAt: new Date().toISOString(), initialSyncCompleted: false,
   })
-  blob.writeJson(privateDataBlobKey(TENANT_B, 'reviews/by-location/tenant-b-restaurant.json', prefix), [])
-  blob.writeJson(privateDataBlobKey(TENANT_B, 'action-items.json', prefix), { items: [] })
-  blob.writeJson(privateDataBlobKey(TENANT_B, 'gbp-sync.json', prefix), { locations: [], neverSynced: true })
-  blob.writeJson(privateDataBlobKey(TENANT_B, '_internal/review-location-index.json', prefix), {})
+  blob.writeJson(generationPrivateDataBlobKey(TENANT_B, TEST_GENERATION, 'reviews/by-location/tenant-b-restaurant.json'), [])
+  blob.writeJson(generationPrivateDataBlobKey(TENANT_B, TEST_GENERATION, 'action-items.json'), { items: [] })
+  blob.writeJson(generationPrivateDataBlobKey(TENANT_B, TEST_GENERATION, 'gbp-sync.json'), { locations: [], neverSynced: true })
+  blob.writeJson(generationPrivateDataBlobKey(TENANT_B, TEST_GENERATION, '_internal/review-location-index.json'), {})
 
   const config = await recordLocationApproval(TENANT_B, [{ googleLocationId: 'accounts/1/locations/1', title: 'Tenant B Restaurant', address: '' }])
   await markTenantProvisioned(TENANT_B, {
     reviewDbBlobKey: reviewDbBlobKey(TENANT_B),
-    privateDataPrefix: prefix,
+    privateDataPrefix: `tenant-data/${TENANT_B}/private-data/`,
+    artifactGeneration: TEST_GENERATION,
     provisionedLocationIds: config.approvedLocations.map(l => l.locationId),
   })
   await upsertTenantConfig(TENANT_B, { status: 'active' }) // simulates Phase 4G's Initial Sync completion

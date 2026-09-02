@@ -34,6 +34,7 @@ TESTS = [
     "test_tenant_blob_keys_cross_language_consistency.py",
     "test_tenant_blob_store.py",
     "test_provision_tenant.py",
+    "test_initial_sync.py",
     "test_db.py",
     "test_gbp_sync.py",
     "test_provider_gbp.py",

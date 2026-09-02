@@ -51,6 +51,26 @@ class TenantBlobKeysCrossLanguageConsistencyTestCase(unittest.TestCase):
             with self.assertRaises(tenant_keys.InvalidTenantIdError, msg=f"expected rejection for tenantId {bad!r}"):
                 tbk.review_db_blob_key(bad)
 
+    def test_generation_root_matches_fixture(self):
+        actual = tbk.generation_root(self.fixture["exampleTenantId"], self.fixture["exampleGeneration"])
+        self.assertEqual(actual, self.fixture["expected"]["generationRoot"])
+
+    def test_generation_private_data_blob_key_matches_fixture_for_every_listed_rel_path(self):
+        for rel_path, expected_key in self.fixture["expected"]["generationPrivateDataBlobKeys"].items():
+            actual = tbk.generation_private_data_blob_key(self.fixture["exampleTenantId"], self.fixture["exampleGeneration"], rel_path)
+            self.assertEqual(actual, expected_key)
+
+    def test_generation_namespace_is_a_sibling_of_not_nested_under_the_flat_prefix(self):
+        flat = tbk.private_data_blob_key(self.fixture["exampleTenantId"], "meta.json")
+        generational = tbk.generation_private_data_blob_key(self.fixture["exampleTenantId"], self.fixture["exampleGeneration"], "meta.json")
+        self.assertFalse(generational.startswith(flat.replace("meta.json", "")))
+        self.assertTrue(generational.startswith(tbk.tenant_blob_root(self.fixture["exampleTenantId"]) + "/generations/"))
+
+    def test_every_fixture_listed_invalid_generation_is_rejected(self):
+        for bad in self.fixture["invalidGenerations"]:
+            with self.assertRaises(tbk.InvalidBlobKeyInputError, msg=f"expected rejection for generation {bad!r}"):
+                tbk.generation_private_data_blob_key(self.fixture["exampleTenantId"], bad, "meta.json")
+
 
 if __name__ == "__main__":
     unittest.main()

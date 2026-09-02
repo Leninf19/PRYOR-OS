@@ -62,11 +62,14 @@ TENANT_CONFIG_KEY = "tenant_config:v1"
 
 # Multi-Tenant Phase 4F closure: 'provisioned' inserted between
 # 'provisioning' and 'active' -- see provision_tenant.py's header for the
-# full state machine. Nothing in this codebase writes 'active' yet; it is
-# reserved for Phase 4G's Initial Sync completion.
+# full state machine.
+# Multi-Tenant Phase 4G: 'initial_sync'/'initial_sync_failed' inserted
+# between 'provisioned' and 'active' -- see initial_sync.py's header. Only
+# initial_sync.py's upsert_tenant_config() calls are ever allowed to write
+# 'active'.
 _VALID_STATUSES = {
-    "onboarding", "locations_approved", "provisioning", "provisioned", "active",
-    "provisioning_failed", "suspended",
+    "onboarding", "locations_approved", "provisioning", "provisioned",
+    "initial_sync", "active", "initial_sync_failed", "provisioning_failed", "suspended",
 }
 
 # Multi-Tenant Phase 4F.1 -- mirrors tenantConfigStore.js's
@@ -224,7 +227,16 @@ def upsert_tenant_config(tenant_id: str, patch: dict, expected_version: int | No
         "storageMode": "BLOB",
         "provisioning": {
             "status": "none", "reviewDbBlobKey": None, "privateDataPrefix": None, "reviewDbEtag": None,
-            "provisionedLocationIds": [], "lastAttemptAt": None, "lastError": None,
+            "artifactGeneration": None, "provisionedLocationIds": [], "lastAttemptAt": None, "lastError": None,
+        },
+        # Multi-Tenant Phase 4G -- see tenantConfigStore.js's own default
+        # record comment: kept separate from "provisioning" (storage
+        # existence) since this describes "has real data been synced," a
+        # distinct concern owned exclusively by initial_sync.py.
+        "initialSync": {
+            "status": "none", "startedAt": None, "completedAt": None, "failedAt": None,
+            "reviewDbEtag": None, "artifactGeneration": None,
+            "reviewCount": None, "locationCount": None, "lastError": None,
         },
         **(existing or {}),
         "createdAt": (existing or {}).get("createdAt", now),
