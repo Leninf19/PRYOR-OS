@@ -17,7 +17,8 @@ import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError } from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
-import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError } from '../_lib/tenants.js'
+import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
+import { getTenantConfig, TenantConfigStoreUnavailableError } from '../_lib/tenantConfigStore.js'
 import {
   consumeInviteToken, markInviteConsumedPending, clearInviteConsumedPending, peekInviteToken,
   createResetToken, consumeResetToken, markResetConsumedPending, clearResetConsumedPending, peekResetToken,
@@ -157,6 +158,87 @@ async function whoami(req, res) {
   const account = await requireAuth(req, res, null) // null = any authenticated role
   if (!account) return
   return res.status(200).json({ account })
+}
+
+// GET /api/session/tenant-status -- Multi-Tenant Phase 4J: the ONE thing
+// the frontend needs to answer "what lifecycle state is MY OWN tenant in"
+// (onboarding/locations_approved/provisioning/.../active/suspended) --
+// nothing before this phase exposed tenant_config to the browser at all.
+// Any authenticated role may call it (same as whoami) -- every tenant
+// member, not just the Owner driving onboarding, needs to know why they
+// can or cannot reach the normal dashboard yet. tenantId is ALWAYS
+// resolveTenantId(account) -- server-derived from the session, never from
+// request input, exactly like every other tenant-scoped read in this
+// codebase.
+//
+// SANITIZATION, same allowlist discipline as tenant-ops/[action].js's
+// sanitizeTenant(): never locationIdMap, never a raw tenant_config spread,
+// never googleLocationId (not secret, but not needed by any UI this phase
+// builds -- the numeric locationId is the only id the frontend has any use
+// for). Never credential material of any kind (this endpoint doesn't even
+// import credentialStore.js).
+//
+// LOS TRES AMIGOS (BOOTSTRAP mode, DEFAULT_TENANT_ID): has no tenant_config
+// record at all -- it never goes through this onboarding state machine
+// (see tenants.js's LocationCatalogMigrationMode) and must always report as
+// operationally 'active', exactly preserving its current, unconstrained
+// dashboard access. This is a hardcoded special case, not an inference
+// from "no record found" (see the `config === null` branch below, which
+// answers the OPPOSITE way for every other tenant) -- the two must never
+// be conflated.
+async function tenantStatus(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `session:tenant-status:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
+
+  const tenantId = resolveTenantId(account)
+
+  if (tenantId === DEFAULT_TENANT_ID) {
+    return res.status(200).json({
+      tenantId, status: 'active', displayName: 'Los Tres Amigos', logoUrl: null, brands: [],
+      approvedLocations: null, provisioning: null, initialSync: null, entitlementChange: null,
+    })
+  }
+
+  let config
+  try {
+    config = await getTenantConfig(tenantId)
+  } catch (err) {
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not read tenant status. Please try again shortly.' })
+    }
+    throw err
+  }
+
+  if (!config) {
+    // Never onboarded at all yet -- a brand-new tenant's very first
+    // authenticated request must land cleanly on the onboarding flow,
+    // never a 404/error.
+    return res.status(200).json({
+      tenantId, status: 'onboarding', displayName: tenantId, logoUrl: null, brands: [],
+      approvedLocations: [], provisioning: null, initialSync: null, entitlementChange: null,
+    })
+  }
+
+  return res.status(200).json({
+    tenantId,
+    status: config.status,
+    displayName: config.displayName ?? tenantId,
+    logoUrl: config.logoUrl ?? null,
+    brands: Array.isArray(config.brands) ? config.brands : [],
+    approvedLocations: (Array.isArray(config.approvedLocations) ? config.approvedLocations : []).map(l => ({
+      locationId: l.locationId, title: l.title ?? '', address: l.address ?? '', operational: l.operational !== false,
+    })),
+    provisioning: config.provisioning ? { status: config.provisioning.status ?? 'none', lastError: config.provisioning.lastError ?? null } : null,
+    initialSync: config.initialSync ? {
+      status: config.initialSync.status ?? 'none', lastError: config.initialSync.lastError ?? null,
+      reviewCount: config.initialSync.reviewCount ?? null, locationCount: config.initialSync.locationCount ?? null,
+    } : null,
+    entitlementChange: config.entitlementChange ? { status: config.entitlementChange.status ?? 'none', lastError: config.entitlementChange.lastError ?? null } : null,
+  })
 }
 
 // GET /api/session/accounts -- the reusable identity-directory read: every
@@ -513,6 +595,7 @@ export default async function handler(req, res) {
     case 'login':            return login(req, res)
     case 'logout':           return logout(req, res)
     case 'whoami':           return whoami(req, res)
+    case 'tenant-status':    return tenantStatus(req, res)
     case 'accounts':         return accounts(req, res)
     case 'invite-status':    return inviteStatus(req, res)
     case 'accept-invite':    return acceptInvite(req, res)

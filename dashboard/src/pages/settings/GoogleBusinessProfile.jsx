@@ -7,6 +7,7 @@ import ErrorState from '../../components/ui/ErrorState.jsx'
 import ConfirmDialog from '../../components/ui/ConfirmDialog.jsx'
 import { useToast } from '../../components/ui/Toast.jsx'
 import { useGoogleOAuthStatus, useDisconnectGoogle } from '../../hooks/useGoogleOAuthStatus.js'
+import { useTenantStatus } from '../../hooks/useTenantStatus.js'
 
 // Rebuilt for Phase 8, Milestone 8.7: the refresh token now lives in
 // credentialStore.js (Redis, encrypted), not a Vercel env var -- reconnect
@@ -375,6 +376,56 @@ function HistoricalImportPanel() {
   )
 }
 
+// Multi-Tenant Phase 4J -- READ-ONLY view of this tenant's approved
+// locations. Deliberately renders NOTHING for Los Tres Amigos
+// (tenantStatus.approvedLocations is null there -- see session/
+// [action].js's tenantStatus(), which never returns a locations list for
+// the BOOTSTRAP-mode tenant, so LTA's Settings page is visually unchanged
+// by this phase) and nothing while tenant status hasn't loaded yet.
+//
+// NO mutation control of any kind lives here or anywhere else in this
+// Owner-facing page -- post-commitment entitlement changes are
+// platform-admin-only (Phase 4I.3's dashboard/api/tenant-entitlements/
+// [action].js, isSuperAdmin()-gated), and that endpoint is never called,
+// imported, or even mentioned by path from any ordinary-Owner-facing
+// component. This panel exists so an Owner can always SEE what's
+// currently entitled, with a single explicit line telling them how to
+// request a change, rather than silently offering no visibility at all.
+function ApprovedLocationsPanel() {
+  const { data: tenantStatus } = useTenantStatus()
+  if (!tenantStatus || tenantStatus.approvedLocations === null) return null
+
+  const locations = tenantStatus.approvedLocations
+  return (
+    <div className="rounded-2xl border overflow-hidden"
+         style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <div className="px-6 py-5">
+        <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Approved Locations</p>
+        <p className="text-xs mt-0.5 leading-relaxed" style={{ color: 'var(--color-text-3)' }}>
+          These are the Google Business Profile locations your account is licensed for. Contact support to add or remove locations.
+        </p>
+      </div>
+      <div className="px-6 pb-5 pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
+        {locations.length === 0 ? (
+          <p className="text-xs pt-3" style={{ color: 'var(--color-text-3)' }}>No locations are approved yet.</p>
+        ) : (
+          <ul className="divide-y" style={{ borderColor: 'var(--color-border)' }}>
+            {locations.map(loc => (
+              <li key={loc.locationId} className="py-2.5 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-1)' }}>{loc.title || `Location ${loc.locationId}`}</p>
+                  {loc.address && <p className="text-[11px]" style={{ color: 'var(--color-text-3)' }}>{loc.address}</p>}
+                </div>
+                {!loc.operational && <Badge variant="neutral">Setting up…</Badge>}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function GoogleBusinessProfile() {
   const showToast = useToast()
   const [stepsOpen, setStepsOpen] = useState(false)
@@ -528,6 +579,7 @@ export default function GoogleBusinessProfile() {
           <TestConnectionPanel />
           <LocationSyncPanel onLinkedCount={setLinkedLocations} />
           <HistoricalImportPanel />
+          <ApprovedLocationsPanel />
         </>
       )}
 

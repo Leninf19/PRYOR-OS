@@ -45,8 +45,16 @@ function testAuthGateBypassesLoginForAcceptInvitePath() {
 
 function testAuthGateStillRendersRealChildrenWhenAuthenticated() {
   const src = readFileSync(path.join(SRC_DIR, 'components', 'AuthGate.jsx'), 'utf-8')
-  assert(/<AccountContext\.Provider value={account}>{children}<\/AccountContext\.Provider>/.test(src),
-    'the normal authenticated path (children under AccountContext) must be unchanged')
+  // Multi-Tenant Phase 4J: children (App) now render inside a
+  // TenantLifecycleGate nested under AccountContext.Provider, not
+  // directly -- see AuthGate.jsx's own header comment for why (a tenant
+  // not yet active gets <Onboarding/> instead of App). The authenticated
+  // path itself (real account, real children eventually reached) is
+  // otherwise unchanged.
+  assert(/<AccountContext\.Provider value={account}>/.test(src),
+    'the normal authenticated path (AccountContext.Provider with the real account) must be unchanged')
+  assert(/<TenantLifecycleGate[^>]*>{children}<\/TenantLifecycleGate>/.test(src),
+    'AuthGate.jsx must still render the real children (App) once the tenant-lifecycle gate passes, never a placeholder')
 }
 
 function testAcceptInviteUsesTheRealEndpointsAndNeverLogsThePassword() {

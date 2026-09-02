@@ -112,6 +112,12 @@ const TESTS = [
   'test_google_reconnect_reconciliation.js',
   'test_credential_cas_concurrency.js',
   'test_tenant_entitlement_change.js',
+  'test_session_tenant_status_endpoint.js',
+  'test_onboarding_ui.js',
+  'test_auth_gate_tenant_lifecycle_gate_ui.js',
+  'test_tenant_branding_ui.js',
+  'test_approved_locations_panel_ui.js',
+  'test_use_tenant_status_hook_ui.js',
 ]
 
 const results = {}

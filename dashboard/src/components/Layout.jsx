@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { useMeta, usePredictiveAlerts, useActionItems, isLocationScoped } from '../hooks/useIntelligence.js'
 import { useReviewsData } from '../hooks/useReviewsData.js'
 import { useGoogleOAuthStatus } from '../hooks/useGoogleOAuthStatus.js'
+import { useTenantStatus } from '../hooks/useTenantStatus.js'
 import { useNotifications } from '../hooks/useNotifications.js'
 import { useAccount } from './AuthGate.jsx'
 import ThemeToggle from './ui/ThemeToggle.jsx'
@@ -402,9 +403,19 @@ function SidebarContent({ unansweredCount, onLinkClick }) {
   const account = useAccount()
   const scoped = isLocationScoped(account)
   const { data: meta } = useMeta()
+  // Multi-Tenant Phase 4J -- tenant branding. tenantStatus.displayName
+  // defaults to the literal string 'Los Tres Amigos' for LTA (BOOTSTRAP
+  // mode, see session/[action].js's tenantStatus()), so this preserves
+  // LTA's exact current sidebar text unchanged; any other tenant's own
+  // tenant_config.displayName (set at onboarding, defaulting to its
+  // tenantId if never customized) renders here instead. This hook shares
+  // its cache with AuthGate's own tenant-lifecycle read (identical query
+  // key) -- no extra network round trip for an already-active tenant.
+  const { data: tenantStatus } = useTenantStatus()
+  const tenantDisplayName = tenantStatus?.displayName || 'Los Tres Amigos'
   const footerLabel = scoped && meta?.locations?.length === 1
     ? meta.locations[0].name
-    : `Los Tres Amigos · ${meta?.locations?.length ?? account?.locationIds?.length ?? '—'} Location${meta?.locations?.length === 1 ? '' : 's'}`
+    : `${tenantDisplayName} · ${meta?.locations?.length ?? account?.locationIds?.length ?? '—'} Location${meta?.locations?.length === 1 ? '' : 's'}`
   return (
     <>
       {/* Brand */}
@@ -415,6 +426,9 @@ function SidebarContent({ unansweredCount, onLinkClick }) {
            style={{ color: 'var(--color-text-3)' }}>
           By Future Marketing Studio
         </p>
+        {tenantStatus?.logoUrl && (
+          <img src={tenantStatus.logoUrl} alt={`${tenantDisplayName} logo`} className="w-8 h-8 rounded-md object-cover mt-3" />
+        )}
       </div>
 
       {/* Smart Search */}
