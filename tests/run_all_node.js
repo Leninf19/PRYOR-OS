@@ -109,6 +109,7 @@ const TESTS = [
   'test_provisioned_tenant_api_reads.js',
   'test_tenant_ops_endpoint.js',
   'test_tenant_entitlement_boundary.js',
+  'test_google_reconnect_reconciliation.js',
 ]
 
 const results = {}

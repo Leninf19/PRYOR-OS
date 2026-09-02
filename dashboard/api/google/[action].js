@@ -42,7 +42,8 @@ import {
 import { recordReplyFailure, clearReplyFailure } from '../_lib/notificationStore.js'
 import { resolveTenantId, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
 import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDiscoveryStore.js'
-import { recordLocationApproval, LocationApprovalNotEligibleError } from '../_lib/tenantConfigStore.js'
+import { recordLocationApproval, LocationApprovalNotEligibleError, getTenantConfig, LOCATION_APPROVAL_ELIGIBLE_STATUSES } from '../_lib/tenantConfigStore.js'
+import { reconcileApprovedLocationsAgainstDiscovery, UnreconciledApprovedLocationError } from '../_lib/tenantLocationReconciliation.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -275,6 +276,32 @@ async function callback(req, res) {
   const host        = req.headers['x-forwarded-host'] || req.headers.host
   const redirectUri = `${proto}://${host}/api/google/callback`
 
+  // Multi-Tenant Phase 4I.2 -- RACE GUARD, captured now, BEFORE the token
+  // exchange and every Google round trip below: a snapshot of what this
+  // tenant's stored credential's `connectedAt` currently is (null if never
+  // connected). Re-checked immediately before this attempt is ever allowed
+  // to persist (see the end of this function) -- if it has changed by
+  // then, some OTHER reconnect for this SAME tenant completed in between,
+  // and THIS attempt (which started its own external round trips against
+  // an OLDER snapshot of the world) must never overwrite that newer result
+  // purely because it happens to finish second. credentialStore.js has no
+  // per-write CAS of its own; this narrows the unguarded race window from
+  // "this whole function's several-second external round trip" down to
+  // "the few Redis operations between the re-check and the write," reusing
+  // data the store already records rather than adding new schema.
+  // Fail closed if we can't even read current state -- proceeding blind
+  // would defeat the guard's whole purpose.
+  let raceGuardConnectedAt
+  try {
+    const currentCredentialBeforeExchange = await getStoredCredential(verifiedTenantId)
+    raceGuardConnectedAt = currentCredentialBeforeExchange?.connectedAt ?? null
+  } catch (err) {
+    return res.status(503).send(page('Connection temporarily unavailable', `
+      <p>Could not read this tenant's current Google connection state: <strong>${err instanceof CredentialStoreUnavailableError ? 'the credential store is temporarily unavailable' : err.message}</strong></p>
+      <p>Please try again shortly.</p>
+    `))
+  }
+
   let tokens
   try {
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
@@ -336,6 +363,99 @@ async function callback(req, res) {
     // best-effort fetch fails.
   }
 
+  // Multi-Tenant Phase 4I.2 -- ENTITLEMENT RECONCILIATION. The candidate
+  // credential (`tokens`) is held ONLY in this function's local variables
+  // up to this point -- nothing above has persisted anything. "OAuth
+  // succeeded" and "this credential is valid FOR THIS TENANT'S committed
+  // entitlement" are different questions; only a PRE-COMMIT tenant (no
+  // approvedLocations yet worth protecting) may skip straight to
+  // persisting, exactly preserving today's onboarding connect/discover/
+  // approve flow. A COMMITTED tenant (has already gone through
+  // approve-locations at least once -- LOCATION_APPROVAL_ELIGIBLE_STATUSES
+  // is tenantConfigStore.js's own canonical pre-commit/committed split, the
+  // same one its location-approval write path is gated by) must prove the
+  // NEW credential can still see every already-approved Google location
+  // before it is ever allowed to replace the working one.
+  let existingConfig
+  try {
+    existingConfig = await getTenantConfig(verifiedTenantId)
+  } catch (err) {
+    return res.status(503).send(page('Connection temporarily unavailable', `
+      <p>Could not read this tenant's configuration: <strong>${err.message}</strong></p>
+      <p>Your previous Google connection, if any, remains unchanged.</p>
+      <p>Please try again shortly.</p>
+    `))
+  }
+  const currentStatus = existingConfig?.status ?? 'onboarding'
+
+  if (RECONNECT_BLOCKED_STATUSES.has(currentStatus)) {
+    await appendAuditEntry(verifiedTenantId, {
+      actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+      entity: 'google_oauth', entityId: null, action: 'google.reconnect_blocked_lifecycle', changes: { status: currentStatus }, result: 'denied',
+      message: `Reconnect refused: tenant status is ${JSON.stringify(currentStatus)}. Your previous Google connection remains unchanged.`,
+    })
+    return res.status(409).send(page('Reconnect temporarily unavailable', `
+      <p>An Initial Sync is currently running for this tenant. Reconnecting Google is disabled until it finishes or fails.</p>
+      <p style="color:#16a34a">Your previous Google connection remains active and unchanged.</p>
+      <p>Please try again shortly. <a href="/settings/google">← Back to Settings</a></p>
+    `))
+  }
+
+  const isCommittedTenant = !LOCATION_APPROVAL_ELIGIBLE_STATUSES.has(currentStatus)
+
+  if (isCommittedTenant) {
+    let discoveredGoogleLocationIds
+    try {
+      discoveredGoogleLocationIds = await discoverGoogleLocationIdsForReconciliation(tokens.access_token)
+    } catch (err) {
+      // Cannot verify -> treated identically to a failed reconciliation:
+      // the candidate is discarded, the previous credential is untouched.
+      return res.status(502).send(page('Could not verify Google locations', `
+        <p>Could not verify this Google account's locations: <strong>${err.message}</strong></p>
+        <p style="color:#16a34a">Your previous Google connection remains active and unchanged.</p>
+        <p><a href="/settings/google">← Back to Settings</a></p>
+      `))
+    }
+    try {
+      reconcileApprovedLocationsAgainstDiscovery(existingConfig?.approvedLocations ?? [], discoveredGoogleLocationIds)
+    } catch (err) {
+      if (!(err instanceof UnreconciledApprovedLocationError)) throw err
+      await appendAuditEntry(verifiedTenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'google_oauth', entityId: null, action: 'google.reconnect_rejected_incompatible', changes: { missingGoogleLocationIds: err.missingGoogleLocationIds }, result: 'denied',
+        message: `Reconnect rejected: ${err.missingGoogleLocationIds.length} already-approved location(s) are not visible to this Google account. Your previous Google connection remains unchanged.`,
+      })
+      return res.status(409).send(page('This Google account is missing approved locations', `
+        <p>This Google account does not have access to ${err.missingGoogleLocationIds.length} of this business's already-approved location(s).</p>
+        <p style="color:#16a34a">Your previous Google connection remains active and unchanged.</p>
+        <p>Reconnect using the Google account that manages every approved location, or contact support.</p>
+        <p><a href="/settings/google">← Back to Settings</a></p>
+      `))
+    }
+  }
+
+  // Multi-Tenant Phase 4I.2 -- RACE GUARD re-check, immediately before the
+  // only write in this whole function. If another reconnect for this SAME
+  // tenant completed anywhere between the snapshot captured above and now,
+  // that newer result must win -- this attempt (built on stale state) is
+  // discarded rather than clobbering it, regardless of which HTTP request
+  // happens to reach this line first.
+  try {
+    const currentCredentialBeforeWrite = await getStoredCredential(verifiedTenantId)
+    if ((currentCredentialBeforeWrite?.connectedAt ?? null) !== raceGuardConnectedAt) {
+      return res.status(409).send(page('Connection changed', `
+        <p>This tenant's Google connection was updated by another request while this one was being processed.</p>
+        <p style="color:#16a34a">The most recent connection is the one now in effect; nothing further has been changed by this request.</p>
+        <p><a href="/settings/google">← Back to Settings</a></p>
+      `))
+    }
+  } catch (err) {
+    return res.status(503).send(page('Connection temporarily unavailable', `
+      <p>Could not confirm this tenant's current connection state: <strong>${err instanceof CredentialStoreUnavailableError ? 'the credential store is temporarily unavailable' : err.message}</strong></p>
+      <p>Please try again shortly.</p>
+    `))
+  }
+
   try {
     // Multi-Tenant Phase 4A/4C: verifiedTenantId came from the
     // just-validated OAuth state (never re-derived from anything else at
@@ -361,7 +481,9 @@ async function callback(req, res) {
   await appendAuditEntry(verifiedTenantId, {
     actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
     entity: 'google_oauth', entityId: null, action: 'google.reconnected', changes: null, result: 'success',
-    message: connectedAccountName ? `Connected Google Business Profile account "${connectedAccountName}".` : 'Connected a Google Business Profile account.',
+    message: connectedAccountName
+      ? `Connected Google Business Profile account "${connectedAccountName}"${isCommittedTenant ? ' (reconciled against existing approved locations)' : ''}.`
+      : 'Connected a Google Business Profile account.',
   })
 
   return res.send(page('✓ Google connected!', `
@@ -874,6 +996,48 @@ async function gbpGetAllPages(baseUrl, token, listKey, pageParam = 'pageSize', p
   } while (pageToken)
   return items
 }
+
+// Multi-Tenant Phase 4I.2 -- returns the full Set of googleLocationId
+// strings a Google access token can see, across every account and every
+// page (reuses gbpGetAllPages, same pagination-following as publish()'s
+// fallback lookup above -- deliberately NOT discoverLocations()'s simpler
+// single-page call, since a false "location not visible" reconciliation
+// failure caused by a missed page would incorrectly reject a perfectly
+// valid reconnect). Used ONLY to reconcile a freshly-exchanged OAuth
+// candidate credential against a COMMITTED tenant's existing
+// approvedLocations before that candidate is ever persisted -- see
+// callback() below. Returns ids only (no title/address): reconciliation
+// needs nothing else, and the richer, UI-facing shape stays in
+// discoverLocations() below.
+async function discoverGoogleLocationIdsForReconciliation(token) {
+  const accounts = await gbpGetAllPages(`${ACCOUNTS_BASE}/accounts`, token, 'accounts')
+  const ids = new Set()
+  for (const acct of accounts) {
+    const rawLocations = await gbpGetAllPages(
+      `${LOCATIONS_BASE}/${acct.name}/locations?readMask=${encodeURIComponent(LOCATIONS_READ_MASK)}`,
+      token, 'locations'
+    )
+    for (const loc of rawLocations) {
+      ids.add(v4LocationPath(acct.name, loc.name || ''))
+    }
+  }
+  return ids
+}
+
+// Multi-Tenant Phase 4I.2 -- lifecycle statuses in which a Google credential
+// reconnect is refused OUTRIGHT (not merely reconciled), because a live,
+// in-flight process is actively using the CURRENT credential and this
+// codebase has no per-write concurrency primitive over credentialStore.js's
+// single physical key that could safely coexist with it. 'initial_sync' is
+// the only such status -- initial_sync.py fetches and uses the tenant's
+// Google credential throughout a single run; a mid-run swap could hand a
+// running sync a credential for a DIFFERENT Google account than the one it
+// validated at its own start, undermining its own reconciliation
+// (ApprovedLocationsOnlyGBPProvider) guarantees. provision_tenant.py, by
+// contrast, never calls the Google API at all, so 'provisioning'/
+// 'provisioning_failed' carry no equivalent risk and are handled by the
+// ordinary reconciliation path below instead of an outright block.
+const RECONNECT_BLOCKED_STATUSES = new Set(['initial_sync'])
 
 function normName(s) {
   return (s || '').toLowerCase().replace(/[^a-z0-9]/g, '')

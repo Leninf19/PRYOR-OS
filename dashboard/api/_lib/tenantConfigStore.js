@@ -487,7 +487,14 @@ export async function upsertTenantConfig(tenantId, patch, { expectedVersion } = 
 // either (see the Phase 4I.1 report) -- changing an already-committed
 // tenant's approved locations is intentionally left with NO mutation path
 // at all until a future, separately reviewed phase builds one.
-const LOCATION_APPROVAL_ELIGIBLE_STATUSES = new Set(['onboarding', 'locations_approved'])
+// Exported (Multi-Tenant Phase 4I.2): google/[action].js's OAuth callback
+// reuses this EXACT set to decide whether a reconnecting tenant is
+// "pre-commit" (no reconciliation needed, same as this file's own
+// eligibility question) or "committed" (reconciliation required before a
+// new credential may be persisted) -- one authoritative status
+// classification, not two independently-maintained enums that could drift
+// apart.
+export const LOCATION_APPROVAL_ELIGIBLE_STATUSES = new Set(['onboarding', 'locations_approved'])
 
 export class LocationApprovalNotEligibleError extends Error {
   constructor(message, currentStatus) {

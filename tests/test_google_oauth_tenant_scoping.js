@@ -27,6 +27,7 @@ import {
   _setRedisClientForTests as setCredentialRedis, _resetRedisClientForTests as resetCredentialRedis,
   getStoredCredential,
 } from '../dashboard/api/_lib/credentialStore.js'
+import { _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis } from '../dashboard/api/_lib/tenantConfigStore.js'
 import { credentialKeyV2 } from '../dashboard/api/_lib/tenantKeys.js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
@@ -40,8 +41,27 @@ function assert(cond, msg) {
   if (!cond) throw new Error(msg)
 }
 
+// Multi-Tenant Phase 4I.2: callback() now reads tenant_config (to decide
+// pre-commit vs. committed reconciliation) before writing a credential.
+// None of this file's tests are about entitlement state -- an empty,
+// never-populated store correctly reports "no tenant_config record yet"
+// (pre-commit/'onboarding'), exactly this file's synthetic tenants' real
+// state, so callback() proceeds exactly as it did before this store
+// existed. Wired globally per-test (fresh per run) so no individual test
+// body needs to know this dependency exists.
+function fakeTenantConfigRedis() {
+  const store = {}
+  return {
+    hget: async (key, field) => store[key]?.[field] ?? null,
+    hgetall: async (key) => ({ ...(store[key] ?? {}) }),
+    hset: async (key, fields) => { store[key] = { ...(store[key] ?? {}), ...fields } },
+    hdel: async (key, field) => { if (store[key]) delete store[key][field] },
+  }
+}
+
 const results = []
 async function run(name, fn) {
+  setConfigRedis(() => fakeTenantConfigRedis())
   try {
     await fn()
     console.log(`PASS: ${name}`)
@@ -51,6 +71,7 @@ async function run(name, fn) {
     results.push(false)
   } finally {
     resetCredentialRedis()
+    resetConfigRedis()
     _resetLimiterFactoryForTests()
     delete process.env.ACCOUNT_DIRECTORY_JSON
     delete globalThis.fetch

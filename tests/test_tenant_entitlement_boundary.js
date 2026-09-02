@@ -403,7 +403,12 @@ async function testOAuthCallbackNeverWritesApprovedLocations() {
   const match = /async function callback[\s\S]*?\n}\n/.exec(GOOGLE_ACTION_SRC)
   assert(match, 'sanity: could not locate the OAuth callback handler in google/[action].js -- update this test\'s scan if the function was renamed')
   const body = match[0]
-  assert(!/recordLocationApproval/.test(body),
+  // Checks for an actual CALL (`recordLocationApproval(`), not the bare
+  // identifier -- Phase 4I.2 added explanatory comments inside callback()
+  // that legitimately NAME recordLocationApproval() while explaining why
+  // the pre-commit/committed split matters, which a bare substring check
+  // would misflag.
+  assert(!/recordLocationApproval\(/.test(body),
     'the OAuth connect/reconnect callback must never call recordLocationApproval() -- connecting/reconnecting Google must never itself expand or change approvedLocations')
 }
 
