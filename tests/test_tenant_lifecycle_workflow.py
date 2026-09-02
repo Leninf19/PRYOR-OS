@@ -61,8 +61,8 @@ def test_dispatch_inputs_are_exactly_as_required():
     operation = inputs["operation"]
     assert operation["required"] is True
     assert operation["type"] == "choice"
-    assert set(operation["options"]) == {"provision", "initial_sync"}, (
-        f"operation choice must be exactly provision/initial_sync, got {operation['options']}"
+    assert set(operation["options"]) == {"provision", "initial_sync", "apply_entitlement_change"}, (
+        f"operation choice must be exactly provision/initial_sync/apply_entitlement_change, got {operation['options']}"
     )
 
     for name in ("tenant_id", "confirmation"):
@@ -78,10 +78,12 @@ def test_tenant_id_and_confirmation_are_validated_before_any_python_step():
     validate_index = next((i for i, n in enumerate(step_names) if n == "Validate inputs"), None)
     assert validate_index is not None, "no 'Validate inputs' step found"
 
-    python_step_indices = [i for i, s in enumerate(steps) if "python provision_tenant.py" in s.get("run", "") or "python initial_sync.py" in s.get("run", "")]
-    assert python_step_indices, "no provision_tenant.py/initial_sync.py invocation found"
+    python_step_indices = [i for i, s in enumerate(steps) if any(
+        f"python {script}" in s.get("run", "") for script in ("provision_tenant.py", "initial_sync.py", "apply_entitlement_change.py")
+    )]
+    assert python_step_indices, "no provision_tenant.py/initial_sync.py/apply_entitlement_change.py invocation found"
     assert all(validate_index < i for i in python_step_indices), (
-        "the 'Validate inputs' step must run before any provision_tenant.py/initial_sync.py invocation"
+        "the 'Validate inputs' step must run before any provision_tenant.py/initial_sync.py/apply_entitlement_change.py invocation"
     )
 
     validate_step = steps[validate_index]
@@ -167,19 +169,26 @@ def test_minimum_permissions():
 def test_exactly_one_command_per_operation_no_arbitrary_execution():
     _text, data = _load()
     steps = data["jobs"]["operate"]["steps"]
-    run_steps = [s for s in steps if "run" in s and ("provision_tenant.py" in s["run"] or "initial_sync.py" in s["run"])]
-    assert len(run_steps) == 2, f"expected exactly 2 provisioning/sync steps, found {len(run_steps)}"
+    run_steps = [s for s in steps if "run" in s and any(
+        script in s["run"] for script in ("provision_tenant.py", "initial_sync.py", "apply_entitlement_change.py")
+    )]
+    assert len(run_steps) == 3, f"expected exactly 3 provisioning/sync/entitlement-change steps, found {len(run_steps)}"
 
     provision_steps = [s for s in run_steps if s.get("if") == "inputs.operation == 'provision'"]
     sync_steps = [s for s in run_steps if s.get("if") == "inputs.operation == 'initial_sync'"]
+    entitlement_steps = [s for s in run_steps if s.get("if") == "inputs.operation == 'apply_entitlement_change'"]
     assert len(provision_steps) == 1, "expected exactly one step gated on operation == 'provision'"
     assert len(sync_steps) == 1, "expected exactly one step gated on operation == 'initial_sync'"
+    assert len(entitlement_steps) == 1, "expected exactly one step gated on operation == 'apply_entitlement_change'"
 
     assert provision_steps[0]["run"].strip() == 'python provision_tenant.py --tenant-id "$TENANT_ID"', (
         f"unexpected provisioning command: {provision_steps[0]['run']!r}"
     )
     assert sync_steps[0]["run"].strip() == 'python initial_sync.py --tenant-id "$TENANT_ID"', (
         f"unexpected initial-sync command: {sync_steps[0]['run']!r}"
+    )
+    assert entitlement_steps[0]["run"].strip() == 'python apply_entitlement_change.py --tenant-id "$TENANT_ID"', (
+        f"unexpected entitlement-change command: {entitlement_steps[0]['run']!r}"
     )
 
     # No step anywhere accepts a free-form/dynamic command (no eval, no

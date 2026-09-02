@@ -55,6 +55,7 @@ async function resolveHasGoogleCredential(tenantId) {
 function sanitizeTenant(config, hasGoogleCredential) {
   const provisioning = config.provisioning ?? {}
   const initialSync = config.initialSync ?? {}
+  const entitlementChange = config.entitlementChange ?? {}
   return {
     tenantId: config.tenantId,
     displayName: config.displayName ?? config.tenantId,
@@ -80,6 +81,21 @@ function sanitizeTenant(config, hasGoogleCredential) {
       // trace: both scripts catch at their own top level and store only
       // "{ExceptionClassName}: {message}".
       lastError: initialSync.lastError ?? provisioning.lastError ?? null,
+    },
+    // Multi-Tenant Phase 4I.3 -- read-only visibility into whether a
+    // platform-admin entitlement change (tenant-entitlements/[action].js)
+    // is still awaiting its data-plane follow-up. Never a mutation
+    // surface -- this route remains exactly as read-only as before this
+    // phase; addedLocationIds/removedLocationIds are numeric ids/counts
+    // only, not raw Google resource identifiers, so nothing new is
+    // exposed beyond what approvedLocationCount already implies.
+    entitlementChange: {
+      status: entitlementChange.status ?? 'none',
+      requestedAt: entitlementChange.requestedAt ?? null,
+      completedAt: entitlementChange.completedAt ?? null,
+      failedAt: entitlementChange.failedAt ?? null,
+      pendingAdditionCount: Array.isArray(entitlementChange.addedLocationIds) ? entitlementChange.addedLocationIds.length : 0,
+      lastError: entitlementChange.lastError ?? null,
     },
     hasGoogleCredential,
     eligibility: {

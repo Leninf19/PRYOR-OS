@@ -44,6 +44,7 @@ import { resolveTenantId, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
 import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDiscoveryStore.js'
 import { recordLocationApproval, LocationApprovalNotEligibleError, getTenantConfig, LOCATION_APPROVAL_ELIGIBLE_STATUSES } from '../_lib/tenantConfigStore.js'
 import { reconcileApprovedLocationsAgainstDiscovery, UnreconciledApprovedLocationError } from '../_lib/tenantLocationReconciliation.js'
+import { discoverGoogleLocationIdsForReconciliation } from '../_lib/googleLocationDiscovery.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -992,33 +993,6 @@ async function gbpGetAllPages(baseUrl, token, listKey, pageParam = 'pageSize', p
     pageToken = data.nextPageToken || null
   } while (pageToken)
   return items
-}
-
-// Multi-Tenant Phase 4I.2 -- returns the full Set of googleLocationId
-// strings a Google access token can see, across every account and every
-// page (reuses gbpGetAllPages, same pagination-following as publish()'s
-// fallback lookup above -- deliberately NOT discoverLocations()'s simpler
-// single-page call, since a false "location not visible" reconciliation
-// failure caused by a missed page would incorrectly reject a perfectly
-// valid reconnect). Used ONLY to reconcile a freshly-exchanged OAuth
-// candidate credential against a COMMITTED tenant's existing
-// approvedLocations before that candidate is ever persisted -- see
-// callback() below. Returns ids only (no title/address): reconciliation
-// needs nothing else, and the richer, UI-facing shape stays in
-// discoverLocations() below.
-async function discoverGoogleLocationIdsForReconciliation(token) {
-  const accounts = await gbpGetAllPages(`${ACCOUNTS_BASE}/accounts`, token, 'accounts')
-  const ids = new Set()
-  for (const acct of accounts) {
-    const rawLocations = await gbpGetAllPages(
-      `${LOCATIONS_BASE}/${acct.name}/locations?readMask=${encodeURIComponent(LOCATIONS_READ_MASK)}`,
-      token, 'locations'
-    )
-    for (const loc of rawLocations) {
-      ids.add(v4LocationPath(acct.name, loc.name || ''))
-    }
-  }
-  return ids
 }
 
 // Multi-Tenant Phase 4I.2 -- lifecycle statuses in which a Google credential

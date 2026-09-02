@@ -3,7 +3,7 @@
   "topLevelFields": [
     "tenantId", "displayName", "status", "locationCatalogEnabled",
     "approvedLocations", "locationIdMap", "nextLocationId",
-    "brands", "logoUrl", "storageMode", "provisioning", "initialSync", "configVersion", "createdAt", "updatedAt"
+    "brands", "logoUrl", "storageMode", "provisioning", "initialSync", "entitlementChange", "configVersion", "createdAt", "updatedAt"
   ],
   "provisioningFields": [
     "status", "reviewDbBlobKey", "privateDataPrefix", "reviewDbEtag", "artifactGeneration",
@@ -12,6 +12,9 @@
   "initialSyncFields": [
     "status", "startedAt", "completedAt", "failedAt", "reviewDbEtag", "artifactGeneration",
     "reviewCount", "locationCount", "lastError"
+  ],
+  "entitlementChangeFields": [
+    "status", "requestedAt", "completedAt", "failedAt", "addedLocationIds", "removedLocationIds", "lastError"
   ],
   "validStatuses": [
     "onboarding", "locations_approved", "provisioning", "provisioned",
@@ -49,7 +52,16 @@
       "reviewCount": null,
       "locationCount": null,
       "lastError": null
+    },
+    "entitlementChange": {
+      "status": "none",
+      "requestedAt": null,
+      "completedAt": null,
+      "failedAt": null,
+      "addedLocationIds": [],
+      "removedLocationIds": [],
+      "lastError": null
     }
   },
-  "notes": "configVersion starts at 1 after the first write (0 means 'no record exists yet') and is not listed in defaultValues because its value depends on write count, not a fixed default -- see each language's own upsert function. storageMode defaults to 'BLOB' because every tenant getting its FIRST record via either language's upsert function is a new, self-service tenant -- the only architecture new tenants are provisioned under (Phase 4F.1). LEGACY_REPO is reserved for Los Tres Amigos's pre-existing, git-committed/bundled data and is never assigned by either language's default-record logic. 'active' (Phase 4G) is written ONLY by initial_sync.py, after real Google data has been synced, a new reviews.db Blob generation confirmed via a conditional upload, and a complete private-data artifact generation published -- see initial_sync.py's header."
+  "notes": "entitlementChange (Multi-Tenant Phase 4I.3) tracks a platform-admin post-onboarding approvedLocations change (Node's tenantConfigStore.js applyEntitlementChange()/markEntitlementChangeCompleted()/markEntitlementChangeFailed() -- Python's apply_entitlement_change.py writes the completion/failure side directly via tenant_config_store.py, mirroring how initial_sync.py already writes initialSync). 'pending' only while at least one newly-added location's approvedLocations entry still has operational: false; a removal-only change is recorded as already-settled (status: 'none') immediately, since authorization is revoked the instant the CAS write commits with no data-plane follow-up required. configVersion starts at 1 after the first write (0 means 'no record exists yet') and is not listed in defaultValues because its value depends on write count, not a fixed default -- see each language's own upsert function. storageMode defaults to 'BLOB' because every tenant getting its FIRST record via either language's upsert function is a new, self-service tenant -- the only architecture new tenants are provisioned under (Phase 4F.1). LEGACY_REPO is reserved for Los Tres Amigos's pre-existing, git-committed/bundled data and is never assigned by either language's default-record logic. 'active' (Phase 4G) is written ONLY by initial_sync.py, after real Google data has been synced, a new reviews.db Blob generation confirmed via a conditional upload, and a complete private-data artifact generation published -- see initial_sync.py's header."
 }

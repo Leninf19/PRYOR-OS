@@ -49,6 +49,7 @@ import notificationsHandler from '../dashboard/api/notifications/[action].js'
 import tasksHandler from '../dashboard/api/tasks/[action].js'
 import contentHandler from '../dashboard/api/content/[action].js'
 import tenantOpsHandler from '../dashboard/api/tenant-ops/[action].js'
+import tenantEntitlementsHandler from '../dashboard/api/tenant-entitlements/[action].js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -624,6 +625,22 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Response is an explicit sanitized allowlist per tenant (status/storageMode/approvedLocationCount/provisioning/initialSync/hasGoogleCredential/eligibility) -- never a raw tenant_config spread, never approvedLocations/locationIdMap/reviewDbBlobKey, never a decrypted credential (getStoredCredential()\'s refreshToken is reduced to a boolean before it reaches the response). See test_tenant_ops_endpoint.js for the full authorization/sanitization/eligibility test suite.',
   },
+  {
+    route: 'GET /api/tenant-entitlements/discover', file: 'api/tenant-entitlements/[action].js', method: 'GET', action: 'discover',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-operator only (Multi-Tenant Phase 4I.3), same isSuperAdmin() narrowing as /api/tenant-ops -- \'owner\' is necessary but not sufficient; a real tenant\'s own Owner still gets 403. Read-only: discovers a TARGET tenant\'s (tenantId query param, admin-selected, validated against a real tenant_config record before use) currently-visible Google locations via that tenant\'s own stored credential, and returns its current approvedLocations with each entry\'s operational flag.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Never returns locationIdMap, a raw tenant_config spread, or any credential material. See test_tenant_entitlement_change.js for the full authorization/reconciliation/concurrency suite.',
+  },
+  {
+    route: 'POST /api/tenant-entitlements/apply', file: 'api/tenant-entitlements/[action].js', method: 'POST', action: 'apply',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-operator only (Multi-Tenant Phase 4I.3), same isSuperAdmin() narrowing as /api/tenant-ops -- the ONLY supported way to change an already-committed tenant\'s approvedLocations. Requires an exact expectedConfigVersion (CAS); re-verifies every requested addition against a FRESH live discovery at mutation time (never trusts a prior GET); never callable by an ordinary tenant Owner regardless of role.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Removal revokes authorization immediately (tenantOwnsLocation() reads approvedLocations live); an added location is stamped operational: false and stays unauthorized until apply_entitlement_change.py\'s data-plane follow-up succeeds. See test_tenant_entitlement_change.js for the full adversarial suite.',
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -934,6 +951,7 @@ const HANDLERS = {
   'api/tasks/[action].js': tasksHandler,
   'api/content/[action].js': contentHandler,
   'api/tenant-ops/[action].js': tenantOpsHandler,
+  'api/tenant-entitlements/[action].js': tenantEntitlementsHandler,
 }
 
 function minimalReqFor(entry, token) {

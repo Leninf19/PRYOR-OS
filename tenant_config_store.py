@@ -238,6 +238,19 @@ def upsert_tenant_config(tenant_id: str, patch: dict, expected_version: int | No
             "reviewDbEtag": None, "artifactGeneration": None,
             "reviewCount": None, "locationCount": None, "lastError": None,
         },
+        # Multi-Tenant Phase 4I.3 -- see tenantConfigStore.js's own default
+        # record comment: tracks a platform-admin post-onboarding
+        # approvedLocations change, kept separate from "provisioning"/
+        # "initialSync" for the same reason those two are separate from
+        # each other. Node's applyEntitlementChange()/
+        # markEntitlementChangeCompleted()/markEntitlementChangeFailed()
+        # are the primary writers; apply_entitlement_change.py (Python)
+        # writes the completion/failure side directly via this module,
+        # mirroring how initial_sync.py already writes "initialSync".
+        "entitlementChange": {
+            "status": "none", "requestedAt": None, "completedAt": None, "failedAt": None,
+            "addedLocationIds": [], "removedLocationIds": [], "lastError": None,
+        },
         **(existing or {}),
         "createdAt": (existing or {}).get("createdAt", now),
         **patch,

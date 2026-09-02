@@ -508,9 +508,27 @@ export async function resolveLocationCatalogAuthz(tenantId) {
     tenantId,
     status: config.status,
     locationCatalogEnabled: config.locationCatalogEnabled,
+    // Multi-Tenant Phase 4I.3: a location entry with `operational: false`
+    // (freshly added by a platform-admin entitlement change --
+    // tenantConfigStore.js's applyEntitlementChange() -- whose data-plane
+    // follow-up, DB row + sync + a fresh artifact generation, has not yet
+    // succeeded) is EXCLUDED here even though it still exists in the raw
+    // approvedLocations array (for entitlementChange tracking/audit/admin
+    // visibility). This is the one place that distinction is enforced --
+    // tenantOwnsLocation()/requireLocationAccess()/isWildcardGrant() all
+    // consume this already-filtered id list and need no awareness of
+    // `operational` themselves, exactly like they need none of
+    // approvedLocations' other fields. `operational` absent/undefined
+    // (every location approved before this phase, and every removal,
+    // which simply deletes the array entry rather than marking it) is
+    // treated as operational -- only an EXPLICIT `false` withholds
+    // authorization.
     approvedLocationIds: Object.freeze(
       Array.isArray(config.approvedLocations)
-        ? config.approvedLocations.map(l => l?.locationId).filter(id => Number.isInteger(id))
+        ? config.approvedLocations
+            .filter(l => l?.operational !== false)
+            .map(l => l?.locationId)
+            .filter(id => Number.isInteger(id))
         : []
     ),
   })

@@ -330,6 +330,21 @@ export async function upsertTenantConfig(tenantId, patch, { expectedVersion } = 
       reviewDbEtag: null, artifactGeneration: null,
       reviewCount: null, locationCount: null, lastError: null,
     },
+    // Multi-Tenant Phase 4I.3 -- tracks a platform-admin post-onboarding
+    // approvedLocations change (applyEntitlementChange() below), kept
+    // separate from `provisioning`/`initialSync` for the same reason those
+    // two are separate from each other: this describes "is a REQUESTED
+    // entitlement change's data-plane follow-up (DB rows + sync + a fresh
+    // artifact generation) still outstanding," not provisioning or initial
+    // sync themselves. 'pending' only while at least one newly-ADDED
+    // location is not yet operational (see approvedLocations[].operational
+    // and tenants.js's tenantOwnsLocation()) -- a removal-only change has
+    // nothing left to do in the data plane and is recorded as settled
+    // immediately (status: 'none') by applyEntitlementChange() itself.
+    entitlementChange: {
+      status: 'none', requestedAt: null, completedAt: null, failedAt: null,
+      addedLocationIds: [], removedLocationIds: [], lastError: null,
+    },
     ...existing,
     createdAt: existing?.createdAt ?? now,
     ...patch,
@@ -658,6 +673,264 @@ export async function markTenantActive(tenantId, { reviewDbEtag, artifactGenerat
       reviewCount: Number.isInteger(reviewCount) ? reviewCount : null,
       locationCount: Number.isInteger(locationCount) ? locationCount : null,
       lastError: null,
+    },
+  }, expectedVersion === undefined ? {} : { expectedVersion })
+}
+
+// --- Multi-Tenant Phase 4I.3 -- Platform-Controlled Entitlement Changes ---
+//
+// Phase 4I.1/4I.2 built the boundary ("approvedLocations is the tenant's
+// canonical entitlement; nothing else may expand it") and closed the
+// credential side of it. This phase builds the ONE supported way that
+// boundary may still move for an already-committed tenant: an explicit,
+// platform-admin-only, audited, atomic mutation -- never a side effect of
+// OAuth, discovery, or sync.
+//
+// AUTHORIZATION is NOT this function's job -- exactly like
+// recordLocationApproval() above, this is the data-invariant layer; the
+// caller (dashboard/api/tenant-entitlements/[action].js) is the ONLY place
+// that checks isSuperAdmin() and resolves tenantId from trusted,
+// admin-selected server-side context. This function does not, and must
+// not, accept a tenantId from anywhere it could be attacker-influenced --
+// its caller is responsible for that exactly as every other tenant-scoped
+// write in this file already requires.
+export const ENTITLEMENT_CHANGE_ELIGIBLE_STATUSES = new Set([
+  'provisioned', 'active', 'initial_sync_failed', 'provisioning_failed', 'suspended',
+])
+
+export class EntitlementChangeNotEligibleError extends Error {
+  constructor(message, currentStatus) {
+    super(message)
+    this.currentStatus = currentStatus ?? null
+  }
+}
+
+export class UnknownLocationRemovalError extends Error {
+  constructor(message, unknownLocationIds) {
+    super(message)
+    this.unknownLocationIds = unknownLocationIds ?? []
+  }
+}
+
+export class LocationAlreadyApprovedError extends Error {
+  constructor(message, googleLocationIds) {
+    super(message)
+    this.googleLocationIds = googleLocationIds ?? []
+  }
+}
+
+// THE only function allowed to change an already-committed tenant's
+// approvedLocations. `expectedVersion` is REQUIRED (unlike every other
+// CAS-capable write in this file, where it's optional) -- there is no
+// safe plain/last-write-wins mode for this mutation; the caller must
+// always have just read the exact tenant_config generation it is
+// modifying. Item 4's concurrency requirement ("a stale admin operation
+// must not overwrite suspension / another entitlement edit / sync state /
+// provisioning metadata / branding") is satisfied structurally by this
+// single fact: the write is `upsertTenantConfig(tenantId, patch, {
+// expectedVersion })`, which spreads `...existing` BEFORE the patch (see
+// that function above) and CAS-fails atomically if ANY field changed the
+// caller didn't know about -- not just approvedLocations. A concurrent
+// suspension, a concurrent initial_sync completing, a concurrent branding
+// edit -- all of them bump configVersion, so all of them make a stale
+// entitlement-change attempt fail closed via ConfigVersionConflictError,
+// with zero special-casing needed per field.
+//
+// `addGoogleLocations` -- locations to add, ALREADY VERIFIED by the
+// caller as visible to the tenant's own currently-reconciled Google
+// credential (see tenantLocationReconciliation.js / the Phase 4I.2
+// callback() flow this mirrors) -- this function has no Google API access
+// of its own and trusts that verification exactly like
+// recordLocationApproval() trusts its caller's discovery-session check.
+// "Discovery visibility does not itself grant entitlement": this function
+// does not call Google at all -- a caller that skipped verification would
+// be a caller bug, not something this function can detect, exactly the
+// same trust boundary recordLocationApproval() already has with
+// google/[action].js's approveLocations().
+//
+// Each newly added entry is stamped `operational: false` -- it does NOT
+// become visible to tenantOwnsLocation()/requireLocationAccess() (tenants.js)
+// until apply_entitlement_change.py's data-plane follow-up (DB row insert,
+// a sync scoped to the tenant's full current approved set, a freshly
+// published artifact generation) succeeds and calls
+// markEntitlementChangeCompleted() below. This is "do not silently expose
+// a newly-added location before its required provisioning/sync is
+// complete," enforced structurally rather than by a timing assumption.
+//
+// `removeLocationIds` -- local numeric locationIds to remove. Removal
+// takes effect on authorization IMMEDIATELY: the moment this CAS write
+// commits, tenantOwnsLocation() no longer finds the entry in
+// approvedLocations, full stop -- no separate "revoke" step, no
+// transitional state, nothing for a data-plane script to still do.
+// locationIdMap is NEVER touched by a removal: the numeric id remains
+// permanently reserved (this file's pre-existing stable-id guarantee,
+// unchanged), so historical review rows keep a meaningful, un-recycled
+// foreign key, and a location re-added later (even much later) gets its
+// OWN original id back, never a new one.
+export async function applyEntitlementChange(tenantId, { addGoogleLocations = [], removeLocationIds = [] } = {}, expectedVersion) {
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+    throw new TypeError('applyEntitlementChange: expectedVersion is required and must be a non-negative integer')
+  }
+  if (!Array.isArray(addGoogleLocations) || !Array.isArray(removeLocationIds)) {
+    throw new TypeError('applyEntitlementChange: addGoogleLocations and removeLocationIds must be arrays')
+  }
+  if (addGoogleLocations.length === 0 && removeLocationIds.length === 0) {
+    throw new TypeError('applyEntitlementChange: at least one addition or removal is required')
+  }
+  if (!addGoogleLocations.every(l => l && typeof l.googleLocationId === 'string' && l.googleLocationId)) {
+    throw new TypeError('applyEntitlementChange: every added location must have a googleLocationId')
+  }
+  if (!removeLocationIds.every(id => Number.isInteger(id) && id > 0)) {
+    throw new TypeError('applyEntitlementChange: removeLocationIds must be positive integers')
+  }
+
+  const existing = await getTenantConfig(tenantId)
+  if (!existing) {
+    throw new EntitlementChangeNotEligibleError(
+      `applyEntitlementChange: tenant ${tenantId} has no config record -- this mutation is only for already-onboarded, committed tenants`,
+      null
+    )
+  }
+  if (!ENTITLEMENT_CHANGE_ELIGIBLE_STATUSES.has(existing.status)) {
+    throw new EntitlementChangeNotEligibleError(
+      `applyEntitlementChange: tenant ${tenantId} has status ${JSON.stringify(existing.status)} -- entitlement changes are not permitted in this lifecycle state (an in-flight initial_sync must finish or fail first; a pre-commit tenant uses the ordinary approve-locations flow instead)`,
+      existing.status
+    )
+  }
+
+  const currentApproved = Array.isArray(existing.approvedLocations) ? existing.approvedLocations : []
+  const currentLocationIdMap = { ...(existing.locationIdMap ?? {}) }
+
+  // Removals must reference locations that are ACTUALLY currently
+  // approved -- never a silent no-op for a bogus id (which would hide an
+  // operator's mistake), and never able to "remove" an id that was never
+  // approved in the first place.
+  const currentIds = new Set(currentApproved.map(l => l.locationId))
+  const unknownRemovals = removeLocationIds.filter(id => !currentIds.has(id))
+  if (unknownRemovals.length > 0) {
+    throw new UnknownLocationRemovalError(
+      `applyEntitlementChange: location id(s) ${unknownRemovals.join(', ')} are not currently approved for tenant ${tenantId}`,
+      unknownRemovals
+    )
+  }
+
+  const removeSet = new Set(removeLocationIds)
+  const survivingApproved = currentApproved.filter(l => !removeSet.has(l.locationId))
+
+  // A location already surviving this same change (approved, and not also
+  // being removed in it) can never ALSO appear in `addGoogleLocations` --
+  // that would produce two array entries sharing one locationId, which
+  // every consumer of approvedLocations (tenantOwnsLocation() included)
+  // assumes cannot happen. Re-adding a location that IS being removed in
+  // this same call is fine (see below) -- that is a deliberate "reset its
+  // operational state" operation, not a duplicate.
+  const survivingGoogleIds = new Set(survivingApproved.map(l => l.googleLocationId))
+  const alreadyApproved = addGoogleLocations.filter(l => survivingGoogleIds.has(l.googleLocationId))
+  if (alreadyApproved.length > 0) {
+    throw new LocationAlreadyApprovedError(
+      `applyEntitlementChange: location(s) ${alreadyApproved.map(l => l.googleLocationId).join(', ')} are already approved for tenant ${tenantId} and not being removed in this same change -- nothing to add`,
+      alreadyApproved.map(l => l.googleLocationId)
+    )
+  }
+
+  let nextLocationId = Number.isInteger(existing.nextLocationId) && existing.nextLocationId >= 1 ? existing.nextLocationId : 1
+  const addedLocationIds = []
+  const additions = addGoogleLocations.map(loc => {
+    // A location already known to this tenant (previously approved and
+    // now being re-added, including the removed-in-this-same-call case
+    // above) reuses its PERMANENT reserved id from locationIdMap -- never
+    // a new one, and never renumbered. Only a genuinely never-before-seen
+    // googleLocationId gets the next monotonic id.
+    if (!(loc.googleLocationId in currentLocationIdMap)) {
+      currentLocationIdMap[loc.googleLocationId] = nextLocationId
+      nextLocationId += 1
+    }
+    const locationId = currentLocationIdMap[loc.googleLocationId]
+    addedLocationIds.push(locationId)
+    return {
+      locationId,
+      googleLocationId: loc.googleLocationId,
+      title: loc.title ?? '',
+      address: loc.address ?? '',
+      operational: false,
+    }
+  })
+
+  const nextApprovedLocations = [...survivingApproved, ...additions]
+  const now = new Date().toISOString()
+
+  const next = await upsertTenantConfig(tenantId, {
+    approvedLocations: nextApprovedLocations,
+    locationIdMap: currentLocationIdMap,
+    nextLocationId,
+    entitlementChange: additions.length > 0
+      ? {
+          status: 'pending',
+          requestedAt: now, completedAt: null, failedAt: null,
+          addedLocationIds, removedLocationIds: [...removeLocationIds],
+          lastError: null,
+        }
+      : {
+          // A removal-only change has nothing left for the data plane to
+          // do -- authorization is already fully revoked by
+          // nextApprovedLocations itself. Recorded as immediately settled,
+          // for audit/observability only.
+          status: 'none',
+          requestedAt: now, completedAt: now, failedAt: null,
+          addedLocationIds: [], removedLocationIds: [...removeLocationIds],
+          lastError: null,
+        },
+  }, { expectedVersion })
+
+  return { config: next, addedLocationIds, removedLocationIds: [...removeLocationIds] }
+}
+
+// Called by apply_entitlement_change.py (Python, via its own
+// tenant_config_store.py client -- mirroring how markTenantProvisioned()/
+// markTenantActive() above document a write PRODUCTION Python performs
+// directly, with this Node function existing for tests/tooling parity)
+// once the data-plane follow-up for a pending entitlement change (DB rows
+// inserted, a sync scoped to the tenant's full current approved set
+// completed, a new artifact generation published and its pointer flipped)
+// has succeeded. Flips every location named in
+// entitlementChange.addedLocationIds -- and ONLY those -- from
+// `operational: false` to `true`.
+export async function markEntitlementChangeCompleted(tenantId, { expectedVersion } = {}) {
+  const existing = await getTenantConfig(tenantId)
+  if (!existing) throw new TypeError(`markEntitlementChangeCompleted: tenant ${tenantId} has no config record`)
+  const pendingIds = new Set(existing.entitlementChange?.addedLocationIds ?? [])
+  const approvedLocations = (Array.isArray(existing.approvedLocations) ? existing.approvedLocations : []).map(l =>
+    pendingIds.has(l.locationId) ? { ...l, operational: true } : l
+  )
+  return upsertTenantConfig(tenantId, {
+    approvedLocations,
+    entitlementChange: {
+      ...(existing.entitlementChange ?? {}),
+      status: 'none',
+      completedAt: new Date().toISOString(),
+      failedAt: null,
+      lastError: null,
+    },
+  }, expectedVersion === undefined ? {} : { expectedVersion })
+}
+
+// Records that the data-plane follow-up failed -- deliberately does NOT
+// touch approvedLocations at all: the newly-added entries stay exactly as
+// applyEntitlementChange() left them (`operational: false`), so they
+// remain fully unauthorized (never silently exposed) regardless of this
+// failure. An operator can retry the same dispatch (idempotent: re-running
+// the data-plane step against still-`operational: false` entries is
+// exactly what a retry needs) or, if they choose, issue a fresh
+// applyEntitlementChange() removal to give up on the addition entirely.
+export async function markEntitlementChangeFailed(tenantId, errorMessage, { expectedVersion } = {}) {
+  const existing = await getTenantConfig(tenantId)
+  if (!existing) throw new TypeError(`markEntitlementChangeFailed: tenant ${tenantId} has no config record`)
+  return upsertTenantConfig(tenantId, {
+    entitlementChange: {
+      ...(existing.entitlementChange ?? {}),
+      status: 'failed',
+      failedAt: new Date().toISOString(),
+      lastError: String(errorMessage ?? 'unknown error'),
     },
   }, expectedVersion === undefined ? {} : { expectedVersion })
 }

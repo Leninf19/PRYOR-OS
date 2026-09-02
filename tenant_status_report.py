@@ -48,6 +48,7 @@ def build_summary(tenant_id: str, operation: str) -> str:
 
     provisioning = config.get("provisioning") or {}
     initial_sync = config.get("initialSync") or {}
+    entitlement_change = config.get("entitlementChange") or {}
 
     try:
         has_credential = google_api.has_tenant_credential(tenant_id)
@@ -70,9 +71,12 @@ def build_summary(tenant_id: str, operation: str) -> str:
         f"| Locations synced | {_fmt(initial_sync.get('locationCount'))} |",
         f"| Artifact generation | `{_fmt(provisioning.get('artifactGeneration'))}` |",
         f"| Google credential present | {'unknown' if has_credential is None else has_credential} |",
+        f"| Entitlement change status | `{entitlement_change.get('status', 'none')}` |",
+        f"| Entitlement change pending additions | {_fmt(entitlement_change.get('addedLocationIds'))} |",
+        f"| Entitlement change requested | {_fmt(entitlement_change.get('requestedAt'))} |",
     ]
 
-    last_error = initial_sync.get("lastError") or provisioning.get("lastError")
+    last_error = initial_sync.get("lastError") or provisioning.get("lastError") or entitlement_change.get("lastError")
     if last_error:
         lines += ["", f"**Last error:** `{last_error}`"]
 

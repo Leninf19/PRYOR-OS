@@ -41,6 +41,7 @@ on:
         options:
           - provision
           - initial_sync
+          - apply_entitlement_change
       tenant_id:
         description: "Tenant id, e.g. t_example-restaurant"
         required: true
@@ -146,6 +147,25 @@ jobs:
         # deliberately never sets that env var, so no such fallback is even
         # reachable for a new tenant dispatched here.
         run: python initial_sync.py --tenant-id "$TENANT_ID"
+
+      # Multi-Tenant Phase 4I.3 -- the data-plane follow-up for a platform
+      # admin's entitlement change already COMMITTED to tenant_config by
+      # dashboard/api/tenant-entitlements/[action].js (the mutation itself
+      # happened in Node, atomically, before this was ever dispatched --
+      # this step never decides what changed, only makes an already-approved
+      # addition operational). Refuses outright (apply_entitlement_change.py's
+      # own precondition check) if entitlementChange.status isn't 'pending'.
+      - name: Apply entitlement change
+        if: inputs.operation == 'apply_entitlement_change'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: python apply_entitlement_change.py --tenant-id "$TENANT_ID"
 
       # Runs regardless of whether the step(s) above succeeded or failed
       # (if: always()) purely so an operator can see the resulting state

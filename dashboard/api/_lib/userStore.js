@@ -43,6 +43,7 @@ import { Redis } from '@upstash/redis'
 import { normalizeEmail, isValidLocationIds, ROLES } from './accounts.js'
 import { usersKeyV2, usersEmailIndexKeyV2 } from './tenantKeys.js'
 import { resolveHashReadKey, resolveHashWriteKey } from './tenantDualRead.js'
+import { resolveBootstrapTenantId } from './tenants.js'
 
 const USERS_KEY = 'users:v1'
 const EMAIL_INDEX_KEY = 'users_email_index:v1'
@@ -233,4 +234,85 @@ export async function touchLastLogin(tenantId, userId) {
     console.error(`[userStore] failed to record lastLoginAt for ${userId}: ${err.message}`)
     return false
   }
+}
+
+// Multi-Tenant Phase 4I.3 -- best-effort account-grant hygiene after a
+// platform admin removes location(s) from a tenant's approvedLocations
+// (tenantConfigStore.js's applyEntitlementChange()). NOT ITSELF A SECURITY
+// BOUNDARY -- tenants.js's tenantOwnsLocation() already denies access to a
+// removed location unconditionally the moment the entitlement change
+// commits, regardless of what any individual account's own locationIds
+// array still says (requireLocationAccess() requires BOTH tenantOwnsLocation()
+// AND the account's own grant -- tenant-level denial alone already blocks
+// access). This function exists so a removed location's numeric id
+// doesn't linger indefinitely in account records, and so every affected
+// account's outstanding session tokens are invalidated (sessionVersion
+// bump) even though those sessions were never actually able to reach the
+// removed location in the first place.
+//
+// Wildcard ('*') accounts are skipped entirely -- wildcard already means
+// "every CURRENTLY approved location" (tenants.js's isWildcardGrant(),
+// resolved fresh on every request from live tenant config), so removing a
+// location from approvedLocations already narrows a wildcard account's
+// effective access with zero per-account bookkeeping required. Adding a
+// location never touches any account's grant either (not called by that
+// path at all) -- a wildcard account gains it automatically and for the
+// same reason; a non-wildcard account's own explicit array is NEVER
+// widened by this function, only ever narrowed.
+//
+// KNOWN LIMITATION: an account whose explicit locationIds would become
+// EMPTY after stripping every removed id is left with its STALE array
+// UNTOUCHED (though its sessionVersion is still bumped, forcing re-auth) --
+// accounts.js's isValidLocationIds() requires a non-empty array, so
+// upsertUser()/updateUser() would reject a literal `[]` outright and there
+// is no valid way under the current schema to persist "this account now
+// has zero locations." This does not weaken the security guarantee
+// (tenantOwnsLocation() already blocks the removed location
+// unconditionally, so the stale array entry is inert) but does mean such
+// an account's own record is not fully cleaned up -- a future phase could
+// add an explicit "no locations" valid state, or surface these accounts
+// to an Owner for manual reassignment. Returned in `emptied` so a caller
+// (the Phase 4I.3 admin endpoint) can report exactly which accounts hit
+// this limitation, for audit-trail completeness.
+export async function reconcileAccountGrantsAfterLocationRemoval(tenantId, removedLocationIds) {
+  const removeSet = new Set(removedLocationIds ?? [])
+  if (removeSet.size === 0) return { narrowed: [], emptied: [] }
+
+  // Multi-Tenant Phase 3 has not yet built real per-tenant user-store
+  // partitioning -- EVERY account, regardless of its own claimed
+  // tenantId, currently lives in the ONE bootstrap tenant's hash (see
+  // resolveBootstrapTenantId()'s own header, and accountStore.js's
+  // listAccounts(), which already establishes this exact pattern:
+  // `listUsers(resolveBootstrapTenantId())`, never `listUsers(tenantId)`
+  // for an arbitrary target tenant). Calling listUsers(tenantId) directly
+  // here would silently search the wrong physical key for any tenant
+  // other than the bootstrap one and find nothing -- this mirrors
+  // listAccounts()'s call, then filters to the accounts that actually
+  // belong to THIS tenant by their own tenantId field, which is what
+  // makes cross-tenant accounts distinguishable within that one shared
+  // hash today.
+  const bootstrapUsers = await listUsers(resolveBootstrapTenantId())
+  const bootstrapTenantId = resolveBootstrapTenantId()
+  const users = bootstrapUsers.filter(u => u.tenantId === tenantId || (tenantId === bootstrapTenantId && u.tenantId === undefined))
+  const narrowed = []
+  const emptied = []
+  for (const user of users) {
+    if (!Array.isArray(user.locationIds)) continue // wildcard, or a shape this codebase's own validated writers never produce
+    if (!user.locationIds.some(id => removeSet.has(id))) continue // nothing to remove for this account
+
+    const remaining = user.locationIds.filter(id => !removeSet.has(id))
+    const nextSessionVersion = (Number.isInteger(user.sessionVersion) ? user.sessionVersion : 1) + 1
+    // Written back through the SAME bootstrap-tenant hash the record was
+    // just read from (updateUser(tenantId, ...) here would resolve a
+    // DIFFERENT physical key for any non-bootstrap tenantId and silently
+    // create a duplicate/orphaned record instead of updating this one).
+    if (remaining.length === 0) {
+      await updateUser(bootstrapTenantId, user.userId, { sessionVersion: nextSessionVersion })
+      emptied.push(user.userId)
+    } else {
+      await updateUser(bootstrapTenantId, user.userId, { locationIds: remaining, sessionVersion: nextSessionVersion })
+      narrowed.push(user.userId)
+    }
+  }
+  return { narrowed, emptied }
 }

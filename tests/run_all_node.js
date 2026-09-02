@@ -111,6 +111,7 @@ const TESTS = [
   'test_tenant_entitlement_boundary.js',
   'test_google_reconnect_reconciliation.js',
   'test_credential_cas_concurrency.js',
+  'test_tenant_entitlement_change.js',
 ]
 
 const results = {}
