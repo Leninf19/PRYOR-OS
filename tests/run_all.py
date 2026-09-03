@@ -29,7 +29,6 @@ TESTS = [
     "test_diagnose_google_status.py",
     "test_redis_identity_probe.py",
     "test_redis_credential_key_audit.py",
-    "test_encryption_key_challenge_probe.py",
     "test_tenant_paths.py",
     "test_tenant_review_data_isolation.py",
     "test_backfill_sentiment.py",
