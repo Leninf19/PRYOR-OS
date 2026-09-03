@@ -35,12 +35,15 @@ import {
   clearStoredCredential, GoogleHealth, CredentialStoreUnavailableError, CredentialVersionConflictError,
   isQuotaExceededError, extractQuotaProjectNumber,
 } from '../_lib/credentialStore.js'
+import {
+  sealGoogleOAuthClientForPinnedGitHubRepo, OAuthClientSealerUnavailableError, OAuthClientNotConfiguredError,
+} from '../_lib/googleOAuthClientSealer.js'
 import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
 import {
   writePublishBridge, getPublishBridges, PublishBridgeUnavailableError,
 } from '../_lib/publishBridgeStore.js'
 import { recordReplyFailure, clearReplyFailure } from '../_lib/notificationStore.js'
-import { resolveTenantId, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
+import { resolveTenantId, DEFAULT_TENANT_ID, isPlatformOwnerEmail } from '../_lib/tenants.js'
 import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDiscoveryStore.js'
 import { recordLocationApproval, LocationApprovalNotEligibleError, getTenantConfig, LOCATION_APPROVAL_ELIGIBLE_STATUSES } from '../_lib/tenantConfigStore.js'
 import { reconcileApprovedLocationsAgainstDiscovery, UnreconciledApprovedLocationError } from '../_lib/tenantLocationReconciliation.js'
@@ -1353,6 +1356,76 @@ async function publishBridge(req, res) {
 
 const DISCONNECT_CONFIRM_PHRASE = 'DISCONNECT'
 
+// ---------------------------------------------------------------------------
+// POST /api/google/seal-google-oauth-client-for-github -- TEMPORARY,
+// Phase 4N one-time synchronization mechanism ONLY. Gated to platform
+// owners only, same model as Phase 4M's
+// seal-encryption-key-for-github. Seals THIS environment's live
+// GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (independently) for a
+// HARDCODED, repository-pinned GitHub Actions public key
+// (googleOAuthClientSealer.js) -- accepts NO body fields at all (a
+// request body of any kind is rejected), so there is no way for a
+// caller to influence which key either secret is sealed for. Returns
+// ONLY the two sealed ciphertexts + the pinned key_id -- never either
+// plaintext value, never a caller-suppliable value reflected back.
+// Remove this action (and googleOAuthClientSealer.js) once the
+// GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET synchronization is verified
+// complete.
+// ---------------------------------------------------------------------------
+async function sealGoogleOAuthClientForGithub(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+  if (!isPlatformOwnerEmail(account.email)) {
+    return res.status(403).json({ error: 'Forbidden' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `seal-google-oauth-client-for-github:${account.userId}`, { requestsPerWindow: 3, windowSeconds: 60 })
+  if (!allowed) return
+
+  // Deliberately requires an EMPTY body -- any field at all is rejected,
+  // so there is no request-controlled input of any kind into the seal
+  // operation (see googleOAuthClientSealer.js's header comment for why a
+  // caller-suppliable public key would be a secret-export oracle).
+  const body = req.body
+  const hasAnyField = body != null && typeof body === 'object' && Object.keys(body).length > 0
+  if (hasAnyField) {
+    return res.status(400).json({ error: 'invalid_request', message: 'This endpoint accepts no request body.' })
+  }
+
+  let result
+  try {
+    result = await sealGoogleOAuthClientForPinnedGitHubRepo()
+  } catch (err) {
+    await appendAuditEntry(resolveTenantId(account), {
+      actorId: account.userId, actorEmail: account.email,
+      action: 'seal_google_oauth_client_for_github', result: 'failure',
+    })
+    if (err instanceof OAuthClientNotConfiguredError) {
+      return res.status(503).json({ error: 'not_configured' })
+    }
+    if (err instanceof OAuthClientSealerUnavailableError) {
+      return res.status(500).json({ error: 'sealing_failed' })
+    }
+    throw err
+  }
+
+  await appendAuditEntry(resolveTenantId(account), {
+    actorId: account.userId, actorEmail: account.email,
+    action: 'seal_google_oauth_client_for_github', result: 'success',
+  })
+
+  // Deliberately returns ONLY these three fields -- never either
+  // plaintext value, never anything echoing a request input (there is
+  // none to echo).
+  return res.status(200).json({
+    googleClientIdSealedBase64: result.googleClientIdSealedBase64,
+    googleClientSecretSealedBase64: result.googleClientSecretSealedBase64,
+    keyId: result.keyId,
+  })
+}
+
 async function disconnect(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
@@ -1635,6 +1708,7 @@ export default async function handler(req, res) {
     case 'publish':            return publish(req, res)
     case 'publish-bridge':     return publishBridge(req, res)
     case 'disconnect':         return disconnect(req, res)
+    case 'seal-google-oauth-client-for-github': return sealGoogleOAuthClientForGithub(req, res)
     case 'discover-locations': return discoverLocations(req, res)
     case 'approve-locations':  return approveLocations(req, res)
     default:                   return res.status(404).json({ error: 'not_found' })
