@@ -66,7 +66,7 @@
 //
 // Node-only, same as actionStore.js/contactStore.js.
 
-import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypto'
+import { createCipheriv, createDecipheriv, randomBytes, createHash, createHmac } from 'crypto'
 import { Redis } from '@upstash/redis'
 import { credentialKeyV2 } from './tenantKeys.js'
 import { isValidTenantId, DEFAULT_TENANT_ID } from './tenants.js'
@@ -201,6 +201,37 @@ function decrypt({ ciphertext, iv, authTag }) {
   decipher.setAuthTag(Buffer.from(authTag, 'base64'))
   const plaintext = Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64')), decipher.final()])
   return plaintext.toString('utf8')
+}
+
+// --- Encryption-key challenge-response (Phase 4M incident diagnosis) -----
+// TEMPORARY -- added to prove whether GitHub Actions' CREDENTIAL_ENCRYPTION_KEY
+// and Vercel production's CREDENTIAL_ENCRYPTION_KEY are the same secret,
+// WITHOUT either environment ever exchanging or printing the raw key, a
+// derived key, or any value obtained by decrypting a real credential
+// record. Computes an HMAC-SHA256 over an arbitrary, non-secret,
+// caller-supplied nonce using the EXACT SAME derived key
+// (SHA-256(CREDENTIAL_ENCRYPTION_KEY)) this module already uses for
+// AES-256-GCM -- so a match/mismatch here precisely predicts whether
+// decryption would succeed, without decrypting anything. The one HMAC
+// digest this returns is a one-way function of the key; it is still never
+// returned to an HTTP caller or written to a log by this module's own
+// caller (see google/[action].js's verifyEncryptionKeyChallenge(), the
+// only caller, which stores it in Redis for a few minutes and returns
+// only a boolean to whoever invoked it).
+//
+// Remove this export (and google/[action].js's matching action route,
+// dashboard/api/_lib/encryptionKeyChallengeStore.js, and
+// encryption_key_challenge_probe.py) once the Phase 4M incident is closed.
+export class EncryptionKeyChallengeError extends Error {}
+
+const CHALLENGE_NONCE_PATTERN = /^[0-9a-f]{64}$/i
+
+export function computeEncryptionKeyChallengeHmac(nonceHex) {
+  if (typeof nonceHex !== 'string' || !CHALLENGE_NONCE_PATTERN.test(nonceHex)) {
+    throw new EncryptionKeyChallengeError('computeEncryptionKeyChallengeHmac: nonce must be a 64-character hex string')
+  }
+  const key = getEncryptionKey()
+  return createHmac('sha256', key).update(Buffer.from(nonceHex, 'hex')).digest('hex')
 }
 
 // --- Health state enum ---------------------------------------------------

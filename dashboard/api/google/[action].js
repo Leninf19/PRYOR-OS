@@ -21,7 +21,7 @@
 // Vercel/Node populates req.query.action from the URL segment, exactly as
 // it already does for actions/[action].js and session/[action].js.
 
-import { randomBytes } from 'crypto'
+import { randomBytes, timingSafeEqual } from 'crypto'
 import { setCookie, parseCookies, clearCookie } from './_lib/cookies.js'
 import { fetchWithRetry } from './_lib/http.js'
 import { exchangeRefreshToken, getAccessToken } from './_lib/googleAuth.js'
@@ -34,13 +34,17 @@ import {
   getStoredCredential, setStoredCredentialIfVersion, recordSyncOutcome, recordOAuthRefresh,
   clearStoredCredential, GoogleHealth, CredentialStoreUnavailableError, CredentialVersionConflictError,
   isQuotaExceededError, extractQuotaProjectNumber,
+  computeEncryptionKeyChallengeHmac, EncryptionKeyChallengeError,
 } from '../_lib/credentialStore.js'
+import {
+  consumeChallenge, writeResult, EncryptionKeyChallengeStoreUnavailableError,
+} from '../_lib/encryptionKeyChallengeStore.js'
 import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
 import {
   writePublishBridge, getPublishBridges, PublishBridgeUnavailableError,
 } from '../_lib/publishBridgeStore.js'
 import { recordReplyFailure, clearReplyFailure } from '../_lib/notificationStore.js'
-import { resolveTenantId, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
+import { resolveTenantId, DEFAULT_TENANT_ID, isPlatformOwnerEmail } from '../_lib/tenants.js'
 import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDiscoveryStore.js'
 import { recordLocationApproval, LocationApprovalNotEligibleError, getTenantConfig, LOCATION_APPROVAL_ELIGIBLE_STATUSES } from '../_lib/tenantConfigStore.js'
 import { reconcileApprovedLocationsAgainstDiscovery, UnreconciledApprovedLocationError } from '../_lib/tenantLocationReconciliation.js'
@@ -1353,6 +1357,91 @@ async function publishBridge(req, res) {
 
 const DISCONNECT_CONFIRM_PHRASE = 'DISCONNECT'
 
+// ---------------------------------------------------------------------------
+// POST /api/google/verify-encryption-key-challenge -- TEMPORARY, Phase 4M
+// encryption-key-identity incident diagnosis ONLY. Gated to platform
+// owners ONLY (isPlatformOwnerEmail(), on top of an authenticated tenant
+// Owner session) -- this diagnostic tests the single, application-wide
+// CREDENTIAL_ENCRYPTION_KEY, not anything scoped to the caller's own
+// tenant, so an ordinary tenant Owner is deliberately not sufficient.
+// Requires the operator's email to be present in the PLATFORM_OWNER_EMAILS
+// Vercel env var (empty/unset by default -- see tenants.js's
+// isPlatformOwnerEmail()) before this endpoint is usable by anyone at all.
+//
+// Atomically consumes (reads AND deletes in one step) a {nonce, hmacGh}
+// challenge GitHub Actions wrote to Redis by requestId -- single-use, so
+// the same requestId can never be replayed -- recomputes the HMAC using
+// THIS environment's own CREDENTIAL_ENCRYPTION_KEY, compares in constant
+// time, and stores ONLY a boolean match result back to Redis -- never
+// returns either HMAC value, the nonce, or the match result to the
+// caller, never logs any of them. Remove this action (and
+// encryptionKeyChallengeStore.js, credentialStore.js's
+// computeEncryptionKeyChallengeHmac export, and
+// encryption_key_challenge_probe.py) once the incident is closed.
+// ---------------------------------------------------------------------------
+async function verifyEncryptionKeyChallenge(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+  if (!isPlatformOwnerEmail(account.email)) {
+    return res.status(403).json({ error: 'Forbidden' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `verify-encryption-key-challenge:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { requestId } = req.body || {}
+  if (typeof requestId !== 'string' || !requestId) {
+    return res.status(400).json({ error: 'requestId is required' })
+  }
+
+  let challenge
+  try {
+    challenge = await consumeChallenge(requestId)
+  } catch (err) {
+    if (err instanceof EncryptionKeyChallengeStoreUnavailableError) {
+      return res.status(503).json({ error: 'challenge store is temporarily unavailable' })
+    }
+    throw err
+  }
+  if (!challenge) {
+    // Either the requestId never existed, it already expired, or it was
+    // already consumed by an earlier call -- all three collapse to the
+    // same response, deliberately: a replay attempt learns nothing beyond
+    // "not available."
+    return res.status(404).json({ error: 'challenge not found, expired, or already used' })
+  }
+
+  let hmacVercel
+  try {
+    hmacVercel = computeEncryptionKeyChallengeHmac(challenge.nonce)
+  } catch (err) {
+    if (err instanceof EncryptionKeyChallengeError) {
+      return res.status(500).json({ error: 'unable to compute challenge response' })
+    }
+    throw err
+  }
+
+  const a = Buffer.from(hmacVercel, 'hex')
+  const b = Buffer.from(challenge.hmacGh, 'hex')
+  const match = a.length === b.length && timingSafeEqual(a, b)
+
+  try {
+    await writeResult(requestId, match)
+  } catch (err) {
+    if (err instanceof EncryptionKeyChallengeStoreUnavailableError) {
+      return res.status(503).json({ error: 'challenge store is temporarily unavailable' })
+    }
+    throw err
+  }
+
+  // Deliberately never echoes `match`, either HMAC, or the nonce back to
+  // the HTTP caller -- the only place the classification is ever reported
+  // is the GitHub Actions job that reads the result from Redis.
+  return res.status(200).json({ ok: true })
+}
+
 async function disconnect(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
@@ -1635,6 +1724,7 @@ export default async function handler(req, res) {
     case 'publish':            return publish(req, res)
     case 'publish-bridge':     return publishBridge(req, res)
     case 'disconnect':         return disconnect(req, res)
+    case 'verify-encryption-key-challenge': return verifyEncryptionKeyChallenge(req, res)
     case 'discover-locations': return discoverLocations(req, res)
     case 'approve-locations':  return approveLocations(req, res)
     default:                   return res.status(404).json({ error: 'not_found' })
