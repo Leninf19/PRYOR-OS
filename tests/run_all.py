@@ -40,6 +40,7 @@ TESTS = [
     "test_location_contacts.py",
     "test_health_check.py",
     "test_response_policy.py",
+    "test_tenant_lifecycle_dispatch_workflow.py",
 ]
 
 

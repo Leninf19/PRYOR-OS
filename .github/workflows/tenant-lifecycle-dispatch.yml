@@ -1,0 +1,191 @@
+name: Tenant Lifecycle Dispatch (pinned)
+
+# WHY THIS FILE EXISTS: GitHub only allows a workflow_dispatch-triggered
+# workflow to be dispatched via the UI/API if the workflow FILE is present
+# on the repository's DEFAULT branch (main) -- this is true regardless of
+# which `ref:` a checkout step later uses. The real implementation lives
+# ONLY on feature/multi-tenant-pryor, which must NOT be merged to main
+# just to make this dispatchable -- main stays Los Tres Amigos's own,
+# untouched production branch. This file is the SMALLEST possible bridge:
+# it lives on main (so GitHub will dispatch it), but every actual line of
+# application code it runs is checked out from ONE hardcoded, reviewed,
+# immutable commit SHA on feature/multi-tenant-pryor -- never main's own
+# tree, never a caller-supplied ref of any kind.
+#
+# PINNED COMMIT: c3c471e5ac300f21294d8ccc09fb8b1851ead206
+#   "Add a read-only Google status diagnostic operation to tenant-lifecycle.yml"
+#   (feature/multi-tenant-pryor, includes every prior approved multi-tenant
+#   phase through 4M's diagnostic addition). To point this dispatcher at a
+#   newer approved commit later, this SHA is the ONLY line that changes --
+#   a small, reviewable, auditable diff, never automatic.
+#
+# SECURITY INVARIANT (revision 2): if "Validate inputs" fails for ANY
+# reason (malformed tenant_id, Los Tres Amigos, confirmation mismatch, or
+# an unrecognized operation -- see its own shell allowlist below, which
+# does NOT rely solely on the workflow_dispatch `type: choice` schema),
+# ZERO production secrets are supplied to any later step. This is
+# structural, not incidental:
+#   - The four operation steps (provision/initial_sync/apply_entitlement_
+#     change/diagnose_google_status) use a plain `if: inputs.operation ==
+#     '...'` with no always()/failure() override, so GitHub Actions' own
+#     default behavior applies: a step with a plain `if:` implicitly
+#     requires success() of every prior step, so a failed "Validate
+#     inputs" already skips all four unconditionally -- this was already
+#     true before this revision and remains unchanged.
+#   - "Write job summary" is the one step that previously broke this
+#     invariant, because if: always() explicitly overrides the
+#     success()-required default. It is now split into two mutually
+#     exclusive steps: one gated on `steps.validate.outcome == 'success'`
+#     (the only one that ever receives secrets or calls
+#     tenant_status_report.py), and one gated on
+#     `steps.validate.outcome == 'failure'` that writes a static,
+#     secret-free, tenant-code-free message instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Which lifecycle operation to run"
+        required: true
+        type: choice
+        options:
+          - diagnose_google_status
+          - provision
+          - initial_sync
+          - apply_entitlement_change
+      tenant_id:
+        description: "Tenant id, e.g. t_example-restaurant"
+        required: true
+        type: string
+      confirmation:
+        description: "Type the EXACT tenant id again to confirm"
+        required: true
+        type: string
+      # Deliberately NO ref/branch/sha input of any kind.
+
+concurrency:
+  group: tenant-lifecycle-${{ inputs.tenant_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PINNED_LIFECYCLE_SHA: c3c471e5ac300f21294d8ccc09fb8b1851ead206
+
+jobs:
+  operate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pinned lifecycle implementation
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PINNED_LIFECYCLE_SHA }}
+
+      # id: validate -- every later secret-bearing step's `if:` is gated
+      # on this step's own outcome (see the header comment above). The
+      # explicit operation allowlist below does NOT rely solely on the
+      # workflow_dispatch `type: choice` schema (which only constrains the
+      # GitHub UI, not necessarily every possible API caller) -- a fixed
+      # case/comparison, never dynamic command construction.
+      - name: Validate inputs
+        id: validate
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          case "$OPERATION" in
+            diagnose_google_status|provision|initial_sync|apply_entitlement_change) ;;
+            *)
+              echo "::error::operation '$OPERATION' is not an allowed operation"
+              exit 1
+              ;;
+          esac
+          if [[ ! "$TENANT_ID" =~ ^t_[a-z0-9-]+$ ]]; then
+            echo "::error::tenant_id '$TENANT_ID' does not match the required format ^t_[a-z0-9-]+\$"
+            exit 1
+          fi
+          if [[ "$TENANT_ID" == "t_los-tres-amigos" ]]; then
+            echo "::error::Los Tres Amigos is not managed through this workflow -- it stays on its existing LEGACY_REPO pipeline (update-reviews.yml)"
+            exit 1
+          fi
+          if [[ "$CONFIRMATION" != "$TENANT_ID" ]]; then
+            echo "::error::confirmation must exactly match tenant_id -- refusing to proceed"
+            exit 1
+          fi
+          echo "Validated tenant_id=$TENANT_ID operation=$OPERATION"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install cryptography
+
+      - name: Run provisioning
+        if: inputs.operation == 'provision'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+        run: python provision_tenant.py --tenant-id "$TENANT_ID"
+
+      - name: Run Initial Sync
+        if: inputs.operation == 'initial_sync'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: python initial_sync.py --tenant-id "$TENANT_ID"
+
+      - name: Apply entitlement change
+        if: inputs.operation == 'apply_entitlement_change'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: python apply_entitlement_change.py --tenant-id "$TENANT_ID"
+
+      - name: Diagnose Google status
+        if: inputs.operation == 'diagnose_google_status'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: python diagnose_google_status.py --tenant-id "$TENANT_ID"
+
+      # Only reachable when Validate inputs actually succeeded -- the one
+      # place production secrets and tenant_status_report.py are used.
+      - name: Write job summary
+        if: always() && steps.validate.outcome == 'success'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          OPERATION: ${{ inputs.operation }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+        run: python tenant_status_report.py --tenant-id "$TENANT_ID" --operation "$OPERATION" >> "$GITHUB_STEP_SUMMARY"
+
+      # The failure-path counterpart -- no secrets, no checked-out tenant
+      # code invoked, just a static message so a rejected dispatch still
+      # leaves a human-readable summary.
+      - name: Write validation-failure summary
+        if: always() && steps.validate.outcome == 'failure'
+        run: echo "Dispatch rejected at input validation -- no tenant-aware script or production secret was ever invoked. See the 'Validate inputs' step's log for the exact reason." >> "$GITHUB_STEP_SUMMARY"
