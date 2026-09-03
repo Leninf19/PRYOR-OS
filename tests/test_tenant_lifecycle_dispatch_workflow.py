@@ -23,7 +23,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "tenant-lifecycle-dispatch.yml"
-APPROVED_SHA = "6add19e956ba57af16b67a06dcf5e93d571e83d9"
+APPROVED_SHA = "f1c9dd847c2bd42a58bf2212ae970efaefad41ac"
 
 results = []
 
@@ -110,7 +110,7 @@ def test_unsupported_operation_fails_shell_allowlist():
         result = _run_validate_shell(run_script, bad_op, "t_ok", "t_ok")
         assert result.returncode != 0, f"operation {bad_op!r} must be rejected by the shell allowlist"
 
-    for good_op in ("diagnose_google_status", "provision", "initial_sync", "apply_entitlement_change", "redis_identity_probe", "credential_key_audit"):
+    for good_op in ("diagnose_google_status", "provision", "initial_sync", "apply_entitlement_change", "redis_identity_probe", "credential_key_audit", "encryption_key_challenge"):
         result = _run_validate_shell(run_script, good_op, "t_ok", "t_ok")
         assert result.returncode == 0, f"operation {good_op!r} must be accepted, got: {result.stderr}"
 
@@ -173,7 +173,7 @@ def test_operation_steps_have_no_always_override():
     _text, data = _load()
     steps = _steps(data)
     operation_steps = [s for s in steps if s.get("if", "").startswith("inputs.operation ==")]
-    assert len(operation_steps) == 6, f"expected exactly 6 operation-gated steps, found {len(operation_steps)}"
+    assert len(operation_steps) == 7, f"expected exactly 7 operation-gated steps, found {len(operation_steps)}"
     for s in operation_steps:
         cond = s["if"]
         assert "always()" not in cond and "failure()" not in cond, (
@@ -226,7 +226,7 @@ def test_validation_failure_reaches_no_secret_bearing_step_end_to_end():
     }
     assert secret_bearing_step_names == {
         "Run provisioning", "Run Initial Sync", "Apply entitlement change", "Diagnose Google status",
-        "Redis identity probe", "Credential key/schema audit", "Write job summary",
+        "Redis identity probe", "Credential key/schema audit", "Encryption key challenge", "Write job summary",
     }, f"unexpected set of secret-bearing steps: {secret_bearing_step_names}"
 
     for name in secret_bearing_step_names:
@@ -299,6 +299,30 @@ def test_credential_audit_step_receives_only_tenant_id_and_redis_secrets():
 
 
 # ===========================================================================
+# encryption_key_challenge receives ONLY the two Redis secrets plus
+# CREDENTIAL_ENCRYPTION_KEY -- never Google, never Blob (this operation
+# never touches either).
+# ===========================================================================
+
+def test_encryption_key_challenge_step_receives_only_redis_and_encryption_key_secrets():
+    _text, data = _load()
+    steps = _steps(data)
+    step = next(s for s in steps if s.get("name") == "Encryption key challenge")
+    assert step["if"] == "inputs.operation == 'encryption_key_challenge'"
+    env = step.get("env", {})
+    assert set(env.keys()) == {"UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN", "CREDENTIAL_ENCRYPTION_KEY"}, (
+        f"encryption_key_challenge must receive ONLY the two Redis secrets and CREDENTIAL_ENCRYPTION_KEY (no "
+        f"TENANT_ID, no Google, no Blob), got {sorted(env.keys())}"
+    )
+    for name in env:
+        assert env[name] == f"${{{{ secrets.{name} }}}}"
+    assert "encryption_key_challenge_probe.py" in step["run"]
+    assert "always()" not in step["if"] and "failure()" not in step["if"], (
+        "encryption_key_challenge must not be reachable after a failed validation"
+    )
+
+
+# ===========================================================================
 # 9. provisioning receives no Google secrets
 # ===========================================================================
 
@@ -366,6 +390,7 @@ def main() -> int:
     run("diagnose_google_status never receives BLOB_READ_WRITE_TOKEN", test_diagnose_step_never_receives_blob_secret)
     run("redis_identity_probe receives ONLY the two Redis secrets", test_redis_probe_step_receives_only_the_two_redis_secrets)
     run("credential_key_audit receives ONLY TENANT_ID and the two Redis secrets", test_credential_audit_step_receives_only_tenant_id_and_redis_secrets)
+    run("encryption_key_challenge receives ONLY the two Redis secrets and CREDENTIAL_ENCRYPTION_KEY", test_encryption_key_challenge_step_receives_only_redis_and_encryption_key_secrets)
     run("provisioning never receives Google secrets", test_provision_step_never_receives_google_secrets)
     run("concurrency remains tenant-scoped with cancel-in-progress: false", test_concurrency_remains_tenant_scoped)
     run("no multi-tenant app/Python implementation file is merged onto main", test_no_app_or_python_implementation_files_on_main)
