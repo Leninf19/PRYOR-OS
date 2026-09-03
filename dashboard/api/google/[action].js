@@ -39,6 +39,9 @@ import {
 import {
   consumeChallenge, writeResult, EncryptionKeyChallengeStoreUnavailableError,
 } from '../_lib/encryptionKeyChallengeStore.js'
+import {
+  sealCredentialEncryptionKeyForPinnedGitHubRepo, EncryptionKeySealerUnavailableError, EncryptionKeyNotConfiguredError,
+} from '../_lib/encryptionKeySealer.js'
 import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
 import {
   writePublishBridge, getPublishBridges, PublishBridgeUnavailableError,
@@ -1442,6 +1445,69 @@ async function verifyEncryptionKeyChallenge(req, res) {
   return res.status(200).json({ ok: true })
 }
 
+// ---------------------------------------------------------------------------
+// POST /api/google/seal-encryption-key-for-github -- TEMPORARY, Phase 4M
+// one-time synchronization mechanism ONLY. Gated to platform owners only,
+// same as verifyEncryptionKeyChallenge() above. Seals THIS environment's
+// live CREDENTIAL_ENCRYPTION_KEY for a HARDCODED, repository-pinned
+// GitHub Actions public key (encryptionKeySealer.js) -- accepts NO body
+// fields at all (a request body of any kind is rejected), so there is no
+// way for a caller to influence which key the secret is sealed for.
+// Returns ONLY the sealed ciphertext + the pinned key_id -- never the
+// plaintext key, never a caller-suppliable value reflected back. Remove
+// this action (and encryptionKeySealer.js, and the libsodium-wrappers
+// dependency) once the CREDENTIAL_ENCRYPTION_KEY synchronization is
+// verified complete.
+// ---------------------------------------------------------------------------
+async function sealEncryptionKeyForGithub(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+  if (!isPlatformOwnerEmail(account.email)) {
+    return res.status(403).json({ error: 'Forbidden' })
+  }
+
+  const allowed = await enforceRateLimit(req, res, `seal-encryption-key-for-github:${account.userId}`, { requestsPerWindow: 3, windowSeconds: 60 })
+  if (!allowed) return
+
+  // Deliberately requires an EMPTY body -- any field at all is rejected,
+  // so there is no request-controlled input of any kind into the seal
+  // operation (see encryptionKeySealer.js's header comment for why a
+  // caller-suppliable public key would be a secret-export oracle).
+  const body = req.body
+  const hasAnyField = body != null && typeof body === 'object' && Object.keys(body).length > 0
+  if (hasAnyField) {
+    return res.status(400).json({ error: 'invalid_request', message: 'This endpoint accepts no request body.' })
+  }
+
+  let result
+  try {
+    result = await sealCredentialEncryptionKeyForPinnedGitHubRepo()
+  } catch (err) {
+    await appendAuditEntry(resolveTenantId(account), {
+      actorId: account.userId, actorEmail: account.email,
+      action: 'seal_credential_encryption_key_for_github', result: 'failure',
+    })
+    if (err instanceof EncryptionKeyNotConfiguredError) {
+      return res.status(503).json({ error: 'not_configured' })
+    }
+    if (err instanceof EncryptionKeySealerUnavailableError) {
+      return res.status(500).json({ error: 'sealing_failed' })
+    }
+    throw err
+  }
+
+  await appendAuditEntry(resolveTenantId(account), {
+    actorId: account.userId, actorEmail: account.email,
+    action: 'seal_credential_encryption_key_for_github', result: 'success',
+  })
+
+  // Deliberately returns ONLY these two fields -- never the plaintext key,
+  // never anything echoing a request input (there is none to echo).
+  return res.status(200).json({ sealedValueBase64: result.sealedValueBase64, keyId: result.keyId })
+}
+
 async function disconnect(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
@@ -1725,6 +1791,7 @@ export default async function handler(req, res) {
     case 'publish-bridge':     return publishBridge(req, res)
     case 'disconnect':         return disconnect(req, res)
     case 'verify-encryption-key-challenge': return verifyEncryptionKeyChallenge(req, res)
+    case 'seal-encryption-key-for-github': return sealEncryptionKeyForGithub(req, res)
     case 'discover-locations': return discoverLocations(req, res)
     case 'approve-locations':  return approveLocations(req, res)
     default:                   return res.status(404).json({ error: 'not_found' })
