@@ -25,15 +25,14 @@ name: Tenant Lifecycle Dispatch (pinned)
 # does NOT rely solely on the workflow_dispatch `type: choice` schema),
 # ZERO production secrets are supplied to any later step. This is
 # structural, not incidental:
-#   - The nine operation-gated steps (provision/initial_sync/
+#   - The six operation-gated steps (provision/initial_sync/
 #     apply_entitlement_change/diagnose_google_status/redis_identity_probe/
-#     credential_key_audit/the three encryption_key_challenge steps) use a
-#     plain `if: inputs.operation == '...'` with no always()/failure()
-#     override, so GitHub Actions' own default behavior applies: a step
-#     with a plain `if:` implicitly requires success() of every prior
-#     step, so a failed "Validate inputs" already skips all nine
-#     unconditionally -- this was already true before this revision and
-#     remains unchanged.
+#     credential_key_audit) use a plain `if: inputs.operation == '...'`
+#     with no always()/failure() override, so GitHub Actions' own default
+#     behavior applies: a step with a plain `if:` implicitly requires
+#     success() of every prior step, so a failed "Validate inputs" already
+#     skips all six unconditionally -- this was already true before this
+#     revision and remains unchanged.
 #
 # revision 3: adds redis_identity_probe -- diagnoses whether GitHub
 # Actions' Redis secrets and the live Vercel deployment's Redis point at
@@ -49,28 +48,16 @@ name: Tenant Lifecycle Dispatch (pinned)
 # it never decrypts anything, only reports field NAMES and safe metadata
 # (credentialVersion, timestamps, health).
 #
-# revision 5: adds encryption_key_challenge -- a temporary challenge-
-# response probe proving whether GitHub Actions' CREDENTIAL_ENCRYPTION_KEY
-# and Vercel production's match, via a one-way HMAC over a disposable
-# nonce relayed through Redis. Requires CREDENTIAL_ENCRYPTION_KEY (to
-# compute its own side of the HMAC) plus the two Redis secrets -- never
-# Google or Blob secrets. Prints only SAME_ENCRYPTION_KEY/
-# DIFFERENT_ENCRYPTION_KEY/INCONCLUSIVE; the matching temporary Vercel
-# endpoint (POST /api/google/verify-encryption-key-challenge) is gated to
-# platform owners only and never returns the match result or either HMAC.
+# revisions 5-6 (removed in revision 7): added a temporary
+# encryption_key_challenge operation for the Phase 4M
+# CREDENTIAL_ENCRYPTION_KEY-mismatch incident between GitHub Actions and
+# Vercel production. That incident is now fully resolved (confirmed via
+# SAME_ENCRYPTION_KEY and has_tenant_credential: True) and the operation,
+# its dedicated create/upload-artifact/poll steps, and the matching
+# temporary Vercel endpoint have all been removed.
 #
-# revision 6: splits the single "Encryption key challenge" step into
-# three -- "create" (needs CREDENTIAL_ENCRYPTION_KEY + the two Redis
-# secrets), "Upload challenge request ID" (an actions/upload-artifact
-# step, no secrets at all, 1-day retention, containing ONLY the non-secret
-# request_id), and "poll and classify" (needs only the two Redis secrets,
-# never CREDENTIAL_ENCRYPTION_KEY). This fixes a real coordination gap:
-# GitHub's live log streaming was found, in practice, to lag well behind
-# a human's ability to read a short-lived challenge's request_id from it
-# -- a GitHub Actions artifact becomes downloadable as soon as the
-# uploading step completes, well before the job finishes, giving a
-# reliable channel instead. CHALLENGE_TTL_SECONDS/POLL_TIMEOUT_SECONDS
-# are both unchanged (300/240).
+# revision 7: removes encryption_key_challenge entirely (see above) -- no
+# other operation, its pinned SHA, or its own steps were touched.
 #   - "Write job summary" is the one step that previously broke this
 #     invariant, because if: always() explicitly overrides the
 #     success()-required default. It is now split into two mutually
@@ -94,7 +81,6 @@ on:
           - apply_entitlement_change
           - redis_identity_probe
           - credential_key_audit
-          - encryption_key_challenge
       tenant_id:
         description: "Tenant id, e.g. t_example-restaurant"
         required: true
@@ -140,7 +126,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$OPERATION" in
-            diagnose_google_status|provision|initial_sync|apply_entitlement_change|redis_identity_probe|credential_key_audit|encryption_key_challenge) ;;
+            diagnose_google_status|provision|initial_sync|apply_entitlement_change|redis_identity_probe|credential_key_audit) ;;
             *)
               echo "::error::operation '$OPERATION' is not an allowed operation"
               exit 1
@@ -239,46 +225,6 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: python redis_credential_key_audit.py --tenant-id "$TENANT_ID"
-
-      # TEMPORARY -- Phase 4M encryption-key-identity incident diagnosis,
-      # split into three steps (revision 6) so the non-secret request_id
-      # can be handed to a human via a GitHub Actions artifact -- reliably
-      # available within seconds of this step finishing -- instead of
-      # relying on live log streaming, which was found to lag well behind
-      # the challenge's own window in practice. Ignores $TENANT_ID
-      # entirely (the encryption key is application-wide, not
-      # tenant-scoped) -- tenant_id/confirmation are still required by the
-      # schema and validated above as always.
-      - name: Encryption key challenge - create
-        if: inputs.operation == 'encryption_key_challenge'
-        env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
-        run: python encryption_key_challenge_probe.py create --out "${{ runner.temp }}/encryption_key_challenge_request_id.txt"
-
-      # No secrets at all -- uploads ONLY the non-secret request_id (or
-      # the NONE sentinel) written by the step above. 1-day retention,
-      # the shortest Actions supports, since this is a disposable,
-      # temporary diagnostic artifact.
-      - name: Upload challenge request ID
-        if: inputs.operation == 'encryption_key_challenge'
-        uses: actions/upload-artifact@v7
-        with:
-          name: encryption-key-challenge-request-id
-          path: ${{ runner.temp }}/encryption_key_challenge_request_id.txt
-          retention-days: 1
-
-      # Needs only the two Redis secrets -- never CREDENTIAL_ENCRYPTION_KEY,
-      # since polling/cleanup never touches the key material again. Prints
-      # only SAME_ENCRYPTION_KEY/DIFFERENT_ENCRYPTION_KEY/INCONCLUSIVE --
-      # never the nonce, never either HMAC.
-      - name: Encryption key challenge - poll and classify
-        if: inputs.operation == 'encryption_key_challenge'
-        env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-        run: python encryption_key_challenge_probe.py poll --request-id-file "${{ runner.temp }}/encryption_key_challenge_request_id.txt"
 
       # Only reachable when Validate inputs actually succeeded -- the one
       # place production secrets and tenant_status_report.py are used.

@@ -110,7 +110,7 @@ def test_unsupported_operation_fails_shell_allowlist():
         result = _run_validate_shell(run_script, bad_op, "t_ok", "t_ok")
         assert result.returncode != 0, f"operation {bad_op!r} must be rejected by the shell allowlist"
 
-    for good_op in ("diagnose_google_status", "provision", "initial_sync", "apply_entitlement_change", "redis_identity_probe", "credential_key_audit", "encryption_key_challenge"):
+    for good_op in ("diagnose_google_status", "provision", "initial_sync", "apply_entitlement_change", "redis_identity_probe", "credential_key_audit"):
         result = _run_validate_shell(run_script, good_op, "t_ok", "t_ok")
         assert result.returncode == 0, f"operation {good_op!r} must be accepted, got: {result.stderr}"
 
@@ -173,7 +173,7 @@ def test_operation_steps_have_no_always_override():
     _text, data = _load()
     steps = _steps(data)
     operation_steps = [s for s in steps if s.get("if", "").startswith("inputs.operation ==")]
-    assert len(operation_steps) == 9, f"expected exactly 9 operation-gated steps, found {len(operation_steps)}"
+    assert len(operation_steps) == 6, f"expected exactly 6 operation-gated steps, found {len(operation_steps)}"
     for s in operation_steps:
         cond = s["if"]
         assert "always()" not in cond and "failure()" not in cond, (
@@ -226,9 +226,7 @@ def test_validation_failure_reaches_no_secret_bearing_step_end_to_end():
     }
     assert secret_bearing_step_names == {
         "Run provisioning", "Run Initial Sync", "Apply entitlement change", "Diagnose Google status",
-        "Redis identity probe", "Credential key/schema audit",
-        "Encryption key challenge - create", "Encryption key challenge - poll and classify",
-        "Write job summary",
+        "Redis identity probe", "Credential key/schema audit", "Write job summary",
     }, f"unexpected set of secret-bearing steps: {secret_bearing_step_names}"
 
     for name in secret_bearing_step_names:
@@ -301,73 +299,6 @@ def test_credential_audit_step_receives_only_tenant_id_and_redis_secrets():
 
 
 # ===========================================================================
-# encryption_key_challenge (split create/upload/poll, revision 6)
-# ===========================================================================
-
-def test_encryption_key_challenge_create_receives_redis_and_encryption_key_secrets():
-    _text, data = _load()
-    steps = _steps(data)
-    step = next(s for s in steps if s.get("name") == "Encryption key challenge - create")
-    assert step["if"] == "inputs.operation == 'encryption_key_challenge'"
-    env = step.get("env", {})
-    assert set(env.keys()) == {"UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN", "CREDENTIAL_ENCRYPTION_KEY"}, (
-        f"the create step must receive ONLY the two Redis secrets and CREDENTIAL_ENCRYPTION_KEY (no "
-        f"TENANT_ID, no Google, no Blob), got {sorted(env.keys())}"
-    )
-    for name in env:
-        assert env[name] == f"${{{{ secrets.{name} }}}}"
-    assert "encryption_key_challenge_probe.py create --out" in step["run"]
-    assert "always()" not in step["if"] and "failure()" not in step["if"]
-
-
-def test_encryption_key_challenge_upload_artifact_carries_no_secrets():
-    _text, data = _load()
-    steps = _steps(data)
-    step = next(s for s in steps if s.get("name") == "Upload challenge request ID")
-    assert step["if"] == "inputs.operation == 'encryption_key_challenge'"
-    assert step.get("uses", "").startswith("actions/upload-artifact@"), "must use the real upload-artifact action, not a hand-rolled upload"
-    assert "env" not in step, "the artifact-upload step must never declare an env: block (no secrets to leak)"
-    assert step["with"]["retention-days"] == 1, "the temporary diagnostic artifact must use the shortest supported retention"
-    # The uploaded path must be exactly the file `create` wrote the
-    # request_id (or the NONE sentinel) to -- never a broader directory
-    # that could accidentally sweep up something else.
-    assert step["with"]["path"] == "${{ runner.temp }}/encryption_key_challenge_request_id.txt"
-
-
-def test_encryption_key_challenge_poll_receives_only_the_two_redis_secrets():
-    _text, data = _load()
-    steps = _steps(data)
-    step = next(s for s in steps if s.get("name") == "Encryption key challenge - poll and classify")
-    assert step["if"] == "inputs.operation == 'encryption_key_challenge'"
-    env = step.get("env", {})
-    assert set(env.keys()) == {"UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"}, (
-        f"the poll step must receive ONLY the two Redis secrets -- never CREDENTIAL_ENCRYPTION_KEY (polling/cleanup "
-        f"never touches the key material again), got {sorted(env.keys())}"
-    )
-    for name in env:
-        assert env[name] == f"${{{{ secrets.{name} }}}}"
-    assert "encryption_key_challenge_probe.py poll --request-id-file" in step["run"]
-    assert "always()" not in step["if"] and "failure()" not in step["if"]
-
-
-def test_encryption_key_challenge_steps_share_the_same_request_id_file_path():
-    """The create step's --out and the poll step's --request-id-file (and
-    the artifact's own path:) must all point at the exact same file --
-    otherwise the split lifecycle silently can't hand the request_id
-    across steps at all."""
-    _text, data = _load()
-    steps = _steps(data)
-    create = next(s for s in steps if s.get("name") == "Encryption key challenge - create")
-    upload = next(s for s in steps if s.get("name") == "Upload challenge request ID")
-    poll = next(s for s in steps if s.get("name") == "Encryption key challenge - poll and classify")
-
-    path = "${{ runner.temp }}/encryption_key_challenge_request_id.txt"
-    assert f'--out "{path}"' in create["run"]
-    assert upload["with"]["path"] == path
-    assert f'--request-id-file "{path}"' in poll["run"]
-
-
-# ===========================================================================
 # 9. provisioning receives no Google secrets
 # ===========================================================================
 
@@ -435,10 +366,6 @@ def main() -> int:
     run("diagnose_google_status never receives BLOB_READ_WRITE_TOKEN", test_diagnose_step_never_receives_blob_secret)
     run("redis_identity_probe receives ONLY the two Redis secrets", test_redis_probe_step_receives_only_the_two_redis_secrets)
     run("credential_key_audit receives ONLY TENANT_ID and the two Redis secrets", test_credential_audit_step_receives_only_tenant_id_and_redis_secrets)
-    run("encryption_key_challenge create receives the two Redis secrets and CREDENTIAL_ENCRYPTION_KEY", test_encryption_key_challenge_create_receives_redis_and_encryption_key_secrets)
-    run("encryption_key_challenge artifact upload carries no secrets and uses 1-day retention", test_encryption_key_challenge_upload_artifact_carries_no_secrets)
-    run("encryption_key_challenge poll receives ONLY the two Redis secrets", test_encryption_key_challenge_poll_receives_only_the_two_redis_secrets)
-    run("encryption_key_challenge create/upload/poll share the same request-id file path", test_encryption_key_challenge_steps_share_the_same_request_id_file_path)
     run("provisioning never receives Google secrets", test_provision_step_never_receives_google_secrets)
     run("concurrency remains tenant-scoped with cancel-in-progress: false", test_concurrency_remains_tenant_scoped)
     run("no multi-tenant app/Python implementation file is merged onto main", test_no_app_or_python_implementation_files_on_main)
