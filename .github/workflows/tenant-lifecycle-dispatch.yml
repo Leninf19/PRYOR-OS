@@ -12,10 +12,10 @@ name: Tenant Lifecycle Dispatch (pinned)
 # immutable commit SHA on feature/multi-tenant-pryor -- never main's own
 # tree, never a caller-supplied ref of any kind.
 #
-# PINNED COMMIT: c3c471e5ac300f21294d8ccc09fb8b1851ead206
-#   "Add a read-only Google status diagnostic operation to tenant-lifecycle.yml"
+# PINNED COMMIT: 201a5f23686bbd9183ba362c33c7d6b3fe1832f0
+#   "Add a disposable Redis identity probe for GitHub Actions vs Vercel"
 #   (feature/multi-tenant-pryor, includes every prior approved multi-tenant
-#   phase through 4M's diagnostic addition). To point this dispatcher at a
+#   phase through this probe addition). To point this dispatcher at a
 #   newer approved commit later, this SHA is the ONLY line that changes --
 #   a small, reviewable, auditable diff, never automatic.
 #
@@ -25,13 +25,19 @@ name: Tenant Lifecycle Dispatch (pinned)
 # does NOT rely solely on the workflow_dispatch `type: choice` schema),
 # ZERO production secrets are supplied to any later step. This is
 # structural, not incidental:
-#   - The four operation steps (provision/initial_sync/apply_entitlement_
-#     change/diagnose_google_status) use a plain `if: inputs.operation ==
-#     '...'` with no always()/failure() override, so GitHub Actions' own
-#     default behavior applies: a step with a plain `if:` implicitly
-#     requires success() of every prior step, so a failed "Validate
-#     inputs" already skips all four unconditionally -- this was already
-#     true before this revision and remains unchanged.
+#   - The five operation steps (provision/initial_sync/apply_entitlement_
+#     change/diagnose_google_status/redis_identity_probe) use a plain
+#     `if: inputs.operation == '...'` with no always()/failure() override,
+#     so GitHub Actions' own default behavior applies: a step with a plain
+#     `if:` implicitly requires success() of every prior step, so a failed
+#     "Validate inputs" already skips all five unconditionally -- this was
+#     already true before this revision and remains unchanged.
+#
+# revision 3: adds redis_identity_probe -- diagnoses whether GitHub
+# Actions' Redis secrets and the live Vercel deployment's Redis point at
+# the same Upstash database, using one disposable, tenant-unrelated
+# record. Receives ONLY UPSTASH_REDIS_REST_URL/TOKEN -- not even
+# CREDENTIAL_ENCRYPTION_KEY, since it never touches a credential record.
 #   - "Write job summary" is the one step that previously broke this
 #     invariant, because if: always() explicitly overrides the
 #     success()-required default. It is now split into two mutually
@@ -53,6 +59,7 @@ on:
           - provision
           - initial_sync
           - apply_entitlement_change
+          - redis_identity_probe
       tenant_id:
         description: "Tenant id, e.g. t_example-restaurant"
         required: true
@@ -71,7 +78,7 @@ permissions:
   contents: read
 
 env:
-  PINNED_LIFECYCLE_SHA: c3c471e5ac300f21294d8ccc09fb8b1851ead206
+  PINNED_LIFECYCLE_SHA: 201a5f23686bbd9183ba362c33c7d6b3fe1832f0
 
 jobs:
   operate:
@@ -98,7 +105,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$OPERATION" in
-            diagnose_google_status|provision|initial_sync|apply_entitlement_change) ;;
+            diagnose_google_status|provision|initial_sync|apply_entitlement_change|redis_identity_probe) ;;
             *)
               echo "::error::operation '$OPERATION' is not an allowed operation"
               exit 1
@@ -170,6 +177,20 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: python diagnose_google_status.py --tenant-id "$TENANT_ID"
+
+      # Deliberately receives ONLY the two Redis secrets -- not
+      # CREDENTIAL_ENCRYPTION_KEY, not Google, not Blob -- since this
+      # operation never touches a credential record, Google, or Blob at
+      # all. Ignores $TENANT_ID entirely (it operates on one disposable,
+      # tenant-unrelated record) -- tenant_id/confirmation are still
+      # required by the schema and validated above as always, but this
+      # script's own behavior does not depend on their value.
+      - name: Redis identity probe
+        if: inputs.operation == 'redis_identity_probe'
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python redis_identity_probe.py
 
       # Only reachable when Validate inputs actually succeeded -- the one
       # place production secrets and tenant_status_report.py are used.

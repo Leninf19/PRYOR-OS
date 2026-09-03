@@ -23,7 +23,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "tenant-lifecycle-dispatch.yml"
-APPROVED_SHA = "c3c471e5ac300f21294d8ccc09fb8b1851ead206"
+APPROVED_SHA = "201a5f23686bbd9183ba362c33c7d6b3fe1832f0"
 
 results = []
 
@@ -110,7 +110,7 @@ def test_unsupported_operation_fails_shell_allowlist():
         result = _run_validate_shell(run_script, bad_op, "t_ok", "t_ok")
         assert result.returncode != 0, f"operation {bad_op!r} must be rejected by the shell allowlist"
 
-    for good_op in ("diagnose_google_status", "provision", "initial_sync", "apply_entitlement_change"):
+    for good_op in ("diagnose_google_status", "provision", "initial_sync", "apply_entitlement_change", "redis_identity_probe"):
         result = _run_validate_shell(run_script, good_op, "t_ok", "t_ok")
         assert result.returncode == 0, f"operation {good_op!r} must be accepted, got: {result.stderr}"
 
@@ -173,7 +173,7 @@ def test_operation_steps_have_no_always_override():
     _text, data = _load()
     steps = _steps(data)
     operation_steps = [s for s in steps if s.get("if", "").startswith("inputs.operation ==")]
-    assert len(operation_steps) == 4, f"expected exactly 4 operation-gated steps, found {len(operation_steps)}"
+    assert len(operation_steps) == 5, f"expected exactly 5 operation-gated steps, found {len(operation_steps)}"
     for s in operation_steps:
         cond = s["if"]
         assert "always()" not in cond and "failure()" not in cond, (
@@ -225,7 +225,8 @@ def test_validation_failure_reaches_no_secret_bearing_step_end_to_end():
         if any(str(v).startswith("${{ secrets.") for v in s.get("env", {}).values())
     }
     assert secret_bearing_step_names == {
-        "Run provisioning", "Run Initial Sync", "Apply entitlement change", "Diagnose Google status", "Write job summary",
+        "Run provisioning", "Run Initial Sync", "Apply entitlement change", "Diagnose Google status",
+        "Redis identity probe", "Write job summary",
     }, f"unexpected set of secret-bearing steps: {secret_bearing_step_names}"
 
     for name in secret_bearing_step_names:
@@ -252,6 +253,23 @@ def test_diagnose_step_never_receives_blob_secret():
     diagnose = next(s for s in steps if s.get("name") == "Diagnose Google status")
     env = diagnose.get("env", {})
     assert "BLOB_READ_WRITE_TOKEN" not in env, "diagnose_google_status must never receive BLOB_READ_WRITE_TOKEN"
+
+
+# ===========================================================================
+# redis_identity_probe receives ONLY the two Redis secrets
+# ===========================================================================
+
+def test_redis_probe_step_receives_only_the_two_redis_secrets():
+    _text, data = _load()
+    steps = _steps(data)
+    probe = next(s for s in steps if s.get("name") == "Redis identity probe")
+    env = probe.get("env", {})
+    assert set(env.keys()) == {"UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"}, (
+        f"redis_identity_probe must receive ONLY the two Redis secrets (no TENANT_ID, no CREDENTIAL_ENCRYPTION_KEY, "
+        f"no Google, no Blob), got {sorted(env.keys())}"
+    )
+    for name in env:
+        assert env[name] == f"${{{{ secrets.{name} }}}}"
 
 
 # ===========================================================================
@@ -320,6 +338,7 @@ def main() -> int:
     run("failure summary carries no secrets and invokes no script", test_failure_summary_step_carries_no_secrets_and_invokes_no_script)
     run("a failed validation reaches NO secret-bearing step, end to end", test_validation_failure_reaches_no_secret_bearing_step_end_to_end)
     run("diagnose_google_status never receives BLOB_READ_WRITE_TOKEN", test_diagnose_step_never_receives_blob_secret)
+    run("redis_identity_probe receives ONLY the two Redis secrets", test_redis_probe_step_receives_only_the_two_redis_secrets)
     run("provisioning never receives Google secrets", test_provision_step_never_receives_google_secrets)
     run("concurrency remains tenant-scoped with cancel-in-progress: false", test_concurrency_remains_tenant_scoped)
     run("no multi-tenant app/Python implementation file is merged onto main", test_no_app_or_python_implementation_files_on_main)
