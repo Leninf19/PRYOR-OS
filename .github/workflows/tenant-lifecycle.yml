@@ -42,6 +42,7 @@ on:
           - provision
           - initial_sync
           - apply_entitlement_change
+          - diagnose_google_status
       tenant_id:
         description: "Tenant id, e.g. t_example-restaurant"
         required: true
@@ -166,6 +167,26 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: python apply_entitlement_change.py --tenant-id "$TENANT_ID"
+
+      # Phase 4M incident diagnosis -- READ-ONLY, makes no writes of any
+      # kind (see diagnose_google_status.py's own header for the full
+      # contract). Exists so CREDENTIAL_ENCRYPTION_KEY/GOOGLE_CLIENT_SECRET
+      # (both Vercel Sensitive variables, unobtainable via `vercel env
+      # pull`) can be used through this existing, already-trusted secret
+      # store instead -- same tenant_id/confirmation validation above,
+      # same per-tenant concurrency group, no new secret added.
+      # Deliberately does NOT receive BLOB_READ_WRITE_TOKEN -- this
+      # operation never touches Blob.
+      - name: Diagnose Google status
+        if: inputs.operation == 'diagnose_google_status'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: python diagnose_google_status.py --tenant-id "$TENANT_ID"
 
       # Runs regardless of whether the step(s) above succeeded or failed
       # (if: always()) purely so an operator can see the resulting state
