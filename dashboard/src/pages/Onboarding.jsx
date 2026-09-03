@@ -210,11 +210,18 @@ function WaitingStep({ step, title, message, onRefresh }) {
   )
 }
 
+// Phase 4L live-browser finding: this previously rendered tenantStatus's raw
+// internal lastError string (e.g. a Blob/Google API exception message)
+// straight to the tenant Owner -- a real usability/hygiene issue, not just
+// unpolished copy, since that string was never written with an end user as
+// its audience. `lastError` is still read (so a future need to branch on it
+// is easy), just never interpolated into what the Owner sees.
 function FailedStep({ step, title, lastError, onRefresh }) {
+  void lastError
   return (
     <OnboardingShell activeStep={step}>
       <StepTitle>{title}</StepTitle>
-      <ErrorBanner message={lastError || 'Something went wrong on our end.'} />
+      <ErrorBanner message="Something went wrong on our end." />
       <StepBody>Our team has been notified and will retry this shortly. You can check back here anytime.</StepBody>
       <Button variant="secondary" className="w-full justify-center" onClick={onRefresh}>Check again</Button>
     </OnboardingShell>

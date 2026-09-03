@@ -37,6 +37,7 @@ TESTS = [
     "test_provision_tenant.py",
     "test_initial_sync.py",
     "test_apply_entitlement_change.py",
+    "test_tenant_b_pilot_lifecycle.py",
     "test_tenant_status_report.py",
     "test_db.py",
     "test_gbp_sync.py",
