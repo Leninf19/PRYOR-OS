@@ -279,13 +279,60 @@ def test_bundle_verification_step_runs_before_deploy_and_builds_from_repo_root()
         )
 
 
-def test_update_reviews_deploy_step_is_gated_on_bundle_verification():
-    source = (WORKFLOWS_DIR / "update-reviews.yml").read_text(encoding="utf-8")
-    deploy_step = _find_step(_steps(source), "Deploy to Vercel")
-    assert "steps.verify-bundle.outcome == 'success'" in deploy_step, (
-        "update-reviews.yml: 'Deploy to Vercel' (if: always()) must require "
-        "steps.verify-bundle.outcome == 'success' as well as the artifact/integrity checks"
-    )
+def test_bundle_verification_is_non_blocking_and_never_gates_deploy():
+    """Corrected after two real dispatches both failed at `vercel pull`
+    (CI's --token-only auth can't retrieve Project Settings the way it can
+    for the already-proven-reliable `vercel --prod`) -- the experimental
+    bundle check must never again be able to block a real deploy. Requires
+    continue-on-error: true on the bundle-verify step, and the Deploy step
+    must not reference steps.verify-bundle.outcome anywhere. The REQUIRED,
+    still-blocking gate is 'Verify private-data artifacts before deploy',
+    checked separately below."""
+    bundle_step_name = "Build and verify serverless bundle includes required artifacts"
+    for filename in VERCEL_DEPLOY_WORKFLOWS:
+        source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
+        bundle_step = _find_step(_steps(source), bundle_step_name)
+        assert "continue-on-error: true" in bundle_step, (
+            f"{filename}: {bundle_step_name!r} must set continue-on-error: true so its own "
+            f"CI-auth failure can never block the Deploy step"
+        )
+        deploy_step = _find_step(_steps(source), "Deploy to Vercel")
+        assert "verify-bundle" not in deploy_step, (
+            f"{filename}: 'Deploy to Vercel' must not reference steps.verify-bundle at all -- "
+            f"the bundle check is diagnostics-only, never a deployment gate"
+        )
+
+
+def test_required_artifact_assertion_still_blocks_deploy():
+    """The one gate this correction must NOT weaken: a genuinely missing/stale
+    private-data artifact must still prevent deployment."""
+    for filename in VERCEL_DEPLOY_WORKFLOWS:
+        source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
+        deploy_step = _find_step(_steps(source), "Deploy to Vercel")
+        if filename == "update-reviews.yml":
+            # This workflow's steps use if: always(), so the dependency must
+            # be explicit in the condition.
+            assert "steps.verify-artifacts.outcome == 'success'" in deploy_step, (
+                f"{filename}: 'Deploy to Vercel' must still require "
+                f"steps.verify-artifacts.outcome == 'success'"
+            )
+        else:
+            # deploy-frontend.yml has no if: always() anywhere -- GitHub
+            # Actions' own default semantics (a failed step stops the job)
+            # already make this blocking, as long as the artifact-check step
+            # itself has no continue-on-error.
+            artifacts_step = _find_step(_steps(source), "Verify private-data artifacts before deploy")
+            assert "continue-on-error" not in artifacts_step, (
+                f"{filename}: 'Verify private-data artifacts before deploy' must stay blocking "
+                f"(no continue-on-error) -- this is the required production gate"
+            )
+
+
+def test_force_flag_still_present_on_deploy():
+    for filename in VERCEL_DEPLOY_WORKFLOWS:
+        source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
+        deploy_step = _find_step(_steps(source), "Deploy to Vercel")
+        assert "--force" in deploy_step, f"{filename}: 'Deploy to Vercel' must still pass --force"
 
 
 def test_vercel_project_org_ids_unchanged_by_this_fix():
@@ -317,7 +364,9 @@ def main() -> int:
         ("update-reviews.yml's Deploy step is gated on artifact verification success", test_update_reviews_deploy_step_is_gated_on_artifact_verification),
         ("the Deploy step uses --force to skip the build cache, never --with-cache", test_deploy_step_uses_force_to_skip_build_cache),
         ("the bundle-verification step runs after artifacts and before deploy, from the repo root", test_bundle_verification_step_runs_before_deploy_and_builds_from_repo_root),
-        ("update-reviews.yml's Deploy step is gated on bundle verification success", test_update_reviews_deploy_step_is_gated_on_bundle_verification),
+        ("bundle verification is non-blocking and never gates deploy", test_bundle_verification_is_non_blocking_and_never_gates_deploy),
+        ("the required private-data artifact assertion still blocks deploy", test_required_artifact_assertion_still_blocks_deploy),
+        ("the Deploy step still passes --force", test_force_flag_still_present_on_deploy),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()

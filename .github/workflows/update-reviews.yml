@@ -161,9 +161,22 @@ jobs:
       # attempted -- catching a recurrence of this exact class of bug
       # regardless of whether build-cache staleness turns out to be the true
       # runtime mechanism.
+      # NON-BLOCKING (corrected after two real dispatches both failed here):
+      # `vercel pull` cannot authenticate under CI's --token-only auth the
+      # same way `vercel --prod` reliably does -- "Error: Could not retrieve
+      # Project Settings", even with the identical VERCEL_TOKEN/org/project
+      # env vars the Deploy step below uses successfully. This step stays
+      # for diagnostics (its output is still visible in the job log) but
+      # must never block a real deploy on an experimental check whose own
+      # CI auth behavior isn't fixed yet -- continue-on-error: true, and the
+      # Deploy step's condition below no longer references its outcome. The
+      # REQUIRED, blocking gate remains "Verify private-data artifacts
+      # before deploy" above, which only depends on the local filesystem
+      # and already proved reliable across every real run.
       - name: Build and verify serverless bundle includes required artifacts
         if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success'
         id: verify-bundle
+        continue-on-error: true
         run: |
           npx vercel pull dashboard --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
           npx vercel build --yes --token=${{ secrets.VERCEL_TOKEN }}
@@ -193,7 +206,7 @@ jobs:
       # comment for the build-cache-staleness evidence this responds to.
       # Never combined with --with-cache, which would defeat the point.
       - name: Deploy to Vercel
-        if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success' && steps.verify-bundle.outcome == 'success'
+        if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success'
         run: npx vercel --prod --force --yes --token=${{ secrets.VERCEL_TOKEN }}
         env:
           # PRYOR OS Controlled Production Release Preparation + Reconciliation:
