@@ -123,13 +123,31 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Deploy to Vercel
+      - name: Install dashboard dependencies and build
         if: always() && steps.integrity.outcome == 'success'
+        working-directory: dashboard
         run: |
-          cd dashboard
           npm ci
           npm run build
-          npx vercel --prod --yes --token=${{ secrets.VERCEL_TOKEN }}
+
+      # Final PRYOR Deployment Path Repair: the Vercel PROJECT's own "Root
+      # Directory" setting is "dashboard" (deliberately left as-is -- not
+      # changed by this fix). Running `vercel --prod` from INSIDE
+      # dashboard/ (the prior `cd dashboard` here) made the CLI apply that
+      # same "dashboard" root a SECOND time on top of an already-
+      # dashboard-relative working directory, producing a real, confirmed
+      # production failure: "Error: The provided path
+      # ".../dashboard/dashboard" does not exist." Running this command
+      # from the REPOSITORY ROOT instead lets the CLI resolve the
+      # project's configured Root Directory exactly once, correctly, to
+      # the real dashboard/ directory -- Vercel performs its own remote
+      # build from there (using the project's configured Build/Install
+      # Command) regardless of the local build above, which exists purely
+      # as a pre-flight check that the build succeeds before spending a
+      # deploy attempt on it.
+      - name: Deploy to Vercel
+        if: always() && steps.integrity.outcome == 'success'
+        run: npx vercel --prod --yes --token=${{ secrets.VERCEL_TOKEN }}
         env:
           # PRYOR OS Controlled Production Release Preparation + Reconciliation:
           # these IDs previously pointed at a stale/legacy Vercel project --
