@@ -22,6 +22,10 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import google_api as ga  # noqa: E402
+import tenant_keys  # noqa: E402
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
+SYNTHETIC_TENANT_ID = "t_synthetic-second-tenant"
 
 # Generated via:
 #   node -e "const {createCipheriv,randomBytes,createHash}=require('crypto');
@@ -64,14 +68,14 @@ class TestGoogleApiRedisToken(unittest.TestCase):
         for var in ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN", "CREDENTIAL_ENCRYPTION_KEY"):
             os.environ.pop(var, None)
         with patch("urllib.request.urlopen") as mock_urlopen:
-            result = ga._fetch_refresh_token_from_redis()
+            result = ga._fetch_refresh_token_from_redis(TEST_TENANT_ID)
             self.assertIsNone(result, "missing config must return None")
             mock_urlopen.assert_not_called()
 
     def test_no_stored_credential_returns_none(self):
         self._configure_redis_env()
         with patch("urllib.request.urlopen", return_value=fake_upstash_response(None)):
-            result = ga._fetch_refresh_token_from_redis()
+            result = ga._fetch_refresh_token_from_redis(TEST_TENANT_ID)
             self.assertIsNone(result, "an empty Redis result (nothing connected yet) must return None, not raise")
 
     def test_decrypts_a_real_node_generated_ciphertext(self):
@@ -89,7 +93,7 @@ class TestGoogleApiRedisToken(unittest.TestCase):
             "health": "connected",
         }
         with patch("urllib.request.urlopen", return_value=fake_upstash_response(record)):
-            result = ga._fetch_refresh_token_from_redis()
+            result = ga._fetch_refresh_token_from_redis(TEST_TENANT_ID)
             self.assertEqual(result, FIXTURE_PLAINTEXT, "must decrypt to the exact plaintext Node encrypted")
 
     def test_wrong_encryption_key_falls_back_to_none_not_crash(self):
@@ -101,13 +105,13 @@ class TestGoogleApiRedisToken(unittest.TestCase):
             "refreshTokenAuthTag": FIXTURE_AUTH_TAG_B64,
         }
         with patch("urllib.request.urlopen", return_value=fake_upstash_response(record)):
-            result = ga._fetch_refresh_token_from_redis()
+            result = ga._fetch_refresh_token_from_redis(TEST_TENANT_ID)
             self.assertIsNone(result, "a wrong encryption key must fail closed (None), never raise or return garbage")
 
     def test_network_error_falls_back_to_none_not_crash(self):
         self._configure_redis_env()
         with patch("urllib.request.urlopen", side_effect=OSError("ECONNREFUSED fake-upstash-outage")):
-            result = ga._fetch_refresh_token_from_redis()
+            result = ga._fetch_refresh_token_from_redis(TEST_TENANT_ID)
             self.assertIsNone(result, "a network error reaching Upstash must return None, never raise or crash the pipeline")
 
     def test_malformed_json_response_falls_back_to_none(self):
@@ -117,7 +121,7 @@ class TestGoogleApiRedisToken(unittest.TestCase):
         mock_resp.__enter__.return_value = mock_resp
         mock_resp.__exit__.return_value = False
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = ga._fetch_refresh_token_from_redis()
+            result = ga._fetch_refresh_token_from_redis(TEST_TENANT_ID)
             self.assertIsNone(result, "a malformed response must return None, never raise")
 
     def test_get_access_token_prefers_redis_over_env_var(self):
@@ -129,8 +133,7 @@ class TestGoogleApiRedisToken(unittest.TestCase):
         os.environ["GOOGLE_CLIENT_ID"] = "fake-client-id"
         os.environ["GOOGLE_CLIENT_SECRET"] = "fake-client-secret"
         os.environ["GOOGLE_REFRESH_TOKEN"] = "should-not-be-used-env-var-token"
-        ga._access_token_cache["token"] = None
-        ga._access_token_cache["expires_at"] = 0
+        ga._access_token_cache.pop(TEST_TENANT_ID, None)
 
         record = {
             "refreshTokenCiphertext": FIXTURE_CIPHERTEXT_B64,
@@ -153,13 +156,124 @@ class TestGoogleApiRedisToken(unittest.TestCase):
             return token_exchange_response
 
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            token = ga.get_access_token()
+            token = ga.get_access_token(TEST_TENANT_ID)
 
         self.assertEqual(token, "fresh-access-token")
         self.assertEqual(len(captured_request_bodies), 1, "exactly one token-exchange request must be made")
         sent_body = captured_request_bodies[0].decode()
         self.assertIn(f"refresh_token={FIXTURE_PLAINTEXT}", sent_body, "the Redis-sourced token must be the one sent to Google")
         self.assertNotIn("should-not-be-used-env-var-token", sent_body, "the env var fallback token must NOT be used when Redis has a value")
+
+
+# ===========================================================================
+# Multi-Tenant Phase 4C -- adversarial cross-tenant credential isolation.
+# tenant_id is now REQUIRED on every google_api.py function; these tests
+# prove a worker given one tenant's id can never read another tenant's
+# credential, that a forged/invalid tenant id fails closed before any
+# network call, and that Los Tres Amigos's LEGACY-mode key (gbp_credentials
+# :v1) is never used for any other tenant.
+# ===========================================================================
+
+class TestGoogleApiCredentialTenantIsolation(unittest.TestCase):
+    def setUp(self):
+        self._env_backup = dict(os.environ)
+        os.environ["UPSTASH_REDIS_REST_URL"] = "https://fake-upstash.example.com"
+        os.environ["UPSTASH_REDIS_REST_TOKEN"] = "fake-rest-token"
+        os.environ["CREDENTIAL_ENCRYPTION_KEY"] = FIXTURE_ENCRYPTION_KEY
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env_backup)
+
+    def test_tenant_credential_keys_differ(self):
+        lta_key = tenant_keys.resolve_credential_key(TEST_TENANT_ID)
+        tenant_b_key = tenant_keys.resolve_credential_key(SYNTHETIC_TENANT_ID)
+        self.assertNotEqual(lta_key, tenant_b_key)
+        # Los Tres Amigos is explicitly LEGACY -- the exact same key this
+        # module has always read, never a v2 key.
+        self.assertEqual(lta_key, "gbp_credentials:v1")
+        # Any other tenant defaults to CUTOVER -- its own v2 key, never v1.
+        self.assertEqual(tenant_b_key, f"gbp_credentials:v2:{SYNTHETIC_TENANT_ID}")
+
+    def test_tenant_a_worker_cannot_load_tenant_b_credential(self):
+        """A worker fetching Tenant A's (Los Tres Amigos's) credential must
+        request exactly gbp_credentials:v1 -- never Tenant B's v2 key --
+        and vice versa. Verified by inspecting the ACTUAL URL requested."""
+        requested_keys = []
+
+        def fake_urlopen(req, timeout=None):
+            requested_keys.append(req.full_url)
+            return fake_upstash_response(None)  # "not connected" is fine -- we only care which key was asked for
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            ga._fetch_refresh_token_from_redis(TEST_TENANT_ID)
+            ga._fetch_refresh_token_from_redis(SYNTHETIC_TENANT_ID)
+
+        import urllib.parse as _urlparse
+        self.assertEqual(len(requested_keys), 2)
+        self.assertIn(_urlparse.quote("gbp_credentials:v1", safe=""), requested_keys[0],
+                      "Los Tres Amigos must be read from its legacy v1 key")
+        self.assertNotIn(_urlparse.quote("gbp_credentials:v1", safe=""), requested_keys[1],
+                         "Tenant B must never be read from Los Tres Amigos's v1 key")
+        self.assertIn(_urlparse.quote(f"gbp_credentials:v2:{SYNTHETIC_TENANT_ID}", safe=""), requested_keys[1],
+                      "Tenant B must be read from its own v2 key")
+
+    def test_tenant_b_never_falls_back_to_legacy_v1_credential(self):
+        """Even when gbp_credentials:v1 holds a real, decryptable
+        Los Tres Amigos credential, fetching Tenant B's credential must
+        return whatever (or nothing) is at Tenant B's OWN key -- never
+        silently substitute Los Tres Amigos's."""
+        def fake_urlopen(req, timeout=None):
+            if "gbp_credentials%3Av1" in req.full_url or "gbp_credentials:v1" in req.full_url:
+                return fake_upstash_response({
+                    "refreshTokenCiphertext": FIXTURE_CIPHERTEXT_B64,
+                    "refreshTokenIv": FIXTURE_IV_B64,
+                    "refreshTokenAuthTag": FIXTURE_AUTH_TAG_B64,
+                })
+            return fake_upstash_response(None)  # Tenant B's own key: nothing stored yet
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            tenant_b_result = ga._fetch_refresh_token_from_redis(SYNTHETIC_TENANT_ID)
+
+        self.assertIsNone(tenant_b_result, "Tenant B must never receive Los Tres Amigos's v1 credential as an implicit fallback")
+
+    def test_invalid_tenant_id_fails_closed_before_any_network_call(self):
+        for bad in (None, "", "not-a-tenant-id", "T_LOS-TRES-AMIGOS", 123, "t_"):
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                with self.assertRaises(tenant_keys.InvalidTenantIdError, msg=f"expected InvalidTenantIdError for {bad!r}"):
+                    ga._fetch_refresh_token_from_redis(bad)
+                mock_urlopen.assert_not_called()
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                with self.assertRaises(tenant_keys.InvalidTenantIdError, msg=f"expected InvalidTenantIdError for {bad!r} via get_access_token"):
+                    ga.get_access_token(bad)
+                mock_urlopen.assert_not_called()
+
+    def test_forged_tenant_identifier_cannot_redirect_to_another_tenants_credential(self):
+        """A 'forged' tenant id here means one that is well-formed (passes
+        is_valid_tenant_id) but does not correspond to Los Tres Amigos --
+        it must resolve to ITS OWN key, never be coerced into resolving to
+        gbp_credentials:v1 by any spelling trick (case, whitespace, extra
+        segments)."""
+        forged_but_wellformed = ["t_los-tres-amigos-fake", "t_los-tres-amigo", "t_client-2"]
+        for candidate in forged_but_wellformed:
+            key = tenant_keys.resolve_credential_key(candidate)
+            self.assertNotEqual(key, "gbp_credentials:v1",
+                                 f"a well-formed but non-default tenantId {candidate!r} must never resolve to the legacy v1 key")
+            self.assertEqual(key, f"gbp_credentials:v2:{candidate}")
+
+    def test_los_tres_amigos_legitimate_behavior_still_works_under_new_architecture(self):
+        """Regression: the exact interop scenario the rest of this file
+        proves (a real Node-encrypted credential, decrypted correctly)
+        must still work end-to-end for Los Tres Amigos specifically under
+        the new tenant-parameterized module."""
+        record = {
+            "refreshTokenCiphertext": FIXTURE_CIPHERTEXT_B64,
+            "refreshTokenIv": FIXTURE_IV_B64,
+            "refreshTokenAuthTag": FIXTURE_AUTH_TAG_B64,
+        }
+        with patch("urllib.request.urlopen", return_value=fake_upstash_response(record)):
+            result = ga._fetch_refresh_token_from_redis(TEST_TENANT_ID)
+        self.assertEqual(result, FIXTURE_PLAINTEXT)
 
 
 if __name__ == "__main__":

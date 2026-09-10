@@ -255,8 +255,9 @@ def test_existing_gbp_provider_remains_compatible_with_the_new_additive_attribut
     capabilities/cadence -- it must still instantiate, still be a Provider,
     and its identity attributes must reflect what google_api.py/provider_gbp.py
     actually implement today."""
+    import tenant_keys
     from provider_gbp import GBPProvider
-    provider = GBPProvider()
+    provider = GBPProvider(tenant_id=tenant_keys.DEFAULT_TENANT_ID)
     assert isinstance(provider, Provider)
     assert provider.name == "gbp"
     assert provider.display_name == "Google Business Profile"

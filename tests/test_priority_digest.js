@@ -122,7 +122,14 @@ function testDuplicateSuppression() {
 function testSourceAttribution() {
   const { topPriorities } = fullDigest()
   const validSources = new Set(['Operations Impact', 'Action Center', 'Predictive Alerts', 'Trend Alerts'])
-  const validPaths = new Set(['/operations-impact', '/action-center', '/alerts'])
+  // Operations Calendar + Content Library milestone: Action Center content
+  // (AI Suggestions) now lives inside Calendar, not the deprecated
+  // /actions-legacy page -- see priorityDigest.js's own
+  // collectActionCenterPriorityCandidates() comment. '/action-center' is a
+  // legacy route alias (App.jsx redirects it to /calendar) that this test
+  // previously expected verbatim; the digest now emits the canonical,
+  // direct path.
+  const validPaths = new Set(['/operations-impact', '/calendar', '/alerts'])
   topPriorities.forEach(p => {
     assert(validSources.has(p.sourceLabel), `unexpected sourceLabel "${p.sourceLabel}" on "${p.title}"`)
     assert(validPaths.has(p.sourcePath), `unexpected sourcePath "${p.sourcePath}" on "${p.title}"`)
@@ -197,7 +204,8 @@ function testAssignedOverdueItemIsAlwaysCriticalAndAttributedCorrectly() {
   const item = topPriorities[0]
   assert(item.severity === 'critical', `an overdue task assigned to you must always be critical, got ${item.severity}`)
   assert(item.sourceLabel === 'My Overdue Tasks', `expected sourceLabel "My Overdue Tasks", got ${item.sourceLabel}`)
-  assert(item.sourcePath === '/action-center', `expected sourcePath "/action-center", got ${item.sourcePath}`)
+  // '/calendar', not the legacy '/action-center' alias -- see testSourceAttribution's comment above.
+  assert(item.sourcePath === '/calendar', `expected sourcePath "/calendar", got ${item.sourcePath}`)
   assert(item.title.includes('Address rising wait-time complaints'), `title must reference the underlying task, got "${item.title}"`)
   assert(item.explanation.includes('2026-01-01'), `explanation must reference the due date, got "${item.explanation}"`)
 }
@@ -223,7 +231,10 @@ function testEmailFollowUpItemProducesHighSeverityCandidateLinkingToReview() {
   const item = topPriorities[0]
   assert(item.severity === 'high', `an overdue restaurant follow-up must be high severity, got ${item.severity}`)
   assert(item.sourceLabel === 'Restaurant Follow-Up', `expected sourceLabel "Restaurant Follow-Up", got ${item.sourceLabel}`)
-  assert(item.sourcePath === '/explorer?reviewId=review-1', `expected a Review Explorer deep link, got ${item.sourcePath}`)
+  // '/reviews', not the legacy '/explorer' alias -- App.jsx's Review
+  // Explorer page is now mounted directly at /reviews; /explorer only
+  // exists as a redirect (RedirectPreservingSearch) to it.
+  assert(item.sourcePath === '/reviews?reviewId=review-1', `expected a Review Explorer deep link, got ${item.sourcePath}`)
   assert(item.title.includes('Casa Tequila Brighton'), `title must reference the location, got "${item.title}"`)
   assert(item.explanation.includes('2026-01-01'), `explanation must reference the follow-up due date, got "${item.explanation}"`)
 }
@@ -232,7 +243,16 @@ function testEmailFollowUpItemWithoutReviewIdLinksToActionCenter() {
   const { topPriorities } = priorityDigest({
     emailFollowUpItems: [{ id: 'review-2', reviewId: null, locationName: 'Unknown Spot', emailFollowUpDueAt: null }],
   })
-  assert(topPriorities[0].sourcePath === '/action-center', 'without a reviewId, must fall back to linking to Action Center')
+  // '/actions' is a legacy route alias (App.jsx redirects it to /calendar,
+  // same destination as '/action-center') -- this is what
+  // collectEmailFollowUpCandidates() currently emits for its no-reviewId
+  // fallback. Note: this is the one candidate builder in priorityDigest.js
+  // that was NOT updated to the direct '/calendar' path the way
+  // collectActionCenterPriorityCandidates()/collectAssignedOverdueCandidates()
+  // were -- functionally identical (both aliases redirect to the same
+  // page), but worth a follow-up consistency pass; not changed here since
+  // it is working, valid behavior, not a defect.
+  assert(topPriorities[0].sourcePath === '/actions', 'without a reviewId, must fall back to linking to Action Center')
 }
 
 function testEmailFollowUpOutranksLowerSeveritySourcesButNotOverdueTasks() {

@@ -34,6 +34,11 @@ import { Redis } from '@upstash/redis'
 
 const INVITE_TTL_SECONDS = 7 * 24 * 60 * 60 // 7 days
 const RESET_TTL_SECONDS = 60 * 60 // 1 hour
+// Phase 4Q -- a self-service registrant's own inbox, checked once, right
+// after they submit the form -- deliberately shorter than an invite (which
+// an admin may send well ahead of when the invitee actually opens it) but
+// long enough for a normal person to open one email.
+const VERIFY_EMAIL_TTL_SECONDS = 60 * 60 // 1 hour
 const PENDING_TTL_SECONDS = 15 * 60 // retry safety-net window
 
 let redisClient = null
@@ -106,6 +111,18 @@ export async function createResetToken(payload) {
   return createToken('reset', payload, RESET_TTL_SECONDS)
 }
 
+// Phase 4Q -- payload: { email }. Reuses every atomicity/single-use/
+// pending-retry guarantee this file already provides for invite/reset;
+// see the header comment. Deliberately keyed by the SAME raw-token/hash
+// mechanism, never a 6-digit code -- a 32-byte token emailed as a link is
+// already what this codebase's users experience for invite/reset, so this
+// stays consistent rather than introducing a second, weaker verification
+// UX (a short numeric code would need its own, separate brute-force
+// defense this link-based design doesn't need).
+export async function createVerifyEmailToken(payload) {
+  return createToken('verify_email', payload, VERIFY_EMAIL_TTL_SECONDS)
+}
+
 // Atomic fetch+delete via GETDEL -- see the header comment. Returns
 // { payload, tokenHash, fromPending } or null if the token is invalid,
 // expired, or already fully consumed (no pending record either).
@@ -140,6 +157,7 @@ async function consumeToken(kind, rawToken) {
 
 export async function consumeInviteToken(rawToken) { return consumeToken('invite', rawToken) }
 export async function consumeResetToken(rawToken) { return consumeToken('reset', rawToken) }
+export async function consumeVerifyEmailToken(rawToken) { return consumeToken('verify_email', rawToken) }
 
 // Non-destructive read -- lets the frontend preview "you've been invited"
 // (name/role/locations) or validate a reset link before the user submits a
@@ -162,6 +180,7 @@ async function peekToken(kind, rawToken) {
 
 export async function peekInviteToken(rawToken) { return peekToken('invite', rawToken) }
 export async function peekResetToken(rawToken) { return peekToken('reset', rawToken) }
+export async function peekVerifyEmailToken(rawToken) { return peekToken('verify_email', rawToken) }
 
 // Called immediately after a FRESH (non-pending) consume, before attempting
 // the risky account-creation/password-set writes -- the retry safety net.
@@ -183,6 +202,7 @@ async function markConsumedPending(kind, tokenHash, payload) {
 
 export async function markInviteConsumedPending(tokenHash, payload) { return markConsumedPending('invite', tokenHash, payload) }
 export async function markResetConsumedPending(tokenHash, payload) { return markConsumedPending('reset', tokenHash, payload) }
+export async function markVerifyEmailConsumedPending(tokenHash, payload) { return markConsumedPending('verify_email', tokenHash, payload) }
 
 // Called only after the full write sequence (password hash + user upsert +
 // session + audit entry) has ALL succeeded -- clears the retry safety net
@@ -199,6 +219,7 @@ async function clearConsumedPending(kind, tokenHash) {
 
 export async function clearInviteConsumedPending(tokenHash) { return clearConsumedPending('invite', tokenHash) }
 export async function clearResetConsumedPending(tokenHash) { return clearConsumedPending('reset', tokenHash) }
+export async function clearVerifyEmailConsumedPending(tokenHash) { return clearConsumedPending('verify_email', tokenHash) }
 
 // Explicit revocation (Owner/Admin "Revoke Invitation") -- deletes both the
 // primary and pending keys for a specific token hash (recorded on the
@@ -219,3 +240,4 @@ async function revokeToken(kind, tokenHash) {
 
 export async function revokeInviteToken(tokenHash) { return revokeToken('invite', tokenHash) }
 export async function revokeResetToken(tokenHash) { return revokeToken('reset', tokenHash) }
+export async function revokeVerifyEmailToken(tokenHash) { return revokeToken('verify_email', tokenHash) }

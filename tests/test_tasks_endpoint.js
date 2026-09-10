@@ -20,6 +20,7 @@ import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests, _resetRedisClientForTests } from '../dashboard/api/_lib/taskStore.js'
 import { _setReviewLocationIndexForTests, _resetReviewLocationIndexForTests } from '../dashboard/api/_lib/reviewLocationIndex.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -77,7 +78,7 @@ async function setDirectory() {
 }
 
 async function tokenFor(userId, role, locationIds) {
-  return signSession({ userId, email: `${userId}@example.com`, role, locationIds, sessionVersion: 1 })
+  return signSession({ userId, email: `${userId}@example.com`, role, locationIds, tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 const ownerToken = () => tokenFor('usr_owner', 'owner', '*')
 const adminToken = () => tokenFor('usr_admin', 'admin', '*')

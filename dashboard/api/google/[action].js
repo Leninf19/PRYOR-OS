@@ -21,24 +21,35 @@
 // Vercel/Node populates req.query.action from the URL segment, exactly as
 // it already does for actions/[action].js and session/[action].js.
 
-import { randomBytes } from 'crypto'
+import { randomBytes, randomUUID } from 'crypto'
 import { setCookie, parseCookies, clearCookie } from './_lib/cookies.js'
 import { fetchWithRetry } from './_lib/http.js'
 import { exchangeRefreshToken, getAccessToken } from './_lib/googleAuth.js'
-import { requireAuth, requireScopedAuth, requireLocationAccess, evaluateSession, statusForAuthFailure } from '../_lib/auth.js'
+import { signOAuthState, verifyOAuthState } from './_lib/oauthState.js'
+import { requireAuth, requireScopedAuth, requireLocationAccess, isWildcardGrant, evaluateSession, statusForAuthFailure } from '../_lib/auth.js'
 import { Permission, roleHasPermission } from '../_lib/permissions.js'
 import { resolveLocationIdForReview, resolveLocationIdForReviewOrDeny } from '../_lib/reviewLocationIndex.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import {
-  getStoredCredential, setStoredCredential, recordSyncOutcome, recordOAuthRefresh,
-  clearStoredCredential, GoogleHealth, CredentialStoreUnavailableError,
+  getStoredCredential, setStoredCredentialIfVersion, recordConnectionCheckOutcome, recordOAuthRefresh,
+  clearStoredCredential, GoogleHealth, CredentialStoreUnavailableError, CredentialVersionConflictError,
   isQuotaExceededError, extractQuotaProjectNumber,
 } from '../_lib/credentialStore.js'
+import { listConnectionsMetadata } from '../_lib/googleConnectionStore.js'
+import { readPrivateDataFile, UnknownTenantError } from '../_lib/reviewDataPaths.js'
 import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
 import {
   writePublishBridge, getPublishBridges, PublishBridgeUnavailableError,
 } from '../_lib/publishBridgeStore.js'
 import { recordReplyFailure, clearReplyFailure } from '../_lib/notificationStore.js'
+import { resolveTenantId, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
+import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDiscoveryStore.js'
+import {
+  recordLocationApproval, LocationApprovalNotEligibleError, getTenantConfig, LOCATION_APPROVAL_ELIGIBLE_STATUSES,
+  markTenantProvisioningDispatched, markTenantProvisioningDispatchFailed, ConfigVersionConflictError,
+} from '../_lib/tenantConfigStore.js'
+import { reconcileApprovedLocationsAgainstDiscovery, UnreconciledApprovedLocationError } from '../_lib/tenantLocationReconciliation.js'
+import { discoverGoogleLocationIdsForReconciliation } from '../_lib/googleLocationDiscovery.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -54,6 +65,14 @@ function credentialMetaFields(credential) {
     lastSuccessfulSyncAt: credential?.lastSuccessfulSyncAt ?? null,
     lastFailedSyncAt: credential?.lastFailedSyncAt ?? null,
     lastFailureReason: credential?.lastFailureReason ?? null,
+    // "Last Successful Sync" investigation fix -- lastSuccessfulSyncAt/
+    // lastFailedSyncAt above are kept for backward compatibility but are no
+    // longer written by any connectivity check (see credentialStore.js's
+    // recordSyncOutcome() header); lastConnectionCheckAt/Status is the
+    // field every status()/testConnection()/publish() call actually
+    // updates now.
+    lastConnectionCheckAt: credential?.lastConnectionCheckAt ?? null,
+    lastConnectionCheckStatus: credential?.lastConnectionCheckStatus ?? null,
   }
 }
 
@@ -124,10 +143,38 @@ async function auth(req, res) {
   const host       = req.headers['x-forwarded-host'] || req.headers.host
   const redirectUri = `${proto}://${host}/api/google/callback`
 
-  // CSRF protection: a random nonce is stored in an httpOnly cookie and sent
-  // as the OAuth `state` param -- the callback case rejects the flow if the
-  // two don't match on return, closing the login-CSRF gap this endpoint had.
-  const state = randomBytes(32).toString('hex')
+  // Multi-Tenant Phase 4A: tenantId comes ONLY from the account this
+  // request's own session just authenticated above -- never from a query
+  // string, request body, header, or any other request-supplied value.
+  // This is the tenant the callback will later be required to prove it's
+  // still acting for.
+  const tenantId = resolveTenantId(account)
+
+  // CSRF protection, hardened: a random nonce plus the initiating tenant
+  // and user identity are signed together (google/_lib/oauthState.js) into
+  // an integrity-protected, short-lived token -- not a plain random string
+  // or base64 JSON blob. The SAME signed token is stored in an httpOnly
+  // cookie AND sent as the OAuth `state` param; the callback case rejects
+  // the flow if the two don't match on return (the original CSRF
+  // mechanism, preserved) AND independently re-verifies the token's
+  // signature/expiry AND cross-checks its tenantId/userId against whoever
+  // is authenticated at callback time -- closing both the original
+  // login-CSRF gap and the cross-tenant/cross-session state-substitution
+  // gap a bare nonce could never have detected.
+  const nonce = randomBytes(32).toString('hex')
+  let state
+  try {
+    state = await signOAuthState({ nonce, tenantId, userId: account.userId }, { expiresInSeconds: 600 })
+  } catch (err) {
+    console.error(`[google/auth] could not sign OAuth state: ${err.message}`)
+    return res.status(503).send(`
+      <html><body style="font-family:system-ui;max-width:520px;margin:60px auto;padding:0 20px">
+        <h2>Setup incomplete</h2>
+        <p>Could not start the Google connection flow: the session signing key is not configured correctly.</p>
+        <a href="/settings">← Back to Settings</a>
+      </body></html>
+    `)
+  }
   setCookie(res, STATE_COOKIE, state, { maxAgeSeconds: 600 })
 
   const params = new URLSearchParams({
@@ -176,12 +223,45 @@ async function callback(req, res) {
   const expectedState = cookies[STATE_COOKIE]
   clearCookie(res, STATE_COOKIE)
 
-  if (!expectedState || state !== expectedState) {
+  // Original CSRF mechanism, preserved exactly: the state returned by
+  // Google must byte-for-byte match the one this browser's own cookie
+  // holds -- catches a missing cookie (expired, cleared, or never set,
+  // e.g. a stale/forged link) and a state value that doesn't match
+  // (another browser/session's flow) before anything else runs.
+  if (!expectedState || !state || state !== expectedState) {
     return res.status(400).send(page('Session expired or invalid', `
       <p>This authorization link is no longer valid (it may be old, already used, or opened in a different browser session).</p>
       <p>Go back to <a href="/settings">Settings</a> and click Connect again.</p>
     `))
   }
+
+  // Multi-Tenant Phase 4A, hardened state verification: the cookie-match
+  // check above only proves "this browser holds the same string" -- it
+  // does not by itself prove the string hasn't been tampered with, has
+  // not expired, or still belongs to whoever is authenticated RIGHT NOW.
+  // verifyOAuthState() independently re-checks the signature and
+  // expiration (rejects a modified or expired token outright); the
+  // tenantId/userId cross-check below then rejects a state that is
+  // validly signed but was issued for a DIFFERENT tenant or a different
+  // user's session than the one currently authenticated (e.g. the Owner
+  // signed out and a different Owner signed in mid-flow, or -- once a
+  // second tenant exists -- a state minted for Tenant A somehow being
+  // replayed against a Tenant B session). Any failure here fails closed
+  // with the exact same generic response as the CSRF check above, never
+  // revealing which specific check failed.
+  const decodedState = await verifyOAuthState(state)
+  if (!decodedState || decodedState.userId !== account.userId || decodedState.tenantId !== resolveTenantId(account)) {
+    return res.status(400).send(page('Session expired or invalid', `
+      <p>This authorization link is no longer valid (it may be old, already used, or opened in a different browser session).</p>
+      <p>Go back to <a href="/settings">Settings</a> and click Connect again.</p>
+    `))
+  }
+  // The tenant this callback is authorized to write a credential for --
+  // established from the verified OAuth transaction, never from any other
+  // source. Equal to resolveTenantId(account) by construction (just
+  // checked above), used explicitly below so the write is provably tied
+  // to the verified transaction rather than a fresh, separate derivation.
+  const verifiedTenantId = decodedState.tenantId
 
   if (error) {
     return res.status(400).send(page('Authorization denied', `
@@ -209,6 +289,30 @@ async function callback(req, res) {
   const proto       = req.headers['x-forwarded-proto'] || 'https'
   const host        = req.headers['x-forwarded-host'] || req.headers.host
   const redirectUri = `${proto}://${host}/api/google/callback`
+
+  // Multi-Tenant Phase 4I.2 -- expectedCredentialVersion, captured now,
+  // BEFORE the token exchange and every Google round trip below: this
+  // tenant's current credentialVersion (0 if never connected). Passed to
+  // setStoredCredentialIfVersion() at the end of this function, which
+  // checks it and applies the write in ONE ATOMIC Redis operation --
+  // credentialStore.js's own CAS discipline (mirroring
+  // tenantConfigStore.js's configVersion), not a JS-level read-then-compare-
+  // then-write. A read-then-compare-in-JS-then-write ALWAYS has a gap two
+  // concurrent requests can both observe the same state inside, no matter
+  // how small that gap is narrowed; only pushing the compare into the same
+  // atomic operation as the write removes it entirely. Fail closed if we
+  // can't even read current state -- proceeding blind would defeat the
+  // whole point of capturing a version to check against.
+  let expectedCredentialVersion
+  try {
+    const currentCredentialBeforeExchange = await getStoredCredential(verifiedTenantId)
+    expectedCredentialVersion = currentCredentialBeforeExchange?.credentialVersion ?? 0
+  } catch (err) {
+    return res.status(503).send(page('Connection temporarily unavailable', `
+      <p>Could not read this tenant's current Google connection state: <strong>${err instanceof CredentialStoreUnavailableError ? 'the credential store is temporarily unavailable' : err.message}</strong></p>
+      <p>Please try again shortly.</p>
+    `))
+  }
 
   let tokens
   try {
@@ -271,9 +375,109 @@ async function callback(req, res) {
     // best-effort fetch fails.
   }
 
+  // Multi-Tenant Phase 4I.2 -- ENTITLEMENT RECONCILIATION. The candidate
+  // credential (`tokens`) is held ONLY in this function's local variables
+  // up to this point -- nothing above has persisted anything. "OAuth
+  // succeeded" and "this credential is valid FOR THIS TENANT'S committed
+  // entitlement" are different questions; only a PRE-COMMIT tenant (no
+  // approvedLocations yet worth protecting) may skip straight to
+  // persisting, exactly preserving today's onboarding connect/discover/
+  // approve flow. A COMMITTED tenant (has already gone through
+  // approve-locations at least once -- LOCATION_APPROVAL_ELIGIBLE_STATUSES
+  // is tenantConfigStore.js's own canonical pre-commit/committed split, the
+  // same one its location-approval write path is gated by) must prove the
+  // NEW credential can still see every already-approved Google location
+  // before it is ever allowed to replace the working one.
+  let existingConfig
   try {
-    await setStoredCredential({ refreshToken: tokens.refresh_token, connectedAccountName })
+    existingConfig = await getTenantConfig(verifiedTenantId)
   } catch (err) {
+    return res.status(503).send(page('Connection temporarily unavailable', `
+      <p>Could not read this tenant's configuration: <strong>${err.message}</strong></p>
+      <p>Your previous Google connection, if any, remains unchanged.</p>
+      <p>Please try again shortly.</p>
+    `))
+  }
+  const currentStatus = existingConfig?.status ?? 'onboarding'
+
+  if (RECONNECT_BLOCKED_STATUSES.has(currentStatus)) {
+    await appendAuditEntry(verifiedTenantId, {
+      actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+      entity: 'google_oauth', entityId: null, action: 'google.reconnect_blocked_lifecycle', changes: { status: currentStatus }, result: 'denied',
+      message: `Reconnect refused: tenant status is ${JSON.stringify(currentStatus)}. Your previous Google connection remains unchanged.`,
+    })
+    return res.status(409).send(page('Reconnect temporarily unavailable', `
+      <p>An Initial Sync is currently running for this tenant. Reconnecting Google is disabled until it finishes or fails.</p>
+      <p style="color:#16a34a">Your previous Google connection remains active and unchanged.</p>
+      <p>Please try again shortly. <a href="/settings/google">← Back to Settings</a></p>
+    `))
+  }
+
+  const isCommittedTenant = !LOCATION_APPROVAL_ELIGIBLE_STATUSES.has(currentStatus)
+
+  if (isCommittedTenant) {
+    let discoveredGoogleLocationIds
+    try {
+      discoveredGoogleLocationIds = await discoverGoogleLocationIdsForReconciliation(tokens.access_token)
+    } catch (err) {
+      // Cannot verify -> treated identically to a failed reconciliation:
+      // the candidate is discarded, the previous credential is untouched.
+      return res.status(502).send(page('Could not verify Google locations', `
+        <p>Could not verify this Google account's locations: <strong>${err.message}</strong></p>
+        <p style="color:#16a34a">Your previous Google connection remains active and unchanged.</p>
+        <p><a href="/settings/google">← Back to Settings</a></p>
+      `))
+    }
+    try {
+      reconcileApprovedLocationsAgainstDiscovery(existingConfig?.approvedLocations ?? [], discoveredGoogleLocationIds)
+    } catch (err) {
+      if (!(err instanceof UnreconciledApprovedLocationError)) throw err
+      await appendAuditEntry(verifiedTenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'google_oauth', entityId: null, action: 'google.reconnect_rejected_incompatible', changes: { missingGoogleLocationIds: err.missingGoogleLocationIds }, result: 'denied',
+        message: `Reconnect rejected: ${err.missingGoogleLocationIds.length} already-approved location(s) are not visible to this Google account. Your previous Google connection remains unchanged.`,
+      })
+      return res.status(409).send(page('This Google account is missing approved locations', `
+        <p>This Google account does not have access to ${err.missingGoogleLocationIds.length} of this business's already-approved location(s).</p>
+        <p style="color:#16a34a">Your previous Google connection remains active and unchanged.</p>
+        <p>Reconnect using the Google account that manages every approved location, or contact support.</p>
+        <p><a href="/settings/google">← Back to Settings</a></p>
+      `))
+    }
+  }
+
+  try {
+    // Multi-Tenant Phase 4A/4C: verifiedTenantId came from the
+    // just-validated OAuth state (never re-derived from anything else at
+    // this point) and is the ONLY tenant this write can ever target.
+    // setStoredCredentialIfVersion() resolves the physical key via the same
+    // LEGACY/CUTOVER migration mode credentialStore.js's reads use --
+    // gbp_credentials:v1 for the one tenant explicitly pinned to LEGACY
+    // (Los Tres Amigos, to stay in sync with the Python background
+    // pipeline), gbp_credentials:v2:{tenantId} for every other tenant.
+    //
+    // Multi-Tenant Phase 4I.2: this single call both CHECKS
+    // expectedCredentialVersion and WRITES the candidate, atomically, in
+    // one Redis EVAL -- no separate re-check step exists anymore because
+    // none is needed; the atomicity IS the guarantee. On a version
+    // conflict this throws CredentialVersionConflictError below instead of
+    // writing anything, and this function does NOT retry -- a stale
+    // candidate is discarded outright, never automatically re-attempted;
+    // the user explicitly reconnects again if they still want to.
+    await setStoredCredentialIfVersion(verifiedTenantId, { refreshToken: tokens.refresh_token, connectedAccountName }, expectedCredentialVersion)
+  } catch (err) {
+    if (err instanceof CredentialVersionConflictError) {
+      await appendAuditEntry(verifiedTenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'google_oauth', entityId: null, action: 'google.reconnect_rejected_stale_version', changes: { expectedCredentialVersion }, result: 'denied',
+        message: `Reconnect rejected: this tenant's Google connection changed while this request was being processed (expected credential version ${expectedCredentialVersion}). Nothing further was changed by this request.`,
+      })
+      return res.status(409).send(page('Connection changed', `
+        <p>This tenant's Google connection was updated by another request while this one was being processed.</p>
+        <p style="color:#16a34a">The most recent connection is the one now in effect; nothing further has been changed by this request.</p>
+        <p><a href="/settings/google">← Back to Settings</a></p>
+      `))
+    }
     // The refresh token is NEVER displayed, logged, or put in a URL even
     // on this failure path -- `tokens` goes out of scope when this
     // function returns and is not persisted anywhere else.
@@ -285,10 +489,12 @@ async function callback(req, res) {
     `))
   }
 
-  await appendAuditEntry({
+  await appendAuditEntry(verifiedTenantId, {
     actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
     entity: 'google_oauth', entityId: null, action: 'google.reconnected', changes: null, result: 'success',
-    message: connectedAccountName ? `Connected Google Business Profile account "${connectedAccountName}".` : 'Connected a Google Business Profile account.',
+    message: connectedAccountName
+      ? `Connected Google Business Profile account "${connectedAccountName}"${isCommittedTenant ? ' (reconciled against existing approved locations)' : ''}.`
+      : 'Connected a Google Business Profile account.',
   })
 
   return res.send(page('✓ Google connected!', `
@@ -303,6 +509,76 @@ async function callback(req, res) {
 // Returns { connected, state, accountName?, accountId?, scopes?, tokenExpiresIn? }
 // ---------------------------------------------------------------------------
 
+// Multi-Tenant Google Integration Architecture Fix, extended by the "Last
+// Successful Sync" investigation -- the ONE tenant-scoped read of
+// gbp-sync.json (written by export_gbp_sync_status() for THIS tenant's own
+// export run), shared by every response branch below. This is the ONLY
+// place in this codebase that reports the REAL last data-sync outcome --
+// gbp-sync.json's `lastRun` is written exclusively by the actual Python
+// sync pipeline (gbp_sync.py / provider_sync.py, dispatched by
+// triggerSync() below or update-reviews.yml's own schedule), never by any
+// live Google API connectivity check in this file (see
+// credentialStore.js's recordSyncOutcome()/recordConnectionCheckOutcome()
+// headers for the full incident this split fixes). A tenant with no sync
+// data yet (gbp-sync.json not written) reports zero/null for every field
+// rather than throwing -- a legitimate, common state (never yet synced),
+// not an error.
+async function computeLinkedLocationCountsAndSyncFreshness(tenantId, account) {
+  let locations = []
+  let lastRun = null
+  try {
+    const raw = await readPrivateDataFile(tenantId, 'gbp-sync.json')
+    const parsed = JSON.parse(raw)
+    locations = parsed.locations ?? []
+    lastRun = parsed.lastRun ?? null
+  } catch (err) {
+    if (!(err instanceof UnknownTenantError) && err.code !== 'ENOENT') {
+      console.error(`[google/status] could not read gbp-sync.json for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+    }
+    return { linkedLocationCount: 0, accessibleLinkedLocationCount: 0, lastDataSyncAt: null, lastDataSyncStatus: null }
+  }
+  const linked = locations.filter(l => l.linked)
+  const accessible = isWildcardGrant(account) ? linked : linked.filter(l => requireLocationAccess(account, l.locationId))
+  return {
+    linkedLocationCount: linked.length,
+    accessibleLinkedLocationCount: accessible.length,
+    // finished_at is null for a run still in progress or one that crashed
+    // before completing -- started_at is still a meaningful "as of" point
+    // for staleness purposes in that case, never fabricated.
+    lastDataSyncAt: lastRun?.finished_at || lastRun?.started_at || null,
+    lastDataSyncStatus: lastRun?.status ?? null,
+  }
+}
+
+// Multi-Tenant Google Integration Architecture Fix -- fields every caller
+// of /api/google/status now receives regardless of connection health, so
+// Settings, the Reviews-page banner, and the global header all read the
+// SAME numbers from the SAME response (requirement: one source of truth
+// for connection status -- see this endpoint's broadened authorization
+// below). `canManageIntegration` lets the frontend hide Disconnect/
+// Reconnect/Sync-Now controls for a viewer who can see status but may not
+// mutate the organization's connection (SETTINGS_ADMIN, still owner-only).
+async function buildIntegrationSummaryFields(tenantId, account) {
+  let connectionCount = 0
+  try {
+    const connections = await listConnectionsMetadata(tenantId)
+    connectionCount = connections.length
+  } catch (err) {
+    console.error(`[google/status] could not list connections for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+  }
+  const { linkedLocationCount, accessibleLinkedLocationCount, lastDataSyncAt, lastDataSyncStatus } =
+    await computeLinkedLocationCountsAndSyncFreshness(tenantId, account)
+  return {
+    connectionCount, linkedLocationCount, accessibleLinkedLocationCount,
+    // "Last Successful Sync" investigation -- the REAL data-sync signal
+    // (gbp-sync.json's own lastRun, written only by the Python pipeline),
+    // deliberately separate from lastConnectionCheckAt (credentialMetaFields()
+    // below) which a routine status()/testConnection() poll DOES update.
+    lastDataSyncAt, lastDataSyncStatus,
+    canManageIntegration: roleHasPermission(account.role, Permission.SETTINGS_ADMIN),
+  }
+}
+
 // Phase 8, Milestone 8.7: `state` is now one of GoogleHealth's five values
 // (connected/token_expired/token_revoked/auth_failed/never_connected) plus
 // 'not_configured' for the one config-level gap (GOOGLE_CLIENT_ID/SECRET
@@ -312,57 +588,75 @@ async function callback(req, res) {
 // Sync/Token Health available, regardless of which branch produced it.
 //
 // This is also the "automatic recovery" mechanism in action: an
-// invalid_grant here calls recordSyncOutcome() BEFORE responding, so the
+// invalid_grant here calls recordConnectionCheckOutcome() BEFORE responding, so the
 // health this same response reports is already the corrected value -- the
 // dashboard never shows a stale "Connected" after a token was just found
 // to be revoked.
+//
+// Multi-Tenant Google Integration Architecture Fix -- AUTHORIZATION: this
+// used to be requireAuth(req, res, ['owner']), meaning any non-Owner
+// tenant member (Admin, Marketing, a Manager, Read Only) got a flat 403
+// merely for asking "is Google connected" -- an org-wide, secret-free
+// status read, not a mutation. It now requires only Permission
+// .INTEGRATIONS_VIEW, which every real role holds (permissions.js) -- the
+// same broadened gate as test-connection() below. Connect/Reconnect/
+// Disconnect/trigger-sync/trigger-import remain SETTINGS_ADMIN-equivalent
+// (Owner-only, unchanged) -- this endpoint never mutates anything.
 async function status(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
 
-  const account = await requireAuth(req, res, ['owner'])
-  if (!account) return
+  const scope = await requireScopedAuth(req, res, { permission: Permission.INTEGRATIONS_VIEW, resolveLocationId: () => null })
+  if (!scope) return
+  const { account } = scope
+
+  // Multi-Tenant Phase 4A: every credential/health operation below is
+  // scoped to THIS tenant only, derived from the authenticated session --
+  // never from any request input.
+  const tenantId = resolveTenantId(account)
 
   const allowed = await enforceRateLimit(req, res, `status:${account.userId}`, { requestsPerWindow: 15, windowSeconds: 60 })
   if (!allowed) return
 
+  const summaryFields = await buildIntegrationSummaryFields(tenantId, account)
+
   const hasId     = !!process.env.GOOGLE_CLIENT_ID
   const hasSecret = !!process.env.GOOGLE_CLIENT_SECRET
   if (!hasId || !hasSecret) {
-    return res.status(200).json({ connected: false, state: 'not_configured' })
+    return res.status(200).json({ connected: false, state: 'not_configured', ...summaryFields })
   }
 
   let credential
   try {
-    credential = await getStoredCredential()
+    credential = await getStoredCredential(tenantId)
   } catch (err) {
     if (err instanceof CredentialStoreUnavailableError) {
-      return res.status(200).json({ connected: false, state: GoogleHealth.AUTH_FAILED, error: 'The credential store is temporarily unavailable.' })
+      return res.status(200).json({ connected: false, state: GoogleHealth.AUTH_FAILED, error: 'The credential store is temporarily unavailable.', ...summaryFields })
     }
     throw err
   }
 
   if (!credential) {
-    return res.status(200).json({ connected: false, state: GoogleHealth.NEVER_CONNECTED })
+    return res.status(200).json({ connected: false, state: GoogleHealth.NEVER_CONNECTED, ...summaryFields })
   }
   if (!credential.refreshToken) {
     // A stored credential exists but couldn't be decrypted (e.g.
     // CREDENTIAL_ENCRYPTION_KEY changed) -- credentialStore.js already
     // reflects this as health: auth_failed.
-    return res.status(200).json({ connected: false, state: credential.health, error: 'The stored credential could not be read.', ...credentialMetaFields(credential) })
+    return res.status(200).json({ connected: false, state: credential.health, error: 'The stored credential could not be read.', ...credentialMetaFields(credential), ...summaryFields })
   }
 
   try {
     const tokenData = await exchangeRefreshToken(credential.refreshToken)
     if (!tokenData.access_token) {
-      await recordSyncOutcome({ success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
-      const updated = await getStoredCredential()
+      await recordConnectionCheckOutcome(tenantId, { success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
+      const updated = await getStoredCredential(tenantId)
       return res.status(200).json({
         connected: false, state: updated.health,
         error: tokenData.error_description || tokenData.error || 'Refresh token rejected',
-        ...credentialMetaFields(updated),
+        ...credentialMetaFields(updated), ...summaryFields,
       })
     }
-    await recordOAuthRefresh()
+    await recordOAuthRefresh(tenantId)
 
     // Account listing moved off the legacy v4 host in Google's 2022 API
     // split -- mybusiness.googleapis.com/v4/accounts now 404s. Reviews/reply
@@ -384,8 +678,8 @@ async function status(req, res) {
         : r.status === 403 ? 'permission_denied'
         : r.status === 401 ? 'unauthorized'
         : 'api_error'
-      await recordSyncOutcome({ success: false, reason, errorDescription: body.error?.message })
-      const updated = await getStoredCredential()
+      await recordConnectionCheckOutcome(tenantId, { success: false, reason, errorDescription: body.error?.message })
+      const updated = await getStoredCredential(tenantId)
       return res.status(200).json({
         // The Google account connection itself is intact for a quota
         // block (the refresh token and access-token exchange both just
@@ -395,14 +689,14 @@ async function status(req, res) {
         state: updated.health,
         error: body.error?.message || `GBP API ${r.status}`,
         quotaProjectNumber: quotaExceeded ? extractQuotaProjectNumber(body.error?.message) : null,
-        ...credentialMetaFields(updated),
+        ...credentialMetaFields(updated), ...summaryFields,
       })
     }
 
     const data       = await r.json()
     const gbpAccount = (data.accounts || [])[0]
-    await recordSyncOutcome({ success: true })
-    const updated = await getStoredCredential()
+    await recordConnectionCheckOutcome(tenantId, { success: true })
+    const updated = await getStoredCredential(tenantId)
 
     return res.status(200).json({
       connected:      true,
@@ -412,10 +706,10 @@ async function status(req, res) {
       accountCount:   (data.accounts || []).length,
       scopes:         (tokenData.scope || 'https://www.googleapis.com/auth/business.manage').split(' '),
       tokenExpiresIn: tokenData.expires_in || null,
-      ...credentialMetaFields(updated),
+      ...credentialMetaFields(updated), ...summaryFields,
     })
   } catch (err) {
-    return res.status(200).json({ connected: false, state: GoogleHealth.AUTH_FAILED, error: err.message, ...credentialMetaFields(credential) })
+    return res.status(200).json({ connected: false, state: GoogleHealth.AUTH_FAILED, error: err.message, ...credentialMetaFields(credential), ...summaryFields })
   }
 }
 
@@ -447,11 +741,34 @@ function v4LocationPath(accountName, locationApiName) {
   return `${accountName}/locations/${tail}`
 }
 
+// Google Integration + Reviews End-to-End Validation, Part A -- corrected
+// authorization. Unlike status() above (one cheap accounts.list call,
+// booleans/timestamps only), this walks a full live diagnostic chain on
+// every call: token exchange -> accounts.list -> locations.list (per
+// account, up to 100/page) -> reviews.list (5 real review bodies from the
+// tenant's own first location) -- several real Google API requests against
+// the SAME rate-limited surface the production quota incident (project
+// 786038057684) hit, and it returns real customer review content plus
+// infrastructure-level detail (e.g. "Missing GOOGLE_CLIENT_ID/SECRET in
+// Vercel environment variables") no ordinary Manager/Read Only needs. This
+// is an ADMINISTRATIVE DIAGNOSTIC, not a basic "is Google connected" read --
+// it must NOT be reachable via the broad Permission.INTEGRATIONS_VIEW every
+// role holds (status() above is the correct, narrow surface for that).
+// Gated by the SAME Permission.SETTINGS_ADMIN that already restricts
+// Connect/Reconnect/Disconnect (owner-only today, permissions.js) -- reusing
+// that existing permission rather than inventing a new one, per the
+// reviewed policy: "connect, reconnect, disconnect, credential management,
+// and administrative diagnostics stay restricted to appropriate
+// administrative roles."
 async function testConnection(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
 
-  const account = await requireAuth(req, res, ['owner'])
-  if (!account) return
+  const scope = await requireScopedAuth(req, res, { permission: Permission.SETTINGS_ADMIN, resolveLocationId: () => null })
+  if (!scope) return
+  const { account } = scope
+
+  // Multi-Tenant Phase 4A: scoped to this tenant only.
+  const tenantId = resolveTenantId(account)
 
   const allowed = await enforceRateLimit(req, res, `test-connection:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
   if (!allowed) return
@@ -471,7 +788,7 @@ async function testConnection(req, res) {
 
   let credential
   try {
-    credential = await getStoredCredential()
+    credential = await getStoredCredential(tenantId)
   } catch (err) {
     checks.push(check('refresh_token', 'Refresh token present', 'fail',
       err instanceof CredentialStoreUnavailableError ? 'The credential store is temporarily unavailable.' : err.message))
@@ -493,12 +810,12 @@ async function testConnection(req, res) {
   }
 
   if (!tokenData.access_token) {
-    await recordSyncOutcome({ success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
+    await recordConnectionCheckOutcome(tenantId, { success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
     checks.push(check('token_exchange', 'Exchange refresh token for access token', 'fail',
       tokenData.error_description || tokenData.error || 'Google rejected the refresh token. It may have been revoked -- reconnect from Settings.'))
     return res.status(200).json({ overallStatus: 'fail', checks })
   }
-  await recordOAuthRefresh()
+  await recordOAuthRefresh(tenantId)
   checks.push(check('token_exchange', 'Exchange refresh token for access token', 'pass',
     `Access token obtained, expires in ${tokenData.expires_in || '?'}s. Scopes: ${tokenData.scope || 'unknown'}.`))
 
@@ -590,7 +907,7 @@ async function testConnection(req, res) {
   checks.push(check('api_health', 'Google Business Profile API health', 'pass',
     'All API calls in this test completed without errors.'))
 
-  await recordSyncOutcome({ success: true })
+  await recordConnectionCheckOutcome(tenantId, { success: true })
   return res.status(200).json({ overallStatus: 'pass', checks })
 }
 
@@ -607,6 +924,24 @@ async function triggerSync(req, res) {
 
   const account = await requireAuth(req, res, ['owner'])
   if (!account) return
+
+  // Multi-Tenant Phase 4B: this dispatches update-reviews.yml against a
+  // single, HARDCODED repo (REPO_OWNER/REPO_NAME above) that syncs and
+  // exports ONE tenant's data (Los Tres Amigos's reviews.db) -- unlike the
+  // Redis-backed stores and the Phase 4A credential store, this pipeline
+  // has no per-tenant equivalent yet. Without this check, any future
+  // tenant's Owner could dispatch a sync/export cycle that reads and
+  // republishes Los Tres Amigos's own data (a "sync state" cross-tenant
+  // leak per the Phase 4B audit), purely because they hold the Owner role
+  // on their OWN unrelated tenant. Fail closed for every tenant except the
+  // one this pipeline actually belongs to, until a real per-tenant sync
+  // pipeline exists.
+  if (resolveTenantId(account) !== DEFAULT_TENANT_ID) {
+    return res.status(403).json({
+      error:   'forbidden',
+      message: 'This action is not available for your organization yet.',
+    })
+  }
 
   const allowed = await enforceRateLimit(req, res, `trigger-sync:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
   if (!allowed) return
@@ -665,6 +1000,16 @@ async function triggerImport(req, res) {
 
   const account = await requireAuth(req, res, ['owner'])
   if (!account) return
+
+  // Multi-Tenant Phase 4B: same reasoning as triggerSync() above -- this
+  // dispatches a historical-import run against the single, hardcoded
+  // Los Tres Amigos repo/database. Fail closed for any other tenant.
+  if (resolveTenantId(account) !== DEFAULT_TENANT_ID) {
+    return res.status(403).json({
+      error:   'forbidden',
+      message: 'This action is not available for your organization yet.',
+    })
+  }
 
   const allowed = await enforceRateLimit(req, res, `trigger-import:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
   if (!allowed) return
@@ -766,6 +1111,21 @@ async function gbpGetAllPages(baseUrl, token, listKey, pageParam = 'pageSize', p
   return items
 }
 
+// Multi-Tenant Phase 4I.2 -- lifecycle statuses in which a Google credential
+// reconnect is refused OUTRIGHT (not merely reconciled), because a live,
+// in-flight process is actively using the CURRENT credential and this
+// codebase has no per-write concurrency primitive over credentialStore.js's
+// single physical key that could safely coexist with it. 'initial_sync' is
+// the only such status -- initial_sync.py fetches and uses the tenant's
+// Google credential throughout a single run; a mid-run swap could hand a
+// running sync a credential for a DIFFERENT Google account than the one it
+// validated at its own start, undermining its own reconciliation
+// (ApprovedLocationsOnlyGBPProvider) guarantees. provision_tenant.py, by
+// contrast, never calls the Google API at all, so 'provisioning'/
+// 'provisioning_failed' carry no equivalent risk and are handled by the
+// ordinary reconciliation path below instead of an outright block.
+const RECONNECT_BLOCKED_STATUSES = new Set(['initial_sync'])
+
 function normName(s) {
   return (s || '').toLowerCase().replace(/[^a-z0-9]/g, '')
 }
@@ -818,6 +1178,15 @@ async function publish(req, res) {
   if (!scope) return
   const { account } = scope
 
+  // Multi-Tenant Phase 4A: authorization (requireScopedAuth above) has
+  // already run, so this is the tenant whose OWN credential must be used
+  // for the rest of this request -- a Tenant B request can never reach
+  // this point carrying Tenant A's location/review ids in the first place
+  // (requireScopedAuth's location-tenant-ownership check denies that
+  // earlier), and even if it somehow did, this would still only ever load
+  // Tenant B's own (likely nonexistent) credential, never Tenant A's.
+  const tenantId = resolveTenantId(account)
+
   const allowed = await enforceRateLimit(req, res, `publish:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
   if (!allowed) return
 
@@ -830,7 +1199,7 @@ async function publish(req, res) {
 
   let credential
   try {
-    credential = await getStoredCredential()
+    credential = await getStoredCredential(tenantId)
   } catch {
     return res.status(503).json({ error: 'not_connected', message: 'Google Business Profile connection is temporarily unavailable. Please try again shortly.' })
   }
@@ -871,14 +1240,14 @@ async function publish(req, res) {
   // the frontend can say "published, but local confirmation couldn't be
   // saved" instead of silently claiming full durability it doesn't have.
   async function respondPublishSuccess(resolvedGbpReviewName) {
-    await recordSyncOutcome({ success: true })
+    await recordConnectionCheckOutcome(tenantId, { success: true })
     // Notification Center Audit & Fix: a subsequent successful publish
     // resolves any previously-recorded "reply failed" notification for
     // this review -- best-effort, never allowed to affect the actual
     // publish response (matches the bridge-write tolerance immediately
     // below, and the publish bridge's own success path is entirely
     // unaffected by this).
-    if (localReviewId) await clearReplyFailure(localReviewId)
+    if (localReviewId) await clearReplyFailure(tenantId, localReviewId)
     if (!localReviewId) {
       // Frontend didn't send its own review id (older client, or a caller
       // hitting this endpoint directly) -- Google still succeeded, there's
@@ -887,7 +1256,7 @@ async function publish(req, res) {
       return res.status(200).json({ success: true, bridgeWarning: true })
     }
     try {
-      await writePublishBridge(localReviewId, {
+      await writePublishBridge(tenantId, localReviewId, {
         gbpReviewName: resolvedGbpReviewName ?? null,
         responseText: replyText,
         locationName: locationName ?? null,
@@ -912,10 +1281,10 @@ async function publish(req, res) {
   let token
   try {
     token = await getAccessToken(credential.refreshToken)
-    await recordOAuthRefresh()
+    await recordOAuthRefresh(tenantId)
   } catch (err) {
     if (err.code === 'invalid_grant') {
-      await recordSyncOutcome({ success: false, reason: 'invalid_grant', errorDescription: err.description })
+      await recordConnectionCheckOutcome(tenantId, { success: false, reason: 'invalid_grant', errorDescription: err.description })
     }
     return res.status(503).json({
       error:   'not_connected',
@@ -988,8 +1357,8 @@ async function publish(req, res) {
     // or the notification write itself fails, the original error response
     // below is returned exactly as it always was.
     if (localReviewId) {
-      const failedLocationId = await resolveLocationIdForReview(localReviewId).catch(() => null)
-      await recordReplyFailure(localReviewId, {
+      const failedLocationId = await resolveLocationIdForReview(localReviewId, tenantId).catch(() => null)
+      await recordReplyFailure(tenantId, localReviewId, {
         locationId: failedLocationId,
         locationName: locationName ?? null,
         reviewerName: reviewerName ?? null,
@@ -1047,7 +1416,7 @@ async function publishBridge(req, res) {
 
   let records
   try {
-    records = await getPublishBridges(ids)
+    records = await getPublishBridges(resolveTenantId(account), ids)
   } catch (err) {
     if (err instanceof PublishBridgeUnavailableError) {
       // Degrade gracefully -- the frontend's own localStorage fallback
@@ -1067,8 +1436,16 @@ async function publishBridge(req, res) {
     // unresolvable/foreign review is simply omitted, matching this
     // endpoint's existing "absent means no bridge record" contract rather
     // than surfacing a 403/404 for one id among many.
-    if (account.locationIds !== '*') {
-      const locationId = await resolveLocationIdForReview(id)
+    // Multi-Tenant Phase 4B: isWildcardGrant(), not a bare
+    // `locationIds === '*'` check -- a wildcard grant only means "skip
+    // the per-record location filter" when the account's own tenant
+    // actually owns a location catalog (see auth.js's isWildcardGrant()/
+    // tenants.js's tenantOwnsLocationCatalog()). A non-onboarded tenant
+    // holding '*' must still have every record filtered (and therefore
+    // excluded, since it owns no locations at all), never treated as
+    // "sees everything."
+    if (!isWildcardGrant(account)) {
+      const locationId = await resolveLocationIdForReview(id, resolveTenantId(account))
       if (locationId === null || !requireLocationAccess(account, locationId)) continue
     }
     bridges[id] = {
@@ -1098,6 +1475,15 @@ async function disconnect(req, res) {
   const account = await requireAuth(req, res, ['owner'])
   if (!account) return
 
+  // Multi-Tenant Phase 4A/4C: disconnect affects ONLY this tenant's own
+  // credential, resolved via the same LEGACY/CUTOVER migration mode as
+  // every other credential read/write. For the LEGACY-pinned default
+  // tenant (Los Tres Amigos) that IS gbp_credentials:v1 -- intentionally,
+  // since v1 is that tenant's authoritative key -- and for every other
+  // (CUTOVER) tenant it is that tenant's own v2 key, never another
+  // tenant's and never the other migration mode's key.
+  const tenantId = resolveTenantId(account)
+
   const allowed = await enforceRateLimit(req, res, `disconnect:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
   if (!allowed) return
 
@@ -1109,7 +1495,7 @@ async function disconnect(req, res) {
   }
 
   try {
-    await clearStoredCredential()
+    await clearStoredCredential(tenantId)
   } catch (err) {
     if (err instanceof CredentialStoreUnavailableError) {
       return res.status(503).json({ error: 'service_unavailable', message: 'The credential store is temporarily unavailable. Please try again shortly.' })
@@ -1117,7 +1503,7 @@ async function disconnect(req, res) {
     throw err
   }
 
-  await appendAuditEntry({
+  await appendAuditEntry(tenantId, {
     actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
     entity: 'google_oauth', entityId: null, action: 'google.disconnected', changes: null, result: 'success',
     message: 'Disconnected the Google Business Profile connection.',
@@ -1127,18 +1513,371 @@ async function disconnect(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// POST /api/google/discover-locations -- Multi-Tenant Phase 4E, step 1 of
+// the self-service activation transaction:
+//   Connect Google -> DISCOVER LOCATIONS -> Approve Locations -> Ready.
+// Owner-only, tenantId derived exclusively from the authenticated session
+// (never request input). Lists this tenant's own real GBP locations using
+// this tenant's own stored credential (Phase 4A's per-tenant credential
+// store), then records exactly what was discovered in a short-lived,
+// tenant-and-user-bound locationDiscoveryStore.js record. This is what
+// lets approveLocations() below verify a later approval request only ever
+// approves locations PRYOR itself just discovered for THIS tenant -- a
+// client must never be able to submit an arbitrary Google location id and
+// thereby claim it.
+//
+// POST, not GET, DELIBERATELY (final review decision): this call has real
+// side effects -- it creates a new short-lived Redis record on every
+// invocation and spends a real call against Google's (quota-limited) API --
+// neither of which belongs behind a method HTTP treats as safe/cacheable/
+// prefetchable. Every other "do work" action in this file (trigger-sync,
+// trigger-import, publish, disconnect, approve-locations) is already POST
+// for the same reason; the handful of GETs (status, test-connection) are
+// pure reads that create no state. This was changed deliberately for this
+// reason, not merely for stylistic consistency.
+// ---------------------------------------------------------------------------
+
+async function discoverLocations(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed', message: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+  const tenantId = resolveTenantId(account)
+
+  const allowed = await enforceRateLimit(req, res, `discover-locations:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  let credential
+  try {
+    credential = await getStoredCredential(tenantId)
+  } catch {
+    return res.status(503).json({ error: 'not_connected', message: 'Google Business Profile connection is temporarily unavailable. Please try again shortly.' })
+  }
+  if (!credential || !credential.refreshToken) {
+    return res.status(503).json({
+      error:   'not_connected',
+      message: 'Google Business Profile is not connected. Complete setup in Settings → Google Business Profile.',
+    })
+  }
+
+  let token
+  try {
+    token = await getAccessToken(credential.refreshToken)
+  } catch (err) {
+    return res.status(503).json({ error: 'not_connected', message: err.description || err.message || 'Could not obtain a Google access token.' })
+  }
+  const auth = { Authorization: `Bearer ${token}` }
+
+  let accounts
+  try {
+    const r = await fetchWithRetry(`${ACCOUNTS_BASE}/accounts`, { headers: auth })
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}))
+      return res.status(502).json({ error: 'api_error', message: e.error?.message || `Google API returned status ${r.status}.` })
+    }
+    accounts = (await r.json()).accounts || []
+  } catch (err) {
+    return res.status(502).json({ error: 'api_error', message: `Request to Google failed: ${err.message}` })
+  }
+
+  let discoveredLocations = []
+  try {
+    for (const acct of accounts) {
+      const r = await fetchWithRetry(
+        `${LOCATIONS_BASE}/${acct.name}/locations?pageSize=100&readMask=${encodeURIComponent(LOCATIONS_READ_MASK)}`,
+        { headers: auth }
+      )
+      if (!r.ok) continue
+      const data = await r.json()
+      discoveredLocations = discoveredLocations.concat((data.locations || []).map(loc => ({
+        googleLocationId: v4LocationPath(acct.name, loc.name || ''),
+        title: loc.title || '',
+        address: loc.storefrontAddress
+          ? [loc.storefrontAddress.addressLines, loc.storefrontAddress.locality, loc.storefrontAddress.administrativeArea].flat().filter(Boolean).join(', ')
+          : '',
+      })))
+    }
+  } catch (err) {
+    return res.status(502).json({ error: 'api_error', message: `Request to Google failed: ${err.message}` })
+  }
+
+  if (!discoveredLocations.length) {
+    return res.status(200).json({ discoverySessionId: null, expiresAt: null, locations: [] })
+  }
+
+  let session
+  try {
+    session = await createDiscoverySession({ tenantId, userId: account.userId, discoveredLocations })
+  } catch {
+    return res.status(503).json({ error: 'service_unavailable', message: 'Could not start a discovery session. Please try again shortly.' })
+  }
+
+  return res.status(200).json({
+    discoverySessionId: session.discoverySessionId,
+    expiresAt: session.expiresAt,
+    locations: discoveredLocations,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/google/approve-locations -- step 2: { discoverySessionId,
+// selectedGoogleLocationIds }. Owner-only. Validates the selection against
+// the trusted discovery record created by discoverLocations() above --
+// never trusting a location list the browser sends back on its own -- then
+// writes the approved locations (each stamped with a tenant-local numeric
+// locationId, the same id space requireLocationAccess()/tenantOwnsLocation()
+// authorize against) to this tenant's own config record
+// (tenantConfigStore.js) and marks its location catalog active. That write
+// is exactly what tenants.js's tenantOwnsLocationCatalog()/tenantOwnsLocation()
+// read back (via primeLocationCatalogState(), starting with this tenant's
+// very next authenticated request) -- no source-code change or deploy
+// required.
+//
+// USER BINDING (final review decision): locationDiscoveryStore.js records
+// which Owner ran the discovery. This is ENFORCED, not just recorded --
+// only that same Owner may approve it. A discovery session is a bearer
+// capability over a real, quota-limited Google API call and directly
+// controls what a tenant's catalog gets activated with; if two Owners of
+// the same tenant were ever mid-onboarding at once, one silently approving
+// the other's unreviewed discovery result would be a surprising, hard-to-
+// audit outcome for a security-sensitive, one-time transaction. There is
+// no product requirement for cross-Owner handoff today, so the safer,
+// narrower default (this exact Owner, on this exact discovery) is chosen;
+// a future product need to let a DIFFERENT Owner approve could add an
+// explicit "hand off this discovery" step rather than silently allow it.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Multi-Tenant Phase 4O -- automatic post-approval provisioning handoff.
+// dispatchTenantLifecycleWorkflow() calls THIS repo's own pinned dispatcher
+// (.github/workflows/tenant-lifecycle-dispatch.yml on main) -- the exact
+// same trusted, pinned-commit execution engine every manual operator
+// dispatch has used throughout this project. Deliberately a SEPARATE repo
+// and token from triggerSync()/triggerImport() above, which target Los
+// Tres Amigos's own legacy repo with GITHUB_SYNC_PAT -- that token has no
+// relationship to this one and is never used here.
+// ---------------------------------------------------------------------------
+const TENANT_LIFECYCLE_REPO_OWNER = 'Leninf19'
+const TENANT_LIFECYCLE_REPO_NAME = 'PRYOR-OS'
+const TENANT_LIFECYCLE_WORKFLOW_FILE = 'tenant-lifecycle-dispatch.yml'
+const TENANT_LIFECYCLE_DISPATCH_TIMEOUT_MS = 10_000
+
+// Calls GitHub's workflow_dispatch REST API with a bounded timeout, and
+// classifies the outcome into exactly the three cases the CAS/reconciliation
+// design distinguishes -- never a fourth, ambiguous "maybe" bucket beyond
+// what's documented below:
+//   'accepted' -- GitHub responded 204: the dispatch event is durably
+//                 recorded on GitHub's side and WILL result in a run.
+//   'rejected' -- GitHub responded with a clean 4xx: the dispatch was
+//                 DEFINITELY not accepted (bad inputs, auth problem,
+//                 workflow/repo not found) -- safe to treat as an
+//                 immediate, definite failure, no waiting required.
+//   'ambiguous' -- a network-level exception (timeout, connection reset,
+//                 DNS/TLS failure) OR any 5xx from GitHub's own edge --
+//                 GitHub's response, if it even reaches us, gives no
+//                 guarantee the request wasn't already processed
+//                 server-side. NEVER treated as failure by the caller;
+//                 resolved later by reconcileStuckProvisioningDispatch()
+//                 (tenantConfigStore.js), which watches for real progress
+//                 instead of guessing from this HTTP-level signal alone.
+// Never accepts a caller-supplied ref/branch/SHA -- `ref: 'main'` is a
+// fixed literal, exactly like every other property of this call.
+async function dispatchTenantLifecycleWorkflow(operation, tenantId) {
+  const pat = process.env.TENANT_PROVISIONING_DISPATCH_PAT
+  if (!pat) return { outcome: 'ambiguous', reason: 'TENANT_PROVISIONING_DISPATCH_PAT is not configured' }
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), TENANT_LIFECYCLE_DISPATCH_TIMEOUT_MS)
+  try {
+    const r = await fetch(
+      `https://api.github.com/repos/${TENANT_LIFECYCLE_REPO_OWNER}/${TENANT_LIFECYCLE_REPO_NAME}/actions/workflows/${TENANT_LIFECYCLE_WORKFLOW_FILE}/dispatches`,
+      {
+        method:  'POST',
+        signal:  controller.signal,
+        headers: {
+          Authorization:          `Bearer ${pat}`,
+          Accept:                 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'Content-Type':         'application/json',
+        },
+        body: JSON.stringify({ ref: 'main', inputs: { operation, tenant_id: tenantId, confirmation: tenantId } }),
+      }
+    )
+    if (r.status === 204) return { outcome: 'accepted' }
+    if (r.status >= 400 && r.status < 500) {
+      const body = await r.json().catch(() => ({}))
+      return { outcome: 'rejected', status: r.status, message: body.message || `GitHub API returned status ${r.status}.` }
+    }
+    // Any 5xx (or an unexpected 2xx/3xx this endpoint doesn't document) is
+    // treated as ambiguous, never a definite outcome either way.
+    return { outcome: 'ambiguous', reason: `unexpected HTTP status ${r.status}` }
+  } catch (err) {
+    return { outcome: 'ambiguous', reason: err.name === 'AbortError' ? 'request timed out' : err.message }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+// Fire-and-forget from approveLocations()'s perspective in the sense that
+// its outcome never changes the HTTP response shape returned to the
+// browser -- but it IS awaited, so a definite rejection can be recorded
+// synchronously rather than left for the reconciliation pass. Never
+// throws -- every failure mode (CAS lost, dispatch rejected, dispatch
+// ambiguous) is handled internally, since a customer's location approval
+// must never fail or error out because of anything on this path.
+async function triggerAutomaticProvisioning(tenantId, config) {
+  // Explicit, redundant LTA exclusion -- structurally near-impossible
+  // already (LTA never reaches approveLocations() at all: it has no
+  // discovery/approval flow, see tenants.js's LocationCatalogMigrationMode),
+  // but this makes the exclusion self-evident at the exact call site
+  // rather than merely incidental.
+  if (tenantId === DEFAULT_TENANT_ID) return
+
+  const dispatchAttemptId = randomUUID()
+  let claimed
+  try {
+    claimed = await markTenantProvisioningDispatched(tenantId, { dispatchAttemptId, expectedVersion: config.configVersion })
+  } catch (err) {
+    if (err instanceof ConfigVersionConflictError) return // lost the race -- another concurrent approval already claimed/dispatched
+    throw err
+  }
+
+  const result = await dispatchTenantLifecycleWorkflow('provision', tenantId)
+  if (result.outcome === 'rejected') {
+    try {
+      await markTenantProvisioningDispatchFailed(tenantId, `GitHub dispatch rejected (${result.status}): ${result.message}`, { expectedVersion: claimed.configVersion })
+    } catch (err) {
+      if (!(err instanceof ConfigVersionConflictError)) throw err // otherwise: something newer already happened -- leave it alone
+    }
+  }
+  // 'accepted' -- nothing further to do; normal status polling takes over.
+  // 'ambiguous' -- deliberately left at 'provisioning' with dispatchedAt
+  // already stamped by the claim above; reconcileStuckProvisioningDispatch()
+  // resolves it on a later status read, never here.
+}
+
+async function approveLocations(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed', message: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+  // SERVER-DERIVED ONLY -- a forged tenantId anywhere in the request
+  // (query, body, or a header) is never consulted for this or anything
+  // below; this is the one value that decides whose catalog gets activated.
+  const tenantId = resolveTenantId(account)
+
+  const allowed = await enforceRateLimit(req, res, `approve-locations:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { discoverySessionId, selectedGoogleLocationIds } = req.body ?? {}
+  if (typeof discoverySessionId !== 'string' || !discoverySessionId) {
+    return res.status(400).json({ error: 'api_error', message: 'discoverySessionId is required.' })
+  }
+  if (!Array.isArray(selectedGoogleLocationIds) || selectedGoogleLocationIds.length === 0 ||
+      !selectedGoogleLocationIds.every(id => typeof id === 'string' && id)) {
+    return res.status(400).json({ error: 'api_error', message: 'selectedGoogleLocationIds must be a non-empty array of location ids.' })
+  }
+
+  const session = await getDiscoverySession(discoverySessionId)
+  // A missing/expired session, a session belonging to a DIFFERENT tenant,
+  // and a session belonging to a different USER within the SAME tenant are
+  // all deliberately indistinguishable here (404 in every case) -- this is
+  // exactly what stops a Tenant A discovery session from being replayed
+  // under a Tenant B session (or vice versa), and what enforces the user
+  // binding above: a 403 would confirm "that session id is real, just not
+  // yours," which this response must never reveal. Same API-error-contract
+  // reasoning auth.js's requireScopedAuth() already uses for cross-tenant
+  // location lookups.
+  if (!session || session.tenantId !== tenantId || session.userId !== account.userId) {
+    return res.status(404).json({ error: 'not_found', message: 'This discovery session was not found or has expired. Please discover locations again.' })
+  }
+
+  const discoveredIds = new Set(session.discoveredLocations.map(l => l.googleLocationId))
+  const unapproved = selectedGoogleLocationIds.filter(id => !discoveredIds.has(id))
+  if (unapproved.length > 0) {
+    return res.status(400).json({
+      error:   'location_not_discovered',
+      message: 'One or more selected locations were not part of this tenant\'s own discovery result.',
+    })
+  }
+
+  // Numeric locationId assignment is NOT done here -- tenantConfigStore.js's
+  // recordLocationApproval() reconciles against this tenant's own
+  // persistent googleLocationId -> localLocationId map (locationIdMap) and
+  // monotonic nextLocationId counter, so a location keeps the same stable
+  // id across re-approvals regardless of array order or which other
+  // locations are selected alongside it in this call. This endpoint only
+  // ever passes the CURRENT selection's raw Google fields.
+  const selectedLocations = session.discoveredLocations
+    .filter(l => selectedGoogleLocationIds.includes(l.googleLocationId))
+    .map(l => ({ googleLocationId: l.googleLocationId, title: l.title, address: l.address }))
+
+  let config
+  try {
+    config = await recordLocationApproval(tenantId, selectedLocations)
+  } catch (err) {
+    if (err instanceof LocationApprovalNotEligibleError) {
+      // Multi-Tenant Phase 4I.1: this tenant already has a committed
+      // entitlement (provisioning has started or completed) -- self-service
+      // re-approval is refused, fail closed, rather than silently replacing
+      // the tenant's approved/licensed location set. Logged as a denied
+      // privileged operation, same audit trail as a successful approval,
+      // so an unexpected wave of these is visible to whoever reviews
+      // tenant_audit_log -- never a token, credential, or raw Google
+      // response body, only the status/tenantId/actor already safe to log.
+      await appendAuditEntry(tenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'tenant_location_catalog', entityId: tenantId, action: 'location_catalog.approval_denied_not_eligible', changes: null, result: 'denied',
+        message: `Self-service location re-approval was denied: tenant status is ${JSON.stringify(err.currentStatus)}.`,
+      })
+      return res.status(409).json({
+        error: 'not_eligible',
+        message: 'This tenant\'s location catalog is already committed and can no longer be changed from Settings. Contact support to change approved locations.',
+      })
+    }
+    return res.status(503).json({ error: 'service_unavailable', message: 'Could not activate the location catalog. Please try again shortly.' })
+  }
+
+  await appendAuditEntry(tenantId, {
+    actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+    entity: 'tenant_location_catalog', entityId: tenantId, action: 'location_catalog.activated', changes: null, result: 'success',
+    message: `Activated the location catalog with ${config.approvedLocations.length} approved location(s).`,
+  })
+
+  // Multi-Tenant Phase 4O: automatically claims the provisioning dispatch
+  // and triggers it server-side -- see triggerAutomaticProvisioning()'s own
+  // header for the full CAS/classification model. Awaited so a definite
+  // rejection is reflected in THIS response's `status` immediately, but
+  // never throws and never changes this endpoint's response SHAPE --
+  // approving locations itself already succeeded regardless of what
+  // happens next.
+  let responseStatus = config.status
+  try {
+    await triggerAutomaticProvisioning(tenantId, config)
+    const fresh = await getTenantConfig(tenantId)
+    if (fresh) responseStatus = fresh.status
+  } catch (err) {
+    console.error(`[approveLocations] automatic provisioning trigger failed unexpectedly for ${tenantId}: ${err.message}`)
+  }
+
+  return res.status(200).json({ success: true, tenantId, activatedLocationCount: config.approvedLocations.length, status: responseStatus })
+}
+
+// ---------------------------------------------------------------------------
 
 export default async function handler(req, res) {
   switch (req.query?.action) {
-    case 'auth':             return auth(req, res)
-    case 'callback':         return callback(req, res)
-    case 'status':           return status(req, res)
-    case 'test-connection':  return testConnection(req, res)
-    case 'trigger-sync':     return triggerSync(req, res)
-    case 'trigger-import':   return triggerImport(req, res)
-    case 'publish':          return publish(req, res)
-    case 'publish-bridge':   return publishBridge(req, res)
-    case 'disconnect':       return disconnect(req, res)
-    default:                 return res.status(404).json({ error: 'not_found' })
+    case 'auth':               return auth(req, res)
+    case 'callback':           return callback(req, res)
+    case 'status':             return status(req, res)
+    case 'test-connection':    return testConnection(req, res)
+    case 'trigger-sync':       return triggerSync(req, res)
+    case 'trigger-import':     return triggerImport(req, res)
+    case 'publish':            return publish(req, res)
+    case 'publish-bridge':     return publishBridge(req, res)
+    case 'disconnect':         return disconnect(req, res)
+    case 'discover-locations': return discoverLocations(req, res)
+    case 'approve-locations':  return approveLocations(req, res)
+    default:                   return res.status(404).json({ error: 'not_found' })
   }
 }

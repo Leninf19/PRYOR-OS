@@ -48,6 +48,10 @@ import settingsHandler from '../dashboard/api/settings/[action].js'
 import notificationsHandler from '../dashboard/api/notifications/[action].js'
 import tasksHandler from '../dashboard/api/tasks/[action].js'
 import contentHandler from '../dashboard/api/content/[action].js'
+import tenantOpsHandler from '../dashboard/api/tenant-ops/[action].js'
+import tenantEntitlementsHandler from '../dashboard/api/tenant-entitlements/[action].js'
+import adminHandler from '../dashboard/api/admin/[action].js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -108,7 +112,7 @@ async function setDirectory(overrides = {}) {
 async function tokenFor(account, overrides = {}) {
   return signSession({
     userId: account.userId, email: account.email, role: account.role,
-    locationIds: account.locationIds, sessionVersion: account.sessionVersion,
+    locationIds: account.locationIds, tenantId: DEFAULT_TENANT_ID, sessionVersion: account.sessionVersion,
     ...overrides,
   })
 }
@@ -251,20 +255,43 @@ const ENDPOINT_REGISTRY = [
     notes: 'Per the strict location-scoping rule, a company-wide brief can never be handed to a location-scoped role -- Owner/Marketing-only is a PERMANENT design decision, not a pending gap.',
   },
   {
+    // Multi-Tenant Google Integration Architecture Fix: previously flat
+    // Owner-only (currentAllowedRoles: ['owner']) -- a real, non-Owner
+    // tenant member (Admin, Marketing, a location_manager, Read Only) got a
+    // flat 403 merely for asking "is Google connected," even though the
+    // connection itself is a tenant-wide resource none of them can mutate.
+    // Now gated by Permission.INTEGRATIONS_VIEW (permissions.js), held by
+    // every real role -- see test_google_integration_architecture.js for the
+    // full "every role gets 200, no secret ever appears in the body,
+    // canManageIntegration is false for everyone but owner" suite. `null`
+    // here (no flat role gate) matches this registry's own convention for
+    // a permission-gated, non-role-array endpoint (e.g. content/download
+    // above).
     route: 'GET /api/google/status', file: 'api/google/[action].js', method: 'GET', action: 'status',
-    authRequired: true, currentAllowedRoles: ['owner'],
-    scope: 'account-wide administrative (Google connection status)',
-    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'INTEGRATIONS_VIEW (every role) -- read-only tenant connection status, never a secret',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
     locationMilestone: null,
-    notes: 'Owner-only administrative surface; not in scope for any location-aware milestone.',
+    notes: 'See test_google_integration_architecture.js for the full authorization/one-source-of-truth suite.',
   },
   {
+    // Google Integration + Reviews End-to-End Validation, Part A: REVERTED
+    // from the broadened INTEGRATIONS_VIEW gate above -- this is a real,
+    // multi-call diagnostic (token exchange -> accounts.list ->
+    // locations.list -> reviews.list, reading actual review content and
+    // exposing infrastructure-level error text) against the same
+    // rate-limited GBP API surface a real quota incident already hit
+    // (project 786038057684), not a cheap "is Google connected" read. Gated
+    // by Permission.SETTINGS_ADMIN (owner-only today), the SAME permission
+    // that already restricts Connect/Reconnect/Disconnect -- see
+    // test_google_test_connection_permission.js for the dedicated
+    // authorization suite.
     route: 'GET /api/google/test-connection', file: 'api/google/[action].js', method: 'GET', action: 'test-connection',
     authRequired: true, currentAllowedRoles: ['owner'],
-    scope: 'account-wide administrative',
+    scope: 'SETTINGS_ADMIN (owner-only) -- a real multi-call live diagnostic that reads actual review content and infrastructure-level error detail, never a basic status read',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'Owner-only administrative surface.',
+    notes: 'See test_google_test_connection_permission.js.',
   },
   {
     route: 'POST /api/google/trigger-sync', file: 'api/google/[action].js', method: 'POST', action: 'trigger-sync',
@@ -614,6 +641,54 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Campaign CRUD bugfix: cascades to every asset\'s Blob object + metadata and unlinks (never deletes) any Calendar task referencing this campaignId. location_manager/read_only never hold CAMPAIGN_MANAGE via the role table; a direct-id attempt outside the caller\'s location grant returns 404, never 403.',
   },
+  {
+    route: 'GET /api/tenant-ops/list', file: 'api/tenant-ops/[action].js', method: 'GET', action: 'list',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-operator status only (Multi-Tenant Phase 4H.1) -- NOT a per-tenant-owner endpoint like every other entry in this registry. \'owner\' here is necessary but NOT sufficient: isSuperAdmin() (auth.js) additionally requires resolveTenantId(account) === DEFAULT_TENANT_ID, so a real future Tenant B\'s own Owner (role owner, currentAllowedRoles-eligible by role alone) still gets 403. Read-only: never mutates tenant_config, never dispatches provision_tenant.py/initial_sync.py -- see .github/workflows/tenant-lifecycle.yml for the actual (human-operated) mutation path.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Response is an explicit sanitized allowlist per tenant (status/storageMode/approvedLocationCount/provisioning/initialSync/hasGoogleCredential/eligibility) -- never a raw tenant_config spread, never approvedLocations/locationIdMap/reviewDbBlobKey, never a decrypted credential (getStoredCredential()\'s refreshToken is reduced to a boolean before it reaches the response). See test_tenant_ops_endpoint.js for the full authorization/sanitization/eligibility test suite.',
+  },
+  {
+    route: 'GET /api/tenant-entitlements/discover', file: 'api/tenant-entitlements/[action].js', method: 'GET', action: 'discover',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-operator only (Multi-Tenant Phase 4I.3), same isSuperAdmin() narrowing as /api/tenant-ops -- \'owner\' is necessary but not sufficient; a real tenant\'s own Owner still gets 403. Read-only: discovers a TARGET tenant\'s (tenantId query param, admin-selected, validated against a real tenant_config record before use) currently-visible Google locations via that tenant\'s own stored credential, and returns its current approvedLocations with each entry\'s operational flag.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Never returns locationIdMap, a raw tenant_config spread, or any credential material. See test_tenant_entitlement_change.js for the full authorization/reconciliation/concurrency suite.',
+  },
+  {
+    route: 'POST /api/tenant-entitlements/apply', file: 'api/tenant-entitlements/[action].js', method: 'POST', action: 'apply',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-operator only (Multi-Tenant Phase 4I.3), same isSuperAdmin() narrowing as /api/tenant-ops -- the ONLY supported way to change an already-committed tenant\'s approvedLocations. Requires an exact expectedConfigVersion (CAS); re-verifies every requested addition against a FRESH live discovery at mutation time (never trusts a prior GET); never callable by an ordinary tenant Owner regardless of role.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Removal revokes authorization immediately (tenantOwnsLocation() reads approvedLocations live); an added location is stamped operational: false and stays unauthorized until apply_entitlement_change.py\'s data-plane follow-up succeeds. See test_tenant_entitlement_change.js for the full adversarial suite.',
+  },
+  {
+    route: 'GET /api/admin/list-access-codes', file: 'api/admin/[action].js', method: 'GET', action: 'list-access-codes',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as /api/tenant-ops -- \'owner\' here is necessary but NOT sufficient: a real future Tenant B\'s own Owner (role owner, currentAllowedRoles-eligible by role alone) still gets 403. This is a NEW top-level serverless function (the 13th) -- see this file\'s own header comment for the Vercel Hobby-plan/Pro-upgrade pre-push gate this creates.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Never returns the raw access code (it is never persisted -- see accessCodeStore.js). See test_admin_access_codes_endpoint.js for the full authorization/raw-code-exposure/audit-log suite.',
+  },
+  {
+    route: 'POST /api/admin/create-access-code', file: 'api/admin/[action].js', method: 'POST', action: 'create-access-code',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as /api/tenant-ops -- not callable by an ordinary tenant Owner regardless of role.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'The raw code is returned in THIS response exactly once, never logged, never persisted -- see test_admin_access_codes_endpoint.js.',
+  },
+  {
+    route: 'POST /api/admin/revoke-access-code', file: 'api/admin/[action].js', method: 'POST', action: 'revoke-access-code',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as /api/tenant-ops.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'A revoked code fails closed for every subsequent redemption attempt (accessCodeStore.js\'s redeemAccessCode()) -- see test_admin_access_codes_endpoint.js.',
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -827,7 +902,7 @@ async function testExpiredSessionReturns401() {
   // Sign a second, already-expired token rather than waiting -- expiresInSeconds
   // accepts a negative value to simulate a token whose exp already passed.
   const expired = await signSession(
-    { userId: fixtures.owner.userId, email: fixtures.owner.email, role: fixtures.owner.role, locationIds: fixtures.owner.locationIds, sessionVersion: fixtures.owner.sessionVersion },
+    { userId: fixtures.owner.userId, email: fixtures.owner.email, role: fixtures.owner.role, locationIds: fixtures.owner.locationIds, tenantId: DEFAULT_TENANT_ID, sessionVersion: fixtures.owner.sessionVersion },
     { expiresInSeconds: -10 },
   )
   const req = { headers: { cookie: `lta_session=${expired}` } }
@@ -923,6 +998,9 @@ const HANDLERS = {
   'api/notifications/[action].js': notificationsHandler,
   'api/tasks/[action].js': tasksHandler,
   'api/content/[action].js': contentHandler,
+  'api/tenant-ops/[action].js': tenantOpsHandler,
+  'api/tenant-entitlements/[action].js': tenantEntitlementsHandler,
+  'api/admin/[action].js': adminHandler,
 }
 
 function minimalReqFor(entry, token) {
@@ -1157,23 +1235,40 @@ async function testAdminRetainsOperationalCapabilitiesButNotInfrastructureAdmin(
 // ===========================================================================
 // SECTION 4 -- LOCATION-SCOPE INVARIANTS
 // ===========================================================================
+//
+// Multi-Tenant Phase 3 hardening: requireLocationAccess() now requires a
+// resolvable tenant (resolveTenantId(account) -- fail-closed for anything
+// it can't positively resolve, see tenants.js) before ever consulting the
+// location grant itself. Every fixture in this section that is meant to
+// exercise the GRANT logic (not the account-shape/tenant-resolution logic)
+// now needs a valid, resolvable role/userId alongside whatever locationIds
+// shape is actually under test -- a bare `{ locationIds }` object has no
+// role, so it can no longer resolve to any tenant and would (correctly,
+// but for the wrong reason as far as THESE tests are concerned) always
+// return false. The fail-closed behavior for a genuinely malformed
+// account is covered on its own terms further below
+// (testMalformedAccountShapeFailsClosedNotThrows).
+
+function validAccountWith(locationIds) {
+  return { userId: 'usr_fixture', role: 'owner', locationIds }
+}
 
 async function testWildcardGrantsAllValidLocationIds() {
-  const account = { locationIds: '*' }
+  const account = validAccountWith('*')
   for (const id of [1, 3, 7, 12, 9999, 1000000]) {
     assert(requireLocationAccess(account, id) === true, `wildcard must grant location ${id}`)
   }
 }
 
 async function testAssignedNumericIdsAllowed() {
-  const account = { locationIds: [3, 7, 12] }
+  const account = validAccountWith([3, 7, 12])
   for (const id of [3, 7, 12]) {
     assert(requireLocationAccess(account, id) === true, `assigned id ${id} must be allowed`)
   }
 }
 
 async function testUnassignedIdsDenied() {
-  const account = { locationIds: [3, 7, 12] }
+  const account = validAccountWith([3, 7, 12])
   for (const id of [1, 2, 4, 99, 0, -1]) {
     assert(requireLocationAccess(account, id) === false, `unassigned id ${id} must be denied`)
   }
@@ -1185,7 +1280,7 @@ async function testStringNumberMismatchDoesNotAccidentallyPass() {
   // of an assigned id must NOT match. No normalization is designed or
   // implemented; this proves that's still true rather than silently
   // broadening what "matches" means.
-  const account = { locationIds: [7] }
+  const account = validAccountWith([7])
   assert(requireLocationAccess(account, '7') === false, 'string "7" must not match numeric 7 -- no implicit normalization exists')
   assert(requireLocationAccess(account, 7) === true, 'sanity: numeric 7 does match')
 }
@@ -1194,7 +1289,7 @@ async function testMalformedLocationIdRequestedFailsClosed() {
   // The REQUESTED locationId being malformed (as opposed to the account
   // shape) safely returns false in every case -- Array.includes never
   // throws for these inputs, it simply never matches.
-  const account = { locationIds: [3, 7, 12] }
+  const account = validAccountWith([3, 7, 12])
   for (const badId of [null, undefined, NaN, 0, -1, {}, []]) {
     assert(requireLocationAccess(account, badId) === false, `requested locationId ${JSON.stringify(badId)} must fail closed (false), not match`)
   }
@@ -1234,11 +1329,12 @@ async function testMalformedAccountShapeFailsClosedNotThrows() {
   }
 
   // The two cases that must still WORK, unchanged, alongside the new
-  // defensive checks: '*' remains unrestricted, and a valid array of
+  // defensive checks: '*' remains unrestricted (for a resolvable account --
+  // see validAccountWith()'s header comment above), and a valid array of
   // positive numeric ids continues to grant access to a matching id.
-  assert(requireLocationAccess({ locationIds: '*' }, 7) === true, 'wildcard must remain unrestricted')
-  assert(requireLocationAccess({ locationIds: [3, 7, 12] }, 7) === true, 'a valid array must still grant an assigned id')
-  assert(requireLocationAccess({ locationIds: [3, 7, 12] }, 99) === false, 'a valid array must still deny an unassigned id')
+  assert(requireLocationAccess(validAccountWith('*'), 7) === true, 'wildcard must remain unrestricted')
+  assert(requireLocationAccess(validAccountWith([3, 7, 12]), 7) === true, 'a valid array must still grant an assigned id')
+  assert(requireLocationAccess(validAccountWith([3, 7, 12]), 99) === false, 'a valid array must still deny an unassigned id')
 }
 
 // requireOwnership must retain identical fail-closed behavior purely
@@ -1256,15 +1352,15 @@ async function testRequireOwnershipFailsClosedThroughDelegation() {
     assert(!threw, `requireOwnership must never throw for malformed account ${JSON.stringify(account)}`)
     assert(result === false, `requireOwnership must fail closed (false) for malformed account ${JSON.stringify(account)}`)
   }
-  assert(requireOwnership({ locationIds: '*' }, 7) === true, 'requireOwnership wildcard passthrough must still work')
+  assert(requireOwnership(validAccountWith('*'), 7) === true, 'requireOwnership wildcard passthrough must still work')
 }
 
 async function testRequireOwnershipEquivalentToRequireLocationAccess() {
   const cases = [
-    [{ locationIds: '*' }, 42, true],
-    [{ locationIds: [7] }, 7, true],
-    [{ locationIds: [7] }, 8, false],
-    [{ locationIds: [3, 7, 12] }, 12, true],
+    [validAccountWith('*'), 42, true],
+    [validAccountWith([7]), 7, true],
+    [validAccountWith([7]), 8, false],
+    [validAccountWith([3, 7, 12]), 12, true],
   ]
   for (const [account, locationId, expected] of cases) {
     assert(requireOwnership(account, locationId) === requireLocationAccess(account, locationId), 'requireOwnership must always agree with requireLocationAccess')

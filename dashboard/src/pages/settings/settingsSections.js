@@ -86,4 +86,19 @@ export const settingsSections = [
     // backend gate every action in this section enforces.
     requiredRoles: ['owner', 'admin'],
   },
+  {
+    id: 'tenant-ops',
+    path: 'tenant-ops',
+    label: 'Tenant Operations',
+    icon: '🏢',
+    component: lazy(() => import('./TenantOperations.jsx')),
+    // Multi-Tenant Phase 4H.1 -- this is a NAV-VISIBILITY filter only, and
+    // even that is intentionally broader than the real boundary: the real
+    // gate is isSuperAdmin() (dashboard/api/_lib/auth.js), which requires
+    // 'owner' AND tenantId === Los Tres Amigos specifically, not just any
+    // tenant's Owner. TenantOperations.jsx's own component re-checks this
+    // narrower condition client-side (a presentation nicety only) and the
+    // API route enforces it server-side regardless of what this list says.
+    requiredRoles: ['owner'],
+  },
 ]

@@ -27,8 +27,17 @@
 
 import { Redis } from '@upstash/redis'
 import { randomUUID } from 'crypto'
+import { tasksKeyV3 } from './tenantKeys.js'
+import { resolveHashReadKey, resolveHashWriteKey } from './tenantDualRead.js'
 
 const TASK_KEY = 'tasks:v2'
+
+// Multi-Tenant Phase 2: every exported function below (except
+// generateTaskId, which touches no store) now takes `tenantId` as its
+// first argument -- see tenantDualRead.js's header for the full read/write
+// rule. For DEFAULT_TENANT_ID, this resolves to exactly TASK_KEY,
+// unchanged. (The tenant-scoped successor is tasks:v3, not tasks:v2 --
+// see tenantKeys.js's own comment on tasksKeyV3.)
 
 let redisClient = null
 let testClientFactory = null
@@ -71,13 +80,14 @@ export function generateTaskId() {
 // Returns { [id]: record } -- never {} for a genuinely broken store; see
 // actionStore.js's identical reasoning for why a read failure throws
 // instead of degrading to "no tasks".
-export async function getAllTasks() {
+export async function getAllTasks(tenantId) {
   const client = getClient()
   if (!client) throw new TaskStoreUnavailableError('task store is not configured')
 
   let raw
   try {
-    raw = await client.hgetall(TASK_KEY)
+    const key = await resolveHashReadKey(client, { v1Key: TASK_KEY, v2Key: tasksKeyV3(tenantId), tenantId })
+    raw = key ? await client.hgetall(key) : {}
   } catch (err) {
     throw new TaskStoreUnavailableError(`task store unreachable: ${err.message}`)
   }
@@ -90,12 +100,13 @@ export async function getAllTasks() {
   return out
 }
 
-export async function getTask(id) {
+export async function getTask(tenantId, id) {
   const client = getClient()
   if (!client) throw new TaskStoreUnavailableError('task store is not configured')
   let raw
   try {
-    raw = await client.hget(TASK_KEY, id)
+    const key = await resolveHashReadKey(client, { v1Key: TASK_KEY, v2Key: tasksKeyV3(tenantId), tenantId })
+    raw = key ? await client.hget(key, id) : null
   } catch (err) {
     throw new TaskStoreUnavailableError(`task store unreachable: ${err.message}`)
   }
@@ -106,7 +117,7 @@ export async function getTask(id) {
 // (generateTaskId()). `fields` is the already-validated request body (the
 // API layer is responsible for validating shape/enums before calling this,
 // same division of labor actionStore.js's caller has for validatePatch()).
-export async function createTask(fields, account) {
+export async function createTask(tenantId, fields, account) {
   const client = getClient()
   if (!client) throw new TaskStoreUnavailableError('task store is not configured')
 
@@ -136,8 +147,9 @@ export async function createTask(fields, account) {
     history: [{ at: now, by: account.displayName ?? account.email, action: 'Task created' }],
   }
 
+  const writeKey = resolveHashWriteKey({ v1Key: TASK_KEY, v2Key: tasksKeyV3(tenantId), tenantId })
   try {
-    await client.hset(TASK_KEY, { [id]: JSON.stringify(record) })
+    await client.hset(writeKey, { [id]: JSON.stringify(record) })
   } catch (err) {
     throw new TaskStoreUnavailableError(`task store unreachable: ${err.message}`)
   }
@@ -148,11 +160,11 @@ export async function createTask(fields, account) {
 // actionStore.js's upsertAction() exactly. `patch` must already be
 // validated/whitelisted by the caller. Returns null if `id` doesn't exist
 // (an update must never silently create a task the caller didn't ask for).
-export async function updateTask(id, patch, account, logAction) {
+export async function updateTask(tenantId, id, patch, account, logAction) {
   const client = getClient()
   if (!client) throw new TaskStoreUnavailableError('task store is not configured')
 
-  const existing = await getTask(id)
+  const existing = await getTask(tenantId, id)
   if (!existing) return null
 
   const now = new Date().toISOString()
@@ -171,17 +183,19 @@ export async function updateTask(id, patch, account, logAction) {
       : history,
   }
 
+  const writeKey = resolveHashWriteKey({ v1Key: TASK_KEY, v2Key: tasksKeyV3(tenantId), tenantId })
   try {
-    await client.hset(TASK_KEY, { [id]: JSON.stringify(next) })
+    await client.hset(writeKey, { [id]: JSON.stringify(next) })
   } catch (err) {
     throw new TaskStoreUnavailableError(`task store unreachable: ${err.message}`)
   }
   return next
 }
 
-export async function deleteTask(id) {
+export async function deleteTask(tenantId, id) {
   const client = getClient()
   if (!client) throw new TaskStoreUnavailableError('task store is not configured')
+  const writeKey = resolveHashWriteKey({ v1Key: TASK_KEY, v2Key: tasksKeyV3(tenantId), tenantId })
   try {
     const removed = await client.hdel(TASK_KEY, id)
     return removed > 0

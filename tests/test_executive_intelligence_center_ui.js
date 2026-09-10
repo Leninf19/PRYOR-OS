@@ -32,26 +32,58 @@ function read(relPath) {
   return readFileSync(path.join(SRC_DIR, relPath), 'utf-8')
 }
 
-function testAppRegistersTheNewRouteAdditively() {
+// Baseline stabilization pass update: the tests in this section originally
+// captured Milestone 6's snapshot, when ExecutiveIntelligenceCenter.jsx was
+// directly routed at /executive-intelligence and Layout.jsx carried a
+// dedicated nav entry for it. Two LATER, deliberate, documented milestones
+// have since superseded that snapshot:
+//   - "M3" (Navigation Specification v1.0): collapsed the nav down to a
+//     flat, final 8-item structure (Layout.jsx's own header comment) --
+//     Operations Impact/What Changed/Action Center lost their dedicated
+//     nav entries (their pages/routes are untouched and still reachable,
+//     just no longer surfaced as top-level nav items).
+//   - "M4" (Today UX Simplification / Execution Master Plan v1.0): Today
+//     merges Overview/Executive Dashboard/Executive Intelligence Center
+//     content behind one /today route. ExecutiveIntelligenceCenter.jsx,
+//     Overview.jsx, and usePriorityDigest.js all deliberately STAY ON DISK,
+//     unmodified, as App.jsx's own comment states, "for the rollback path
+//     the Execution Master Plan v1.0 describes" -- they are simply no
+//     longer imported/routed. /overview, /executive-intelligence, and
+//     /executive-dashboard are now redirects to /today.
+// None of this is a regression -- it is two real, comment-documented
+// architecture migrations this test file never tracked. The tests below
+// are updated to check current, correct routing/nav wiring; the OTHER
+// tests in this file (which verify the orphaned-but-preserved files'
+// internal content/composition are still intact) are deliberately left
+// unchanged, since that is still an accurate and useful rollback guarantee.
+
+function testAppRegistersTheRetiredRouteAsARedirectForRollback() {
   const content = read('App.jsx')
-  assert(/const ExecutiveIntelligenceCenter = lazy\(\(\) => import\(['"]\.\/pages\/ExecutiveIntelligenceCenter\.jsx['"]\)\)/.test(content),
-    'App.jsx must lazily import ExecutiveIntelligenceCenter.jsx like every other page')
-  assert(/<Route path="executive-intelligence" element={<ExecutiveIntelligenceCenter \/>} \/>/.test(content),
-    'App.jsx must register the new /executive-intelligence route')
-  // Must not be added to NO_FILTER_PATHS -- the page needs filtered/
-  // prevFiltered from the global filter bar, exactly like What Changed.
-  const noFilterBlock = content.match(/const NO_FILTER_PATHS = \[([\s\S]*?)\]/)
-  assert(noFilterBlock, 'could not find NO_FILTER_PATHS in App.jsx -- has its shape changed?')
-  assert(!noFilterBlock[1].includes('executive-intelligence'),
-    'the Executive Intelligence Center must use the global filter bar, so it must not be in NO_FILTER_PATHS')
+  // The page file itself is still lazily reachable in principle (import
+  // path exists in comments/rollback docs), but M4 explicitly stopped
+  // importing it in App.jsx -- confirming that is the point of this test
+  // now, not that it's still directly routed.
+  assert(!/const ExecutiveIntelligenceCenter = lazy\(/.test(content),
+    'ExecutiveIntelligenceCenter.jsx must no longer be lazy-imported by App.jsx (M4: Today supersedes it, kept on disk only for rollback)')
+  assert(/<Route path="executive-intelligence" element={<Navigate to="\/today"\s+replace \/>} \/>/.test(content),
+    'App.jsx must redirect the retired /executive-intelligence route to /today')
+  assert(/const Today\s+= lazy\(\(\) => import\(['"]\.\/pages\/Today\.jsx['"]\)\)/.test(content),
+    'App.jsx must lazily import the current Today.jsx page')
+  assert(/<Route path="today"\s+element={<Today \/>} \/>/.test(content),
+    'App.jsx must register /today as the live route')
 }
 
 function testAppStillRegistersEveryPreviouslyExistingRoute() {
   const content = read('App.jsx')
   const mustStillExist = [
     '<Route index                    element={<Navigate to="/overview" replace />} />',
-    '<Route path="overview"          element={<ROverview />} />',
-    '<Route path="action-center"     element={<ActionCenter />} />',
+    // M4: /overview now redirects to /today (Today.jsx merges its content)
+    // rather than rendering the old ROverview component directly.
+    '<Route path="overview"            element={<Navigate to="/today" replace />} />',
+    // Operations Calendar + Content Library milestone: /action-center now
+    // redirects to /calendar (Calendar.jsx's AI Suggestions section) rather
+    // than rendering the old ActionCenter component directly.
+    '<Route path="action-center"          element={<Navigate to="/calendar" replace />} />',
     '<Route path="operations-impact" element={<OperationsImpact />} />',
     '<Route path="what-changed"      element={<WhatChanged />} />',
     '<Route path="scraper-status"    element={<RScraper />} />',
@@ -61,24 +93,45 @@ function testAppStillRegistersEveryPreviouslyExistingRoute() {
   })
 }
 
-function testLayoutAddsNavEntryAdditively() {
+function testLayoutCarriesTheExecIntelIconForwardOntoToday() {
   const content = read('components/Layout.jsx')
-  assert(/execintel:\s*<svg/.test(content), 'Layout.jsx must define a new execintel icon')
-  assert(/id: 'executive-intelligence', path: '\/executive-intelligence', label: 'Executive Intelligence'/.test(content),
-    'Layout.jsx must add the Executive Intelligence nav entry')
+  // The icon originally added for the Executive Intelligence nav entry
+  // (execintel) is still defined and still in active use -- M4 repointed
+  // it to the 'today' nav entry (Today.jsx effectively succeeds
+  // ExecutiveIntelligenceCenter.jsx as the primary command-center view),
+  // rather than retiring the icon along with the standalone nav entry.
+  assert(/execintel:\s*<svg/.test(content), 'Layout.jsx must still define the execintel icon')
+  assert(/id: 'today',\s+path: '\/today',\s+label: 'Today',\s+icon: I\.execintel/.test(content),
+    "Layout.jsx's 'today' nav entry must use the execintel icon, carried forward from the retired Executive Intelligence nav entry")
 }
 
-function testLayoutStillHasEveryPreviouslyExistingNavEntry() {
+function testLayoutNavReflectsTheFinalEightItemStructure() {
   const content = read('components/Layout.jsx')
+  // Navigation Specification v1.0 ("M3") deliberately collapsed the nav to
+  // a flat, final 8-item structure -- Operations Impact/What Changed/
+  // Action Center no longer have their OWN dedicated top-level nav entry
+  // (their pages/routes are untouched -- see testAppStillRegistersEvery
+  // PreviouslyExistingRoute above -- they're just reached other ways now,
+  // e.g. linked out from Today.jsx). This is a deliberate design decision,
+  // documented in Layout.jsx's own header comment, not an omission.
   const mustStillExist = [
-    "{ id: 'overview',   path: '/overview',   label: 'Command Center', icon: I.overview   }",
-    "{ id: 'action-center', path: '/action-center', label: 'Action Center', icon: I.actioncenter }",
-    "{ id: 'operations-impact', path: '/operations-impact', label: 'Operations Impact', icon: I.opsimpact }",
-    "{ id: 'what-changed', path: '/what-changed', label: 'What Changed?', icon: I.whatchanged }",
+    "{ id: 'today',     path: '/today',     label: 'Today',     icon: I.execintel }",
+    "{ id: 'reviews',   path: '/reviews',   label: 'Reviews',   icon: I.response, badge: 'unanswered' }",
+    "{ id: 'calendar',  path: '/calendar',  label: 'Calendar',  icon: I.calendar }",
+    "{ id: 'locations', path: '/locations', label: 'Locations', icon: I.locations }",
+    "{ id: 'insights',  path: '/insights',  label: 'Insights',  icon: I.trends }",
+    "{ id: 'studio',    path: '/studio',    label: 'Studio',    icon: I.marketing }",
+    "{ id: 'content',   path: '/content',   label: 'Content',   icon: I.content }",
+    "{ id: 'reports',   path: '/reports',   label: 'Reports',   icon: I.reports }",
+    "{ id: 'settings',  path: '/settings',  label: 'Settings',  icon: I.settings }",
   ]
   mustStillExist.forEach(line => {
-    assert(content.includes(line), `existing nav entry must be unchanged: ${line}`)
+    assert(content.includes(line), `expected final-structure nav entry missing/changed: ${line}`)
   })
+  for (const retiredId of ['overview', 'action-center', 'operations-impact', 'what-changed']) {
+    assert(!new RegExp(`id: '${retiredId}'`).test(content),
+      `'${retiredId}' must not reappear as its own top-level nav entry -- it was deliberately folded into the flat 8-item nav`)
+  }
 }
 
 function testHookExistsAndOnlyComposesExistingHooksAndUtils() {
@@ -153,10 +206,10 @@ function testPagePassesAllReviewsToPriorityDigest() {
 }
 
 const tests = [
-  ['App.jsx registers the new route additively', testAppRegistersTheNewRouteAdditively],
+  ['App.jsx redirects the retired /executive-intelligence route to /today for rollback', testAppRegistersTheRetiredRouteAsARedirectForRollback],
   ['App.jsx still registers every previously-existing route', testAppStillRegistersEveryPreviouslyExistingRoute],
-  ['Layout.jsx adds the new nav entry additively', testLayoutAddsNavEntryAdditively],
-  ['Layout.jsx still has every previously-existing nav entry', testLayoutStillHasEveryPreviouslyExistingNavEntry],
+  ["Layout.jsx carries the execintel icon forward onto Today's nav entry", testLayoutCarriesTheExecIntelIconForwardOntoToday],
+  ['Layout.jsx nav reflects the final flat 8-item structure', testLayoutNavReflectsTheFinalEightItemStructure],
   ['usePriorityDigest.js only composes existing hooks/utils', testHookExistsAndOnlyComposesExistingHooksAndUtils],
   ['the page renders all five sections in Problems->Wins->Changes->Narrative order', testPageRendersAllFiveSectionsAndLinksOutward],
   ['the page uses the pure digest hook and makes no new backend call', testPageUsesThePureDigestHookAndNoNewBackendCall],

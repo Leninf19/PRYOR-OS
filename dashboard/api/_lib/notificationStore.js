@@ -21,10 +21,23 @@
 // _setRedisClientForTests.
 
 import { Redis } from '@upstash/redis'
+import { notifReplyFailureKeyV2, notifReadStateKeyV2, notifSeededKeyV2 } from './tenantKeys.js'
+import {
+  resolveIndividualStringReadKey, resolveIndividualHashReadKey, resolveIndividualWriteKey,
+  isLegacyAuthoritative, assertKnownTenantId,
+} from './tenantDualRead.js'
 
 const REPLY_FAILURE_PREFIX = 'notif_reply_failed:v1:'
 const READ_STATE_PREFIX = 'notif_read:v1:'
 const SEEDED_PREFIX = 'notif_seeded:v1:'
+
+// Multi-Tenant Phase 2: every exported function below now takes `tenantId`
+// as its first argument. Unlike the hash-shaped stores, each record here
+// is its OWN individually-keyed Redis key (a string or a per-user hash),
+// not one shared hash for the whole store -- so dual-read/write resolution
+// happens per call, via resolveIndividualStringReadKey/
+// resolveIndividualHashReadKey/resolveIndividualWriteKey, using the v1
+// prefix + userId/reviewId exactly as today for DEFAULT_TENANT_ID.
 
 // Retention (see the milestone report for the full reasoning): 30 days.
 // Review-based notifications (critical/low-star) are bounded by a date
@@ -81,12 +94,16 @@ function parseRecord(value) {
 // the caller. Every function here returns a boolean success flag rather
 // than throwing, so the endpoint's caller can log-and-continue.
 
-export async function recordReplyFailure(reviewId, data) {
+export async function recordReplyFailure(tenantId, reviewId, data) {
+  assertKnownTenantId(tenantId, 'recordReplyFailure')
   const client = getClient()
   if (!client) return false
+  const writeKey = resolveIndividualWriteKey({
+    v1Key: `${REPLY_FAILURE_PREFIX}${reviewId}`, v2Key: notifReplyFailureKeyV2(tenantId, reviewId), tenantId,
+  })
   try {
     await client.set(
-      `${REPLY_FAILURE_PREFIX}${reviewId}`,
+      writeKey,
       JSON.stringify({ reviewId, ...data, failedAt: new Date().toISOString() }),
       { ex: REPLY_FAILURE_TTL_SECONDS }
     )
@@ -99,11 +116,15 @@ export async function recordReplyFailure(reviewId, data) {
 
 // Called on a SUBSEQUENT successful publish for the same review -- clears
 // the failure notification so a resolved issue doesn't keep nagging.
-export async function clearReplyFailure(reviewId) {
+export async function clearReplyFailure(tenantId, reviewId) {
+  assertKnownTenantId(tenantId, 'clearReplyFailure')
   const client = getClient()
   if (!client) return false
+  const writeKey = resolveIndividualWriteKey({
+    v1Key: `${REPLY_FAILURE_PREFIX}${reviewId}`, v2Key: notifReplyFailureKeyV2(tenantId, reviewId), tenantId,
+  })
   try {
-    await client.del(`${REPLY_FAILURE_PREFIX}${reviewId}`)
+    await client.del(writeKey)
     return true
   } catch (err) {
     console.error(`[notificationStore] clearReplyFailure failed for ${reviewId}: ${err.message}`)
@@ -120,12 +141,26 @@ export async function clearReplyFailure(reviewId) {
 // anti-pattern it usually is. Returns [] (never throws) when the store is
 // unavailable -- a degraded notification feed is acceptable; a broken page
 // is not.
-export async function listReplyFailures() {
+// Note: unlike every other function in this file, this one scans an
+// entire prefix rather than resolving one specific key, so the generic
+// per-key resolver functions don't apply cleanly here. It uses
+// isLegacyAuthoritative() -- the SAME migration-mode source of truth every
+// other resolver in this file delegates to -- to pick the prefix, so this
+// scan can never disagree with where recordReplyFailure()/clearReplyFailure()
+// actually wrote: exactly today's v1 prefix for DEFAULT_TENANT_ID (its
+// LEGACY mode, unchanged behavior), or this tenant's own v2 prefix
+// otherwise (CUTOVER mode). A tenant can still never see another tenant's
+// keys, which is the isolation guarantee that actually matters here.
+export async function listReplyFailures(tenantId) {
+  assertKnownTenantId(tenantId, 'listReplyFailures')
   const client = getClient()
   if (!client) return []
+  const prefix = isLegacyAuthoritative(tenantId)
+    ? REPLY_FAILURE_PREFIX
+    : `notif_reply_failed:v2:${tenantId}:` // matches notifReplyFailureKeyV2's own format, minus the reviewId segment
   let keys
   try {
-    keys = await client.keys(`${REPLY_FAILURE_PREFIX}*`)
+    keys = await client.keys(`${prefix}*`)
   } catch (err) {
     console.error(`[notificationStore] listReplyFailures keys() failed: ${err.message}`)
     return []
@@ -143,11 +178,16 @@ export async function listReplyFailures() {
 
 // --- Per-user read state -----------------------------------------------------
 
-export async function getReadState(userId) {
+export async function getReadState(tenantId, userId) {
+  assertKnownTenantId(tenantId, 'getReadState')
   const client = getClient()
   if (!client) return {}
   try {
-    return (await client.hgetall(`${READ_STATE_PREFIX}${userId}`)) ?? {}
+    const key = await resolveIndividualHashReadKey(client, {
+      v1Key: `${READ_STATE_PREFIX}${userId}`, v2Key: notifReadStateKeyV2(tenantId, userId), tenantId,
+    })
+    if (!key) return {}
+    return (await client.hgetall(key)) ?? {}
   } catch (err) {
     console.error(`[notificationStore] getReadState failed for ${userId}: ${err.message}`)
     return {}
@@ -158,14 +198,17 @@ export async function getReadState(userId) {
 // Resets the hash's TTL on every write (see READ_STATE_TTL_SECONDS's own
 // comment) rather than setting it once at creation, so an actively-reading
 // user's state never quietly expires mid-use.
-export async function markRead(userId, eventKeys) {
+export async function markRead(tenantId, userId, eventKeys) {
+  assertKnownTenantId(tenantId, 'markRead')
   if (!eventKeys.length) return true
   const client = getClient()
   if (!client) throw new NotificationStoreUnavailableError('notification store is not configured')
   const now = new Date().toISOString()
   const fields = Object.fromEntries(eventKeys.map(k => [k, now]))
+  const key = resolveIndividualWriteKey({
+    v1Key: `${READ_STATE_PREFIX}${userId}`, v2Key: notifReadStateKeyV2(tenantId, userId), tenantId,
+  })
   try {
-    const key = `${READ_STATE_PREFIX}${userId}`
     await client.hset(key, fields)
     await client.expire(key, READ_STATE_TTL_SECONDS)
     return true
@@ -194,7 +237,8 @@ export async function markRead(userId, eventKeys) {
 // expiry would silently reproduce the exact backlog-dump this exists to
 // prevent, so this is deliberately NOT time-bounded the way reply-failure
 // records or read-state hashes are.
-export async function hasBeenSeeded(userId) {
+export async function hasBeenSeeded(tenantId, userId) {
+  assertKnownTenantId(tenantId, 'hasBeenSeeded')
   const client = getClient()
   // Fails toward "already seeded" (skip seeding, fall through to normal
   // unread computation) rather than "not seeded" -- an outage must never
@@ -204,18 +248,26 @@ export async function hasBeenSeeded(userId) {
   // behavior this feature had before this fix, never a new failure mode.
   if (!client) return true
   try {
-    return Boolean(await client.get(`${SEEDED_PREFIX}${userId}`))
+    const key = await resolveIndividualStringReadKey(client, {
+      v1Key: `${SEEDED_PREFIX}${userId}`, v2Key: notifSeededKeyV2(tenantId, userId), tenantId,
+    })
+    if (!key) return false
+    return Boolean(await client.get(key))
   } catch (err) {
     console.error(`[notificationStore] hasBeenSeeded failed for ${userId}: ${err.message}`)
     return true
   }
 }
 
-export async function markSeeded(userId) {
+export async function markSeeded(tenantId, userId) {
+  assertKnownTenantId(tenantId, 'markSeeded')
   const client = getClient()
   if (!client) return false
+  const key = resolveIndividualWriteKey({
+    v1Key: `${SEEDED_PREFIX}${userId}`, v2Key: notifSeededKeyV2(tenantId, userId), tenantId,
+  })
   try {
-    await client.set(`${SEEDED_PREFIX}${userId}`, '1')
+    await client.set(key, '1')
     return true
   } catch (err) {
     console.error(`[notificationStore] markSeeded failed for ${userId}: ${err.message}`)

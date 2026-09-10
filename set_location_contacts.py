@@ -12,14 +12,20 @@ script is retained only as an emergency CLI fallback for if the dashboard
 itself is unreachable, and no longer needs to be run for routine contact
 changes. See README "Restaurant Contacts Store" for the full migration.
 
+Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED. This script reads
+AND writes the real, tenant-owned review database (db.set_location_contact()
+below), so it gets the same fail-closed treatment as every other
+production-capable entrypoint, even though it's an emergency/occasional
+fallback rather than a scheduled pipeline step.
+
 Usage:
-    python set_location_contacts.py --status
+    python set_location_contacts.py --tenant-id t_los-tres-amigos --status
         Lists every location and whether it has a configured, active
         contact -- never prints the actual email addresses to stdout in
         bulk (see NOTE below), just configured/missing/inactive per name.
         Safe to run anytime; makes no changes.
 
-    python set_location_contacts.py --from-csv location_contacts.csv
+    python set_location_contacts.py --tenant-id t_los-tres-amigos --from-csv location_contacts.csv
         Reads a local CSV (NOT committed to git -- see .gitignore) with
         columns: location_name, contact_email, contact_name (optional),
         active (optional, "true"/"false", default true). Matches
@@ -27,7 +33,7 @@ Usage:
         exactly which locations were updated and which known locations are
         still unconfigured afterward.
 
-    python set_location_contacts.py --set "Location Name" contact@example.com [--name "Contact Name"] [--inactive]
+    python set_location_contacts.py --tenant-id t_los-tres-amigos --set "Location Name" contact@example.com [--name "Contact Name"] [--inactive]
         Sets a single location's contact directly from the command line.
 
 This script deliberately contains NO real contact email addresses and
@@ -42,6 +48,8 @@ import sys
 from pathlib import Path
 
 import db
+import tenant_keys
+import tenant_paths
 
 
 def cmd_status(conn):
@@ -122,7 +130,19 @@ def main():
     parser.add_argument("--set", nargs=2, metavar=("LOCATION_NAME", "EMAIL"), help="set one location's contact")
     parser.add_argument("--name", metavar="CONTACT_NAME", help="optional display name, used with --set")
     parser.add_argument("--inactive", action="store_true", help="mark the contact inactive, used with --set")
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to update. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
     args = parser.parse_args()
+
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::set_location_contacts.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        db.DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::set_location_contacts.py: {e}")
+        sys.exit(1)
 
     conn = db.get_connection()
     db.init_schema(conn)

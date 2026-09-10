@@ -21,15 +21,23 @@ Read-only guarantees:
     db.get_or_create_location()). Its matching logic is reimplemented
     here verbatim, read-only, for simulation only.
 
-Usage: py gbp_location_diagnostic.py
+Usage: py gbp_location_diagnostic.py --tenant-id t_los-tres-amigos
 """
+import argparse
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
+import tenant_keys
+import tenant_paths
 from provider_gbp import GBPProvider
 
-DB_PATH = Path(__file__).resolve().parent / "dashboard" / "reviews.db"
+# Multi-Tenant Phase 4D: resolved in main() from --tenant-id via
+# tenant_paths.resolve_review_db_path() -- never a hardcoded default.
+# Module-global (like export_chunks.py's PRIVATE_DATA_DIR) because this is
+# a short-lived, single-tenant-per-invocation script, not a server.
+DB_PATH: Path | None = None
 
 
 # Verbatim copy of provider_sync.py's _norm_name -- must match exactly,
@@ -86,12 +94,27 @@ def format_address(address: dict) -> str:
 
 
 def main():
+    global DB_PATH
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose Google credential to use. REQUIRED -- no default. "
+                              "This script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::gbp_location_diagnostic.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::gbp_location_diagnostic.py: {e}")
+        sys.exit(1)
+
     print("=== gbp_location_diagnostic.py -- READ-ONLY, one-time run ===\n")
 
     our_locations = load_local_locations()
     print(f"Local `locations` table: {len(our_locations)} active rows.\n")
 
-    provider = GBPProvider()
+    provider = GBPProvider(tenant_id=args.tenant_id)
     provider_locations = provider.discover_locations()
     print(f"GBP discover_locations(): {len(provider_locations)} locations discovered.\n")
 

@@ -1,0 +1,68 @@
+{
+  "description": "Multi-Tenant Phase 4F (revised in Phase 4F.1 for Blob-backed storage, extended in Phase 4G for Initial Sync) -- the canonical tenant_config:v1 record shape. Both dashboard/api/_lib/tenantConfigStore.js (Node) and tenant_config_store.py (Python) write and read the literal SAME Upstash Redis hash; this fixture is the shared contract both languages' test suites (tests/test_tenant_config_store.js and tests/test_tenant_config_store.py) validate their own default-producing function against, so the two can never silently drift apart without a test failing on whichever side changed.",
+  "topLevelFields": [
+    "tenantId", "displayName", "status", "locationCatalogEnabled",
+    "approvedLocations", "locationIdMap", "nextLocationId",
+    "brands", "logoUrl", "storageMode", "provisioning", "initialSync", "entitlementChange", "commercial", "configVersion", "createdAt", "updatedAt"
+  ],
+  "provisioningFields": [
+    "status", "reviewDbBlobKey", "privateDataPrefix", "reviewDbEtag", "artifactGeneration",
+    "provisionedLocationIds", "lastAttemptAt", "lastError"
+  ],
+  "initialSyncFields": [
+    "status", "startedAt", "completedAt", "failedAt", "reviewDbEtag", "artifactGeneration",
+    "reviewCount", "locationCount", "lastError"
+  ],
+  "entitlementChangeFields": [
+    "status", "requestedAt", "completedAt", "failedAt", "addedLocationIds", "removedLocationIds", "lastError"
+  ],
+  "validStatuses": [
+    "onboarding", "locations_approved", "provisioning", "provisioned",
+    "initial_sync", "active", "initial_sync_failed", "provisioning_failed", "suspended"
+  ],
+  "validStorageModes": ["LEGACY_REPO", "BLOB"],
+  "validProvisioningStatuses": ["none", "in_progress", "provisioned", "failed"],
+  "validInitialSyncStatuses": ["none", "in_progress", "completed", "failed"],
+  "defaultValues": {
+    "status": "onboarding",
+    "locationCatalogEnabled": false,
+    "approvedLocations": [],
+    "locationIdMap": {},
+    "nextLocationId": 1,
+    "brands": [],
+    "logoUrl": null,
+    "storageMode": "BLOB",
+    "provisioning": {
+      "status": "none",
+      "reviewDbBlobKey": null,
+      "privateDataPrefix": null,
+      "reviewDbEtag": null,
+      "artifactGeneration": null,
+      "provisionedLocationIds": [],
+      "lastAttemptAt": null,
+      "lastError": null
+    },
+    "initialSync": {
+      "status": "none",
+      "startedAt": null,
+      "completedAt": null,
+      "failedAt": null,
+      "reviewDbEtag": null,
+      "artifactGeneration": null,
+      "reviewCount": null,
+      "locationCount": null,
+      "lastError": null
+    },
+    "entitlementChange": {
+      "status": "none",
+      "requestedAt": null,
+      "completedAt": null,
+      "failedAt": null,
+      "addedLocationIds": [],
+      "removedLocationIds": [],
+      "lastError": null
+    },
+    "commercial": null
+  },
+  "notes": "entitlementChange (Multi-Tenant Phase 4I.3) tracks a platform-admin post-onboarding approvedLocations change (Node's tenantConfigStore.js applyEntitlementChange()/markEntitlementChangeCompleted()/markEntitlementChangeFailed() -- Python's apply_entitlement_change.py writes the completion/failure side directly via tenant_config_store.py, mirroring how initial_sync.py already writes initialSync). 'pending' only while at least one newly-added location's approvedLocations entry still has operational: false; a removal-only change is recorded as already-settled (status: 'none') immediately, since authorization is revoked the instant the CAS write commits with no data-plane follow-up required. configVersion starts at 1 after the first write (0 means 'no record exists yet') and is not listed in defaultValues because its value depends on write count, not a fixed default -- see each language's own upsert function. storageMode defaults to 'BLOB' because every tenant getting its FIRST record via either language's upsert function is a new, self-service tenant -- the only architecture new tenants are provisioned under (Phase 4F.1). LEGACY_REPO is reserved for Los Tres Amigos's pre-existing, git-committed/bundled data and is never assigned by either language's default-record logic. 'active' (Phase 4G) is written ONLY by initial_sync.py, after real Google data has been synced, a new reviews.db Blob generation confirmed via a conditional upload, and a complete private-data artifact generation published -- see initial_sync.py's header."
+}

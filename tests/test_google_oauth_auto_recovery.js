@@ -6,6 +6,13 @@
 // token_expired/token_revoked states), never a silent failure that leaves
 // the dashboard showing a stale "Connected".
 //
+// "Last Successful Sync" investigation (Google Integration + Reviews
+// End-to-End Validation) -- these connectivity checks now write via
+// credentialStore.js's recordConnectionCheckOutcome() (lastConnectionCheckAt/
+// Status + health), NOT recordSyncOutcome() (lastSuccessfulSyncAt/
+// lastFailedSyncAt, reserved for an actual data sync) -- this file's own
+// tests below explicitly prove the two never get conflated.
+//
 // Run directly: node tests/test_google_oauth_auto_recovery.js
 
 process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xyz'
@@ -20,6 +27,7 @@ import {
   _setRedisClientForTests, _resetRedisClientForTests, setStoredCredential, getStoredCredential, GoogleHealth,
 } from '../dashboard/api/_lib/credentialStore.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -42,7 +50,29 @@ async function run(name, fn) {
 
 function fakeCredentialRedis(initial = null) {
   let value = initial
-  return { get: async () => value, set: async (_key, v) => { value = v }, del: async () => { value = null } }
+  return {
+    get: async () => value,
+    set: async (_key, v) => { value = v },
+    del: async () => { value = null },
+    // Multi-Tenant Phase 4I.2: recordSyncOutcome()/recordOAuthRefresh() now
+    // write via a CAS EVAL, not a plain set() -- see credentialStore.js's
+    // CREDENTIAL_CAS_SCRIPT. Faithfully emulated here (single-threaded JS,
+    // so trivially atomic) rather than stubbed, so a genuine version
+    // mismatch still behaves correctly if a test ever produces one.
+    eval: async (_script, _keys, args) => {
+      const [expectedVersionStr, nextJson] = args
+      let currentVersion = '0'
+      if (value) {
+        try {
+          const decoded = JSON.parse(value)
+          if (decoded && decoded.credentialVersion !== undefined) currentVersion = String(decoded.credentialVersion)
+        } catch { /* treat as version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return value ?? false
+      value = nextJson
+      return true
+    },
+  }
 }
 
 function fakeRes() {
@@ -59,7 +89,7 @@ async function setDirectory() {
     accounts: [{ userId: 'usr_owner', email: 'owner@example.com', passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false, displayName: 'Owner Person' }],
   })
 }
-const ownerToken = () => signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+const ownerToken = () => signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 
 async function invokeStatus(token) {
   globalThis.fetch = async (url) => {
@@ -78,9 +108,9 @@ async function testStatusFlipsToReconnectRequiredOnInvalidGrant() {
   await setDirectory()
   const client = fakeCredentialRedis()
   _setRedisClientForTests(() => client)
-  await setStoredCredential({ refreshToken: 'now-revoked-token', connectedAccountName: 'Los Tres Amigos' })
+  await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'now-revoked-token', connectedAccountName: 'Los Tres Amigos' })
 
-  const before = await getStoredCredential()
+  const before = await getStoredCredential(DEFAULT_TENANT_ID)
   assert(before.health === GoogleHealth.CONNECTED, 'sanity check: starts connected')
 
   const res = await invokeStatus(await ownerToken())
@@ -91,9 +121,15 @@ async function testStatusFlipsToReconnectRequiredOnInvalidGrant() {
   // The critical assertion: the health flip must already be PERSISTED by
   // the time this response is sent -- the very next independent read must
   // see it too, without needing a second manual check.
-  const after = await getStoredCredential()
+  const after = await getStoredCredential(DEFAULT_TENANT_ID)
   assert(after.health === GoogleHealth.TOKEN_REVOKED, 'the stored health must be updated BEFORE the response is sent, not lazily on a later request')
-  assert(after.lastFailedSyncAt !== null, 'lastFailedSyncAt must be stamped')
+  // "Last Successful Sync" investigation fix: a status() connectivity check
+  // now records via recordConnectionCheckOutcome() -- lastConnectionCheckAt,
+  // never lastFailedSyncAt (reserved for an ACTUAL data-sync outcome, which
+  // nothing in google/[action].js performs -- see credentialStore.js's
+  // recordSyncOutcome() header for the full incident this split fixes).
+  assert(after.lastConnectionCheckAt !== null, 'lastConnectionCheckAt must be stamped')
+  assert(after.lastFailedSyncAt === null, 'a routine connectivity check must NEVER stamp lastFailedSyncAt -- that field is reserved for an actual data-sync failure')
   assert(after.lastFailureReason === 'invalid_grant', 'the failure reason must be recorded')
 }
 
@@ -101,11 +137,11 @@ async function testSubsequentSuccessfulStatusRestoresConnected() {
   await setDirectory()
   const client = fakeCredentialRedis()
   _setRedisClientForTests(() => client)
-  await setStoredCredential({ refreshToken: 'a-token', connectedAccountName: null })
+  await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'a-token', connectedAccountName: null })
 
   // First: simulate the failure.
   await invokeStatus(await ownerToken())
-  assert((await getStoredCredential()).health === GoogleHealth.TOKEN_REVOKED, 'sanity check: failed first')
+  assert((await getStoredCredential(DEFAULT_TENANT_ID)).health === GoogleHealth.TOKEN_REVOKED, 'sanity check: failed first')
 
   // Then: simulate a successful reconnect (as if the Owner reconnected and
   // the token now works) -- fetch is remocked for a passing exchange.
@@ -123,9 +159,16 @@ async function testSubsequentSuccessfulStatusRestoresConnected() {
   await handler(req, res)
 
   assert(res.body.connected === true && res.body.state === GoogleHealth.CONNECTED, 'a subsequent successful check must restore Connected')
-  const after = await getStoredCredential()
+  const after = await getStoredCredential(DEFAULT_TENANT_ID)
   assert(after.health === GoogleHealth.CONNECTED, 'the stored health must also be restored to connected')
   assert(after.lastFailureReason === null, 'the prior failure reason must be cleared on success')
+  // "Last Successful Sync" investigation fix: a mere connectivity check
+  // succeeding -- even one that RESTORES health after a prior failure --
+  // must never be recorded as a real data sync. This is the exact
+  // production bug: the Settings card's "Last Successful Sync" was being
+  // silently overwritten by ordinary status polls.
+  assert(after.lastSuccessfulSyncAt === null, 'a successful status() connectivity check must NEVER stamp lastSuccessfulSyncAt -- that must remain reserved for an actual data-sync completion')
+  assert(after.lastConnectionCheckAt !== null && after.lastConnectionCheckStatus === 'success', 'the connectivity check itself is recorded on the correct, separate field')
 }
 
 async function testNeverConnectedReturnsCorrectState() {
@@ -145,7 +188,7 @@ async function testFailedPublishAlsoTriggersAutomaticRecovery() {
   await setDirectory()
   const client = fakeCredentialRedis()
   _setRedisClientForTests(() => client)
-  await setStoredCredential({ refreshToken: 'now-revoked-token', connectedAccountName: null })
+  await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'now-revoked-token', connectedAccountName: null })
 
   globalThis.fetch = async (url) => {
     if (url.includes('oauth2.googleapis.com/token')) {
@@ -162,7 +205,7 @@ async function testFailedPublishAlsoTriggersAutomaticRecovery() {
   await handler(req, res)
   assert(res.statusCode === 503, `a publish attempt with a revoked token must fail with 503 not_connected, got ${res.statusCode}`)
 
-  const after = await getStoredCredential()
+  const after = await getStoredCredential(DEFAULT_TENANT_ID)
   assert(after.health === GoogleHealth.TOKEN_REVOKED, 'a failed publish must also flip the stored connection health, not just status/test-connection checks')
 }
 

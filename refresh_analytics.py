@@ -6,13 +6,17 @@ categories, employee mentions, sentiment trends, predictions, AI summaries)
 and writes results to analytics_cache so export_chunks.py can ship
 precomputed JSON to the static frontend.
 """
+import argparse
 import json
 import re
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 import db
 import ai_engine
+import tenant_keys
+import tenant_paths
 
 # ---------------------------------------------------------------------------
 # Complaint / praise classification — 15 operational categories each
@@ -1323,10 +1327,6 @@ NAME_DENYLIST = {
 _WORD_RE = re.compile(r"[^a-z0-9\s']")
 
 
-def slugify(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-
-
 def tokenize(text: str) -> list:
     text = _WORD_RE.sub(" ", text.lower())
     return [w for w in text.split() if len(w) > 2 and w not in STOP_WORDS]
@@ -1528,6 +1528,14 @@ def location_stats(all_reviews: list, period_reviews: list, locations: dict) -> 
     for r in period_reviews:
         by_loc_period[r["location_id"]].append(r)
 
+    # Multi-Tenant Phase 4P: locationId/slug added so frontend consumers of
+    # this artifact (e.g. LocationDetail.jsx's LocationPicker,
+    # useIntelligence.js's usePrefetchLocationDetails/useAllLocationDetails)
+    # can identify a location by its stable id and fetch its detail file by
+    # the SAME canonical, collision-safe slug the backend actually wrote it
+    # under -- never by re-deriving a slug from `name` independently.
+    slug_map = db.canonical_location_slugs({loc_id: loc["name"] for loc_id, loc in locations.items()})
+
     out = []
     for loc_id, loc in locations.items():
         all_r    = by_loc_all[loc_id]
@@ -1539,6 +1547,7 @@ def location_stats(all_reviews: list, period_reviews: list, locations: dict) -> 
         health  = compute_health_score(all_r, period_r)
         predict = predict_rating(all_r)
         out.append({
+            "locationId": loc_id, "slug": slug_map[loc_id],
             "name": loc["name"], "city": loc["city"], "brand": loc["brand"],
             "lifetimeRating": lifetime_rating, "lifetimeCount": len(all_r),
             "periodSentiment": sentiment(period_r), "starBreakdown": star_breakdown,
@@ -1703,6 +1712,7 @@ def build_competitive_intelligence(
             "rank":         rank,
             "prevRank":     pr,
             "rankChange":   (pr - rank) if pr else 0,
+            "locationId":   loc.get("locationId"),
             "name":         name,
             "avgRating":    loc["periodSentiment"]["avgRating"],
             "reviewCount":  loc["periodSentiment"]["n"],
@@ -1719,7 +1729,10 @@ def build_competitive_intelligence(
         if abs(delta) >= 0.15:
             direction = "up" if delta > 0 else "down"
             changes.append({
-                "id": f"rating_{slugify(loc['name'])}",
+                # Multi-Tenant Phase 4P: keyed by the stable locationId, not
+                # a re-slugified name -- two same-named locations must never
+                # collide into one alert id.
+                "id": f"rating_{loc['locationId']}",
                 "type": "rating_change", "direction": direction,
                 "title": f"{loc['name']} rating {'improved' if direction == 'up' else 'declined'} {abs(delta):.2f}★",
                 "body": f"Now averaging {loc['avgRating']:.2f}★ ({delta:+.2f} vs prior 30 days).",
@@ -1730,7 +1743,7 @@ def build_competitive_intelligence(
         if abs(rc) >= 2 and loc["prevRank"]:
             direction = "up" if rc > 0 else "down"
             changes.append({
-                "id": f"rank_{slugify(loc['name'])}",
+                "id": f"rank_{loc['locationId']}",
                 "type": "rank_change", "direction": direction,
                 "title": f"{loc['name']} {'climbed' if rc > 0 else 'dropped'} to #{loc['rank']} in performance rankings",
                 "body": f"Moved from #{loc['prevRank']} to #{loc['rank']} ({abs(rc)} position{'s' if abs(rc) > 1 else ''}).",
@@ -1918,6 +1931,23 @@ CLASSIFY_LIMIT_PER_RUN = 300
 
 
 def main():
+    """Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED, no default.
+    Resolved before any DB connection, so a missing/invalid/unregistered
+    tenant fails closed before touching anything."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to analyze. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::refresh_analytics.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        db.DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::refresh_analytics.py: {e}")
+        sys.exit(1)
+
     conn = db.get_connection()
     db.init_schema(conn)
 
@@ -2037,6 +2067,13 @@ def main():
     consistency = []     # accumulated across locations, for the Operations Impact Center
     staff_sentiment_totals = {"positive": 0, "negative": 0, "mixed": 0}  # for the Executive Dashboard's manager-performance proxy
 
+    # Multi-Tenant Phase 4P: one canonical, collision-safe slug per
+    # location, computed once against this full location set -- every
+    # location_detail_{slug} cache key below uses this, never a bare
+    # re-slugify of `name` (two same-named locations must never collide
+    # into one cache entry -- see db.canonical_location_slugs()).
+    slug_map = db.canonical_location_slugs({lid: l["name"] for lid, l in locations.items()})
+
     for loc_id, loc in locations.items():
         all_r    = by_loc_all[loc_id]
         period_r = by_loc_30[loc_id]
@@ -2093,8 +2130,9 @@ def main():
 
         ai_summary = ai_engine.generate_location_summary(loc_summary_data) if ai_engine.is_available() else None
 
-        slug = slugify(loc["name"])
+        slug = slug_map[loc_id]
         set_cache(conn, f"location_detail_{slug}", {
+            "locationId": loc_id,
             "name": loc["name"], "city": loc["city"], "brand": loc["brand"],
             "healthScore": loc_health,
             "avgRating30d": loc_avg_30,

@@ -9,9 +9,14 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import check_db_integrity
+import tenant_keys
+import tenant_paths
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 results = []
 
@@ -160,15 +165,30 @@ def test_check_integrity_still_passes_and_includes_warning_text_in_warn_tier():
 
 
 def test_cli_main_exit_code_matches_check_integrity():
+    # Multi-Tenant Phase 4D: main() now requires --tenant-id and resolves
+    # its db path via tenant_paths.resolve_review_db_path() -- simulated
+    # here via sys.argv + a patched resolver, the same pattern every other
+    # tenant-aware script's CLI tests already use.
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "scratch.db"
         _make_valid_db(path)
-        original = check_db_integrity.DB_PATH
-        check_db_integrity.DB_PATH = path
-        try:
+        with mock.patch.object(sys, "argv", ["check_db_integrity.py", "--tenant-id", TEST_TENANT_ID]), \
+             mock.patch.object(tenant_paths, "resolve_review_db_path", return_value=path):
             assert check_db_integrity.main() == 0
-        finally:
-            check_db_integrity.DB_PATH = original
+
+
+def test_cli_main_requires_tenant_id():
+    with mock.patch.object(sys, "argv", ["check_db_integrity.py"]):
+        try:
+            check_db_integrity.main()
+            raise AssertionError("argparse should have exited on a missing --tenant-id")
+        except SystemExit as e:
+            assert e.code == 2
+
+
+def test_cli_main_fails_closed_for_an_unregistered_tenant():
+    with mock.patch.object(sys, "argv", ["check_db_integrity.py", "--tenant-id", "t_unregistered-tenant"]):
+        assert check_db_integrity.main() == 1
 
 
 def main():
@@ -184,6 +204,8 @@ def main():
     run("check_integrity(): overall fails when the size guard fails", test_check_integrity_fails_overall_when_size_guard_fails)
     run("check_integrity(): still passes but surfaces the warning text in the warn tier", test_check_integrity_still_passes_and_includes_warning_text_in_warn_tier)
     run("main()'s CLI exit code matches check_integrity()'s ok flag", test_cli_main_exit_code_matches_check_integrity)
+    run("main() requires --tenant-id (argparse exits 2 without it)", test_cli_main_requires_tenant_id)
+    run("main() fails closed for an unregistered tenant", test_cli_main_fails_closed_for_an_unregistered_tenant)
 
     print()
     if all(results):

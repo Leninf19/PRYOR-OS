@@ -15,9 +15,12 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import sync_reviews
+import tenant_keys
 from provider_gbp import GBPProvider
 from provider_mock import MockProvider
 from provider_scraper import ScraperProvider
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 results = []
 
@@ -54,17 +57,37 @@ def test_resolve_provider_name_defaults_to_scraper():
 
 
 def test_build_provider_instantiates_the_correct_class():
-    assert isinstance(sync_reviews.build_provider("gbp"), GBPProvider)
-    assert isinstance(sync_reviews.build_provider("scraper"), ScraperProvider)
-    assert isinstance(sync_reviews.build_provider("mock"), MockProvider)
+    assert isinstance(sync_reviews.build_provider("gbp", TEST_TENANT_ID), GBPProvider)
+    assert isinstance(sync_reviews.build_provider("scraper", TEST_TENANT_ID), ScraperProvider)
+    assert isinstance(sync_reviews.build_provider("mock", TEST_TENANT_ID), MockProvider)
 
 
 def test_build_provider_rejects_unknown_name():
     try:
-        sync_reviews.build_provider("not_a_real_provider")
+        sync_reviews.build_provider("not_a_real_provider", TEST_TENANT_ID)
         raise AssertionError("expected ValueError")
     except ValueError as e:
         assert "not_a_real_provider" in str(e)
+
+
+def test_build_provider_requires_tenant_id_positionally():
+    """Multi-Tenant Phase 4C revision: tenant_id has no default anywhere --
+    calling build_provider() without one must fail with a TypeError before
+    any provider is constructed, never silently assume a tenant."""
+    try:
+        sync_reviews.build_provider("mock")
+        raise AssertionError("expected TypeError for a missing tenant_id")
+    except TypeError:
+        pass
+
+
+def test_build_provider_rejects_invalid_tenant_id_before_constructing_anything():
+    for bad in (None, "", "not-a-tenant-id", "T_LOS-TRES-AMIGOS"):
+        try:
+            sync_reviews.build_provider("gbp", bad)
+            raise AssertionError(f"expected InvalidTenantIdError for {bad!r}")
+        except tenant_keys.InvalidTenantIdError:
+            pass
 
 
 # --- main(): CLI argument handling + exit codes -------------------------------
@@ -73,7 +96,7 @@ def test_main_unknown_provider_cli_arg_rejected_by_argparse():
     # argparse's `choices=` rejects an unrecognized --provider value itself,
     # before build_provider() is ever reached -- argparse exits 2 for a
     # usage error.
-    with _argv("--provider", "nonsense"):
+    with _argv("--provider", "nonsense", "--tenant-id", TEST_TENANT_ID):
         try:
             sync_reviews.main()
             raise AssertionError("argparse should have exited on an invalid --provider choice")
@@ -81,15 +104,30 @@ def test_main_unknown_provider_cli_arg_rejected_by_argparse():
             assert e.code == 2
 
 
+def test_main_missing_tenant_id_rejected_by_argparse_before_anything_runs():
+    """Multi-Tenant Phase 4C revision: --tenant-id is REQUIRED. Omitting it
+    must fail via argparse (exit code 2) before build_provider()/
+    provider_sync.sync_all() are ever reached -- proven here by never
+    mocking sync_all at all: if this test's main() call somehow got past
+    argument parsing, it would hit a real, unmocked network call and error
+    differently (or hang), not raise SystemExit(2) immediately."""
+    with _argv("--provider", "mock", "--fast"):
+        try:
+            sync_reviews.main()
+            raise AssertionError("argparse should have exited on a missing --tenant-id")
+        except SystemExit as e:
+            assert e.code == 2
+
+
 def test_main_returns_zero_on_ok_status():
-    with _argv("--provider", "mock", "--fast"), \
+    with _argv("--provider", "mock", "--fast", "--tenant-id", TEST_TENANT_ID), \
          mock.patch("sync_reviews.provider_sync.sync_all", new=mock.AsyncMock(
              return_value={"status": "ok", "locations_succeeded": 1, "locations_failed": 0, "new": 1})):
         assert sync_reviews.main() == 0
 
 
 def test_main_returns_zero_on_skipped_status():
-    with _argv("--provider", "gbp"), \
+    with _argv("--provider", "gbp", "--tenant-id", TEST_TENANT_ID), \
          mock.patch("sync_reviews.provider_sync.sync_all", new=mock.AsyncMock(
              return_value={"status": "skipped", "reason": "not configured"})):
         assert sync_reviews.main() == 0
@@ -107,7 +145,7 @@ def test_main_returns_one_on_failed_status():
     only makes the workflow run's own reported conclusion accurately
     reflect a total failure, without changing whether anything gets
     committed or deployed."""
-    with _argv("--provider", "mock", "--fast"), \
+    with _argv("--provider", "mock", "--fast", "--tenant-id", TEST_TENANT_ID), \
          mock.patch("sync_reviews.provider_sync.sync_all", new=mock.AsyncMock(
              return_value={"status": "failed", "reason": "simulated failure",
                            "locations_succeeded": 0, "locations_failed": 0})):
@@ -121,7 +159,7 @@ def test_main_passes_fast_flag_through_to_sync_all():
         captured["fast"] = fast
         return {"status": "ok", "locations_succeeded": 0, "locations_failed": 0, "new": 0}
 
-    with _argv("--provider", "mock", "--fast"), \
+    with _argv("--provider", "mock", "--fast", "--tenant-id", TEST_TENANT_ID), \
          mock.patch("sync_reviews.provider_sync.sync_all", new=fake_sync_all):
         sync_reviews.main()
     assert captured["fast"] is True
@@ -136,7 +174,7 @@ def test_github_output_format_matches_existing_contract():
             {"location": "Loc A", "reviewer_name": "Alice", "star_rating": 1, "review_text": "Bad"},
             {"location": "Loc A", "reviewer_name": "Bob", "star_rating": 5, "review_text": "Great"},
         ]
-        with _argv("--provider", "mock"), \
+        with _argv("--provider", "mock", "--tenant-id", TEST_TENANT_ID), \
              mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output_path)}), \
              mock.patch("sync_reviews.provider_sync.sync_all", new=mock.AsyncMock(
                  return_value={"status": "ok", "locations_succeeded": 1, "locations_failed": 0,
@@ -156,7 +194,7 @@ def test_no_email_html_output_for_fast_runs():
     never touches the GH Actions output at all."""
     with tempfile.TemporaryDirectory() as tmp:
         output_path = Path(tmp) / "gh_output.txt"
-        with _argv("--provider", "mock", "--fast"), \
+        with _argv("--provider", "mock", "--fast", "--tenant-id", TEST_TENANT_ID), \
              mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output_path)}), \
              mock.patch("sync_reviews.provider_sync.sync_all", new=mock.AsyncMock(
                  return_value={"status": "ok", "locations_succeeded": 1, "locations_failed": 0, "new": 0})):
@@ -171,7 +209,10 @@ def main():
         ("resolve_provider_name(): defaults to 'scraper' with neither set", test_resolve_provider_name_defaults_to_scraper),
         ("build_provider(): instantiates the correct class for gbp/scraper/mock", test_build_provider_instantiates_the_correct_class),
         ("build_provider(): rejects an unrecognized provider name", test_build_provider_rejects_unknown_name),
+        ("build_provider(): requires tenant_id -- fails with TypeError, not a silent default", test_build_provider_requires_tenant_id_positionally),
+        ("build_provider(): rejects an invalid tenant_id before constructing any provider", test_build_provider_rejects_invalid_tenant_id_before_constructing_anything),
         ("main(): argparse itself rejects an unrecognized --provider choice", test_main_unknown_provider_cli_arg_rejected_by_argparse),
+        ("main(): argparse rejects a missing --tenant-id before any provider/sync code runs", test_main_missing_tenant_id_rejected_by_argparse_before_anything_runs),
         ("main(): returns 0 on an 'ok' sync result", test_main_returns_zero_on_ok_status),
         ("main(): returns 0 on a 'skipped' sync result", test_main_returns_zero_on_skipped_status),
         ("main(): returns 1 on a 'failed' sync result", test_main_returns_one_on_failed_status),

@@ -1,3 +1,6 @@
 playwright==1.44.0
 anthropic
 cryptography
+# Test-suite only (tests/test_tenant_lifecycle_workflow.py parses
+# .github/workflows/*.yml) -- not imported by any production pipeline script.
+pyyaml

@@ -27,11 +27,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import gbp_reply_bridge_reconcile as reconcile
+import tenant_keys
+import tenant_paths
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
+SYNTHETIC_TENANT_ID = "t_synthetic-second-tenant"
 
 
 def _fresh_db():
     tmpdir = tempfile.mkdtemp(prefix="test_bridge_reconcile_")
     db.DB_PATH = Path(tmpdir) / "reviews.db"
+    tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, db.DB_PATH)
     conn = db.get_connection()
     db.init_schema(conn)
     return conn
@@ -84,7 +90,7 @@ def test_confirmed_reply_reconciles_db_and_clears_bridge():
         return {"reviewReply": {"comment": "Thank you so much!", "updateTime": "2026-08-22T13:50:00Z"}}
 
     counts = reconcile.run_reconcile(
-        conn, dry_run=False,
+        conn, TEST_TENANT_ID, dry_run=False,
         list_keys=lambda: ["publish_bridge:v1:r1"],
         get_record=lambda k: _bridge_record(),
         fetch_review=fake_fetch,
@@ -104,7 +110,7 @@ def test_still_pending_leaves_row_and_bridge_untouched():
     deleted = []
 
     counts = reconcile.run_reconcile(
-        conn, dry_run=False,
+        conn, TEST_TENANT_ID, dry_run=False,
         list_keys=lambda: ["publish_bridge:v1:r1"],
         get_record=lambda k: _bridge_record(),
         fetch_review=lambda name: {},  # no reviewReply at all
@@ -124,7 +130,7 @@ def test_already_answered_locally_clears_stale_bridge_without_google_call():
     fetch_calls = []
 
     counts = reconcile.run_reconcile(
-        conn, dry_run=False,
+        conn, TEST_TENANT_ID, dry_run=False,
         list_keys=lambda: ["publish_bridge:v1:r1"],
         get_record=lambda k: _bridge_record(),
         fetch_review=lambda name: fetch_calls.append(name) or {},
@@ -145,7 +151,7 @@ def test_fetch_failure_leaves_everything_untouched():
         raise RuntimeError("network error")
 
     counts = reconcile.run_reconcile(
-        conn, dry_run=False,
+        conn, TEST_TENANT_ID, dry_run=False,
         list_keys=lambda: ["publish_bridge:v1:r1"],
         get_record=lambda k: _bridge_record(),
         fetch_review=fake_fetch,
@@ -162,7 +168,7 @@ def test_no_gbp_review_name_is_skipped_not_crashed():
     record = _bridge_record()
     record["gbpReviewName"] = None
     counts = reconcile.run_reconcile(
-        conn, dry_run=False,
+        conn, TEST_TENANT_ID, dry_run=False,
         list_keys=lambda: ["publish_bridge:v1:r1"],
         get_record=lambda k: record,
         fetch_review=lambda name: (_ for _ in ()).throw(AssertionError("must not be called")),
@@ -175,7 +181,7 @@ def test_review_not_found_locally_is_skipped_not_crashed():
     conn = _fresh_db()
     _add_location(conn)  # no matching review row at all
     counts = reconcile.run_reconcile(
-        conn, dry_run=False,
+        conn, TEST_TENANT_ID, dry_run=False,
         list_keys=lambda: ["publish_bridge:v1:r1"],
         get_record=lambda k: _bridge_record(gbp_review_name="accounts/1/locations/2/reviews/does-not-exist"),
         fetch_review=lambda name: (_ for _ in ()).throw(AssertionError("must not be called")),
@@ -191,7 +197,7 @@ def test_dry_run_performs_zero_writes_or_deletes():
     deleted = []
 
     counts = reconcile.run_reconcile(
-        conn, dry_run=True,
+        conn, TEST_TENANT_ID, dry_run=True,
         list_keys=lambda: ["publish_bridge:v1:r1"],
         get_record=lambda k: _bridge_record(),
         fetch_review=lambda name: {"reviewReply": {"comment": "Thank you!", "updateTime": "2026-08-22T13:50:00Z"}},
@@ -210,7 +216,7 @@ def test_only_the_matching_row_is_ever_touched():
     other_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/xyz", reviewer_name="Other Person")
 
     reconcile.run_reconcile(
-        conn, dry_run=False,
+        conn, TEST_TENANT_ID, dry_run=False,
         list_keys=lambda: ["publish_bridge:v1:r1"],
         get_record=lambda k: _bridge_record(gbp_review_name="accounts/1/locations/2/reviews/abc"),
         fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "updateTime": "2026-08-22T13:50:00Z"}},
@@ -359,7 +365,7 @@ def test_delete_bridge_record_deletes_correctly_for_every_special_key():
 
 def test_list_bridge_keys_pattern_is_sent_unencoded():
     def run(fake):
-        reconcile.list_bridge_keys()
+        reconcile.list_bridge_keys(TEST_TENANT_ID)
         sent_path = fake.calls[-1]
         assert sent_path.endswith("/keys/publish_bridge:v1:*"), f"the KEYS glob pattern must be sent with a literal, unencoded '*' and ':' -- got {sent_path!r}"
 
@@ -380,7 +386,7 @@ def test_full_reconcile_round_trip_with_a_space_containing_key_never_crashes():
 
     def run(fake):
         counts = reconcile.run_reconcile(
-            conn, dry_run=False,
+            conn, TEST_TENANT_ID, dry_run=False,
             list_keys=lambda: [key],
             get_record=reconcile.get_bridge_record,  # the REAL function, not a lambda fake
             fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "updateTime": "2026-08-22T13:50:00Z"}},
@@ -393,6 +399,109 @@ def test_full_reconcile_round_trip_with_a_space_containing_key_never_crashes():
         assert len(fake.store) == 0, "no duplicate bridge record must be created under a mangled/different key"
 
     _with_fake_upstash({key: record}, run)
+
+
+# ===========================================================================
+# Multi-Tenant Phase 4C -- adversarial cross-tenant publish-bridge isolation.
+# A worker processing Tenant A must have no way to enumerate, claim,
+# reconcile, mutate, or delete Tenant B's bridge records. Since Los Tres
+# Amigos is explicitly LEGACY-mode (publish_bridge:v1:*) and any other
+# tenant defaults to CUTOVER (publish_bridge:v2:{tenantId}:*), these tests
+# drive the REAL list_bridge_keys()/reconcile_one() default-binding logic
+# (not the lambda-injected fakes above) against a FakeUpstash seeded with
+# BOTH a Los Tres Amigos record and a synthetic Tenant B record, and prove
+# a run for one tenant never sees, reconciles, or deletes the other's.
+# ===========================================================================
+
+def test_tenant_a_scan_never_enumerates_tenant_b_keys():
+    lta_key = "publish_bridge:v1:r1"
+    tenant_b_key = tenant_keys.publish_bridge_key_v2(SYNTHETIC_TENANT_ID, "r2")
+    store = {
+        lta_key: _bridge_record(gbp_review_name="accounts/1/locations/2/reviews/abc"),
+        tenant_b_key: _bridge_record(gbp_review_name="accounts/9/locations/9/reviews/xyz"),
+    }
+
+    def run(fake):
+        keys = reconcile.list_bridge_keys(TEST_TENANT_ID)
+        assert keys == [lta_key], f"Los Tres Amigos's scan must see only its own v1 key, got {keys}"
+
+    _with_fake_upstash(store, run)
+
+
+def test_tenant_b_scan_never_enumerates_los_tres_amigos_keys():
+    lta_key = "publish_bridge:v1:r1"
+    tenant_b_key = tenant_keys.publish_bridge_key_v2(SYNTHETIC_TENANT_ID, "r2")
+    store = {
+        lta_key: _bridge_record(gbp_review_name="accounts/1/locations/2/reviews/abc"),
+        tenant_b_key: _bridge_record(gbp_review_name="accounts/9/locations/9/reviews/xyz"),
+    }
+
+    def run(fake):
+        keys = reconcile.list_bridge_keys(SYNTHETIC_TENANT_ID)
+        assert keys == [tenant_b_key], f"Tenant B's scan must see only its own v2 key, got {keys}"
+
+    _with_fake_upstash(store, run)
+
+
+def test_full_reconcile_run_for_tenant_a_never_touches_tenant_bs_record():
+    """End-to-end adversarial proof: seed BOTH tenants' records in the same
+    fake Upstash store, run a full reconciliation pass FOR Los Tres Amigos
+    only, and confirm Tenant B's record is completely untouched (not read,
+    not reconciled, not deleted) while Los Tres Amigos's own record is
+    correctly confirmed and cleared."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+
+    lta_key = "publish_bridge:v1:r1"
+    tenant_b_key = tenant_keys.publish_bridge_key_v2(SYNTHETIC_TENANT_ID, "r2")
+    tenant_b_record = _bridge_record(gbp_review_name="accounts/9/locations/9/reviews/xyz")
+    store = {
+        lta_key: _bridge_record(gbp_review_name="accounts/1/locations/2/reviews/abc"),
+        tenant_b_key: tenant_b_record,
+    }
+
+    def run(fake):
+        counts = reconcile.run_reconcile(
+            conn, TEST_TENANT_ID, dry_run=False,
+            fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "updateTime": "2026-08-22T13:50:00Z"}},
+        )
+        assert counts["confirmed"] == 1, counts
+        row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
+        assert row["owner_response"] == "Thanks!"
+        assert lta_key not in fake.store, "Los Tres Amigos's own record must be cleared after reconciliation"
+        assert tenant_b_key in fake.store, "Tenant B's record must never be deleted by a Los Tres Amigos reconciliation run"
+        assert fake.store[tenant_b_key] == tenant_b_record, "Tenant B's record must be completely unmodified"
+
+    _with_fake_upstash(store, run)
+
+
+def test_forged_tenant_identifier_cannot_redirect_scan_to_another_tenant():
+    """A 'forged' tenant id here is well-formed (passes is_valid_tenant_id)
+    but not Los Tres Amigos -- it must resolve to its OWN v2 prefix, never
+    be coerced (by spelling, case, or any trick) into scanning
+    publish_bridge:v1:* (Los Tres Amigos's own keyspace)."""
+    for candidate in ("t_los-tres-amigos-fake", "t_client-2", "t_another-tenant"):
+        prefix = tenant_keys.resolve_publish_bridge_scan_prefix(candidate)
+        assert prefix != tenant_keys.LEGACY_PUBLISH_BRIDGE_PREFIX, (
+            f"a well-formed but non-default tenantId {candidate!r} must never resolve to the legacy v1 scan prefix"
+        )
+        assert prefix == f"publish_bridge:v2:{candidate}:"
+
+
+def test_invalid_tenant_id_fails_closed_on_list_and_reconcile():
+    for bad in (None, "", "not-a-tenant-id", "T_LOS-TRES-AMIGOS"):
+        try:
+            reconcile.list_bridge_keys(bad)
+            raise AssertionError(f"expected InvalidTenantIdError for list_bridge_keys({bad!r})")
+        except tenant_keys.InvalidTenantIdError:
+            pass
+        conn = _fresh_db()
+        try:
+            reconcile.run_reconcile(conn, bad, dry_run=True)
+            raise AssertionError(f"expected InvalidTenantIdError for run_reconcile(tenant_id={bad!r})")
+        except tenant_keys.InvalidTenantIdError:
+            pass
 
 
 def main() -> int:
@@ -410,6 +519,11 @@ def main() -> int:
         ("delete_bridge_record deletes correctly for every special-character key, no duplicate left behind", test_delete_bridge_record_deletes_correctly_for_every_special_key),
         ("list_bridge_keys' KEYS glob pattern is sent unencoded (never quoted)", test_list_bridge_keys_pattern_is_sent_unencoded),
         ("full reconcile round-trip with a space-containing key never crashes (the exact production bug)", test_full_reconcile_round_trip_with_a_space_containing_key_never_crashes),
+        ("Tenant A's scan never enumerates Tenant B's keys", test_tenant_a_scan_never_enumerates_tenant_b_keys),
+        ("Tenant B's scan never enumerates Los Tres Amigos's keys", test_tenant_b_scan_never_enumerates_los_tres_amigos_keys),
+        ("a full reconcile run for Los Tres Amigos never touches Tenant B's record", test_full_reconcile_run_for_tenant_a_never_touches_tenant_bs_record),
+        ("a forged (but well-formed) tenant id cannot redirect a scan to Los Tres Amigos's keyspace", test_forged_tenant_identifier_cannot_redirect_scan_to_another_tenant),
+        ("an invalid tenant id fails closed on list_bridge_keys/run_reconcile", test_invalid_tenant_id_fails_closed_on_list_and_reconcile),
     ]
     results = [_run(name, fn) for name, fn in tests]
     passed = sum(results)

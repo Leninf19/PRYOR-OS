@@ -20,11 +20,16 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import export_chunks
 import refresh_analytics
+import tenant_keys
+import tenant_paths
+
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 results = []
 
@@ -87,18 +92,26 @@ class ScratchPipeline:
         self._orig_private_data_dir = export_chunks.PRIVATE_DATA_DIR
         db.DB_PATH = self.db_path
         export_chunks.PRIVATE_DATA_DIR = self.private_data_dir
+        tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, self.db_path)
+        tenant_paths._set_export_dir_for_tests(TEST_TENANT_ID, self.private_data_dir)
         return self
 
     def __exit__(self, *exc):
         db.DB_PATH = self._orig_db_path
         export_chunks.PRIVATE_DATA_DIR = self._orig_private_data_dir
+        tenant_paths._reset_review_db_paths_for_tests()
+        tenant_paths._reset_export_dirs_for_tests()
         self.conn.close()
         self._tmp.cleanup()
 
     def run_analytics(self):
         """refresh_analytics.main() opens its own connection via
-        db.get_connection(), which reads the (redirected) db.DB_PATH."""
-        refresh_analytics.main()
+        db.get_connection(), which reads the (redirected) db.DB_PATH --
+        refresh_analytics.main() itself re-resolves db.DB_PATH from
+        --tenant-id (Multi-Tenant Phase 4D), so the tenant_paths override
+        above must point at the same scratch db_path for this to work."""
+        with mock.patch.object(sys, "argv", ["refresh_analytics.py", "--tenant-id", TEST_TENANT_ID]):
+            refresh_analytics.main()
 
     def export(self):
         locations = {row["id"]: dict(row) for row in self.conn.execute("SELECT * FROM locations").fetchall()}

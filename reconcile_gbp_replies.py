@@ -29,8 +29,9 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
-import db
 import google_api as ga
+import tenant_keys
+import tenant_paths
 
 MATCH_PREDICATE = "gbp_reply_update_time IS NOT NULL AND TRIM(COALESCE(owner_response, '')) = ''"
 
@@ -87,7 +88,7 @@ def print_preflight(report: dict) -> None:
     print(f"File hash (sha256): {report['file_hash']}")
 
 
-def run_reconcile(conn: sqlite3.Connection, fetch_review=None) -> dict:
+def run_reconcile(conn: sqlite3.Connection, tenant_id: str, fetch_review=None) -> dict:
     """Re-fetches each matching row from Google by its exact gbp_review_name
     and backfills only when Google returns a genuine, non-empty reply
     comment. Each row is committed independently the moment its own update
@@ -96,11 +97,20 @@ def run_reconcile(conn: sqlite3.Connection, fetch_review=None) -> dict:
     untouched. Safe to re-run: a row backfilled on a prior run no longer
     matches MATCH_PREDICATE, so it's simply not selected again.
 
+    Multi-Tenant Phase 4C revision: tenant_id is REQUIRED, with no default,
+    and is validated unconditionally -- even when fetch_review is
+    overridden and tenant_id ends up unused by that path -- because this
+    function performs reconciliation (a SQLite write path) explicitly
+    called out as requiring an explicit tenant, regardless of which
+    Google-fetch implementation is plugged in.
+
     fetch_review defaults to google_api.get_review (the real Google API
-    call) -- overridable so callers (tests, scratch validation) can inject a
-    deterministic stand-in without ever fabricating what a real API would
-    have returned."""
-    fetch_review = fetch_review or ga.get_review
+    call, bound to tenant_id) -- overridable so callers (tests, scratch
+    validation) can inject a deterministic stand-in without ever
+    fabricating what a real API would have returned."""
+    tenant_keys.assert_valid_tenant_id(tenant_id, "reconcile_gbp_replies.run_reconcile")
+    if fetch_review is None:
+        fetch_review = lambda review_name: ga.get_review(tenant_id, review_name)  # noqa: E731
     rows = find_matching_rows(conn)
 
     before_reviews = conn.execute("SELECT COUNT(*) c FROM reviews").fetchone()["c"]
@@ -159,12 +169,29 @@ def run_reconcile(conn: sqlite3.Connection, fetch_review=None) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=None,
-                         help="Path to the SQLite DB to operate on (default: db.DB_PATH)")
+                         help="Path to the SQLite DB to operate on (default: the --tenant-id's own "
+                              "registered review database -- see tenant_paths.py). Use this to point "
+                              "at a SCRATCH COPY, never the real database, for a first dry-run.")
     parser.add_argument("--apply", action="store_true",
                          help="Actually re-fetch from Google and backfill (default: report-only, no writes)")
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose credential to use for the re-fetch. REQUIRED -- "
+                              "no default. This script never infers a tenant on its own.")
     args = parser.parse_args()
 
-    db_path = args.db or db.DB_PATH
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::reconcile_gbp_replies.py: invalid --tenant-id {args.tenant_id!r}")
+        return 1
+
+    # Multi-Tenant Phase 4D: resolve THIS tenant's own review database
+    # before any file/DB access -- --db still exists to point at a scratch
+    # copy for a safe first dry-run, but its default is now the tenant's
+    # own registered database, never a bare global.
+    try:
+        db_path = args.db or tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::reconcile_gbp_replies.py: {e}")
+        return 1
     if not db_path.exists():
         print(f"::error::reconcile_gbp_replies.py: no database at {db_path}")
         return 1
@@ -183,7 +210,7 @@ def main() -> int:
         conn.close()
         return 0
 
-    result = run_reconcile(conn)
+    result = run_reconcile(conn, tenant_id=args.tenant_id)
     print(f"\nmatched={result['matched']} backfilled={len(result['backfilled'])} "
           f"unresolved={len(result['unresolved'])} failed={len(result['failed'])}")
     print(f"reviews_unchanged={result['reviews_unchanged']} locations_unchanged={result['locations_unchanged']} "

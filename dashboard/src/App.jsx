@@ -16,6 +16,8 @@ import {
   resolveDateRangeWithExpiration,
 } from './utils/filterPersistence.js'
 import { settingsSections } from './pages/settings/settingsSections.js'
+import RequireSuperAdmin from './components/auth/RequireSuperAdmin.jsx'
+import AdminAccessCodes from './pages/admin/AccessCodes.jsx'
 
 // Route-level code-splitting -- each page ships in its own chunk, fetched
 // only when its route is visited, instead of one ~480KB bundle up front.
@@ -445,6 +447,13 @@ export default function App() {
 
         <Route path="*"          element={<Navigate to="/overview"    replace />} />
       </Route>
+
+      {/* Multi-Tenant Phase 4Q.1 -- platform-admin only, deliberately
+          OUTSIDE RootLayout (no restaurant-dashboard chrome/sidebar makes
+          sense for a cross-tenant platform tool). Client-side gate is
+          convenience-only; the real enforcement is server-side
+          (dashboard/api/admin/[action].js's isSuperAdmin() check). */}
+      <Route path="admin/access-codes" element={<RequireSuperAdmin><AdminAccessCodes /></RequireSuperAdmin>} />
     </Routes>
   )
 }

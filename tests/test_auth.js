@@ -13,6 +13,7 @@ import { fileURLToPath } from 'url'
 import { signSession, verifySession, SESSION_COOKIE } from '../dashboard/api/_lib/session.js'
 import { loadAccountDirectory, findAccountById, findAccountByEmail } from '../dashboard/api/_lib/accounts.js'
 import { requireAuth } from '../dashboard/api/_lib/auth.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DASHBOARD_DIR = path.resolve(__dirname, '..', 'dashboard')
@@ -53,7 +54,7 @@ function fakeReqRes(cookieValue) {
 }
 
 async function testSignAndVerifyRoundTrip() {
-  const token = await signSession({ userId: 'usr_1', email: 'a@b.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_1', email: 'a@b.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const claims = await verifySession(token)
   assert(claims.userId === 'usr_1', 'userId round-trips')
   assert(claims.role === 'owner', 'role round-trips')
@@ -61,13 +62,13 @@ async function testSignAndVerifyRoundTrip() {
 }
 
 async function testExpiredTokenRejected() {
-  const token = await signSession({ userId: 'usr_1', email: 'a@b.com', role: 'owner', locationIds: '*', sessionVersion: 1 }, { expiresInSeconds: -10 })
+  const token = await signSession({ userId: 'usr_1', email: 'a@b.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 }, { expiresInSeconds: -10 })
   const claims = await verifySession(token)
   assert(claims === null, 'expired token must be rejected')
 }
 
 async function testTamperedSignatureRejected() {
-  const token = await signSession({ userId: 'usr_1', email: 'a@b.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_1', email: 'a@b.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const tampered = token.slice(0, -4) + 'abcd'
   const claims = await verifySession(tampered)
   assert(claims === null, 'tampered signature must be rejected')
@@ -198,7 +199,7 @@ async function testRequireAuthUnauthenticated() {
 
 async function testRequireAuthOwnerSucceeds() {
   process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify(await buildDirectory())
-  const token = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const { req, res } = fakeReqRes(token)
   const account = await requireAuth(req, res, ['owner'])
   assert(account !== null, 'owner session must be accepted')
@@ -208,7 +209,7 @@ async function testRequireAuthOwnerSucceeds() {
 
 async function testRequireAuthWrongRoleForbidden() {
   process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify(await buildDirectory())
-  const token = await signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', sessionVersion: 3 })
+  const token = await signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 3 })
   const { req, res } = fakeReqRes(token)
   const account = await requireAuth(req, res, ['owner'])
   assert(account === null, 'marketing must be rejected from an owner-only route')
@@ -219,7 +220,7 @@ async function testStaleSessionVersionRejected() {
   process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify(await buildDirectory())
   // Token signed with an old sessionVersion (account's current is 3) --
   // simulates a password/role change happening after the token was issued.
-  const token = await signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const { req, res } = fakeReqRes(token)
   const account = await requireAuth(req, res, null)
   assert(account === null, 'stale sessionVersion must be rejected even with a validly-signed token')
@@ -229,7 +230,7 @@ async function testStaleSessionVersionRejected() {
 
 async function testDisabledAccountRejected() {
   process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify(await buildDirectory())
-  const token = await signSession({ userId: 'usr_disabled', email: 'disabled@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_disabled', email: 'disabled@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const { req, res } = fakeReqRes(token)
   const account = await requireAuth(req, res, ['owner'])
   assert(account === null, 'disabled account must be rejected even with a valid, current-version token')
@@ -238,7 +239,7 @@ async function testDisabledAccountRejected() {
 
 async function testRemovedAccountRejected() {
   process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify(await buildDirectory())
-  const token = await signSession({ userId: 'usr_ghost', email: 'ghost@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_ghost', email: 'ghost@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const { req, res } = fakeReqRes(token)
   const account = await requireAuth(req, res, ['owner'])
   assert(account === null, 'a userId no longer in the directory must be rejected')

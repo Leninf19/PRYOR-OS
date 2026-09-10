@@ -13,6 +13,7 @@ import handler from '../dashboard/api/actions/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests, _resetRedisClientForTests } from '../dashboard/api/_lib/actionStore.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -63,10 +64,10 @@ async function setDirectory() {
 }
 
 async function ownerToken() {
-  return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 async function readOnlyToken() {
-  return signSession({ userId: 'usr_readonly', email: 'readonly@example.com', role: 'read_only', locationIds: '*', sessionVersion: 1 })
+  return signSession({ userId: 'usr_readonly', email: 'readonly@example.com', role: 'read_only', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 
 async function invoke({ action, method = 'GET', token, body }) {
@@ -123,7 +124,7 @@ async function testListLocationScopedAccountSeesOnlyItsOwnLocation() {
   const { _setReviewLocationIndexForTests, _resetReviewLocationIndexForTests } = await import('../dashboard/api/_lib/reviewLocationIndex.js')
   _setReviewLocationIndexForTests({ mine: 7, foreign: 9 })
   try {
-    const lmToken = await signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7], sessionVersion: 1 })
+    const lmToken = await signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
     process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
       accounts: JSON.parse(process.env.ACCOUNT_DIRECTORY_JSON).accounts.concat([
         { userId: 'usr_lm', email: 'lm@example.com', passwordHash: await bcrypt.hash('x', 12), role: 'location_manager', locationIds: [7], sessionVersion: 1, disabled: false, displayName: 'LM' },

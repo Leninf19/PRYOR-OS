@@ -17,18 +17,14 @@
 // division of labor dashboard/api/data.js already has with
 // reviewLocationIndex.js.
 
-import { readFile } from 'fs/promises'
-import path from 'path'
-import { fileURLToPath } from 'url'
-import { requireLocationAccess } from './auth.js'
+import { requireLocationAccess, isWildcardGrant } from './auth.js'
 import { getAllActions, ActionStoreUnavailableError } from './actionStore.js'
 import { getStoredCredential } from './credentialStore.js'
 import { listReplyFailures } from './notificationStore.js'
 import { getAllTasks, TaskStoreUnavailableError } from './taskStore.js'
 import { getAllCampaigns, CampaignStoreUnavailableError } from './campaignStore.js'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PRIVATE_ROOT = path.resolve(__dirname, '..', '..', 'private-data')
+import { resolveTenantId } from './tenants.js'
+import { readPrivateDataFile } from './reviewDataPaths.js'
 
 // Review-based notifications only ever look back this far -- see the
 // milestone report for the retention rationale (30 days, matching the
@@ -71,14 +67,14 @@ let privateDataTestOverride = null
 export function _setPrivateDataForTests(filesByRelPath) { privateDataTestOverride = filesByRelPath }
 export function _resetPrivateDataForTests() { privateDataTestOverride = null }
 
-async function readJsonFile(relPath) {
+async function readJsonFile(tenantId, relPath) {
   if (privateDataTestOverride !== null) {
     return Object.prototype.hasOwnProperty.call(privateDataTestOverride, relPath)
       ? privateDataTestOverride[relPath]
       : null
   }
   try {
-    const raw = await readFile(path.join(PRIVATE_ROOT, relPath), 'utf-8')
+    const raw = await readPrivateDataFile(tenantId, relPath)
     return JSON.parse(raw)
   } catch {
     return null
@@ -91,14 +87,15 @@ async function readJsonFile(relPath) {
 // review from an unauthorized location is never even READ, let alone
 // filtered client-side.
 async function loadAuthorizedReviews(account) {
-  const meta = await readJsonFile('meta.json')
+  const tenantId = resolveTenantId(account)
+  const meta = await readJsonFile(tenantId, 'meta.json')
   if (!meta?.locations) return []
-  const locations = account.locationIds === '*'
+  const locations = isWildcardGrant(account)
     ? meta.locations
     : meta.locations.filter(l => requireLocationAccess(account, l.locationId))
 
   const perLocation = await Promise.all(locations.map(async loc => {
-    const reviews = await readJsonFile(`reviews/by-location/${loc.slug}.json`)
+    const reviews = await readJsonFile(tenantId, `reviews/by-location/${loc.slug}.json`)
     return Array.isArray(reviews) ? reviews : []
   }))
   return perLocation.flat()
@@ -154,7 +151,7 @@ function reviewNotificationCandidates(reviews) {
 // the existing record rather than creating a second one.
 function replyFailureCandidates(failures, account) {
   return failures
-    .filter(f => account.locationIds === '*' || requireLocationAccess(account, f.locationId))
+    .filter(f => isWildcardGrant(account) || requireLocationAccess(account, f.locationId))
     .map(f => ({
       key: `reply_failed:${f.reviewId}`, type: 'reply_failed', severity: 'critical',
       title: 'Reply failed to publish', location: f.locationName ?? null,
@@ -175,7 +172,7 @@ function replyFailureCandidates(failures, account) {
 async function assignedActionCandidates(account) {
   let all
   try {
-    all = await getAllActions()
+    all = await getAllActions(resolveTenantId(account))
   } catch (err) {
     if (err instanceof ActionStoreUnavailableError) return []
     throw err
@@ -200,7 +197,9 @@ async function assignedActionCandidates(account) {
 // rules out.
 async function gbpDisconnectedCandidate(account) {
   if (account.role !== 'owner') return null
-  const credential = await getStoredCredential().catch(() => null)
+  // Multi-Tenant Phase 4A: credentialStore.js now requires an explicit
+  // tenantId -- this account's own, never any other tenant's.
+  const credential = await getStoredCredential(resolveTenantId(account)).catch(() => null)
   if (!credential || !credential.health) return null
   if (credential.health === 'connected' || credential.health === 'never_connected') return null
   const messages = {
@@ -334,18 +333,18 @@ const MAX_NOTIFICATIONS = 50
 // notifications/[action].js), not here, since read state is per-user and
 // this function's output must stay identical for every user sharing the
 // same authorized scope.
-async function tasksForNotifications() {
+async function tasksForNotifications(tenantId) {
   try {
-    return Object.values(await getAllTasks())
+    return Object.values(await getAllTasks(tenantId))
   } catch (err) {
     if (err instanceof TaskStoreUnavailableError) return []
     throw err
   }
 }
 
-async function campaignsForNotifications() {
+async function campaignsForNotifications(tenantId) {
   try {
-    return Object.values(await getAllCampaigns())
+    return Object.values(await getAllCampaigns(tenantId))
   } catch (err) {
     if (err instanceof CampaignStoreUnavailableError) return []
     throw err
@@ -353,13 +352,14 @@ async function campaignsForNotifications() {
 }
 
 export async function getNotificationCandidates(account) {
+  const tenantId = resolveTenantId(account)
   const [reviews, failures, assignedActions, gbpDisconnected, tasks, campaigns] = await Promise.all([
     loadAuthorizedReviews(account),
-    listReplyFailures(),
+    listReplyFailures(tenantId),
     assignedActionCandidates(account),
     gbpDisconnectedCandidate(account),
-    tasksForNotifications(),
-    campaignsForNotifications(),
+    tasksForNotifications(tenantId),
+    campaignsForNotifications(tenantId),
   ])
 
   const candidates = [

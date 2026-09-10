@@ -44,13 +44,35 @@ const ACCOUNT_FIELDS = new Set([
 // any other malformed value) sitting in passwordHash instead of a real hash.
 const BCRYPT_HASH_RE = /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/
 
-// Exported so userStore.js (the Redis-backed dynamic directory) can validate
-// locationIds with the exact same rule as the static directory below,
-// without duplicating it -- '*' or a non-empty array of distinct positive
-// integers, nothing else.
-export function isValidLocationIds(locationIds) {
+// Exported so userStore.js (the Redis-backed dynamic directory) can
+// validate locationIds with the exact same core rule as the static
+// directory below, without duplicating it -- '*' (wildcard) or an array of
+// distinct positive integers.
+//
+// `allowEmpty` (Multi-Tenant Phase 4K, default false): the STATIC directory
+// (ACCOUNT_DIRECTORY_JSON, hand-authored config) NEVER allows an empty
+// array -- a hand-provisioned account with zero locations is virtually
+// always a configuration mistake, so isValidAccount() below keeps calling
+// this with the default. The DYNAMIC (Redis) store, by contrast, can
+// LEGITIMATELY reach zero locations at RUNTIME -- e.g.
+// tenantConfigStore.js's applyEntitlementChange() removing the last
+// location a location_manager held (see userStore.js's
+// reconcileAccountGrantsAfterLocationRemoval()) -- so userStore.js's
+// upsertUser() calls this with `{ allowEmpty: true }`. Either way,
+// requireLocationAccess() (auth.js) already treats `[]` correctly by
+// construction (`[].includes(anyLocationId)` is always false, i.e. "deny
+// everything") -- this parameter only ever widens what a given caller's
+// SCHEMA accepts as well-formed, it never changes an authorization
+// decision. The ADMIN-FACING manual assignment flow (userManagement.js's
+// validateRoleAndLocations(), used by POST /api/settings/update-user-role-
+// locations) separately keeps its OWN, stricter "must be non-empty" check
+// on top of this -- a human assigning a location_manager zero locations by
+// hand is almost certainly a mistake and stays rejected there regardless
+// of what this function alone would accept.
+export function isValidLocationIds(locationIds, { allowEmpty = false } = {}) {
   if (locationIds === '*') return true
-  if (!Array.isArray(locationIds) || locationIds.length === 0) return false
+  if (!Array.isArray(locationIds)) return false
+  if (locationIds.length === 0) return allowEmpty
   const seen = new Set()
   for (const id of locationIds) {
     if (!Number.isInteger(id) || id <= 0) return false

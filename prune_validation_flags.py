@@ -22,10 +22,15 @@ human-debugging grace period -- long enough to look back at something
 noticed within the past week, not tied to any actual product requirement --
 and is fully overridable via --retention-days.
 
+Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED. --db still exists
+to point at a scratch copy for a safe first dry-run, but its default is now
+the tenant's own registered database (tenant_paths.py), never a bare
+db.DB_PATH global.
+
 Usage:
-    py prune_validation_flags.py                         # preflight report only (dry run)
-    py prune_validation_flags.py --retention-days 7 --apply
-    py prune_validation_flags.py --db path/to/scratch.db --apply --vacuum
+    py prune_validation_flags.py --tenant-id t_los-tres-amigos                     # preflight report only (dry run)
+    py prune_validation_flags.py --tenant-id t_los-tres-amigos --retention-days 7 --apply
+    py prune_validation_flags.py --tenant-id t_los-tres-amigos --db path/to/scratch.db --apply --vacuum
 """
 import argparse
 import hashlib
@@ -34,7 +39,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import db
+import tenant_keys
+import tenant_paths
 
 DEFAULT_RETENTION_DAYS = 7
 
@@ -216,16 +222,28 @@ def compact(conn: sqlite3.Connection) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=None,
-                         help="Path to the SQLite DB to operate on (default: db.DB_PATH)")
+                         help="Path to the SQLite DB to operate on (default: the --tenant-id's own "
+                              "registered review database -- see tenant_paths.py). Use this to point "
+                              "at a SCRATCH COPY, never the real database, for a first dry-run.")
     parser.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS,
                          help=f"Delete resolved flags older than this many days (default: {DEFAULT_RETENTION_DAYS})")
     parser.add_argument("--apply", action="store_true",
                          help="Actually delete (default: preflight report only, no writes)")
     parser.add_argument("--vacuum", action="store_true",
                          help="Run VACUUM after a successful --apply (ignored without --apply)")
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to prune. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
     args = parser.parse_args()
 
-    db_path = args.db or db.DB_PATH
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::prune_validation_flags.py: invalid --tenant-id {args.tenant_id!r}")
+        return 1
+    try:
+        db_path = args.db or tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::prune_validation_flags.py: {e}")
+        return 1
     if not db_path.exists():
         print(f"::error::prune_validation_flags.py: no database at {db_path}")
         return 1

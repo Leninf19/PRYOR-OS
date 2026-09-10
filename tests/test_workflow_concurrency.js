@@ -180,13 +180,29 @@ function testUpdateReviewsStillPreservesFullPipelineOrder() {
 }
 
 // Phase 3 Milestone 4b: update-reviews.yml now routes through the generic,
-// provider-agnostic sync_reviews.py entrypoint (with REVIEW_PROVIDER=scraper,
-// preserving today's exact active provider) instead of calling
+// provider-agnostic sync_reviews.py entrypoint instead of calling
 // auto_update.py directly -- see the Milestone 4b design review. This is a
 // deliberately narrow, isolated migration: only the one step's command/env
 // changed; everything else (id, timeout, downstream output references,
 // concurrency, commit fail-safe, deployment gating) must be provably
 // untouched.
+//
+// Baseline stabilization pass update: the sync step's ACTIVE PROVIDER has
+// since moved on from this test's original snapshot (Milestone 4b's
+// "preserving today's exact active provider" was scraper, at the time --
+// see the removed reference to REVIEW_PROVIDER=scraper below). The
+// workflow file itself now documents a deliberate, reasoned follow-up
+// migration (its own comment, directly above the step: "Google Cloud
+// project migration resolved the prior quota block... Switching this
+// pipeline's primary provider from the Playwright scraper to the official
+// Google Business Profile API accordingly. The scraper... remains in the
+// repo, untouched, as the documented manual fallback.") -- a real,
+// intentional production change, not drift. This test was simply never
+// updated to track it; the fix here is test-only, matching current,
+// correct production behavior, and additionally guards the GBP-specific
+// credentials the step now legitimately depends on (Phase 8 Milestone 8.8's
+// encrypted-refresh-token flow) so a future accidental removal of one of
+// them would be caught here.
 function testUpdateReviewsUsesGenericSyncEntrypoint() {
   const content = read('update-reviews.yml')
 
@@ -198,17 +214,33 @@ function testUpdateReviewsUsesGenericSyncEntrypoint() {
   // Isolate the sync step's own YAML block (from its "- name:" line up to
   // the next "- name:"/"- uses:" line) so REVIEW_PROVIDER/id/timeout checks
   // are scoped to that step specifically, not just anywhere in the file.
-  const syncStepMatch = content.match(/- name: Sync reviews \(scraper provider\)\n([\s\S]*?)(?=\n\s*- (?:name|uses):|\n*$)/)
-  assert(syncStepMatch, 'update-reviews.yml must have a named "Sync reviews (scraper provider)" step')
+  const syncStepMatch = content.match(/- name: Sync reviews \(GBP provider\)\n([\s\S]*?)(?=\n\s*- (?:name|uses):|\n*$)/)
+  assert(syncStepMatch, 'update-reviews.yml must have a named "Sync reviews (GBP provider)" step')
   const syncStep = syncStepMatch[1]
 
   assert(/id:\s*scrape/.test(syncStep), 'the sync step must retain id: scrape')
   assert(/timeout-minutes:\s*30/.test(syncStep), 'the sync step must retain its 30-minute timeout')
-  assert(/REVIEW_PROVIDER:\s*scraper/.test(syncStep),
-    'the sync step must explicitly set REVIEW_PROVIDER: scraper')
+  assert(/REVIEW_PROVIDER:\s*gbp/.test(syncStep),
+    'the sync step must explicitly set REVIEW_PROVIDER: gbp, matching the now-active Google Business Profile provider')
   assert(/ANTHROPIC_API_KEY:\s*\$\{\{\s*secrets\.ANTHROPIC_API_KEY\s*\}\}/.test(syncStep),
     'the sync step must retain ANTHROPIC_API_KEY')
   assert(/PYTHONUNBUFFERED:\s*"1"/.test(syncStep), 'the sync step must retain PYTHONUNBUFFERED')
+
+  // The GBP provider's encrypted-refresh-token flow (Phase 8, Milestone 8.8)
+  // needs these to authenticate and decrypt the stored Google credential --
+  // guarded here so their accidental removal from this step is caught.
+  assert(/GOOGLE_CLIENT_ID:\s*\$\{\{\s*secrets\.GOOGLE_CLIENT_ID\s*\}\}/.test(syncStep),
+    'the sync step must retain GOOGLE_CLIENT_ID for the GBP provider')
+  assert(/GOOGLE_CLIENT_SECRET:\s*\$\{\{\s*secrets\.GOOGLE_CLIENT_SECRET\s*\}\}/.test(syncStep),
+    'the sync step must retain GOOGLE_CLIENT_SECRET for the GBP provider')
+  assert(/GOOGLE_REFRESH_TOKEN:\s*\$\{\{\s*secrets\.GOOGLE_REFRESH_TOKEN\s*\}\}/.test(syncStep),
+    'the sync step must retain GOOGLE_REFRESH_TOKEN for the GBP provider')
+  assert(/UPSTASH_REDIS_REST_URL:\s*\$\{\{\s*secrets\.UPSTASH_REDIS_REST_URL\s*\}\}/.test(syncStep),
+    'the sync step must retain UPSTASH_REDIS_REST_URL to read the stored Google credential')
+  assert(/UPSTASH_REDIS_REST_TOKEN:\s*\$\{\{\s*secrets\.UPSTASH_REDIS_REST_TOKEN\s*\}\}/.test(syncStep),
+    'the sync step must retain UPSTASH_REDIS_REST_TOKEN to read the stored Google credential')
+  assert(/CREDENTIAL_ENCRYPTION_KEY:\s*\$\{\{\s*secrets\.CREDENTIAL_ENCRYPTION_KEY\s*\}\}/.test(syncStep),
+    'the sync step must retain CREDENTIAL_ENCRYPTION_KEY to decrypt the stored Google refresh token')
 }
 
 function testDownstreamScrapeOutputReferencesUnchanged() {

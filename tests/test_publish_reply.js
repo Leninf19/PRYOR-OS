@@ -15,6 +15,7 @@ import {
   _setRedisClientForTests as _setBridgeRedisForTests,
   _resetRedisClientForTests as _resetBridgeRedisForTests,
 } from '../dashboard/api/_lib/publishBridgeStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 // publish.js was merged into the consolidated dispatch file (Phase 8,
 // Milestone 8.2) -- this wrapper keeps every call site below exactly as it
@@ -31,11 +32,32 @@ process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xy
 // connected credential, replaces the old env var for every test below.
 function fakeCredentialRedis(initial = null) {
   let value = initial
-  return { get: async () => value, set: async (_key, v) => { value = v }, del: async () => { value = null } }
+  return {
+    get: async () => value,
+    set: async (_key, v) => { value = v },
+    del: async () => { value = null },
+    // Multi-Tenant Phase 4I.2: recordSyncOutcome()/recordOAuthRefresh() now
+    // write via a CAS EVAL, not a plain set() -- see credentialStore.js's
+    // CREDENTIAL_CAS_SCRIPT. Faithfully emulated here (single-threaded JS,
+    // so trivially atomic).
+    eval: async (_script, _keys, args) => {
+      const [expectedVersionStr, nextJson] = args
+      let currentVersion = '0'
+      if (value) {
+        try {
+          const decoded = JSON.parse(value)
+          if (decoded && decoded.credentialVersion !== undefined) currentVersion = String(decoded.credentialVersion)
+        } catch { /* treat as version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return value ?? false
+      value = nextJson
+      return true
+    },
+  }
 }
 const credentialClient = fakeCredentialRedis()
 _setCredentialRedisForTests(() => credentialClient)
-await setStoredCredential({ refreshToken: 'fake-refresh-token', connectedAccountName: null })
+await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'fake-refresh-token', connectedAccountName: null })
 
 // Recovery Milestone 6B: publishBridgeStore.js's own Redis client -- a
 // separate fake from the credential one above, matching the real app
@@ -68,7 +90,7 @@ process.env.ACCOUNT_DIRECTORY_JSON = JSON.stringify({
     role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false,
   }],
 })
-const AUTH_COOKIE = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+const AUTH_COOKIE = await signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 
 function fakeRes() {
   const res = { statusCode: null, body: null }

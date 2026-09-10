@@ -20,6 +20,7 @@ import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests as setCredentialRedis, setStoredCredential } from '../dashboard/api/_lib/credentialStore.js'
 import { _setRedisClientForTests as setBridgeRedis, _resetRedisClientForTests as resetBridgeRedis, writePublishBridge } from '../dashboard/api/_lib/publishBridgeStore.js'
 import { _setReviewLocationIndexForTests, _resetReviewLocationIndexForTests } from '../dashboard/api/_lib/reviewLocationIndex.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 process.env.GOOGLE_CLIENT_ID = 'fake-client-id'
 process.env.GOOGLE_CLIENT_SECRET = 'fake-client-secret'
@@ -28,11 +29,32 @@ process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xy
 
 function fakeCredentialRedis(initial = null) {
   let value = initial
-  return { get: async () => value, set: async (_key, v) => { value = v }, del: async () => { value = null } }
+  return {
+    get: async () => value,
+    set: async (_key, v) => { value = v },
+    del: async () => { value = null },
+    // Multi-Tenant Phase 4I.2: recordSyncOutcome()/recordOAuthRefresh() now
+    // write via a CAS EVAL, not a plain set() -- see credentialStore.js's
+    // CREDENTIAL_CAS_SCRIPT. Faithfully emulated here (single-threaded JS,
+    // so trivially atomic).
+    eval: async (_script, _keys, args) => {
+      const [expectedVersionStr, nextJson] = args
+      let currentVersion = '0'
+      if (value) {
+        try {
+          const decoded = JSON.parse(value)
+          if (decoded && decoded.credentialVersion !== undefined) currentVersion = String(decoded.credentialVersion)
+        } catch { /* treat as version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return value ?? false
+      value = nextJson
+      return true
+    },
+  }
 }
 const credentialClient = fakeCredentialRedis()
 setCredentialRedis(() => credentialClient) // same instance every call -- getClient() has no caching for the test-factory path
-await setStoredCredential({ refreshToken: 'fake-refresh-token', connectedAccountName: null })
+await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'fake-refresh-token', connectedAccountName: null })
 
 function fakeBridgeRedis(initial = {}) {
   const store = { ...initial }
@@ -78,10 +100,10 @@ async function seedDirectory() {
 }
 
 async function lmToken() {
-  return signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7], sessionVersion: 1 })
+  return signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 async function roToken() {
-  return signSession({ userId: 'usr_ro', email: 'ro@example.com', role: 'read_only', locationIds: [7], sessionVersion: 1 })
+  return signSession({ userId: 'usr_ro', email: 'ro@example.com', role: 'read_only', locationIds: [7], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
 
 function fakeRes() {
@@ -155,8 +177,8 @@ async function testReadOnlyDeniedEntirelyNoFetchAttempted() {
 
 async function testPublishBridgeBulkReadFiltersForeignLocationRecords() {
   await seedDirectory()
-  await writePublishBridge('mine', { gbpReviewName: 'accounts/1/locations/7/reviews/1', responseText: 'x', locationName: null, reviewerName: null, reviewDate: null })
-  await writePublishBridge('foreign', { gbpReviewName: 'accounts/1/locations/99/reviews/1', responseText: 'x', locationName: null, reviewerName: null, reviewDate: null })
+  await writePublishBridge(DEFAULT_TENANT_ID, 'mine', { gbpReviewName: 'accounts/1/locations/7/reviews/1', responseText: 'x', locationName: null, reviewerName: null, reviewDate: null })
+  await writePublishBridge(DEFAULT_TENANT_ID, 'foreign', { gbpReviewName: 'accounts/1/locations/99/reviews/1', responseText: 'x', locationName: null, reviewerName: null, reviewDate: null })
   _setReviewLocationIndexForTests({ mine: 7, foreign: 99 })
 
   const res = fakeRes()

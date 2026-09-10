@@ -25,7 +25,15 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import google_api as ga
+import tenant_keys
 from provider_base import ProviderError
+
+# Multi-Tenant Phase 4C: every google_api.py function now requires an
+# explicit tenantId -- this file only ever exercises Los Tres Amigos (the
+# one real tenant), matching this test's own pre-existing scope (the 2022
+# API-split host-routing regression), not tenant isolation itself (see
+# test_google_api_redis_token.py's own Phase 4C additions for that).
+TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 
 OLD_ACCOUNTS_URL_PREFIX = "https://mybusiness.googleapis.com/v4/accounts"
 OLD_LOCATIONS_URL_PREFIX = "https://mybusiness.googleapis.com/v4/accounts/123/locations"
@@ -59,7 +67,7 @@ def test_list_accounts_hits_new_host():
 
     with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-        accounts = ga.list_accounts()
+        accounts = ga.list_accounts(TEST_TENANT_ID)
 
     assert not captured["url"].startswith(OLD_ACCOUNTS_URL_PREFIX), (
         f"list_accounts() called the deprecated v4 host that 404s in production: {captured['url']}"
@@ -82,7 +90,7 @@ def test_list_locations_hits_new_host_with_readmask():
 
     with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-        locations = ga.list_locations("accounts/123")
+        locations = ga.list_locations(TEST_TENANT_ID, "accounts/123")
 
     assert not captured["url"].startswith(OLD_LOCATIONS_URL_PREFIX), (
         f"list_locations() called the deprecated v4 host that 404s in production: {captured['url']}"
@@ -111,7 +119,7 @@ def test_list_locations_handles_account_prefixed_name_too():
 
     with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-        locations = ga.list_locations("accounts/123")
+        locations = ga.list_locations(TEST_TENANT_ID, "accounts/123")
 
     assert locations[0]["name"] == "accounts/123/locations/456", (
         f"Expected the passed-in account (123) to win, got {locations[0]['name']}"
@@ -129,7 +137,7 @@ def test_list_reviews_and_reply_still_use_v4():
 
     with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-        ga.list_reviews("accounts/123/locations/456")
+        ga.list_reviews(TEST_TENANT_ID, "accounts/123/locations/456")
 
     assert captured["url"].startswith("https://mybusiness.googleapis.com/v4/accounts/123/locations/456/reviews"), (
         f"list_reviews() must stay on the v4 host, got {captured['url']}"
@@ -141,7 +149,7 @@ def test_list_reviews_and_reply_still_use_v4():
 
     with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen_reply):
-        ga.reply_to_review("accounts/123/locations/456/reviews/789", "Thank you!")
+        ga.reply_to_review(TEST_TENANT_ID, "accounts/123/locations/456/reviews/789", "Thank you!")
 
     assert captured["url"].startswith("https://mybusiness.googleapis.com/v4/accounts/123/locations/456/reviews/789/reply"), (
         f"reply_to_review() must stay on the v4 host, got {captured['url']}"
@@ -171,11 +179,11 @@ def test_401_forces_token_refresh_and_retries_immediately_without_sleep():
     with mock.patch.object(ga, "get_access_token", return_value="fake-token") as token_mock, \
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
          mock.patch("retry.time.sleep") as sleep_mock:
-        result = ga.list_accounts()
+        result = ga.list_accounts(TEST_TENANT_ID)
 
     assert result == []
     assert call_count["n"] == 2, f"expected exactly 2 attempts (1 failure + 1 success), got {call_count['n']}"
-    token_mock.assert_any_call(force_refresh=True)
+    token_mock.assert_any_call(TEST_TENANT_ID, force_refresh=True)
     # a 401 must retry immediately (0s wait), not the default exponential backoff
     sleep_mock.assert_called_once_with(0)
 
@@ -192,7 +200,7 @@ def test_429_honors_retry_after_header():
     with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
          mock.patch("retry.time.sleep") as sleep_mock:
-        ga.list_accounts()
+        ga.list_accounts(TEST_TENANT_ID)
 
     sleep_mock.assert_called_once_with(2.0)
 
@@ -209,7 +217,7 @@ def test_5xx_retries_with_exponential_backoff_when_no_retry_after_header():
     with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
          mock.patch("retry.time.sleep") as sleep_mock:
-        ga.list_accounts()
+        ga.list_accounts(TEST_TENANT_ID)
 
     sleep_mock.assert_called_once_with(ga._BASE_BACKOFF_SECONDS * (2 ** 0))
 
@@ -222,7 +230,7 @@ def test_403_raises_immediately_without_retry():
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen) as urlopen_mock, \
          mock.patch("retry.time.sleep") as sleep_mock:
         try:
-            ga.list_accounts()
+            ga.list_accounts(TEST_TENANT_ID)
             raise AssertionError("expected GBPPermissionError to be raised")
         except ga.GBPPermissionError as e:
             assert e.status == 403
@@ -239,7 +247,7 @@ def test_404_raises_immediately_without_retry():
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen) as urlopen_mock, \
          mock.patch("retry.time.sleep") as sleep_mock:
         try:
-            ga.list_accounts()
+            ga.list_accounts(TEST_TENANT_ID)
             raise AssertionError("expected GBPNotFoundError to be raised")
         except ga.GBPNotFoundError as e:
             assert e.status == 404
@@ -260,7 +268,7 @@ def test_network_error_retries_with_backoff():
     with mock.patch.object(ga, "get_access_token", return_value="fake-token"), \
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
          mock.patch("retry.time.sleep") as sleep_mock:
-        result = ga.list_accounts()
+        result = ga.list_accounts(TEST_TENANT_ID)
 
     assert result == []
     assert call_count["n"] == 2
@@ -276,8 +284,7 @@ def test_get_access_token_invalid_grant_raises_typed_gbpautherror():
     real GitHub Actions logs: a 400 HTTPError from oauth2.googleapis.com/
     token whose body is {"error": "invalid_grant", "error_description":
     "Token has been expired or revoked."}."""
-    ga._access_token_cache["token"] = None
-    ga._access_token_cache["expires_at"] = 0
+    ga._access_token_cache.pop(TEST_TENANT_ID, None)
 
     body = json.dumps({"error": "invalid_grant", "error_description": "Token has been expired or revoked."}).encode()
     err = urllib.error.HTTPError(url=ga.TOKEN_URL, code=400, msg="Bad Request", hdrs={}, fp=io.BytesIO(body))
@@ -290,7 +297,7 @@ def test_get_access_token_invalid_grant_raises_typed_gbpautherror():
          mock.patch.object(ga, "_fetch_refresh_token_from_redis", return_value=None), \
          mock.patch("urllib.request.urlopen", side_effect=err):
         try:
-            ga.get_access_token()
+            ga.get_access_token(TEST_TENANT_ID)
             raise AssertionError("expected GBPAuthError to be raised")
         except ga.GBPAuthError as e:
             assert e.status == 400, f"expected status=400, got {e.status}"
@@ -300,8 +307,7 @@ def test_get_access_token_invalid_grant_raises_typed_gbpautherror():
 
 
 def test_get_access_token_success_caches_token_until_expiry():
-    ga._access_token_cache["token"] = None
-    ga._access_token_cache["expires_at"] = 0
+    ga._access_token_cache.pop(TEST_TENANT_ID, None)
     call_count = {"n": 0}
 
     def fake_urlopen(req, timeout=None):
@@ -315,8 +321,8 @@ def test_get_access_token_success_caches_token_until_expiry():
     }, clear=False), \
          mock.patch.object(ga, "_fetch_refresh_token_from_redis", return_value=None), \
          mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-        first = ga.get_access_token()
-        second = ga.get_access_token()  # must be served from the in-process cache, no second exchange
+        first = ga.get_access_token(TEST_TENANT_ID)
+        second = ga.get_access_token(TEST_TENANT_ID)  # must be served from the in-process cache, no second exchange
 
     assert first == "fresh-token"
     assert second == "fresh-token"

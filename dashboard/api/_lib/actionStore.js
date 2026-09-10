@@ -24,8 +24,15 @@
 // dashboard/middleware.js).
 
 import { Redis } from '@upstash/redis'
+import { actionWorkspaceKeyV2 } from './tenantKeys.js'
+import { resolveHashReadKey, resolveHashWriteKey } from './tenantDualRead.js'
 
 const ACTION_WORKSPACE_KEY = 'action_workspace:v1'
+
+// Multi-Tenant Phase 2: every exported function below now takes `tenantId`
+// as its first argument -- see tenantDualRead.js's header for the full
+// read/write rule. For DEFAULT_TENANT_ID, this resolves to exactly
+// ACTION_WORKSPACE_KEY, unchanged.
 
 let redisClient = null
 // Test-only seam: lets tests simulate a real Upstash hash's get/set
@@ -74,13 +81,14 @@ function parseRecord(value) {
 // rather than returning {} -- silently presenting "no tasks" when the
 // store is actually broken would hide real data-loss-shaped failures from
 // every viewer at once.
-export async function getAllActions() {
+export async function getAllActions(tenantId) {
   const client = getClient()
   if (!client) throw new ActionStoreUnavailableError('action store is not configured')
 
   let raw
   try {
-    raw = await client.hgetall(ACTION_WORKSPACE_KEY)
+    const key = await resolveHashReadKey(client, { v1Key: ACTION_WORKSPACE_KEY, v2Key: actionWorkspaceKeyV2(tenantId), tenantId })
+    raw = key ? await client.hgetall(key) : {}
   } catch (err) {
     throw new ActionStoreUnavailableError(`action store unreachable: ${err.message}`)
   }
@@ -96,13 +104,14 @@ export async function getAllActions() {
 // Reads a single record without fetching the whole hash -- used by callers
 // that only need to check one id's current state (e.g. duplicate-send
 // checks before sending a review email) rather than the full workspace.
-export async function getAction(id) {
+export async function getAction(tenantId, id) {
   const client = getClient()
   if (!client) throw new ActionStoreUnavailableError('action store is not configured')
 
   let raw
   try {
-    raw = await client.hget(ACTION_WORKSPACE_KEY, id)
+    const key = await resolveHashReadKey(client, { v1Key: ACTION_WORKSPACE_KEY, v2Key: actionWorkspaceKeyV2(tenantId), tenantId })
+    raw = key ? await client.hget(key, id) : null
   } catch (err) {
     throw new ActionStoreUnavailableError(`action store unreachable: ${err.message}`)
   }
@@ -119,13 +128,14 @@ export async function getAction(id) {
 //
 // `account` is the authenticated, server-verified account record (from
 // requireAuth()) -- never a client-supplied identity.
-export async function upsertAction(id, patch, account, logAction) {
+export async function upsertAction(tenantId, id, patch, account, logAction) {
   const client = getClient()
   if (!client) throw new ActionStoreUnavailableError('action store is not configured')
 
-  let existingRaw
+  let existingRaw = null
   try {
-    existingRaw = await client.hget(ACTION_WORKSPACE_KEY, id)
+    const readKey = await resolveHashReadKey(client, { v1Key: ACTION_WORKSPACE_KEY, v2Key: actionWorkspaceKeyV2(tenantId), tenantId })
+    if (readKey) existingRaw = await client.hget(readKey, id)
   } catch (err) {
     throw new ActionStoreUnavailableError(`action store unreachable: ${err.message}`)
   }
@@ -154,8 +164,9 @@ export async function upsertAction(id, patch, account, logAction) {
       : history,
   }
 
+  const writeKey = resolveHashWriteKey({ v1Key: ACTION_WORKSPACE_KEY, v2Key: actionWorkspaceKeyV2(tenantId), tenantId })
   try {
-    await client.hset(ACTION_WORKSPACE_KEY, { [id]: JSON.stringify(next) })
+    await client.hset(writeKey, { [id]: JSON.stringify(next) })
   } catch (err) {
     throw new ActionStoreUnavailableError(`action store unreachable: ${err.message}`)
   }

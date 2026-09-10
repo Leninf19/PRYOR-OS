@@ -19,9 +19,20 @@
 
 import { randomUUID } from 'crypto'
 import { Redis } from '@upstash/redis'
+import { auditLogKeyV2 } from './tenantKeys.js'
+import { resolveListReadKey, resolveListWriteKey, assertKnownTenantId } from './tenantDualRead.js'
 
 const AUDIT_LOG_KEY = 'audit_log:v1'
 const MAX_ENTRIES = 20000
+
+// Multi-Tenant Phase 2: both exported functions below now take `tenantId`
+// as their first argument. The security audit specifically flagged this
+// store as the largest cross-tenant risk (a flat, unfiltered event log
+// with no location or tenant boundary at all) -- this is the fix's
+// foundation: for DEFAULT_TENANT_ID this resolves to exactly
+// AUDIT_LOG_KEY, unchanged, but any other tenantId can NEVER read or write
+// this log, full stop, enforced by tenantDualRead.js's centralized rule
+// rather than by this file re-deriving it.
 
 let redisClient = null
 let testClientFactory = null
@@ -82,7 +93,8 @@ export function clientIp(req) {
 // write" convention: an audit entry is important, but it is not the
 // source of truth for the change itself (contactStore.js's own history
 // array already recorded that).
-export async function appendAuditEntry(entry) {
+export async function appendAuditEntry(tenantId, entry) {
+  assertKnownTenantId(tenantId, 'appendAuditEntry') // a missing tenantId is a caller bug, not a Redis outage -- throws synchronously either way
   const client = getClient()
   if (!client) {
     console.error('[auditLog] audit log is not configured -- entry not recorded:', entry.action)
@@ -93,9 +105,10 @@ export async function appendAuditEntry(entry) {
     at: new Date().toISOString(),
     ...entry,
   }
+  const writeKey = resolveListWriteKey({ v1Key: AUDIT_LOG_KEY, v2Key: auditLogKeyV2(tenantId), tenantId })
   try {
-    await client.lpush(AUDIT_LOG_KEY, JSON.stringify(record))
-    await client.ltrim(AUDIT_LOG_KEY, 0, MAX_ENTRIES - 1)
+    await client.lpush(writeKey, JSON.stringify(record))
+    await client.ltrim(writeKey, 0, MAX_ENTRIES - 1)
     return true
   } catch (err) {
     console.error(`[auditLog] failed to append entry: ${err.message}`)
@@ -109,13 +122,15 @@ export async function appendAuditEntry(entry) {
 // (AuditLogUnavailableError) -- silently showing an empty audit log when
 // the store is actually broken would hide a real problem from the one
 // place (Owner-only) that's supposed to catch it.
-export async function listAuditEntries({ entity, actorId, from, to, result, limit = 50, offset = 0 } = {}) {
+export async function listAuditEntries(tenantId, { entity, actorId, from, to, result, limit = 50, offset = 0 } = {}) {
+  assertKnownTenantId(tenantId, 'listAuditEntries')
   const client = getClient()
   if (!client) throw new AuditLogUnavailableError('audit log is not configured')
 
   let raw
   try {
-    raw = await client.lrange(AUDIT_LOG_KEY, 0, MAX_ENTRIES - 1)
+    const key = await resolveListReadKey(client, { v1Key: AUDIT_LOG_KEY, v2Key: auditLogKeyV2(tenantId), tenantId })
+    raw = key ? await client.lrange(key, 0, MAX_ENTRIES - 1) : []
   } catch (err) {
     throw new AuditLogUnavailableError(`audit log unreachable: ${err.message}`)
   }

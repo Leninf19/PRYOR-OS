@@ -23,8 +23,21 @@
 // Node-only, same as actionStore.js.
 
 import { Redis } from '@upstash/redis'
+import { publishBridgeKeyV2 } from './tenantKeys.js'
+import { resolveIndividualWriteKey, assertKnownTenantId } from './tenantDualRead.js'
 
 const KEY_PREFIX = 'publish_bridge:v1:'
+
+// Multi-Tenant Phase 2: every exported function below now takes `tenantId`
+// as its first argument. EXTRA CAUTION HERE: this store's v1 keys
+// (publish_bridge:v1:{localReviewId}) are also read/written directly by
+// gbp_reply_bridge_reconcile.py, a Python cron job entirely outside this
+// codebase's own deploys -- for DEFAULT_TENANT_ID, keyFor() below
+// resolves to EXACTLY the same key string that job already expects,
+// completely unchanged. Any other tenantId writes to its own v2 key
+// instead (see tenantDualRead.js), which that Python job does not know
+// about yet -- correct for Phase 2, since no second tenant is onboarded
+// and that reconciliation job has no concept of tenants at all yet.
 
 // Recovery Milestone 6B, Part 6 (lifecycle/cleanup): the fast reconciliation
 // job (gbp_reply_bridge_reconcile.py, run every 15 minutes alongside
@@ -80,6 +93,12 @@ function keyFor(localReviewId) {
   return `${KEY_PREFIX}${localReviewId}`
 }
 
+function resolveWriteKeyFor(tenantId, localReviewId) {
+  return resolveIndividualWriteKey({
+    v1Key: keyFor(localReviewId), v2Key: publishBridgeKeyV2(tenantId, localReviewId), tenantId,
+  })
+}
+
 function parseRecord(value) {
   if (value == null) return null
   if (typeof value === 'object') return value // @upstash/redis may already deserialize JSON values
@@ -97,9 +116,10 @@ function parseRecord(value) {
 // is the actual restaurant reply (legitimately needed so the frontend can
 // keep showing it before Google's own copy has synced back) -- callers
 // (Part 12) are responsible for never logging it.
-export async function writePublishBridge(localReviewId, {
+export async function writePublishBridge(tenantId, localReviewId, {
   gbpReviewName, responseText, locationName, reviewerName, reviewDate,
 }) {
+  assertKnownTenantId(tenantId, 'writePublishBridge')
   const client = getClient()
   if (!client) throw new PublishBridgeUnavailableError('publish bridge store is not configured')
 
@@ -116,7 +136,7 @@ export async function writePublishBridge(localReviewId, {
   }
 
   try {
-    await client.set(keyFor(localReviewId), JSON.stringify(record), { ex: BRIDGE_TTL_SECONDS })
+    await client.set(resolveWriteKeyFor(tenantId, localReviewId), JSON.stringify(record), { ex: BRIDGE_TTL_SECONDS })
   } catch (err) {
     throw new PublishBridgeUnavailableError(`publish bridge store unreachable: ${err.message}`)
   }
@@ -127,14 +147,23 @@ export async function writePublishBridge(localReviewId, {
 // Returns { [localReviewId]: record } for only the ids that currently have
 // a live bridge record; ids with none are simply absent from the result
 // (not an error -- "no bridge" is the overwhelmingly common case).
-export async function getPublishBridges(localReviewIds) {
+//
+// Note: like notificationStore.js's listReplyFailures(), this bulk lookup
+// resolves each key on the WRITE side (today's unchanged v1 keyFor() for
+// DEFAULT_TENANT_ID, this tenant's own v2 key otherwise) rather than
+// per-key checking whether v2 happens to be populated -- these are
+// short-TTL (48h), transient reconciliation records, and the isolation
+// guarantee that actually matters (a tenant can never read another
+// tenant's bridge records) holds either way.
+export async function getPublishBridges(tenantId, localReviewIds) {
+  assertKnownTenantId(tenantId, 'getPublishBridges')
   const client = getClient()
   if (!client) throw new PublishBridgeUnavailableError('publish bridge store is not configured')
   if (!localReviewIds.length) return {}
 
   let raws
   try {
-    raws = await client.mget(...localReviewIds.map(keyFor))
+    raws = await client.mget(...localReviewIds.map(id => resolveWriteKeyFor(tenantId, id)))
   } catch (err) {
     throw new PublishBridgeUnavailableError(`publish bridge store unreachable: ${err.message}`)
   }
@@ -155,11 +184,12 @@ export async function getPublishBridges(localReviewIds) {
 // accidentally end up leaning on the TTL as the ONLY cleanup path. Never
 // throws on a missing key (deleting something already gone is a no-op, not
 // an error).
-export async function deletePublishBridge(localReviewId) {
+export async function deletePublishBridge(tenantId, localReviewId) {
+  assertKnownTenantId(tenantId, 'deletePublishBridge')
   const client = getClient()
   if (!client) throw new PublishBridgeUnavailableError('publish bridge store is not configured')
   try {
-    await client.del(keyFor(localReviewId))
+    await client.del(resolveWriteKeyFor(tenantId, localReviewId))
   } catch (err) {
     throw new PublishBridgeUnavailableError(`publish bridge store unreachable: ${err.message}`)
   }

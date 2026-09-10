@@ -28,11 +28,21 @@ ever attempted and rejected with a much more confusing git-level error:
     limit -- close enough to be a real, timely alarm, far enough that a
     single large run can't sail past it between checks.
 
-Run directly: python check_db_integrity.py
+Multi-Tenant Phase 4D: this script's CLI now requires --tenant-id, resolved
+via tenant_paths.resolve_review_db_path() -- the module-level DB_PATH
+constant below remains only as the fallback for direct library callers
+(auto_update.py's --local pre/post checks) that pass their own db_path
+explicitly to check_integrity(); it is never used implicitly by main().
+
+Run directly: python check_db_integrity.py --tenant-id t_los-tres-amigos
 """
+import argparse
 import sqlite3
 import sys
 from pathlib import Path
+
+import tenant_keys
+import tenant_paths
 
 DB_PATH = Path(__file__).resolve().parent / "dashboard" / "reviews.db"
 
@@ -127,7 +137,21 @@ def check_integrity(db_path: Path) -> tuple[bool, str, dict | None]:
 
 
 def main() -> int:
-    ok, message, _ = check_integrity(DB_PATH)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to check. REQUIRED -- no default. "
+                              "This script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::check_db_integrity.py: invalid --tenant-id {args.tenant_id!r}")
+        return 1
+    try:
+        db_path = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::check_db_integrity.py: {e}")
+        return 1
+
+    ok, message, _ = check_integrity(db_path)
     print(message if ok else f"::error::{message}")
     return 0 if ok else 1
 

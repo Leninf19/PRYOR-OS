@@ -14,6 +14,7 @@ import { signSession, verifySession, SESSION_COOKIE } from '../dashboard/api/_li
 import { requireAuth } from '../dashboard/api/_lib/auth.js'
 import { _setRedisClientForTests as setUserStoreClient, _resetRedisClientForTests as resetUserStoreClient } from '../dashboard/api/_lib/userStore.js'
 import { _setRedisClientForTests as setTokenStoreClient, _resetRedisClientForTests as resetTokenStoreClient } from '../dashboard/api/_lib/tokenStore.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -74,9 +75,9 @@ async function seedDirectory(overrides = {}) {
   return base
 }
 
-async function ownerToken() { return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 }) }
-async function adminToken() { return signSession({ userId: 'usr_admin', email: 'admin@example.com', role: 'admin', locationIds: '*', sessionVersion: 1 }) }
-async function lmToken() { return signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7, 12], sessionVersion: 1 }) }
+async function ownerToken() { return signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 }) }
+async function adminToken() { return signSession({ userId: 'usr_admin', email: 'admin@example.com', role: 'admin', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 }) }
+async function lmToken() { return signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7, 12], tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 }) }
 
 function fakeRes() {
   const res = { statusCode: null, body: null }
@@ -110,7 +111,7 @@ async function testUsersListIncludesStaticAndRedisAccountsDeduplicated() {
 async function testUsersListForbiddenForMarketing() {
   await seedDirectory({ usr_marketing: { userId: 'usr_marketing', email: 'marketing@example.com', passwordHash: await bcryptHash(), role: 'marketing', locationIds: '*', sessionVersion: 1, disabled: false } })
   installFakeRedis()
-  const token = await signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', sessionVersion: 1 })
+  const token = await signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
   const res = await call('users-list', { method: 'GET', token })
   assert(res.statusCode === 403, `Marketing must not hold USERS_MANAGE, got ${res.statusCode}`)
 }
@@ -213,7 +214,7 @@ async function testEnableUserReactivatesAccess() {
   assert(enableRes.statusCode === 200 && enableRes.body.disabled === false, `expected disabled:false, got ${enableRes.statusCode}`)
 
   // A fresh login-style token (current sessionVersion) must now work again.
-  const freshToken = await signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7, 12], sessionVersion: 2 })
+  const freshToken = await signSession({ userId: 'usr_lm', email: 'lm@example.com', role: 'location_manager', locationIds: [7, 12], tenantId: DEFAULT_TENANT_ID, sessionVersion: 2 })
   const account = await requireAuth({ headers: { cookie: `${SESSION_COOKIE}=${freshToken}` } }, fakeRes(), null)
   assert(account !== null, 're-enabled account must be reachable again with a current sessionVersion token')
 }

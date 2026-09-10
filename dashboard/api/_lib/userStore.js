@@ -41,9 +41,114 @@
 
 import { Redis } from '@upstash/redis'
 import { normalizeEmail, isValidLocationIds, ROLES } from './accounts.js'
+import { usersKeyV2, usersEmailIndexKeyV2 } from './tenantKeys.js'
+import { resolveHashReadKey, resolveHashWriteKey, getTenantMigrationMode, TenantMigrationMode } from './tenantDualRead.js'
 
 const USERS_KEY = 'users:v1'
 const EMAIL_INDEX_KEY = 'users_email_index:v1'
+
+// --- Global identity index (Multi-Tenant Phase 4K) -------------------------
+// Every account record above is TENANT-SCOPED (its own per-tenant hash, or
+// the LEGACY bootstrap hash) -- but login and every other pre-authentication
+// lookup starts with ONLY an email or a userId, with no tenant known yet.
+// Before this phase, that gap was papered over by always searching the ONE
+// bootstrap tenant's hash (accountStore.js's resolveBootstrapTenantId()
+// calls) -- correct by accident while Los Tres Amigos is the only tenant,
+// silently broken the moment a second, TENANT_SCOPED-mode tenant's users
+// are created (their records live in THEIR OWN usersKeyV2() hash, which
+// the bootstrap-only lookup never even looks at).
+//
+// This index is deliberately GLOBAL (no tenant segment in its key, unlike
+// every other key in tenantKeys.js) and deliberately minimal: it stores
+// ONLY {tenantId, userId} per email, and tenantId per userId -- enough to
+// locate the tenant-owned account, nothing else. It is a POINTER, never a
+// second copy of account data; accountStore.js still performs a real,
+// tenant-scoped getUserById()/getUserByEmail() read after consulting it.
+//
+// EMAIL IS GLOBALLY UNIQUE BY DESIGN in this system (see
+// settings/[action].js's inviteUserAction(), which already rejects an
+// invite for an email that resolves to ANY existing account, checked via
+// the cross-tenant-capable accountStore.js:getAccountByEmail() -- this
+// phase does not change that intent, only makes the lookup that enforces
+// it actually correct for a second tenant). There is therefore no
+// "disambiguation" case to design for the SAME email existing in two
+// tenants -- it is a precondition violation, prevented at write time, not
+// a runtime ambiguity to resolve at read time.
+//
+// MIGRATION MODE, explicit and delegated (never inferred from a record's
+// absence): a tenant's participation in this index is decided by the exact
+// same, already-reviewed per-tenant registry tenantDualRead.js uses to
+// decide WHERE a tenant's own user hash lives (TENANT_MIGRATION_MODE) --
+// see getUserIdentityMigrationMode() below. Los Tres Amigos (LEGACY) is
+// never written to this index by upsertUser() below, exactly preserving
+// its current, index-free resolution path (accountStore.js's bootstrap+
+// static-directory fallback) with zero behavior change. Every
+// TENANT_SCOPED-mode tenant (every tenant other than Los Tres Amigos) is
+// unconditionally indexed on every upsertUser() call.
+export const UserIdentityMigrationMode = Object.freeze({
+  LEGACY: 'legacy',
+  TENANT_SCOPED: 'tenant_scoped',
+})
+
+// Deliberately DELEGATES to tenantDualRead.js's own registry rather than
+// maintaining a second, independently-driftable one -- a tenant's identity-
+// index participation and its user-hash storage location answer the exact
+// same underlying question ("has this tenant been migrated off the
+// bootstrap/LEGACY path yet"), so one reviewed change to
+// TENANT_MIGRATION_MODE moves both at once, never one without the other.
+export function getUserIdentityMigrationMode(tenantId) {
+  return getTenantMigrationMode(tenantId) === TenantMigrationMode.LEGACY
+    ? UserIdentityMigrationMode.LEGACY
+    : UserIdentityMigrationMode.TENANT_SCOPED
+}
+
+const IDENTITY_INDEX_BY_EMAIL_KEY = 'identity_index_by_email:v1'
+const IDENTITY_INDEX_BY_USER_ID_KEY = 'identity_index_by_user_id:v1'
+
+async function writeIdentityIndexEntries(client, tenantId, userId, normalizedEmail) {
+  await client.hset(IDENTITY_INDEX_BY_EMAIL_KEY, { [normalizedEmail]: JSON.stringify({ tenantId, userId }) })
+  await client.hset(IDENTITY_INDEX_BY_USER_ID_KEY, { [userId]: tenantId })
+}
+
+// Looks up the {tenantId, userId} a normalized email belongs to via the
+// GLOBAL identity index. Returns null if this email was never indexed
+// (every LEGACY-mode tenant's accounts, by construction -- never a
+// migration-status inference, see the header above) or is genuinely
+// unknown. Throws UserStoreUnavailableError on a real store outage,
+// exactly like every other read in this file -- accountStore.js is the
+// one caller that catches this and degrades to its own LEGACY fallback.
+export async function lookupIdentityByEmail(email) {
+  const client = getClient()
+  if (!client) throw new UserStoreUnavailableError('user store is not configured')
+  const normalized = normalizeEmail(email)
+  let raw
+  try {
+    raw = await client.hget(IDENTITY_INDEX_BY_EMAIL_KEY, normalized)
+  } catch (err) {
+    throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
+  }
+  return parseRecord(raw)
+}
+
+// Looks up which tenant owns a given userId, via the GLOBAL identity
+// index. Returns null (not a tenantId) if never indexed -- same LEGACY/
+// unknown distinction as lookupIdentityByEmail() above.
+export async function lookupTenantIdForUserId(userId) {
+  const client = getClient()
+  if (!client) throw new UserStoreUnavailableError('user store is not configured')
+  try {
+    return (await client.hget(IDENTITY_INDEX_BY_USER_ID_KEY, userId)) || null
+  } catch (err) {
+    throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
+  }
+}
+
+// Multi-Tenant Phase 2: every exported function below now takes `tenantId`
+// as its first argument -- see tenantDualRead.js's header for the full
+// read/write rule. For DEFAULT_TENANT_ID (the only tenant that exists
+// today), this resolves to exactly USERS_KEY/EMAIL_INDEX_KEY, unchanged --
+// nothing about login, the Users & Access admin list, or invite/reset
+// behavior changes for Los Tres Amigos as a result of this refactor.
 
 let redisClient = null
 let testClientFactory = null
@@ -99,41 +204,44 @@ export function deriveUserStatus(record) {
   return 'invited'
 }
 
-export async function getUserById(userId) {
+export async function getUserById(tenantId, userId) {
   const client = getClient()
   if (!client) throw new UserStoreUnavailableError('user store is not configured')
   let raw
   try {
-    raw = await client.hget(USERS_KEY, userId)
+    const key = await resolveHashReadKey(client, { v1Key: USERS_KEY, v2Key: usersKeyV2(tenantId), tenantId })
+    raw = key ? await client.hget(key, userId) : null
   } catch (err) {
     throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
   }
   return parseRecord(raw)
 }
 
-export async function getUserByEmail(email) {
+export async function getUserByEmail(tenantId, email) {
   const client = getClient()
   if (!client) throw new UserStoreUnavailableError('user store is not configured')
   const normalized = normalizeEmail(email)
   let userId
   try {
-    userId = await client.hget(EMAIL_INDEX_KEY, normalized)
+    const indexKey = await resolveHashReadKey(client, { v1Key: EMAIL_INDEX_KEY, v2Key: usersEmailIndexKeyV2(tenantId), tenantId })
+    userId = indexKey ? await client.hget(indexKey, normalized) : null
   } catch (err) {
     throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
   }
   if (!userId) return null
-  return getUserById(userId)
+  return getUserById(tenantId, userId)
 }
 
 // Returns every user record (no filtering) -- callers (the Users & Access
 // admin action, assertNotLastActiveOwner) are responsible for any
 // filtering/sanitization they need.
-export async function listUsers() {
+export async function listUsers(tenantId) {
   const client = getClient()
   if (!client) throw new UserStoreUnavailableError('user store is not configured')
   let raw
   try {
-    raw = await client.hgetall(USERS_KEY)
+    const key = await resolveHashReadKey(client, { v1Key: USERS_KEY, v2Key: usersKeyV2(tenantId), tenantId })
+    raw = key ? await client.hgetall(key) : {}
   } catch (err) {
     throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
   }
@@ -160,7 +268,7 @@ function isValidRoleIncludingAdmin(role) {
 // well-formed if present) -- the caller (invitation-accept, user-management
 // actions) is responsible for its own request-body validation; this is a
 // second, defensive layer, matching contactStore.js's division of labor.
-export async function upsertUser(record, { previousEmail } = {}) {
+export async function upsertUser(tenantId, record, { previousEmail } = {}) {
   const client = getClient()
   if (!client) throw new UserStoreUnavailableError('user store is not configured')
   if (!record || typeof record.userId !== 'string' || !record.userId) {
@@ -169,18 +277,36 @@ export async function upsertUser(record, { previousEmail } = {}) {
   if (!isValidRoleIncludingAdmin(record.role)) {
     throw new Error(`upsertUser: invalid role "${record.role}"`)
   }
-  if (!isValidLocationIds(record.locationIds)) {
+  // Multi-Tenant Phase 4K: allowEmpty -- the DYNAMIC store, unlike the
+  // static ACCOUNT_DIRECTORY_JSON directory, can legitimately reach zero
+  // authorized locations at runtime (see isValidLocationIds()'s own header
+  // comment). This does not loosen anything for hand-authored config.
+  if (!isValidLocationIds(record.locationIds, { allowEmpty: true })) {
     throw new Error('upsertUser: invalid locationIds')
   }
+
+  const usersKey = resolveHashWriteKey({ v1Key: USERS_KEY, v2Key: usersKeyV2(tenantId), tenantId })
+  const emailIndexKey = resolveHashWriteKey({ v1Key: EMAIL_INDEX_KEY, v2Key: usersEmailIndexKeyV2(tenantId), tenantId })
 
   const normalized = normalizeEmail(record.email)
   const toWrite = { ...record, email: normalized }
 
   try {
-    await client.hset(USERS_KEY, { [record.userId]: JSON.stringify(toWrite) })
-    await client.hset(EMAIL_INDEX_KEY, { [normalized]: record.userId })
+    await client.hset(usersKey, { [record.userId]: JSON.stringify(toWrite) })
+    await client.hset(emailIndexKey, { [normalized]: record.userId })
     if (previousEmail && normalizeEmail(previousEmail) !== normalized) {
-      await client.hdel(EMAIL_INDEX_KEY, normalizeEmail(previousEmail))
+      await client.hdel(emailIndexKey, normalizeEmail(previousEmail))
+    }
+    // Multi-Tenant Phase 4K -- maintain the GLOBAL identity index for any
+    // TENANT_SCOPED-mode tenant. Los Tres Amigos (LEGACY) is deliberately
+    // NEVER written here, even though it goes through this exact same
+    // upsertUser() call for password resets/promotions today -- its
+    // resolution path stays index-free, exactly as before this phase.
+    if (getUserIdentityMigrationMode(tenantId) === UserIdentityMigrationMode.TENANT_SCOPED) {
+      await writeIdentityIndexEntries(client, tenantId, record.userId, normalized)
+      if (previousEmail && normalizeEmail(previousEmail) !== normalized) {
+        await client.hdel(IDENTITY_INDEX_BY_EMAIL_KEY, normalizeEmail(previousEmail))
+      }
     }
   } catch (err) {
     throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
@@ -192,8 +318,8 @@ export async function upsertUser(record, { previousEmail } = {}) {
 // change, location change, disable/enable, password set) actually wants,
 // rather than requiring every caller to read-modify-write the full record
 // itself. Returns the updated record, or null if userId doesn't exist.
-export async function updateUser(userId, patch) {
-  const existing = await getUserById(userId)
+export async function updateUser(tenantId, userId, patch) {
+  const existing = await getUserById(tenantId, userId)
   if (!existing) return null
   const next = {
     ...existing,
@@ -201,7 +327,7 @@ export async function updateUser(userId, patch) {
     userId, // never overwritable via patch
     updatedAt: new Date().toISOString(),
   }
-  return upsertUser(next, { previousEmail: patch.email ? existing.email : undefined })
+  return upsertUser(tenantId, next, { previousEmail: patch.email ? existing.email : undefined })
 }
 
 // Best-effort, non-blocking timestamp touch -- called from the login
@@ -210,12 +336,72 @@ export async function updateUser(userId, patch) {
 // otherwise-successful login, mirroring auditLog.js's appendAuditEntry()
 // same "this matters but is not the source of truth for the action itself"
 // reasoning.
-export async function touchLastLogin(userId) {
+export async function touchLastLogin(tenantId, userId) {
   try {
-    await updateUser(userId, { lastLoginAt: new Date().toISOString() })
+    await updateUser(tenantId, userId, { lastLoginAt: new Date().toISOString() })
     return true
   } catch (err) {
     console.error(`[userStore] failed to record lastLoginAt for ${userId}: ${err.message}`)
     return false
   }
+}
+
+// Multi-Tenant Phase 4I.3 -- best-effort account-grant hygiene after a
+// platform admin removes location(s) from a tenant's approvedLocations
+// (tenantConfigStore.js's applyEntitlementChange()). NOT ITSELF A SECURITY
+// BOUNDARY -- tenants.js's tenantOwnsLocation() already denies access to a
+// removed location unconditionally the moment the entitlement change
+// commits, regardless of what any individual account's own locationIds
+// array still says (requireLocationAccess() requires BOTH tenantOwnsLocation()
+// AND the account's own grant -- tenant-level denial alone already blocks
+// access). This function exists so a removed location's numeric id
+// doesn't linger indefinitely in account records, and so every affected
+// account's outstanding session tokens are invalidated (sessionVersion
+// bump) even though those sessions were never actually able to reach the
+// removed location in the first place.
+//
+// Wildcard ('*') accounts are skipped entirely -- wildcard already means
+// "every CURRENTLY approved location" (tenants.js's isWildcardGrant(),
+// resolved fresh on every request from live tenant config), so removing a
+// location from approvedLocations already narrows a wildcard account's
+// effective access with zero per-account bookkeeping required. Adding a
+// location never touches any account's grant either (not called by that
+// path at all) -- a wildcard account gains it automatically and for the
+// same reason; a non-wildcard account's own explicit array is NEVER
+// widened by this function, only ever narrowed.
+//
+// Multi-Tenant Phase 4K -- now calls listUsers(tenantId)/updateUser(tenantId, ...)
+// DIRECTLY: with the identity-index fix above, listUsers(tenantId) for a
+// TENANT_SCOPED-mode tenant correctly reads ONLY that tenant's own hash
+// (usersKeyV2(tenantId)) -- there is no longer a bootstrap-hash detour to
+// route around, and this function can never scan or mutate a different
+// tenant's accounts. For Los Tres Amigos (LEGACY), listUsers(DEFAULT_TENANT_ID)
+// still resolves to the same bootstrap hash as always -- unchanged.
+//
+// Phase 4I.3's KNOWN LIMITATION is now closed: accounts.js's
+// isValidLocationIds() accepts an explicit empty array as of this phase, so
+// an account whose explicit locationIds would become EMPTY after stripping
+// every removed id is written as a genuine `locationIds: []` -- "zero
+// authorized locations" -- rather than left with a stale, no-longer-
+// meaningful array. `emptied` (vs. `narrowed`) in the return value is now
+// purely descriptive (which accounts landed at zero vs. some-but-fewer
+// locations), not a report of a schema limitation.
+export async function reconcileAccountGrantsAfterLocationRemoval(tenantId, removedLocationIds) {
+  const removeSet = new Set(removedLocationIds ?? [])
+  if (removeSet.size === 0) return { narrowed: [], emptied: [] }
+
+  const users = await listUsers(tenantId)
+  const narrowed = []
+  const emptied = []
+  for (const user of users) {
+    if (!Array.isArray(user.locationIds)) continue // wildcard, or a shape this codebase's own validated writers never produce
+    if (!user.locationIds.some(id => removeSet.has(id))) continue // nothing to remove for this account
+
+    const remaining = user.locationIds.filter(id => !removeSet.has(id))
+    const nextSessionVersion = (Number.isInteger(user.sessionVersion) ? user.sessionVersion : 1) + 1
+    await updateUser(tenantId, user.userId, { locationIds: remaining, sessionVersion: nextSessionVersion })
+    if (remaining.length === 0) emptied.push(user.userId)
+    else narrowed.push(user.userId)
+  }
+  return { narrowed, emptied }
 }

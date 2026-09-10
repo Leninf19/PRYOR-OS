@@ -21,25 +21,26 @@
 // in dashboard/vercel.json (already added) -- Vercel's static dependency
 // tracer cannot discover a fs.readFile path built at request time.
 
-import { readFile } from 'fs/promises'
-import path from 'path'
-import { fileURLToPath } from 'url'
 import { getContact as getRedisContact, ContactStoreUnavailableError } from './contactStore.js'
+import { readPrivateDataFile } from './reviewDataPaths.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const CONTACTS_PATH = path.resolve(__dirname, '..', '..', 'private-data', 'location-contacts.json')
+// Multi-Tenant Phase 4D: keyed per tenantId -- before this fix this was a
+// single, shared module-level cache read from a single hardcoded path,
+// meaning EVERY tenant's legacy-fallback contact lookup would have been
+// served from Los Tres Amigos's own location-contacts.json.
+const legacyCacheByTenant = new Map()
 
-let legacyCache = null
-
-async function getLegacyContact(locationId) {
-  if (!legacyCache) {
+async function getLegacyContact(tenantId, locationId) {
+  if (!legacyCacheByTenant.has(tenantId)) {
+    let contacts
     try {
-      legacyCache = JSON.parse(await readFile(CONTACTS_PATH, 'utf-8'))
+      contacts = JSON.parse(await readPrivateDataFile(tenantId, 'location-contacts.json'))
     } catch {
-      legacyCache = {}
+      contacts = {}
     }
+    legacyCacheByTenant.set(tenantId, contacts)
   }
-  return legacyCache[String(locationId)] ?? null
+  return legacyCacheByTenant.get(tenantId)[String(locationId)] ?? null
 }
 
 // Returns { email, name } or null (no configured contact anywhere). Tries
@@ -47,9 +48,9 @@ async function getLegacyContact(locationId) {
 // falls back to the last-baked legacy JSON file rather than failing the
 // whole send/preview action -- a real outage of the newer store should
 // degrade to the old behavior, not break a working feature.
-export async function getLocationContact(locationId) {
+export async function getLocationContact(tenantId, locationId) {
   try {
-    const record = await getRedisContact(locationId)
+    const record = await getRedisContact(tenantId, locationId)
     if (record && record.active && record.primaryEmail) {
       return { email: record.primaryEmail, name: record.managerName ?? null }
     }
@@ -58,16 +59,16 @@ export async function getLocationContact(locationId) {
     if (!(err instanceof ContactStoreUnavailableError)) throw err
     // fall through to the legacy path below
   }
-  return getLegacyContact(locationId)
+  return getLegacyContact(tenantId, locationId)
 }
 
 // Test-only seam -- lets tests inject a fixed legacy-fallback contact map
-// without touching the real filesystem path or dashboard/private-data/.
-// Redis itself is mocked independently via contactStore.js's own
-// _setRedisClientForTests seam.
-export function _setContactsForTests(map) {
-  legacyCache = map
+// (for the given tenantId) without touching the real filesystem path or
+// dashboard/private-data/. Redis itself is mocked independently via
+// contactStore.js's own _setRedisClientForTests seam.
+export function _setContactsForTests(tenantId, map) {
+  legacyCacheByTenant.set(tenantId, map)
 }
 export function _resetContactsForTests() {
-  legacyCache = null
+  legacyCacheByTenant.clear()
 }

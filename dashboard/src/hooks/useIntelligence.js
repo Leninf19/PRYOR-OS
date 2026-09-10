@@ -96,7 +96,14 @@ export function usePrefetchLocationDetails(stats) {
   useEffect(() => {
     if (!stats?.length) return
     stats.forEach(loc => {
-      const slug = loc.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+      // Multi-Tenant Phase 4P: consume the canonical, collision-safe slug
+      // location-stats.json now carries (db.canonical_location_slugs()) --
+      // never re-derive one from `name` independently. Two locations that
+      // legitimately share a display name get DISTINCT slugs server-side
+      // (disambiguated by locationId); re-deriving here would silently
+      // collide them back onto the same intelligence/locations/*.json file.
+      const slug = loc.slug
+      if (!slug) return
       qc.prefetchQuery({
         queryKey: ['location-detail', slug],
         queryFn: () => fetchJSON(`intelligence/locations/${slug}.json`),
@@ -112,7 +119,9 @@ export function usePrefetchLocationDetails(stats) {
 // usePrefetchLocationDetails() already primes, so on most navigations this resolves
 // from cache instantly instead of firing 20+ new requests.
 export function useAllLocationDetails(stats) {
-  const slugs = (stats ?? []).map(s => s.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''))
+  // Multi-Tenant Phase 4P: same canonical-slug requirement as
+  // usePrefetchLocationDetails() above -- see its comment.
+  const slugs = (stats ?? []).map(s => s.slug).filter(Boolean)
   const results = useQueries({
     queries: slugs.map(slug => ({
       queryKey: ['location-detail', slug],

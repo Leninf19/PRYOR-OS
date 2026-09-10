@@ -12,8 +12,16 @@
 
 import { Redis } from '@upstash/redis'
 import { randomUUID } from 'crypto'
+import { contentAssetsKeyV2 } from './tenantKeys.js'
+import { resolveHashReadKey, resolveHashWriteKey } from './tenantDualRead.js'
 
 const ASSET_KEY = 'content_assets:v1'
+
+// Multi-Tenant Phase 2: every exported function below (except
+// generateAssetId, which touches no store) now takes `tenantId` as its
+// first argument -- see tenantDualRead.js's header for the full read/write
+// rule. For DEFAULT_TENANT_ID, this resolves to exactly ASSET_KEY,
+// unchanged.
 
 let redisClient = null
 let testClientFactory = null
@@ -53,12 +61,13 @@ export function generateAssetId() {
   return `asset_${randomUUID()}`
 }
 
-export async function getAllAssets() {
+export async function getAllAssets(tenantId) {
   const client = getClient()
   if (!client) throw new ContentAssetStoreUnavailableError('content asset store is not configured')
   let raw
   try {
-    raw = await client.hgetall(ASSET_KEY)
+    const key = await resolveHashReadKey(client, { v1Key: ASSET_KEY, v2Key: contentAssetsKeyV2(tenantId), tenantId })
+    raw = key ? await client.hgetall(key) : {}
   } catch (err) {
     throw new ContentAssetStoreUnavailableError(`content asset store unreachable: ${err.message}`)
   }
@@ -70,12 +79,13 @@ export async function getAllAssets() {
   return out
 }
 
-export async function getAsset(id) {
+export async function getAsset(tenantId, id) {
   const client = getClient()
   if (!client) throw new ContentAssetStoreUnavailableError('content asset store is not configured')
   let raw
   try {
-    raw = await client.hget(ASSET_KEY, id)
+    const key = await resolveHashReadKey(client, { v1Key: ASSET_KEY, v2Key: contentAssetsKeyV2(tenantId), tenantId })
+    raw = key ? await client.hget(key, id) : null
   } catch (err) {
     throw new ContentAssetStoreUnavailableError(`content asset store unreachable: ${err.message}`)
   }
@@ -86,7 +96,7 @@ export async function getAsset(id) {
 // see api/content/[action].js's validateUpload()). This store never
 // re-derives or trusts a client-supplied blobPathname's authenticity beyond
 // persisting it; the upload endpoint is the only writer.
-export async function createAsset(fields, account) {
+export async function createAsset(tenantId, fields, account) {
   const client = getClient()
   if (!client) throw new ContentAssetStoreUnavailableError('content asset store is not configured')
 
@@ -105,19 +115,21 @@ export async function createAsset(fields, account) {
     uploadedAt: now,
   }
 
+  const writeKey = resolveHashWriteKey({ v1Key: ASSET_KEY, v2Key: contentAssetsKeyV2(tenantId), tenantId })
   try {
-    await client.hset(ASSET_KEY, { [id]: JSON.stringify(record) })
+    await client.hset(writeKey, { [id]: JSON.stringify(record) })
   } catch (err) {
     throw new ContentAssetStoreUnavailableError(`content asset store unreachable: ${err.message}`)
   }
   return record
 }
 
-export async function deleteAsset(id) {
+export async function deleteAsset(tenantId, id) {
   const client = getClient()
   if (!client) throw new ContentAssetStoreUnavailableError('content asset store is not configured')
+  const writeKey = resolveHashWriteKey({ v1Key: ASSET_KEY, v2Key: contentAssetsKeyV2(tenantId), tenantId })
   try {
-    const removed = await client.hdel(ASSET_KEY, id)
+    const removed = await client.hdel(writeKey, id)
     return removed > 0
   } catch (err) {
     throw new ContentAssetStoreUnavailableError(`content asset store unreachable: ${err.message}`)

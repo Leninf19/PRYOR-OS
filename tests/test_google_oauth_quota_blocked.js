@@ -30,6 +30,7 @@ import {
   _setRedisClientForTests, _resetRedisClientForTests, setStoredCredential, getStoredCredential, GoogleHealth,
 } from '../dashboard/api/_lib/credentialStore.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -52,7 +53,28 @@ async function run(name, fn) {
 
 function fakeCredentialRedis(initial = null) {
   let value = initial
-  return { get: async () => value, set: async (_key, v) => { value = v }, del: async () => { value = null } }
+  return {
+    get: async () => value,
+    set: async (_key, v) => { value = v },
+    del: async () => { value = null },
+    // Multi-Tenant Phase 4I.2: recordSyncOutcome()/recordOAuthRefresh() now
+    // write via a CAS EVAL, not a plain set() -- see credentialStore.js's
+    // CREDENTIAL_CAS_SCRIPT. Faithfully emulated here (single-threaded JS,
+    // so trivially atomic).
+    eval: async (_script, _keys, args) => {
+      const [expectedVersionStr, nextJson] = args
+      let currentVersion = '0'
+      if (value) {
+        try {
+          const decoded = JSON.parse(value)
+          if (decoded && decoded.credentialVersion !== undefined) currentVersion = String(decoded.credentialVersion)
+        } catch { /* treat as version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return value ?? false
+      value = nextJson
+      return true
+    },
+  }
 }
 
 function fakeRes() {
@@ -69,7 +91,7 @@ async function setDirectory() {
     accounts: [{ userId: 'usr_owner', email: 'owner@example.com', passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false, displayName: 'Owner Person' }],
   })
 }
-const ownerToken = () => signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', sessionVersion: 1 })
+const ownerToken = () => signSession({ userId: 'usr_owner', email: 'owner@example.com', role: 'owner', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 
 const REAL_QUOTA_MESSAGE = "Quota exceeded for quota metric 'Requests' and limit 'Requests per minute' of service 'mybusinessaccountmanagement.googleapis.com' for consumer 'project_number:786038057684'."
 
@@ -77,7 +99,7 @@ async function invokeStatus(accountsResponse) {
   await setDirectory()
   const client = fakeCredentialRedis()
   _setRedisClientForTests(() => client)
-  await setStoredCredential({ refreshToken: 'a-valid-refresh-token', connectedAccountName: 'Los Tres Amigos' })
+  await setStoredCredential(DEFAULT_TENANT_ID, { refreshToken: 'a-valid-refresh-token', connectedAccountName: 'Los Tres Amigos' })
 
   globalThis.fetch = async (url) => {
     if (url.includes('oauth2.googleapis.com/token')) {

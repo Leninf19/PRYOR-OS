@@ -43,8 +43,15 @@ function testAuthGateProvidesTheRealSessionAccount() {
   const content = read('components/AuthGate.jsx')
   assert(/const \{ status, account, login \} = useSession\(\)/.test(content),
     'AuthGate.jsx must destructure account (not just status/login) from useSession()')
-  assert(/<AccountContext\.Provider value={account}>{children}<\/AccountContext\.Provider>/.test(content),
+  // Multi-Tenant Phase 4J: children now render inside a TenantLifecycleGate
+  // nested under AccountContext.Provider (see AuthGate.jsx's own header
+  // comment) rather than directly -- the account passed to the Provider is
+  // still the real session account either way; this only checks the
+  // Provider itself, not what's immediately inside it.
+  assert(/<AccountContext\.Provider value={account}>/.test(content),
     'AuthGate.jsx must provide the real session account, not a placeholder, to children')
+  assert(/<TenantLifecycleGate[^>]*>{children}<\/TenantLifecycleGate>/.test(content),
+    'AuthGate.jsx must still render the real children (App) inside its Phase 4J tenant-lifecycle gate, never a placeholder')
 }
 
 function testAuthGateStillGatesOnLoadingAndUnauthenticated() {

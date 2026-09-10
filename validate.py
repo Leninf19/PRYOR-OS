@@ -35,9 +35,13 @@ alert, export_chunks.py's export_validation()) that nothing anywhere reads
 RESOLVED flag history -- only currently-open flags are ever consumed. No
 product feature depends on this function's resolved-row output.
 """
+import argparse
+import sys
 from datetime import datetime, timezone
 
 import db
+import tenant_keys
+import tenant_paths
 
 CHECK_TYPES = [
     "duplicate_review_url", "missing_text", "missing_url", "missing_reviewer",
@@ -196,6 +200,23 @@ def run(conn) -> dict:
 
 
 def main():
+    """Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED, no default.
+    Resolved before any DB connection, so a missing/invalid/unregistered
+    tenant fails closed before touching anything."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to validate. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::validate.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        db.DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::validate.py: {e}")
+        sys.exit(1)
+
     conn = db.get_connection()
     db.init_schema(conn)
     counts = run(conn)

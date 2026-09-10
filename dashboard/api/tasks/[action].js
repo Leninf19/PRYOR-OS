@@ -25,6 +25,7 @@ import {
 } from '../_lib/taskStore.js'
 import { resolveLocationIdForReview } from '../_lib/reviewLocationIndex.js'
 import { computeReviewAssignmentProgress } from '../_lib/reviewAssignmentProgress.js'
+import { resolveTenantId } from '../_lib/tenants.js'
 
 const TASK_TYPES = new Set([
   'promotion', 'social_media', 'review_assignment', 'operations',
@@ -191,7 +192,7 @@ function validateCreateFields(body) {
 // widen a task's location scope by attaching an out-of-scope review to it.
 async function validateReviewAssignmentLocations(relatedReviewIds, account, taskLocationIds) {
   for (const id of relatedReviewIds ?? []) {
-    const locationId = await resolveLocationIdForReview(id)
+    const locationId = await resolveLocationIdForReview(id, resolveTenantId(account))
     if (locationId === null) return { valid: false, message: `Review "${id}" could not be resolved to a known location.` }
     if (!requireLocationAccess(account, locationId)) {
       return { valid: false, message: `Review "${id}" belongs to a location outside your authorization.` }
@@ -220,7 +221,7 @@ async function list(req, res) {
   }
 
   try {
-    const all = await getAllTasks()
+    const all = await getAllTasks(resolveTenantId(account))
     const visible = []
     for (const task of Object.values(all)) {
       if (task.locationIds === '*' || accountCoversTaskLocations(account, task.locationIds) ||
@@ -231,7 +232,7 @@ async function list(req, res) {
 
     const withProgress = await Promise.all(visible.map(async task => {
       if (task.type !== 'review_assignment') return task
-      const progress = await computeReviewAssignmentProgress(task.relatedReviewIds)
+      const progress = await computeReviewAssignmentProgress(task.relatedReviewIds, resolveTenantId(account))
       return progress ? { ...task, reviewProgress: progress } : task
     }))
 
@@ -262,7 +263,7 @@ async function get(req, res) {
   if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'invalid_request', message: 'id is required.' })
 
   try {
-    const task = await getTask(id)
+    const task = await getTask(resolveTenantId(account), id)
     if (!task) return res.status(404).json({ error: 'not_found' })
     const authorized = task.locationIds === '*' || accountCoversTaskLocations(account, task.locationIds) ||
       (Array.isArray(account.locationIds) && Array.isArray(task.locationIds) && task.locationIds.some(lid => account.locationIds.includes(lid)))
@@ -270,7 +271,7 @@ async function get(req, res) {
 
     let result = task
     if (task.type === 'review_assignment') {
-      const progress = await computeReviewAssignmentProgress(task.relatedReviewIds)
+      const progress = await computeReviewAssignmentProgress(task.relatedReviewIds, resolveTenantId(account))
       if (progress) result = { ...task, reviewProgress: progress }
     }
     return res.status(200).json({ task: result })
@@ -321,8 +322,8 @@ async function create(req, res) {
   // pass isRequestedLocationsAuthorized() for locationIds: '*'.
 
   try {
-    const record = await createTask(fields, account)
-    await appendAuditEntry({
+    const record = await createTask(resolveTenantId(account), fields, account)
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'task', entityId: record.id,
       action: 'task.created', result: 'success',
       message: `Created task "${record.title}" (${record.type}).`,
@@ -369,7 +370,7 @@ async function update(req, res) {
   }
 
   try {
-    const existing = await getTask(id)
+    const existing = await getTask(resolveTenantId(account), id)
     // Direct-id tampering: an unauthorized target returns 404, matching
     // the get()/reviewLocationIndex.js convention -- never 403 (which
     // would confirm a task exists at an id the caller has no access to).
@@ -413,14 +414,14 @@ async function update(req, res) {
       }
     }
 
-    const record = await updateTask(id, patch, account, logAction)
+    const record = await updateTask(resolveTenantId(account), id, patch, account, logAction)
     if ('status' in patch && patch.status === 'Completed') {
-      await appendAuditEntry({
+      await appendAuditEntry(resolveTenantId(account), {
         ...actorFields(account, req), entity: 'task', entityId: id,
         action: 'task.completed', result: 'success', message: `Marked task "${record.title}" completed.`,
       })
     } else if ('assignee' in patch) {
-      await appendAuditEntry({
+      await appendAuditEntry(resolveTenantId(account), {
         ...actorFields(account, req), entity: 'task', entityId: id,
         action: 'task.reassigned', result: 'success', message: `Reassigned task "${record.title}".`,
       })
@@ -453,12 +454,12 @@ async function del(req, res) {
   if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'invalid_request', message: 'id is required.' })
 
   try {
-    const existing = await getTask(id)
+    const existing = await getTask(resolveTenantId(account), id)
     if (!existing) return res.status(404).json({ error: 'not_found' })
     if (!accountCoversTaskLocations(account, existing.locationIds)) return res.status(404).json({ error: 'not_found' })
 
-    await deleteTask(id)
-    await appendAuditEntry({
+    await deleteTask(resolveTenantId(account), id)
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'task', entityId: id,
       action: 'task.deleted', result: 'success', message: `Deleted task "${existing.title}".`,
     })

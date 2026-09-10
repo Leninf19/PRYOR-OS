@@ -13,6 +13,7 @@
 import { readFileSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -110,7 +111,11 @@ function testNoNewFunctionEverLogsASecretToAppendAuditEntry() {
   for (const [fileName, src, fnName] of functionsToCheck) {
     const fnSrc = extractFunctionSource(src, fnName)
     assert(fnSrc, `could not locate function ${fnName} in ${fileName} -- has it been renamed?`)
-    const calls = fnSrc.match(/appendAuditEntry\(\{[\s\S]*?\}\)/g) ?? []
+    // Multi-Tenant Phase 2 prefixed every real call with a leading
+    // `resolveTenantId(account), ` argument before the object literal --
+    // [^,]* tolerates that (or any other single tenantId expression with no
+    // comma of its own) ahead of the required comma + object literal.
+    const calls = fnSrc.match(/appendAuditEntry\([^,]*,\s*\{[\s\S]*?\}\)/g) ?? []
     for (const call of calls) {
       checkedAtLeastOneCall = true
       for (const pattern of forbidden) {
@@ -134,8 +139,19 @@ function testOwnerWildcardBypassesEveryNewLocationCheck() {
   const authSrc = readApi('_lib/auth.js')
   assert(/if \(locationIds === '\*'\) return true/.test(authSrc), 'requireLocationAccess must short-circuit true for a wildcard account -- this is what every other check in this milestone ultimately relies on')
 
+  // Multi-Tenant Phase 3, reviewed update: the literal wildcard check this
+  // assertion originally matched (`account.locationIds !== '*'`) was
+  // replaced by the centralized, tenant-aware isWildcardGrant(account)
+  // helper (dashboard/api/_lib/auth.js) -- a wildcard grant now only
+  // shortcuts to "sees everything" when the account's own tenant actually
+  // owns a location catalog (see tenants.js's tenantOwnsLocationCatalog()),
+  // which is true for every real Los Tres Amigos account today, so a real
+  // Owner's behavior is unchanged. The structural guarantee this test
+  // exists to protect -- data.js gates its entire per-file/per-location
+  // branch behind a wildcard check, never running it for a genuinely
+  // company-wide account -- still holds, just via the new helper name.
   const dataSrc = readApi('data.js')
-  assert(/if \(account\.locationIds !== '\*'\)/.test(dataSrc), 'data.js must gate its entire per-file/per-location branch behind a non-wildcard check, leaving a wildcard account\'s existing behavior completely untouched')
+  assert(/if \(!isWildcardGrant\(account\)\)/.test(dataSrc), 'data.js must gate its entire per-file/per-location branch behind a non-wildcard (tenant-aware) check, leaving a genuinely company-wide account\'s existing behavior completely untouched')
 
   const publishSrc = readApi('google/[action].js')
   assert(/account\.locationIds !== '\*' && !reviewName/.test(publishSrc), 'publish()\'s fuzzy-fallback restriction must only apply to a non-wildcard account')

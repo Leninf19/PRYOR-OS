@@ -8,9 +8,15 @@ every batch so it's safe to Ctrl-C and re-run -- get_reviews_needing_classificat
 only ever returns rows whose ai_hash doesn't match their current content, so
 already-classified reviews are skipped automatically on a re-run.
 
+Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED. This script reads
+AND writes the real, tenant-owned review database (db.save_ai_classification()
+below), so it gets the same fail-closed treatment as every other
+production-capable entrypoint -- resolved via tenant_paths.py before any DB
+connection is opened.
+
 Usage:
-    python backfill_sentiment.py            # classify everything unclassified
-    python backfill_sentiment.py --limit 500  # classify at most 500 reviews
+    python backfill_sentiment.py --tenant-id t_los-tres-amigos              # classify everything unclassified
+    python backfill_sentiment.py --tenant-id t_los-tres-amigos --limit 500  # classify at most 500 reviews
 """
 import argparse
 import sys
@@ -18,13 +24,27 @@ import time
 
 import ai_engine
 import db
+import tenant_keys
+import tenant_paths
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=None, help="Max reviews to classify this run")
     parser.add_argument("--batch-size", type=int, default=20, help="Reviews per Claude call")
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to classify. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
     args = parser.parse_args()
+
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::backfill_sentiment.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        db.DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::backfill_sentiment.py: {e}")
+        sys.exit(1)
 
     if not ai_engine.is_available():
         print("ANTHROPIC_API_KEY not set -- nothing to do.")

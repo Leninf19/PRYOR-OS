@@ -10,6 +10,7 @@ instead of re-implementing dedup/diff logic per script.
 """
 import re
 import sqlite3
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -35,10 +36,85 @@ def get_brand(name: str) -> str:
             return b
     return 'Other'
 
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(name: str) -> str:
+    """The ONE slugification rule every producer of a per-location artifact
+    path/cache key must use -- lowercase, non-alphanumeric runs collapsed
+    to a single hyphen, leading/trailing hyphens stripped. Previously
+    duplicated, byte-for-byte identically, in export_chunks.py,
+    refresh_analytics.py, and provision_tenant.py; centralized here
+    (Multi-Tenant Phase 4P) so there is exactly one algorithm to keep in
+    sync. This is the BASE slug only -- see canonical_location_slugs()
+    for the collision-safe, per-tenant-set version every one of those
+    callers actually needs."""
+    return _SLUG_RE.sub("-", (name or "").lower()).strip("-")
+
+
+def canonical_location_slugs(id_to_name: dict) -> dict:
+    """The ONE place a duplicate display name is disambiguated for
+    artifact-file-name/cache-key purposes -- every producer (export_chunks.py,
+    refresh_analytics.py, provision_tenant.py, initial_sync.py,
+    apply_entitlement_change.py) must call this instead of slugify()
+    directly whenever the result identifies a SPECIFIC location (a file
+    path, a cache key, an alert id) rather than merely being displayed.
+
+    `id_to_name`: {locationId: displayName} for one tenant's full,
+    CURRENT location set (never a subset -- collisions can only be
+    detected against the complete set a given export/sync run is
+    operating on). Returns {locationId: slug}.
+
+    A location's own bare slugify(name) is used whenever no OTHER
+    location in this exact set shares it. A name shared by 2+ locations
+    gets ITS OWN numeric locationId appended (e.g. "los-tres-amigos-14")
+    -- the tenant's permanent, stable per-location id (this table's own
+    primary key / tenantConfigStore.js's locationIdMap-assigned id) --
+    NEVER array position, iteration order, or anything random, so calling
+    this again with the same location set always produces the same
+    mapping, deterministically, regardless of dict ordering.
+
+    Stability note: a location's slug is a function of the CURRENT full
+    location set, not of history -- if a same-named sibling is added
+    later (an entitlement change), a previously-bare slug can become
+    disambiguated on the next full artifact regeneration. This is safe:
+    slug is never a persisted or user-bookmarked identifier anywhere in
+    this codebase (no frontend route reads it from a URL) -- only an
+    internal artifact-file-name/cache-key, always re-read fresh from the
+    current meta.json on every load.
+
+    A name with no alphanumeric characters at all (rare, but not
+    impossible -- e.g. a title that's pure punctuation/emoji) slugifies to
+    an empty string; that base is replaced with "location-{id}" BEFORE the
+    collision check below, so no artifact/cache key is ever written under
+    an empty or bare-numeric-looking path."""
+    base = {loc_id: (slugify(name) or f"location-{loc_id}") for loc_id, name in id_to_name.items()}
+    counts = Counter(base.values())
+    return {
+        loc_id: (slug if counts[slug] == 1 else f"{slug}-{loc_id}")
+        for loc_id, slug in base.items()
+    }
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS locations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    name          TEXT UNIQUE NOT NULL,
+    -- Multi-Tenant Phase 4P -- UNIQUE deliberately removed (was:
+    -- `name TEXT UNIQUE NOT NULL`). `name` is customer-facing display
+    -- metadata, never a canonical identifier -- a real multi-location
+    -- restaurant group can legitimately operate several identically-named
+    -- locations at different addresses. The canonical identity has always
+    -- been this table's own `id` (== tenantConfigStore.js's stable,
+    -- per-tenant locationId -- see provision_tenant.py's
+    -- _insert_location_with_explicit_id()) and, for GBP-connected
+    -- tenants, `gbp_location_name` (Google's own resource name). See
+    -- canonical_location_slugs() below for how a duplicate display name
+    -- is disambiguated for artifact/cache-key purposes without ever
+    -- renaming the location itself. Existing databases created before
+    -- this change are migrated in-place by _migrate_schema() below
+    -- (_drop_locations_name_unique_constraint()); a brand-new database
+    -- never has the old constraint to begin with.
+    name          TEXT NOT NULL,
     city          TEXT,
     brand         TEXT,
     search_query  TEXT,
@@ -153,6 +229,19 @@ def dedup_key(location_name: str, row: dict) -> str:
     rid = canonical_review_id(row.get("review_url", ""))
     if rid:
         return rid
+    # Multi-Tenant Phase 4P audit: this fallback branch uses location_name
+    # as PART of an identity key -- LEGACY-SCRAPER-ONLY, out of scope for
+    # this phase's fix. It is reached only when a review has neither
+    # gbp_review_name nor a parseable review_url, which is true for every
+    # scraper-sourced row (auto_update.py) and NEVER true for any
+    # multi-tenant/GBP-API-sourced row (initial_sync.py/gbp_import.py
+    # always populate gbp_review_name, the branch above). Two same-named
+    # locations could in theory collide here if they also had a review
+    # from the same reviewer on the same date with the same star rating --
+    # not fixed now: doing so safely would mean reworking how the
+    # scraper (which has no Google resource id to key off) resolves a
+    # location at all, a materially larger, separately-scoped change with
+    # no multi-tenant customer impact today.
     return "|".join([location_name, row.get("reviewer_name", ""),
                       row.get("review_date", ""), str(row.get("star_rating", ""))])
 
@@ -210,7 +299,96 @@ def ensure_validation_flags_open_identity_index(conn: sqlite3.Connection) -> boo
 # doesn't control which migrations run. It just lets you tell at a glance,
 # from the DB file alone, whether it's seen the latest migration batch --
 # `sqlite3 reviews.db "PRAGMA user_version"` -- without reading this file.
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
+
+
+def _column_level_unique_index_name(conn: sqlite3.Connection, table: str, column: str) -> str | None:
+    """Returns the name of the auto-generated index SQLite created for a
+    COLUMN-LEVEL `UNIQUE` constraint in `table`'s original CREATE TABLE
+    statement (named sqlite_autoindex_<table>_N), if `column` is the sole
+    column of one -- else None. A named index created explicitly via
+    `CREATE UNIQUE INDEX ...` (origin 'c') is NOT what this detects; only
+    the legacy inline constraint _drop_locations_name_unique_constraint()
+    exists to remove.
+
+    Reads every PRAGMA result by POSITION, not by column name -- this
+    function must work regardless of the caller's own row_factory
+    (provision_tenant.py's connections are plain sqlite3.connect() with no
+    row_factory set at all, unlike this module's own get_connection()),
+    so it can never rely on dict-style ["unique"]/["origin"] access."""
+    # PRAGMA index_list columns: seq, name, unique, origin, partial
+    for seq, name, unique, origin, partial in conn.execute(f"PRAGMA index_list({table})").fetchall():
+        if unique != 1 or origin != "u":
+            continue
+        # PRAGMA index_info columns: seqno, cid, name
+        cols = [info_name for _seqno, _cid, info_name in conn.execute(f"PRAGMA index_info({name})").fetchall()]
+        if cols == [column]:
+            return name
+    return None
+
+
+def _drop_locations_name_unique_constraint(conn: sqlite3.Connection) -> None:
+    """Multi-Tenant Phase 4P: removes the legacy column-level
+    `UNIQUE` constraint on locations.name from an EXISTING database --
+    see the SCHEMA comment above for why it must not exist at all going
+    forward. SQLite has no `ALTER TABLE ... DROP CONSTRAINT`, so this uses
+    the standard rebuild: introspect the table's CURRENT full column list
+    (whatever ALTER TABLE ADD COLUMNs have already applied to it -- this
+    runs after all of them, below), recreate it with the identical
+    columns/types/defaults minus the inline UNIQUE on name, copy every row
+    across by explicit column list (so `id` -- and therefore every
+    reviews.location_id / scraper_run_locations.location_id /
+    validation_flags.location_id / notifications_log.related_location_id
+    foreign-key reference -- is preserved EXACTLY, never renumbered), drop
+    the old table, rename. Runs inside init_schema()'s own transaction
+    (committed once, in _migrate_schema()'s caller), so a crash mid-
+    migration leaves the ORIGINAL table completely intact, never a
+    half-renamed/half-copied state.
+
+    Idempotent: a table that has already been migrated (or a brand-new
+    table created fresh from the corrected SCHEMA string, which never had
+    the constraint to begin with) is detected via
+    _column_level_unique_index_name() and this is a pure no-op. Never
+    invoked against, and carries no special-case exclusion for, any
+    specific tenant -- it is exactly as safe to run against Los Tres
+    Amigos's own storage as any other, since it only ever WIDENS what
+    `name` may hold; this function simply is not called against LTA's
+    production file by anything in this change."""
+    if _column_level_unique_index_name(conn, "locations", "name") is None:
+        return
+
+    # PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk --
+    # read by position for the same row_factory-independence reason as
+    # _column_level_unique_index_name() above.
+    columns = conn.execute("PRAGMA table_info(locations)").fetchall()
+    col_defs = []
+    col_names = []
+    for _cid, col_name, col_type, notnull, dflt_value, pk in columns:
+        col_names.append(col_name)
+        if col_name == "id" and pk:
+            col_defs.append(f"{col_name} INTEGER PRIMARY KEY AUTOINCREMENT")
+            continue
+        parts = [col_name, col_type or "TEXT"]
+        if notnull:
+            parts.append("NOT NULL")
+        if dflt_value is not None:
+            # PRAGMA table_info() reports an expression default (e.g.
+            # datetime('now')) with its outer parens already stripped --
+            # wrapping in parens here is always valid SQLite syntax for
+            # EVERY default shape (a plain literal like `(1)` parses fine
+            # too), so this is the one form that's correct for both cases
+            # without needing to distinguish them.
+            parts.append(f"DEFAULT ({dflt_value})")
+        col_defs.append(" ".join(parts))
+    column_list = ", ".join(col_names)
+
+    conn.execute("ALTER TABLE locations RENAME TO locations__pre_name_unique_migration")
+    conn.execute(f"CREATE TABLE locations ({', '.join(col_defs)})")
+    conn.execute(
+        f"INSERT INTO locations ({column_list}) "
+        f"SELECT {column_list} FROM locations__pre_name_unique_migration"
+    )
+    conn.execute("DROP TABLE locations__pre_name_unique_migration")
 
 
 def _migrate_schema(conn: sqlite3.Connection):
@@ -293,6 +471,13 @@ def _migrate_schema(conn: sqlite3.Connection):
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+    # Multi-Tenant Phase 4P (schema v19) -- must run after every ALTER TABLE
+    # ADD COLUMN above, so the rebuilt table it may perform carries the
+    # full, current column set. A no-op for any table created fresh from
+    # the corrected SCHEMA string (never had the constraint) or already
+    # migrated by a prior call.
+    _drop_locations_name_unique_constraint(conn)
+
     # Must run after the ALTER TABLEs above -- the column has to exist first.
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_gbp_review_name "
@@ -369,6 +554,18 @@ def save_ai_classification(conn, review_id: int, sentiment: str, reason: str, pr
 
 
 def get_or_create_location(conn, name: str, city: str = "", brand: str = "", search_query: str = "", maps_url: str = "") -> int:
+    """LEGACY-SCRAPER-ONLY (Multi-Tenant Phase 4P audit) -- called exclusively
+    by auto_update.py and the one-time migrate_csv_to_sqlite.py, both part
+    of Los Tres Amigos's own Maps-scraper pipeline, which has no Google API
+    resource id to key a location by and so has always resolved a location
+    by its scraped display name -- the only identity a scraper naturally
+    has. Never called by any multi-tenant path (provision_tenant.py inserts
+    with an explicit id via _insert_location_with_explicit_id(); GBP-API
+    syncs resolve by gbp_location_name via get_location_by_gbp_name()).
+    Out of scope for this phase's fix: LTA's real locations have never
+    collided (5 distinct brand names, see BRANDS), and fixing this
+    properly would mean redesigning how the scraper identifies a location
+    at all, not a schema/artifact change. Left exactly as-is, intentionally."""
     row = conn.execute("SELECT id FROM locations WHERE name = ?", (name,)).fetchone()
     if row:
         if maps_url:

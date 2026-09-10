@@ -26,8 +26,15 @@
 // dashboard/middleware.js).
 
 import { Redis } from '@upstash/redis'
+import { contactsKeyV2 } from './tenantKeys.js'
+import { resolveHashReadKey, resolveHashWriteKey } from './tenantDualRead.js'
 
 const CONTACT_DIRECTORY_KEY = 'restaurant_contacts:v1'
+
+// Multi-Tenant Phase 2: every exported function below now takes `tenantId`
+// as its first argument -- see tenantDualRead.js's header for the full
+// read/write rule. For DEFAULT_TENANT_ID, this resolves to exactly
+// CONTACT_DIRECTORY_KEY, unchanged.
 
 let redisClient = null
 // Test-only seam: lets tests simulate a real Upstash hash's get/set
@@ -76,13 +83,14 @@ function parseRecord(value) {
 // throws rather than returning {} -- silently presenting "no contacts
 // configured" when the store is actually broken would hide a real
 // data-loss-shaped failure from every viewer at once.
-export async function getAllContacts() {
+export async function getAllContacts(tenantId) {
   const client = getClient()
   if (!client) throw new ContactStoreUnavailableError('contact store is not configured')
 
   let raw
   try {
-    raw = await client.hgetall(CONTACT_DIRECTORY_KEY)
+    const key = await resolveHashReadKey(client, { v1Key: CONTACT_DIRECTORY_KEY, v2Key: contactsKeyV2(tenantId), tenantId })
+    raw = key ? await client.hgetall(key) : {}
   } catch (err) {
     throw new ContactStoreUnavailableError(`contact store unreachable: ${err.message}`)
   }
@@ -98,13 +106,14 @@ export async function getAllContacts() {
 // Reads a single location's contact without fetching the whole directory --
 // used by the restaurant-email workflow (via locationContacts.js,
 // Milestone 8.5) and by the Manager-scoped single-location read.
-export async function getContact(locationId) {
+export async function getContact(tenantId, locationId) {
   const client = getClient()
   if (!client) throw new ContactStoreUnavailableError('contact store is not configured')
 
   let raw
   try {
-    raw = await client.hget(CONTACT_DIRECTORY_KEY, String(locationId))
+    const key = await resolveHashReadKey(client, { v1Key: CONTACT_DIRECTORY_KEY, v2Key: contactsKeyV2(tenantId), tenantId })
+    raw = key ? await client.hget(key, String(locationId)) : null
   } catch (err) {
     throw new ContactStoreUnavailableError(`contact store unreachable: ${err.message}`)
   }
@@ -123,14 +132,15 @@ export async function getContact(locationId) {
 //
 // `account` is the authenticated, server-verified account record (from
 // requireAuth()) -- never a client-supplied identity.
-export async function upsertContact(locationId, patch, account, logAction) {
+export async function upsertContact(tenantId, locationId, patch, account, logAction) {
   const client = getClient()
   if (!client) throw new ContactStoreUnavailableError('contact store is not configured')
 
-  const key = String(locationId)
-  let existingRaw
+  const field = String(locationId)
+  let existingRaw = null
   try {
-    existingRaw = await client.hget(CONTACT_DIRECTORY_KEY, key)
+    const readKey = await resolveHashReadKey(client, { v1Key: CONTACT_DIRECTORY_KEY, v2Key: contactsKeyV2(tenantId), tenantId })
+    if (readKey) existingRaw = await client.hget(readKey, field)
   } catch (err) {
     throw new ContactStoreUnavailableError(`contact store unreachable: ${err.message}`)
   }
@@ -157,8 +167,9 @@ export async function upsertContact(locationId, patch, account, logAction) {
       : history,
   }
 
+  const writeKey = resolveHashWriteKey({ v1Key: CONTACT_DIRECTORY_KEY, v2Key: contactsKeyV2(tenantId), tenantId })
   try {
-    await client.hset(CONTACT_DIRECTORY_KEY, { [key]: JSON.stringify(next) })
+    await client.hset(writeKey, { [field]: JSON.stringify(next) })
   } catch (err) {
     throw new ContactStoreUnavailableError(`contact store unreachable: ${err.message}`)
   }
@@ -169,12 +180,13 @@ export async function upsertContact(locationId, patch, account, logAction) {
 // toggle, which is just a normal upsertContact({ active: false/true }) so
 // the record (and its history) survives. Returns true if a record existed
 // and was removed, false if there was nothing to delete.
-export async function deleteContact(locationId) {
+export async function deleteContact(tenantId, locationId) {
   const client = getClient()
   if (!client) throw new ContactStoreUnavailableError('contact store is not configured')
 
+  const writeKey = resolveHashWriteKey({ v1Key: CONTACT_DIRECTORY_KEY, v2Key: contactsKeyV2(tenantId), tenantId })
   try {
-    const removed = await client.hdel(CONTACT_DIRECTORY_KEY, String(locationId))
+    const removed = await client.hdel(writeKey, String(locationId))
     return removed > 0
   } catch (err) {
     throw new ContactStoreUnavailableError(`contact store unreachable: ${err.message}`)

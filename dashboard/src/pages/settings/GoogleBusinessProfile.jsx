@@ -7,6 +7,7 @@ import ErrorState from '../../components/ui/ErrorState.jsx'
 import ConfirmDialog from '../../components/ui/ConfirmDialog.jsx'
 import { useToast } from '../../components/ui/Toast.jsx'
 import { useGoogleOAuthStatus, useDisconnectGoogle } from '../../hooks/useGoogleOAuthStatus.js'
+import { useTenantStatus } from '../../hooks/useTenantStatus.js'
 
 // Rebuilt for Phase 8, Milestone 8.7: the refresh token now lives in
 // credentialStore.js (Redis, encrypted), not a Vercel env var -- reconnect
@@ -99,6 +100,34 @@ function fmtWhen(iso) {
   return new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 }
 
+// "Last Successful Sync" investigation -- the real sync pipeline
+// (update-reviews.yml) targets a rolling ~6-hour cadence, but GitHub's own
+// scheduler documents real, normal delay under load, and a single missed
+// run is not itself a problem worth alarming an Owner about. Centralized
+// here (never duplicated/hardcoded at each call site) so the threshold is
+// a one-place, one-number decision: roughly 2.5x the scheduled cadence
+// (~15h) absorbs at least two consecutive missed/delayed runs before
+// warning, while still catching a genuinely stalled pipeline well before
+// it goes silent for days (the reported incident: stale since Sep 6).
+const SYNC_CADENCE_HOURS = 6
+const STALE_SYNC_THRESHOLD_HOURS = SYNC_CADENCE_HOURS * 2.5 // 15h
+
+function hoursSince(iso) {
+  if (!iso) return null
+  return (Date.now() - new Date(iso).getTime()) / 3_600_000
+}
+
+// Three states -- never conflates "Google is connected" with "the data is
+// current," per the explicit product requirement: a connected-but-stale
+// (or connected-but-never-synced) tenant must never imply fresh data.
+function computeSyncFreshness(lastDataSyncAt, lastDataSyncStatus) {
+  if (!lastDataSyncAt) return { level: 'never', label: 'Initial sync required', icon: '⚠' }
+  const hours = hoursSince(lastDataSyncAt)
+  if (lastDataSyncStatus === 'failed') return { level: 'failed', label: 'Last sync attempt failed', icon: '⚠' }
+  if (hours != null && hours > STALE_SYNC_THRESHOLD_HOURS) return { level: 'stale', label: 'Data may be outdated', icon: '⚠' }
+  return { level: 'fresh', label: 'Up to date', icon: '✅' }
+}
+
 function useGbpSyncData() {
   const [state, setState] = useState({ loading: true, data: null, error: false })
 
@@ -139,6 +168,11 @@ function CheckRow({ c }) {
   )
 }
 
+// Google Integration + Reviews End-to-End Validation, Part A -- this now
+// calls a SETTINGS_ADMIN-gated (owner-only) endpoint server-side (see
+// google/[action].js's testConnection() comment: it's a real diagnostic
+// walk, not a status read), so it is not rendered at all for a viewer
+// without canManageIntegration -- avoiding a control that would just 403.
 function TestConnectionPanel() {
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState(null)
@@ -188,7 +222,7 @@ function TestConnectionPanel() {
   )
 }
 
-function LocationSyncPanel({ onLinkedCount }) {
+function LocationSyncPanel({ onLinkedCount, canManage }) {
   const { loading, data, error, refetch } = useGbpSyncData()
   const [triggering, setTriggering] = useState(false)
   const [triggerMsg, setTriggerMsg] = useState(null)
@@ -229,13 +263,15 @@ function LocationSyncPanel({ onLinkedCount }) {
             {data?.lastRun && ` · last sync ${data.lastRun.status} at ${data.lastRun.finished_at || data.lastRun.started_at}`}
           </p>
         </div>
-        <button
-          onClick={syncNow}
-          disabled={triggering}
-          className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
-          style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)', opacity: triggering ? 0.6 : 1 }}>
-          {triggering ? 'Starting…' : 'Sync Now'}
-        </button>
+        {canManage && (
+          <button
+            onClick={syncNow}
+            disabled={triggering}
+            className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
+            style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)', opacity: triggering ? 0.6 : 1 }}>
+            {triggering ? 'Starting…' : 'Sync Now'}
+          </button>
+        )}
       </div>
       {triggerMsg && (
         <div className="px-6 pb-3 text-xs" style={{ color: triggerMsg.ok ? 'var(--color-text-2)' : 'var(--color-danger, #dc2626)' }}>
@@ -291,7 +327,7 @@ function LocationSyncPanel({ onLinkedCount }) {
 // One-time reconciliation between existing scraped reviews and the Google
 // API (gbp_import.py) -- preview first, then a confirmed apply, never a
 // single blind click straight to writing 16,000+ reviews.
-function HistoricalImportPanel() {
+function HistoricalImportPanel({ canManage }) {
   const [triggering, setTriggering] = useState(null) // null | 'preview' | 'apply'
   const [msg, setMsg] = useState(null)
   const [confirmText, setConfirmText] = useState('')
@@ -333,42 +369,98 @@ function HistoricalImportPanel() {
         </p>
       </div>
       <div className="px-6 pb-5 pt-1 border-t space-y-3" style={{ borderColor: 'var(--color-border)' }}>
-        <div className="flex items-center gap-3 flex-wrap pt-3">
-          <button
-            onClick={() => trigger(false)}
-            disabled={triggering !== null}
-            className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
-            style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)', opacity: triggering ? 0.6 : 1 }}>
-            {triggering === 'preview' ? 'Starting…' : 'Preview Import'}
-          </button>
-          <div className="flex items-center gap-2">
-            <input
-              type="text"
-              value={confirmText}
-              onChange={e => setConfirmText(e.target.value)}
-              placeholder='Type "IMPORT" to enable'
-              aria-label='Type IMPORT to confirm running the historical import'
-              className="text-xs px-2.5 py-2 rounded-lg border w-40 focus:outline-none"
-              style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
-            />
+        {canManage ? (
+          <div className="flex items-center gap-3 flex-wrap pt-3">
             <button
-              onClick={() => trigger(true)}
-              disabled={triggering !== null || confirmText !== 'IMPORT'}
+              onClick={() => trigger(false)}
+              disabled={triggering !== null}
               className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
-              style={{
-                background: confirmText === 'IMPORT' ? 'var(--color-accent)' : 'var(--color-surface-2)',
-                borderColor: confirmText === 'IMPORT' ? 'var(--color-accent)' : 'var(--color-border)',
-                color: confirmText === 'IMPORT' ? 'white' : 'var(--color-text-3)',
-                opacity: triggering ? 0.6 : 1,
-              }}>
-              {triggering === 'apply' ? 'Starting…' : 'Run Import'}
+              style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)', opacity: triggering ? 0.6 : 1 }}>
+              {triggering === 'preview' ? 'Starting…' : 'Preview Import'}
             </button>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={confirmText}
+                onChange={e => setConfirmText(e.target.value)}
+                placeholder='Type "IMPORT" to enable'
+                aria-label='Type IMPORT to confirm running the historical import'
+                className="text-xs px-2.5 py-2 rounded-lg border w-40 focus:outline-none"
+                style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
+              />
+              <button
+                onClick={() => trigger(true)}
+                disabled={triggering !== null || confirmText !== 'IMPORT'}
+                className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
+                style={{
+                  background: confirmText === 'IMPORT' ? 'var(--color-accent)' : 'var(--color-surface-2)',
+                  borderColor: confirmText === 'IMPORT' ? 'var(--color-accent)' : 'var(--color-border)',
+                  color: confirmText === 'IMPORT' ? 'white' : 'var(--color-text-3)',
+                  opacity: triggering ? 0.6 : 1,
+                }}>
+                {triggering === 'apply' ? 'Starting…' : 'Run Import'}
+              </button>
+            </div>
           </div>
-        </div>
+        ) : (
+          <p className="text-xs pt-3" style={{ color: 'var(--color-text-3)' }}>
+            Ask an Owner to run a historical import.
+          </p>
+        )}
         {msg && (
           <p className="text-xs" style={{ color: msg.ok ? 'var(--color-text-2)' : 'var(--color-danger, #dc2626)' }}>
             {msg.text}
           </p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// Multi-Tenant Phase 4J -- READ-ONLY view of this tenant's approved
+// locations. Deliberately renders NOTHING for Los Tres Amigos
+// (tenantStatus.approvedLocations is null there -- see session/
+// [action].js's tenantStatus(), which never returns a locations list for
+// the BOOTSTRAP-mode tenant, so LTA's Settings page is visually unchanged
+// by this phase) and nothing while tenant status hasn't loaded yet.
+//
+// NO mutation control of any kind lives here or anywhere else in this
+// Owner-facing page -- post-commitment entitlement changes are
+// platform-admin-only (Phase 4I.3's dashboard/api/tenant-entitlements/
+// [action].js, isSuperAdmin()-gated), and that endpoint is never called,
+// imported, or even mentioned by path from any ordinary-Owner-facing
+// component. This panel exists so an Owner can always SEE what's
+// currently entitled, with a single explicit line telling them how to
+// request a change, rather than silently offering no visibility at all.
+function ApprovedLocationsPanel() {
+  const { data: tenantStatus } = useTenantStatus()
+  if (!tenantStatus || tenantStatus.approvedLocations === null) return null
+
+  const locations = tenantStatus.approvedLocations
+  return (
+    <div className="rounded-2xl border overflow-hidden"
+         style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <div className="px-6 py-5">
+        <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Approved Locations</p>
+        <p className="text-xs mt-0.5 leading-relaxed" style={{ color: 'var(--color-text-3)' }}>
+          These are the Google Business Profile locations your account is licensed for. Contact support to add or remove locations.
+        </p>
+      </div>
+      <div className="px-6 pb-5 pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
+        {locations.length === 0 ? (
+          <p className="text-xs pt-3" style={{ color: 'var(--color-text-3)' }}>No locations are approved yet.</p>
+        ) : (
+          <ul className="divide-y" style={{ borderColor: 'var(--color-border)' }}>
+            {locations.map(loc => (
+              <li key={loc.locationId} className="py-2.5 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-1)' }}>{loc.title || `Location ${loc.locationId}`}</p>
+                  {loc.address && <p className="text-[11px]" style={{ color: 'var(--color-text-3)' }}>{loc.address}</p>}
+                </div>
+                {!loc.operational && <Badge variant="neutral">Setting up…</Badge>}
+              </li>
+            ))}
+          </ul>
         )}
       </div>
     </div>
@@ -392,6 +484,21 @@ export default function GoogleBusinessProfile() {
   // its own guidance box below (quotaGuidance()), never RECOVERY_COPY's
   // "click Reconnect" framing.
   const isQuotaBlocked = state === 'quota_blocked'
+  // Multi-Tenant Google Integration Architecture Fix: whether THIS viewer
+  // may mutate the organization's connection (Reconnect/Disconnect/Sync
+  // Now/Historical Import) -- server-derived from their own role
+  // (SETTINGS_ADMIN, still owner-only) via the SAME /api/google/status
+  // response this whole page already reads, never a separate client-side
+  // role check. Any authenticated tenant member can now SEE this page's
+  // real connection state (status/state/linkedLocations below); only a
+  // canManageIntegration:true viewer sees the controls that change it.
+  const canManage = status?.canManageIntegration ?? false
+  // "Last Successful Sync" investigation -- computed ONLY from
+  // lastDataSyncAt/lastDataSyncStatus (gbp-sync.json's own lastRun,
+  // written exclusively by the real Python sync pipeline), never from
+  // connection health -- a fully healthy, connected token says nothing
+  // about how recently the actual review/location data was refreshed.
+  const syncFreshness = isConnected ? computeSyncFreshness(status?.lastDataSyncAt, status?.lastDataSyncStatus) : null
 
   async function handleDisconnect() {
     try {
@@ -447,17 +554,75 @@ export default function GoogleBusinessProfile() {
               </p>
             </div>
           )}
+          {/* "Last Successful Sync" investigation: Google being CONNECTED
+              never implies the review/location DATA is current -- a
+              healthy token and a stale (or never-run) sync are shown
+              separately, always, whenever connected. */}
+          {isConnected && syncFreshness && syncFreshness.level !== 'fresh' && (
+            <div className="mb-3 rounded-lg p-3" style={{
+              background: syncFreshness.level === 'never' ? 'var(--color-surface)' : 'rgba(217,119,6,0.07)',
+              border: syncFreshness.level === 'never' ? '1px solid var(--color-border)' : '1px solid rgba(217,119,6,0.2)',
+            }}>
+              <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-1)', lineHeight: 1.7 }}>
+                {syncFreshness.icon} <strong>{syncFreshness.label}.</strong>{' '}
+                {syncFreshness.level === 'never' && 'Google is connected, but no location/review sync has completed yet -- run Sync Now, or wait for the next scheduled sync.'}
+                {syncFreshness.level === 'stale' && `Google is connected, but the last successful sync was ${fmtWhen(status?.lastDataSyncAt)} -- more than ${STALE_SYNC_THRESHOLD_HOURS}h ago. Reviews and location data shown elsewhere in Pryor OS may not reflect Google's current state.`}
+                {syncFreshness.level === 'failed' && `The most recent sync attempt (${fmtWhen(status?.lastDataSyncAt)}) failed. Data shown elsewhere may be out of date until the next sync succeeds.`}
+              </p>
+            </div>
+          )}
 
           {hasEverConnected ? (
             <>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
                 {[
                   { label: 'Connected Google Account', value: status?.accountName || status?.connectedAccountName || '—' },
-                  { label: 'Last Authentication', value: fmtWhen(status?.lastOAuthRefreshAt) },
-                  { label: 'Last Successful Sync', value: fmtWhen(status?.lastSuccessfulSyncAt) },
-                  { label: 'Last Failed Sync', value: fmtWhen(status?.lastFailedSyncAt) },
+                  // "Last Successful Sync" investigation fix: this now
+                  // reads connectedAt (stamped ONLY by a real Connect/
+                  // Reconnect -- see credentialStore.js's buildFreshRecord())
+                  // instead of lastOAuthRefreshAt, which used to be bumped
+                  // by every silent token refresh (any status()/
+                  // test-connection/publish call) and therefore never
+                  // actually meant "last authentication."
+                  { label: 'Last Authentication', value: fmtWhen(status?.connectedAt) },
+                  // Last Connection Check -- the SEPARATE, honestly-named
+                  // field a routine status()/test-connection/publish call
+                  // DOES legitimately update (proves the token still works
+                  // right now); never confused with a data sync.
+                  { label: 'Last Connection Check', value: fmtWhen(status?.lastConnectionCheckAt) },
+                  {
+                    // The REAL sync signal -- gbp-sync.json's own lastRun,
+                    // written exclusively by the Python pipeline
+                    // (update-reviews.yml / gbp_sync.py). Never touched by
+                    // any live Google API connectivity check in this file.
+                    label: 'Last Data Sync',
+                    value: status?.lastDataSyncAt
+                      ? `${fmtWhen(status.lastDataSyncAt)}${syncFreshness && syncFreshness.level !== 'fresh' ? ` ${syncFreshness.icon}` : ''}`
+                      : 'Never (initial sync required)',
+                  },
                   { label: 'Token Health', value: isConnected ? (status?.tokenExpiresIn ? `Valid — expires in ${status.tokenExpiresIn}s` : 'Valid') : isQuotaBlocked ? 'Valid (Google API quota blocked)' : (status?.lastFailureReason || 'Unavailable') },
-                  { label: 'Number of Linked Locations', value: linkedLocations ? `${linkedLocations.linked} of ${linkedLocations.total}` : '—' },
+                  {
+                    // Multi-Tenant Google Integration Architecture Fix: the
+                    // canonical count now comes straight off THIS same
+                    // status response (server-computed, tenant-scoped, and
+                    // already narrowed to what THIS viewer's own location
+                    // grant can see) -- LocationSyncPanel's own gbp-sync.json
+                    // read (linkedLocations) is kept only as a fallback for
+                    // the brief window before that panel's own fetch
+                    // resolves; both read the exact same file, at rest.
+                    //
+                    // "Last Successful Sync" investigation, point 8: this
+                    // number means LINKAGE (PRYOR knows which Google
+                    // location this maps to) -- it does NOT mean every
+                    // linked location has current review data. The
+                    // separate "Last Data Sync" row above (and this row's
+                    // own freshness badge) is what answers "is that data
+                    // current."
+                    label: `Linked Locations${syncFreshness && syncFreshness.level !== 'fresh' ? ` ${syncFreshness.icon}` : ''}`,
+                    value: status?.linkedLocationCount != null
+                      ? `${status.accessibleLinkedLocationCount} of ${status.linkedLocationCount} linked`
+                      : linkedLocations ? `${linkedLocations.linked} of ${linkedLocations.total} linked` : '—',
+                  },
                 ].map(row => (
                   <div key={row.label}>
                     <p className="text-[10px] font-medium" style={{ color: 'var(--color-text-3)' }}>{row.label}</p>
@@ -467,20 +632,32 @@ export default function GoogleBusinessProfile() {
               </div>
 
               <div className="flex items-center gap-3 flex-wrap mt-3">
-                {/* For a quota block, Reconnect is kept only as a secondary
-                    action (plain surface styling, not the accent primary
-                    button) -- reconnecting doesn't fix a Cloud-project
-                    quota/access problem, so it must never look like the
-                    primary fix the way it correctly does for every other
-                    non-connected state. */}
-                <a href="/api/google/auth"
-                   className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
-                   style={isQuotaBlocked
-                     ? { background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }
-                     : { background: 'var(--color-accent)', borderColor: 'var(--color-accent)', color: 'white' }}>
-                  Reconnect →
-                </a>
-                <Button variant="danger" onClick={() => setDisconnectOpen(true)}>Disconnect</Button>
+                {canManage ? (
+                  <>
+                    {/* For a quota block, Reconnect is kept only as a
+                        secondary action (plain surface styling, not the
+                        accent primary button) -- reconnecting doesn't fix a
+                        Cloud-project quota/access problem, so it must never
+                        look like the primary fix the way it correctly does
+                        for every other non-connected state. */}
+                    <a href="/api/google/auth"
+                       className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
+                       style={isQuotaBlocked
+                         ? { background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }
+                         : { background: 'var(--color-accent)', borderColor: 'var(--color-accent)', color: 'white' }}>
+                      Reconnect →
+                    </a>
+                    <Button variant="danger" onClick={() => setDisconnectOpen(true)}>Disconnect</Button>
+                  </>
+                ) : (
+                  // Disconnecting affects the whole organization -- an
+                  // ordinary manager/employee who can SEE this status (any
+                  // authenticated tenant member now can) must not be able to
+                  // Reconnect/Disconnect it, only an Owner (SETTINGS_ADMIN).
+                  <p className="text-[11px]" style={{ color: 'var(--color-text-3)' }}>
+                    Ask an Owner to reconnect or disconnect this connection.
+                  </p>
+                )}
               </div>
 
               {status?.error && (
@@ -493,17 +670,23 @@ export default function GoogleBusinessProfile() {
           ) : (
             <>
               <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)', lineHeight: 1.75 }}>
-                Once connected, one Google account covers all 21 locations. Pryor OS can publish
+                Once connected, your Google account covers every location it manages. Pryor OS can publish
                 responses directly to Google, sync new reviews automatically, and track publish status
-                for every response your team sends.
+                for every response your team sends -- every tenant member sees this same connection, without
+                signing in to Google themselves.
               </p>
               <div className="mt-3 flex items-center gap-3 flex-wrap">
-                {state === 'never_connected' && (
+                {state === 'never_connected' && canManage && (
                   <a href="/api/google/auth"
                      className="text-xs font-semibold px-3.5 py-2 rounded-lg border transition-colors"
                      style={{ background: 'var(--color-accent)', borderColor: 'var(--color-accent)', color: 'white' }}>
                     Connect Google Account →
                   </a>
+                )}
+                {state === 'never_connected' && !canManage && (
+                  <p className="text-[11px]" style={{ color: 'var(--color-text-3)' }}>
+                    Ask an Owner to connect your organization's Google account.
+                  </p>
                 )}
                 <button
                   onClick={() => setStepsOpen(s => !s)}
@@ -525,9 +708,10 @@ export default function GoogleBusinessProfile() {
       {/* Diagnostics -- only meaningful once credentials exist */}
       {hasEverConnected && (
         <>
-          <TestConnectionPanel />
-          <LocationSyncPanel onLinkedCount={setLinkedLocations} />
-          <HistoricalImportPanel />
+          {canManage && <TestConnectionPanel />}
+          <LocationSyncPanel onLinkedCount={setLinkedLocations} canManage={canManage} />
+          <HistoricalImportPanel canManage={canManage} />
+          <ApprovedLocationsPanel />
         </>
       )}
 
@@ -586,7 +770,7 @@ export default function GoogleBusinessProfile() {
                 { label: 'OAuth scope',      value: 'https://www.googleapis.com/auth/business.manage' },
                 { label: 'Reply endpoint',   value: 'PUT .../reviews/{reviewId}/reply' },
                 { label: 'Rate limit',       value: '300 requests/minute (after approval)' },
-                { label: 'Location coverage', value: 'All 21 locations under one Google account token' },
+                { label: 'Location coverage', value: 'Every location the connected Google account manages, under one token' },
               ].map(row => (
                 <div key={row.label} className="flex items-start gap-3">
                   <span className="text-[10px] w-28 flex-shrink-0 font-medium mt-0.5"

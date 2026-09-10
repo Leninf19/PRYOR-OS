@@ -38,8 +38,11 @@ import argparse
 import asyncio
 import os
 
+import db
 import digest_filters
 import provider_sync
+import tenant_keys
+import tenant_paths
 from provider_base import Provider
 from provider_gbp import GBPProvider
 from provider_mock import MockProvider
@@ -89,9 +92,23 @@ def resolve_provider_name(cli_provider: str | None) -> str:
     return cli_provider or os.environ.get("REVIEW_PROVIDER", "scraper")
 
 
-def build_provider(provider_name: str) -> Provider:
+def build_provider(provider_name: str, tenant_id: str) -> Provider:
+    """Multi-Tenant Phase 4C revision: tenant_id is REQUIRED, with no
+    default -- even though it is only actually USED by the 'gbp' provider
+    (the only one that touches a Google credential at all; scraper/mock
+    never accept it). It is still validated here, unconditionally, before
+    any provider is built, for two reasons: (1) main()'s own --tenant-id
+    flag is required regardless of --provider, so every invocation of this
+    script explicitly states which tenant it is running for, not just GBP
+    runs; (2) a caller can't accidentally skip validation by picking a
+    provider that happens not to need the value. The original Phase 4C
+    pass defaulted this to Los Tres Amigos -- rejected on review as exactly
+    the implicit-tenant fallback this architecture must not have."""
+    tenant_keys.assert_valid_tenant_id(tenant_id, "sync_reviews.build_provider")
     if provider_name not in PROVIDERS:
         raise ValueError(f"unknown provider {provider_name!r}, expected one of {sorted(PROVIDERS)}")
+    if provider_name == "gbp":
+        return GBPProvider(tenant_id=tenant_id)
     return PROVIDERS[provider_name]()
 
 
@@ -101,12 +118,33 @@ def main() -> int:
                          help="Which provider to sync (default: $REVIEW_PROVIDER env var, else 'scraper')")
     parser.add_argument("--fast", action="store_true",
                          help="First page of reviews per location only (for frequent critical-alert checks)")
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant to sync. REQUIRED -- no default, even for non-gbp "
+                              "providers. The calling workflow must pass this explicitly (e.g. "
+                              "--tenant-id t_los-tres-amigos); this script never infers a tenant on "
+                              "its own. See the Multi-Tenant Phase 4C report.")
     args = parser.parse_args()
 
-    provider_name = resolve_provider_name(args.provider)
-    print(f"[sync_reviews] stage=start provider={provider_name} fast={args.fast}")
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::sync_reviews.py: invalid --tenant-id {args.tenant_id!r}")
+        return 1
+
+    # Multi-Tenant Phase 4D: resolve THIS tenant's own review database
+    # before any provider/sync/DB code runs. db.DB_PATH is a process-global
+    # (this script is a short-lived, single-tenant-per-invocation batch
+    # process, never a long-running multi-tenant server) -- setting it here
+    # is the one point that determines which physical SQLite file every
+    # downstream db.get_connection() call in this process will open.
     try:
-        provider = build_provider(provider_name)
+        db.DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::sync_reviews.py: {e}")
+        return 1
+
+    provider_name = resolve_provider_name(args.provider)
+    print(f"[sync_reviews] stage=start provider={provider_name} fast={args.fast} tenant_id={args.tenant_id}")
+    try:
+        provider = build_provider(provider_name, tenant_id=args.tenant_id)
     except ValueError as e:
         print(f"::error::sync_reviews.py: {e}")
         return 1

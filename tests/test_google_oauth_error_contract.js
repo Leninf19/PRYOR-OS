@@ -22,6 +22,7 @@ import bcrypt from 'bcryptjs'
 import googleHandler from '../dashboard/api/google/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { statusForAuthFailure } from '../dashboard/api/_lib/auth.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 // Both endpoints now live in the same consolidated dispatch file
 // (Phase 8, Milestone 8.2) -- these wrappers keep every call site below
@@ -72,7 +73,7 @@ async function setDirectory(overrides = {}) {
 async function tokenFor(account, overrides = {}) {
   return signSession({
     userId: account.userId, email: account.email, role: account.role,
-    locationIds: account.locationIds, sessionVersion: account.sessionVersion,
+    locationIds: account.locationIds, tenantId: DEFAULT_TENANT_ID, sessionVersion: account.sessionVersion,
     ...overrides,
   })
 }

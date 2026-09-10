@@ -28,6 +28,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Multi-Tenant Phase 4C revision: gbp_import.py's --tenant-id is
+    # REQUIRED, no default. This single, reviewed, version-controlled value
+    # is this pipeline's explicit statement of which tenant it imports for
+    # -- it is never derived from any user-controlled dispatch input.
+    env:
+      TENANT_ID: t_los-tres-amigos
 
     steps:
       - name: Checkout repo
@@ -52,9 +58,9 @@ jobs:
         id: import
         run: |
           if [ "${{ inputs.apply }}" = "true" ]; then
-            python gbp_import.py --apply | tee import_output.txt
+            python gbp_import.py --tenant-id "$TENANT_ID" --apply | tee import_output.txt
           else
-            python gbp_import.py | tee import_output.txt
+            python gbp_import.py --tenant-id "$TENANT_ID" | tee import_output.txt
           fi
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -83,7 +89,7 @@ jobs:
       - name: Verify database integrity before commit
         id: integrity
         if: always() && inputs.apply
-        run: python check_db_integrity.py
+        run: python check_db_integrity.py --tenant-id "$TENANT_ID"
 
       - name: Commit updated data
         if: inputs.apply && steps.integrity.outcome == 'success'

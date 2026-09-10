@@ -32,9 +32,6 @@
 // POST /api/settings/disable-user           -- immediate; blocked for the last active Owner
 // POST /api/settings/enable-user            -- re-enable a disabled account
 
-import { readFile } from 'fs/promises'
-import path from 'path'
-import { fileURLToPath } from 'url'
 import { requireAuth, requireScopedAuth } from '../_lib/auth.js'
 import { roleHasPermission, Permission } from '../_lib/permissions.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
@@ -42,9 +39,11 @@ import {
   getAllContacts, getContact, upsertContact, deleteContact, ContactStoreUnavailableError,
 } from '../_lib/contactStore.js'
 import { appendAuditEntry, listAuditEntries, clientIp, AuditLogUnavailableError } from '../_lib/auditLog.js'
+import { resolveTenantId } from '../_lib/tenants.js'
+import { readPrivateDataFile } from '../_lib/reviewDataPaths.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
-import { getAccountByEmail, getAccountById, listAccounts } from '../_lib/accountStore.js'
+import { getAccountByEmail, getAccountByIdForTenant, listAccounts } from '../_lib/accountStore.js'
 import { getUserById, upsertUser, updateUser, deriveUserStatus, UserStoreUnavailableError } from '../_lib/userStore.js'
 import { createInviteToken, revokeInviteToken, createResetToken, TokenStoreUnavailableError } from '../_lib/tokenStore.js'
 import { buildInviteEmail, buildInviteEmailSubject, buildResetEmail, buildResetEmailSubject } from '../_lib/accountEmailTemplate.js'
@@ -70,10 +69,6 @@ function sanitizeErrorMessage(message) {
   if (process.env.MICROSOFT_CLIENT_SECRET) out = out.split(process.env.MICROSOFT_CLIENT_SECRET).join('[redacted]')
   return out.slice(0, 300)
 }
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const LEGACY_CONTACTS_PATH = path.resolve(__dirname, '..', '..', 'private-data', 'location-contacts.json')
-const META_PATH = path.resolve(__dirname, '..', '..', 'private-data', 'meta.json')
 
 // Test-only seam for the backfill action below -- lets tests inject fixed
 // legacy-contacts/meta content without touching the real filesystem path,
@@ -105,14 +100,16 @@ function isPlainObject(v) {
 
 // Best-effort, cosmetic-only: resolves location ids to display names for
 // the invitation email's copy (never for authorization -- reuses the same
-// META_PATH/metaOverride seam the contacts-backfill action already has).
-// Returns [] on any failure or for '*' -- callers already handle an empty
-// list as "names unavailable, use a generic scoped phrase" (see
-// accountEmailTemplate.js's buildInviteEmail).
-async function resolveLocationNames(locationIds) {
+// metaOverride seam the contacts-backfill action already has). Returns []
+// on any failure or for '*' -- callers already handle an empty list as
+// "names unavailable, use a generic scoped phrase" (see
+// accountEmailTemplate.js's buildInviteEmail). tenantId is REQUIRED --
+// derived by the caller from the authenticated account, never from
+// request input.
+async function resolveLocationNames(tenantId, locationIds) {
   if (locationIds === '*' || !Array.isArray(locationIds)) return []
   try {
-    const meta = metaOverride ?? JSON.parse(await readFile(META_PATH, 'utf-8'))
+    const meta = metaOverride ?? JSON.parse(await readPrivateDataFile(tenantId, 'meta.json'))
     const byId = new Map((meta.locations ?? []).map(l => [l.locationId, l.name]))
     return locationIds.map(id => byId.get(id)).filter(Boolean)
   } catch {
@@ -165,7 +162,7 @@ async function listContacts(req, res) {
   }
 
   try {
-    const all = await getAllContacts()
+    const all = await getAllContacts(resolveTenantId(account))
     const scoped = account.locationIds === '*'
       ? all
       : Object.fromEntries(
@@ -216,13 +213,13 @@ async function upsertContactAction(req, res) {
   }
 
   try {
-    const existing = await getContact(locationId)
+    const existing = await getContact(resolveTenantId(account), locationId)
     const isNew = !existing
-    const record = await upsertContact(locationId, sanitized, account, logAction ?? (isNew ? 'Contact created' : 'Contact updated'))
+    const record = await upsertContact(resolveTenantId(account), locationId, sanitized, account, logAction ?? (isNew ? 'Contact created' : 'Contact updated'))
 
     const warnings = []
     if (sanitized.primaryEmail) {
-      const all = await getAllContacts()
+      const all = await getAllContacts(resolveTenantId(account))
       const dupe = Object.values(all).find(c =>
         c.locationId !== locationId && c.primaryEmail?.toLowerCase() === sanitized.primaryEmail.toLowerCase()
       )
@@ -231,7 +228,7 @@ async function upsertContactAction(req, res) {
       }
     }
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req),
       entity: 'contact',
       entityId: String(locationId),
@@ -272,10 +269,10 @@ async function deleteContactAction(req, res) {
   if (!allowed) return
 
   try {
-    const existing = await getContact(locationId)
-    const removed = await deleteContact(locationId)
+    const existing = await getContact(resolveTenantId(account), locationId)
+    const removed = await deleteContact(resolveTenantId(account), locationId)
     if (removed) {
-      await appendAuditEntry({
+      await appendAuditEntry(resolveTenantId(account), {
         ...actorFields(account, req),
         entity: 'contact',
         entityId: String(locationId),
@@ -317,14 +314,14 @@ async function toggleContactActiveAction(req, res) {
   if (!allowed) return
 
   try {
-    const existing = await getContact(locationId)
+    const existing = await getContact(resolveTenantId(account), locationId)
     if (!existing) {
       return res.status(404).json({ error: 'not_found', message: 'No contact is configured for this location yet.' })
     }
     const active = req.body.active
-    const record = await upsertContact(locationId, { active }, account, active ? 'Contact enabled' : 'Contact disabled')
+    const record = await upsertContact(resolveTenantId(account), locationId, { active }, account, active ? 'Contact enabled' : 'Contact disabled')
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req),
       entity: 'contact',
       entityId: String(locationId),
@@ -362,10 +359,14 @@ async function backfillContactsFromLegacyAction(req, res) {
   const allowed = await enforceRateLimit(req, res, `settings:contacts-backfill:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
   if (!allowed) return
 
+  // Multi-Tenant Phase 4D: tenantId derived exclusively from the
+  // authenticated account -- both legacy files are read from THIS
+  // tenant's own private-data root, never a hardcoded/shared path.
+  const tenantId = resolveTenantId(account)
   let legacy = legacyContactsOverride
   if (legacy === null) {
     try {
-      legacy = JSON.parse(await readFile(LEGACY_CONTACTS_PATH, 'utf-8'))
+      legacy = JSON.parse(await readPrivateDataFile(tenantId, 'location-contacts.json'))
     } catch {
       legacy = {}
     }
@@ -373,7 +374,7 @@ async function backfillContactsFromLegacyAction(req, res) {
   let meta = metaOverride
   if (meta === null) {
     try {
-      meta = JSON.parse(await readFile(META_PATH, 'utf-8'))
+      meta = JSON.parse(await readPrivateDataFile(tenantId, 'meta.json'))
     } catch {
       meta = { locations: [] }
     }
@@ -387,13 +388,13 @@ async function backfillContactsFromLegacyAction(req, res) {
       const locationId = Number(locationIdStr)
       if (!isPositiveInteger(locationId) || !isValidEmail(entry?.email)) continue
 
-      const existing = await getContact(locationId)
+      const existing = await getContact(resolveTenantId(account), locationId)
       if (existing) {
         skipped.push(locationId) // Redis already has this location -- never overwrite
         continue
       }
 
-      await upsertContact(locationId, {
+      await upsertContact(resolveTenantId(account), locationId, {
         locationName: nameById.get(locationIdStr) ?? null,
         managerName: entry.name ?? null,
         primaryEmail: entry.email,
@@ -403,7 +404,7 @@ async function backfillContactsFromLegacyAction(req, res) {
       seeded.push(locationId)
     }
     if (seeded.length > 0) {
-      await appendAuditEntry({
+      await appendAuditEntry(resolveTenantId(account), {
         ...actorFields(account, req),
         entity: 'contact',
         entityId: null,
@@ -444,7 +445,7 @@ async function auditLogAction(req, res) {
   const offset = Number.isInteger(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0
 
   try {
-    const { entries, total } = await listAuditEntries({ entity, actorId, from, to, result, limit, offset })
+    const { entries, total } = await listAuditEntries(resolveTenantId(account), { entity, actorId, from, to, result, limit, offset })
     return res.status(200).json({ entries, total })
   } catch (err) {
     if (err instanceof AuditLogUnavailableError) {
@@ -483,7 +484,7 @@ async function emailStatusAction(req, res) {
   let auditDegraded = false
 
   try {
-    const { entries } = await listAuditEntries({ entity: 'email', limit: 200, offset: 0 })
+    const { entries } = await listAuditEntries(resolveTenantId(account), { entity: 'email', limit: 200, offset: 0 })
     lastSuccess = entries.find(e => e.result === 'success') ?? null
     lastFailure = entries.find(e => e.result === 'failure') ?? null
     recentErrors = entries.filter(e => e.result === 'failure').slice(0, 5)
@@ -539,7 +540,7 @@ async function sendTestEmailAction(req, res) {
 
   let contact
   try {
-    contact = await getContact(locationId)
+    contact = await getContact(resolveTenantId(account), locationId)
   } catch (err) {
     if (err instanceof ContactStoreUnavailableError) {
       console.error(`[settings/contacts-send-test-email] ${err.message}`)
@@ -561,8 +562,8 @@ async function sendTestEmailAction(req, res) {
     const { response } = await sendReviewEmail({ to: contact.primaryEmail, cc: contact.ccEmails, replyTo: undefined, subject, html, text })
 
     await Promise.all([
-      upsertContact(locationId, {}, account, 'Test email sent'),
-      appendAuditEntry({
+      upsertContact(resolveTenantId(account), locationId, {}, account, 'Test email sent'),
+      appendAuditEntry(resolveTenantId(account), {
         ...actorFields(account, req),
         entity: 'email',
         entityId: String(locationId),
@@ -585,8 +586,8 @@ async function sendTestEmailAction(req, res) {
 
     try {
       await Promise.all([
-        upsertContact(locationId, {}, account, 'Test email failed'),
-        appendAuditEntry({
+        upsertContact(resolveTenantId(account), locationId, {}, account, 'Test email failed'),
+        appendAuditEntry(resolveTenantId(account), {
           ...actorFields(account, req),
           entity: 'email',
           entityId: String(locationId),
@@ -655,8 +656,18 @@ async function inviteUserAction(req, res) {
       userId, email: email.toLowerCase(), role, locationIds, invitedBy: account.userId,
     })
 
-    await upsertUser({
-      userId, email, passwordHash: null, role, locationIds,
+    await upsertUser(resolveTenantId(account), {
+      // Multi-Tenant Phase 4K: `tenantId` is now stamped EXPLICITLY on the
+      // record itself, not just implied by which physical hash it's
+      // written to. resolveTenantId() (tenants.js) resolves an account's
+      // tenant from this field FIRST, before ever falling back to legacy
+      // role-mapping (which always answers DEFAULT_TENANT_ID) -- without
+      // this, a non-LTA tenant's invited user would authenticate
+      // correctly (found via the identity index / their own tenant's
+      // hash) but then be silently treated as an LTA account by
+      // resolveTenantId(), since it has no way to tell tenants apart
+      // without an explicit field to read.
+      userId, email, passwordHash: null, role, locationIds, tenantId: resolveTenantId(account),
       sessionVersion: 1, disabled: false, displayName: trimmedName,
       createdAt: now, updatedAt: now, lastLoginAt: null,
       invitedAt: now, invitedBy: account.userId, lastInviteSentAt: now,
@@ -667,7 +678,7 @@ async function inviteUserAction(req, res) {
     const inviteUrl = buildInviteUrl(req, rawToken)
     let emailWarning = null
     try {
-      const locationNames = await resolveLocationNames(locationIds)
+      const locationNames = await resolveLocationNames(resolveTenantId(account), locationIds)
       const subject = buildInviteEmailSubject()
       const { html, text } = buildInviteEmail({ name: trimmedName, role, locationIds, locationNames, inviteUrl, expiresAt })
       await sendReviewEmail({ to: email, cc: [], replyTo: undefined, subject, html, text })
@@ -678,7 +689,7 @@ async function inviteUserAction(req, res) {
       console.error(`[settings/invite-user] invite email failed: ${sanitizeErrorMessage(err.message)}`)
     }
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req),
       entity: 'user', entityId: userId,
       action: 'invitation.created',
@@ -719,7 +730,7 @@ async function resendInviteAction(req, res) {
   }
 
   try {
-    const target = await getUserById(userId)
+    const target = await getUserById(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
     if (target.passwordSetAt) {
       return res.status(409).json({ error: 'already_active', message: 'This account has already been activated -- use password reset instead.' })
@@ -733,14 +744,14 @@ async function resendInviteAction(req, res) {
       userId, email: target.email, role: target.role, locationIds: target.locationIds, invitedBy: account.userId,
     })
     const now = new Date().toISOString()
-    await updateUser(userId, {
+    await updateUser(resolveTenantId(account), userId, {
       inviteTokenHash: tokenHash, inviteExpiresAt: expiresAt, inviteRevokedAt: null, lastInviteSentAt: now,
     })
 
     const inviteUrl = buildInviteUrl(req, rawToken)
     let emailWarning = null
     try {
-      const locationNames = await resolveLocationNames(target.locationIds)
+      const locationNames = await resolveLocationNames(resolveTenantId(account), target.locationIds)
       const subject = buildInviteEmailSubject()
       const { html, text } = buildInviteEmail({ name: target.displayName, role: target.role, locationIds: target.locationIds, locationNames, inviteUrl, expiresAt })
       await sendReviewEmail({ to: target.email, cc: [], replyTo: undefined, subject, html, text })
@@ -751,7 +762,7 @@ async function resendInviteAction(req, res) {
       console.error(`[settings/resend-invite] invite email failed: ${sanitizeErrorMessage(err.message)}`)
     }
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: 'invitation.resent', changes: null, result: 'success',
       message: `Resent invitation to ${target.email}.`,
@@ -790,7 +801,7 @@ async function revokeInviteAction(req, res) {
   }
 
   try {
-    const target = await getUserById(userId)
+    const target = await getUserById(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
     if (target.passwordSetAt) {
       return res.status(409).json({ error: 'already_active', message: 'This account has already been activated -- disable it instead.' })
@@ -799,9 +810,9 @@ async function revokeInviteAction(req, res) {
     if (target.inviteTokenHash) {
       await revokeInviteToken(target.inviteTokenHash)
     }
-    await updateUser(userId, { inviteRevokedAt: new Date().toISOString() })
+    await updateUser(resolveTenantId(account), userId, { inviteRevokedAt: new Date().toISOString() })
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: 'invitation.revoked', changes: null, result: 'success',
       message: `Revoked invitation for ${target.email}.`,
@@ -843,7 +854,7 @@ async function generateResetLinkAction(req, res) {
   }
 
   try {
-    const target = await getUserById(userId)
+    const target = await getUserById(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
     if (!target.passwordSetAt) {
       return res.status(409).json({ error: 'not_yet_active', message: 'This account has not been activated yet -- resend the invitation instead.' })
@@ -864,7 +875,7 @@ async function generateResetLinkAction(req, res) {
       console.error(`[settings/generate-reset-link] reset email failed: ${sanitizeErrorMessage(err.message)}`)
     }
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: 'password_reset.link_generated', changes: null, result: 'success',
       message: `Generated a password reset link for ${target.email}.`,
@@ -899,7 +910,7 @@ async function usersListAction(req, res) {
   const allowed = await enforceRateLimit(req, res, `settings:users-list:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
 
-  const all = await listAccounts()
+  const all = await listAccounts(resolveTenantId(account))
   const users = all
     .map(a => ({
       userId: a.userId,
@@ -953,18 +964,28 @@ async function updateUserRoleLocationsAction(req, res) {
   }
 
   try {
-    const target = await getAccountById(userId)
+    // Multi-Tenant Phase 4K: STRICTLY tenant-scoped lookup -- never
+    // accountStore.js's getAccountById() (which, as of this phase, can
+    // resolve an identity in a DIFFERENT tenant via the global identity
+    // index). A userId belonging to another tenant simply does not exist
+    // from THIS tenant's own store's point of view, so this call
+    // structurally cannot find (or mutate) a foreign tenant's user --
+    // never a check that could be forgotten, a fact enforced by which
+    // function is called. getAccountByIdForTenant() (not the plain,
+    // Redis-only getUserById()) so Los Tres Amigos's own possibly-still-
+    // static-directory-only accounts remain manageable here too.
+    const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
 
     if (target.role === 'owner' && role !== 'owner') {
-      const lastOwnerCheck = await assertNotLastActiveOwner(userId)
+      const lastOwnerCheck = await assertNotLastActiveOwner(resolveTenantId(account), userId)
       if (!lastOwnerCheck.safe) {
         return res.status(409).json({ error: 'last_owner', message: lastOwnerCheck.message })
       }
     }
 
     const now = new Date().toISOString()
-    const updated = await upsertUser({
+    const updated = await upsertUser(resolveTenantId(account), {
       createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
       inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
       ...target,
@@ -973,7 +994,7 @@ async function updateUserRoleLocationsAction(req, res) {
       updatedAt: now,
     })
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: 'user.role_or_locations_changed',
       changes: [
@@ -1017,18 +1038,21 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
   }
 
   try {
-    const target = await getAccountById(userId)
+    // Multi-Tenant Phase 4K: STRICTLY tenant-scoped lookup (with the
+    // static-directory fallback for Los Tres Amigos) -- see
+    // updateUserRoleLocationsAction()'s identical comment above.
+    const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
 
     if (disabled && target.role === 'owner') {
-      const lastOwnerCheck = await assertNotLastActiveOwner(userId)
+      const lastOwnerCheck = await assertNotLastActiveOwner(resolveTenantId(account), userId)
       if (!lastOwnerCheck.safe) {
         return res.status(409).json({ error: 'last_owner', message: lastOwnerCheck.message })
       }
     }
 
     const now = new Date().toISOString()
-    const updated = await upsertUser({
+    const updated = await upsertUser(resolveTenantId(account), {
       createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
       inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
       ...target,
@@ -1037,7 +1061,7 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
       updatedAt: now,
     })
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: disabled ? 'user.disabled' : 'user.enabled',
       changes: [{ field: 'disabled', oldValue: target.disabled, newValue: disabled }],
@@ -1087,11 +1111,14 @@ async function updateUserCanCreateTasksAction(req, res) {
   }
 
   try {
-    const target = await getAccountById(userId)
+    // Multi-Tenant Phase 4K: STRICTLY tenant-scoped lookup (with the
+    // static-directory fallback for Los Tres Amigos) -- see
+    // updateUserRoleLocationsAction()'s identical comment above.
+    const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
 
     const now = new Date().toISOString()
-    const updated = await upsertUser({
+    const updated = await upsertUser(resolveTenantId(account), {
       createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
       inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
       ...target,
@@ -1099,7 +1126,7 @@ async function updateUserCanCreateTasksAction(req, res) {
       updatedAt: now,
     })
 
-    await appendAuditEntry({
+    await appendAuditEntry(resolveTenantId(account), {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: 'user.can_create_tasks_changed',
       changes: [{ field: 'canCreateTasks', oldValue: Boolean(target.canCreateTasks), newValue: canCreateTasks }],

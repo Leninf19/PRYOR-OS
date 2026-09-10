@@ -412,6 +412,121 @@ def test_link_review_to_gbp_is_idempotent():
     assert linked["dedup_key"] == "reviews/IDEMPOTENT1"
 
 
+# ---------------------------------------------------------------------------
+# Multi-Tenant Phase 4P: locations.name is no longer UNIQUE, and duplicate
+# display names get a deterministic, collision-safe slug via
+# db.canonical_location_slugs() instead.
+# ---------------------------------------------------------------------------
+
+def test_duplicate_display_names_insert_successfully():
+    conn, _ = _fresh_conn()
+    id_a = conn.execute(
+        "INSERT INTO locations (id, name, city) VALUES (101, 'Los Tres Amigos', 'Springfield')"
+    ).lastrowid
+    id_b = conn.execute(
+        "INSERT INTO locations (id, name, city) VALUES (102, 'Los Tres Amigos', 'Shelbyville')"
+    ).lastrowid
+    conn.commit()
+    assert id_a == 101 and id_b == 102
+    rows = conn.execute("SELECT id, name, city FROM locations WHERE name = 'Los Tres Amigos' ORDER BY id").fetchall()
+    assert len(rows) == 2, f"expected both duplicate-named rows to persist, got {len(rows)}"
+    assert rows[0]["city"] == "Springfield" and rows[1]["city"] == "Shelbyville"
+
+
+def test_old_schema_migration_preserves_ids_and_data():
+    tmpdir = tempfile.mkdtemp(prefix="test_db_migration_")
+    db_path = Path(tmpdir) / "reviews.db"
+    # Build a database under the OLD schema (inline UNIQUE on name),
+    # deliberately bypassing db.py's own (already-fixed) SCHEMA string.
+    old_conn = sqlite3.connect(db_path)
+    old_conn.execute(
+        "CREATE TABLE locations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, "
+        "city TEXT, brand TEXT, search_query TEXT, is_active INTEGER NOT NULL DEFAULT 1, "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+    )
+    old_conn.execute("INSERT INTO locations (id, name, city, brand) VALUES (5, 'Casa Tequila Prime', 'Testtown', 'Casa Tequila')")
+    old_conn.commit()
+    old_conn.close()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    db.init_schema(conn)  # runs _migrate_schema() -> _drop_locations_name_unique_constraint()
+
+    before = conn.execute("SELECT * FROM locations WHERE id = 5").fetchone()
+    assert before is not None, "the pre-existing row (id=5) must survive the migration unchanged"
+    assert before["name"] == "Casa Tequila Prime" and before["city"] == "Testtown" and before["brand"] == "Casa Tequila"
+
+    # The whole point: a second, same-named location must now insert successfully.
+    conn.execute("INSERT INTO locations (id, name, city) VALUES (6, 'Casa Tequila Prime', 'Elsewhere')")
+    conn.commit()
+    rows = conn.execute("SELECT id, city FROM locations WHERE name = 'Casa Tequila Prime' ORDER BY id").fetchall()
+    assert [r["id"] for r in rows] == [5, 6], f"expected ids [5, 6] preserved, got {[r['id'] for r in rows]}"
+    assert db._column_level_unique_index_name(conn, "locations", "name") is None, \
+        "the legacy UNIQUE constraint must be gone after migration"
+
+
+def test_migration_is_idempotent():
+    tmpdir = tempfile.mkdtemp(prefix="test_db_migration_idempotent_")
+    db_path = Path(tmpdir) / "reviews.db"
+    old_conn = sqlite3.connect(db_path)
+    old_conn.execute(
+        "CREATE TABLE locations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, "
+        "city TEXT, brand TEXT, search_query TEXT, is_active INTEGER NOT NULL DEFAULT 1, "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+    )
+    old_conn.execute("INSERT INTO locations (id, name) VALUES (1, 'Solo Location')")
+    old_conn.commit()
+    old_conn.close()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    db.init_schema(conn)  # first migration run
+    first_pass_rows = conn.execute("SELECT id, name FROM locations").fetchall()
+
+    db.init_schema(conn)  # second run -- must be a pure no-op
+    db.init_schema(conn)  # and a third, for good measure
+    second_pass_rows = conn.execute("SELECT id, name FROM locations").fetchall()
+
+    assert [dict(r) for r in first_pass_rows] == [dict(r) for r in second_pass_rows], \
+        "re-running the migration must never change already-migrated data"
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+
+
+def test_fresh_database_never_has_the_old_constraint_to_begin_with():
+    conn, _ = _fresh_conn()
+    assert db._column_level_unique_index_name(conn, "locations", "name") is None
+
+
+# ---------------------------------------------------------------------------
+# db.canonical_location_slugs() -- the collision-safe disambiguation itself.
+# ---------------------------------------------------------------------------
+
+def test_canonical_slugs_are_clean_when_unique():
+    result = db.canonical_location_slugs({1: "Los Tres Amigos", 2: "Casa Tequila Prime"})
+    assert result == {1: "los-tres-amigos", 2: "casa-tequila-prime"}
+
+
+def test_canonical_slugs_disambiguate_duplicates_with_stable_location_id():
+    result = db.canonical_location_slugs({14: "Los Tres Amigos", 22: "Los Tres Amigos", 9: "Los Tres Amigos"})
+    assert result == {14: "los-tres-amigos-14", 22: "los-tres-amigos-22", 9: "los-tres-amigos-9"}, result
+    # Deterministic regardless of dict insertion order.
+    reordered = db.canonical_location_slugs({9: "Los Tres Amigos", 14: "Los Tres Amigos", 22: "Los Tres Amigos"})
+    assert reordered == result, "the mapping must not depend on iteration/insertion order"
+
+
+def test_canonical_slugs_never_use_array_position_or_random_suffix():
+    # Calling twice with the exact same input must always produce the
+    # exact same output -- no randomness, no counter state.
+    a = db.canonical_location_slugs({1: "Los Tres Amigos", 2: "Los Tres Amigos"})
+    b = db.canonical_location_slugs({1: "Los Tres Amigos", 2: "Los Tres Amigos"})
+    assert a == b == {1: "los-tres-amigos-1", 2: "los-tres-amigos-2"}
+
+
+def test_canonical_slug_handles_empty_slug_name():
+    result = db.canonical_location_slugs({7: "!!!"})
+    assert result == {7: "location-7"}, result
+
+
 def main():
     tests = [
         ("Case 1: historically linked row is updated, not duplicated", test_historically_linked_row_is_updated_not_duplicated),
@@ -423,6 +538,14 @@ def main():
         ("Case 7: existing reply is not erased by a blank incoming value", test_link_review_to_gbp_does_not_erase_existing_reply),
         ("Case 8: reply timestamp without comment is not treated as replied", test_reply_timestamp_without_comment_is_not_treated_as_replied),
         ("Case 9: link_review_to_gbp() is idempotent", test_link_review_to_gbp_is_idempotent),
+        ("Phase 4P: duplicate display names insert successfully", test_duplicate_display_names_insert_successfully),
+        ("Phase 4P: old-schema migration preserves ids and data", test_old_schema_migration_preserves_ids_and_data),
+        ("Phase 4P: migration is idempotent", test_migration_is_idempotent),
+        ("Phase 4P: a fresh database never has the old constraint", test_fresh_database_never_has_the_old_constraint_to_begin_with),
+        ("Phase 4P: canonical slugs are clean when unique", test_canonical_slugs_are_clean_when_unique),
+        ("Phase 4P: canonical slugs disambiguate with stable locationId", test_canonical_slugs_disambiguate_duplicates_with_stable_location_id),
+        ("Phase 4P: canonical slugs use no array position/random suffix", test_canonical_slugs_never_use_array_position_or_random_suffix),
+        ("Phase 4P: canonical slug handles an empty-slug name", test_canonical_slug_handles_empty_slug_name),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()

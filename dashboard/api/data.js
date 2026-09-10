@@ -40,13 +40,9 @@
 // dashboard/private-data/** included in this function's deployment bundle.
 // Do not assume runtime fs access "just works" without that entry.
 
-import { readFile } from 'fs/promises'
-import path from 'path'
-import { fileURLToPath } from 'url'
-import { requireAuth, requireLocationAccess } from './_lib/auth.js'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PRIVATE_ROOT = path.resolve(__dirname, '..', 'private-data')
+import { requireAuth, requireLocationAccess, isWildcardGrant } from './_lib/auth.js'
+import { resolveTenantId } from './_lib/tenants.js'
+import { readPrivateDataFile, UnknownTenantError } from './_lib/reviewDataPaths.js'
 
 // Every static file export_chunks.py writes (see its main()/export_* calls).
 const EXACT_ALLOWLIST = new Set([
@@ -114,42 +110,67 @@ function extractSlugFromRelPath(relPath) {
   return last.replace(/\.json$/, '')
 }
 
-let metaLocationsCache = null
+// Multi-Tenant Phase 4D: keyed per tenantId -- before this fix this was a
+// single, shared module-level cache, meaning a Tenant B caller could have
+// been served Tenant A's meta.json locations from a warm cache Tenant A's
+// own earlier request had already populated.
+//
+// Multi-Tenant Google Integration Architecture Fix: this cache previously
+// had NO expiry at all -- once a warm instance read a tenant's meta.json
+// once, it served that SAME locations list forever, for the lifetime of
+// the instance, regardless of how many real approve-locations/provisioning/
+// sync events happened afterward. Because Vercel keeps multiple warm
+// instances alive concurrently and routes requests to whichever is free,
+// two different requests for the SAME tenant (e.g. two different PRYOR
+// users, or the same user reloading the page) could land on instances that
+// cached this list at genuinely different points in that tenant's history
+// -- one instance warmed before a location was approved/synced, another
+// warmed after -- producing exactly the "same organization, different
+// linked-location count depending on who's asking" symptom this fix
+// addresses. A short TTL bounds how long such a split can persist without
+// requiring per-write cache invalidation plumbing into every place that
+// can change a tenant's location catalog.
+const META_LOCATIONS_CACHE_TTL_MS = 60 * 1000
+const metaLocationsCacheByTenant = new Map() // tenantId -> { locations, cachedAtMs }
 let metaLocationsTestOverride = null
 
 // Test-only seam, same pattern as reviewLocationIndex.js's own
 // _setReviewLocationIndexForTests.
 export function _setMetaLocationsForTests(locations) {
   metaLocationsTestOverride = locations
-  metaLocationsCache = null
+  metaLocationsCacheByTenant.clear()
 }
 export function _resetMetaLocationsForTests() {
   metaLocationsTestOverride = null
-  metaLocationsCache = null
+  metaLocationsCacheByTenant.clear()
 }
 
-// Returns meta.json's `locations` array (cached per warm instance -- see
-// reviewLocationIndex.js's identical reasoning). Used both to resolve a
-// requested slug's locationId (per-location files) and to filter the
-// locations list itself (meta.json requests). Reads directly off disk,
+// Returns meta.json's `locations` array (cached per warm instance, per
+// tenant, for at most META_LOCATIONS_CACHE_TTL_MS -- see the cache's own
+// header comment for why an unbounded cache was unsafe). Used both to
+// resolve a requested slug's locationId (per-location files) and to filter
+// the locations list itself (meta.json requests). Reads directly off disk,
 // independent of isAllowed()/EXACT_ALLOWLIST -- meta.json is always
 // allowlisted for every role, so this never bypasses anything the
 // allowlist itself wouldn't already permit.
-async function loadMetaLocations() {
+async function loadMetaLocations(tenantId) {
   if (metaLocationsTestOverride !== null) return metaLocationsTestOverride
-  if (metaLocationsCache !== null) return metaLocationsCache
+  const cached = metaLocationsCacheByTenant.get(tenantId)
+  if (cached && Date.now() - cached.cachedAtMs < META_LOCATIONS_CACHE_TTL_MS) return cached.locations
+  let locations
   try {
-    const raw = await readFile(path.join(PRIVATE_ROOT, 'meta.json'), 'utf-8')
-    metaLocationsCache = JSON.parse(raw).locations ?? []
+    const raw = await readPrivateDataFile(tenantId, 'meta.json')
+    locations = JSON.parse(raw).locations ?? []
   } catch (err) {
-    console.error(`[api/data] could not load meta.json for location resolution: ${err.message}`)
-    metaLocationsCache = []
+    console.error(`[api/data] could not load meta.json for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+    locations = []
   }
-  return metaLocationsCache
+  metaLocationsCacheByTenant.set(tenantId, { locations, cachedAtMs: Date.now() })
+  return locations
 }
 
-async function resolveLocationIdForSlug(slug) {
-  const locations = await loadMetaLocations()
+async function resolveLocationIdForSlug(tenantId, slug) {
+  const locations = await loadMetaLocations(tenantId)
   const match = locations.find(l => l.slug === slug)
   return match ? match.locationId : null
 }
@@ -187,20 +208,30 @@ export default async function handler(req, res) {
   const account = await requireAuth(req, res, null)
   if (!account) return
 
+  // Multi-Tenant Phase 4D/4F.1: tenantId is derived EXCLUSIVELY from the
+  // authenticated, server-side account -- never from req.query/req.body/
+  // any header. The file is then read through the server-controlled
+  // resolver (reviewDataPaths.js's readPrivateDataFile(), which branches on
+  // storage mode internally), never a path/key built from caller input. A
+  // tenant with no registered/operational private-data storage fails
+  // closed with 404 here, before any read is attempted -- it can never
+  // fall through to another tenant's (e.g. Los Tres Amigos's) data.
+  const tenantId = resolveTenantId(account)
+
   const relPath = buildRequestedRelPath(req.query.file)
   if (!relPath || !isAllowed(relPath)) {
     return res.status(404).json({ error: 'not_found' })
   }
 
   let requestedLocationId = null // only meaningful for the 'per-location' category
-  if (account.locationIds !== '*') {
+  if (!isWildcardGrant(account)) {
     const category = categorizeRelPath(relPath)
     if (category === 'company-wide') {
       return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to view company-wide data.' })
     }
     if (category === 'per-location') {
       const slug = extractSlugFromRelPath(relPath)
-      requestedLocationId = await resolveLocationIdForSlug(slug)
+      requestedLocationId = await resolveLocationIdForSlug(tenantId, slug)
       if (requestedLocationId === null || !requireLocationAccess(account, requestedLocationId)) {
         // Existence-hiding, matching the frozen §6 error contract every
         // other location-scope check in this codebase uses -- never 403
@@ -211,26 +242,17 @@ export default async function handler(req, res) {
     // category === 'meta' falls through -- read + filtered after parsing.
   }
 
-  const resolved = path.resolve(PRIVATE_ROOT, relPath)
-  // Defense in depth, not the primary check -- the allowlist above already
-  // guarantees this, but a future edit to the allowlist regexes shouldn't
-  // be able to silently escape PRIVATE_ROOT without this also catching it.
-  if (resolved !== PRIVATE_ROOT && !resolved.startsWith(PRIVATE_ROOT + path.sep)) {
-    return res.status(404).json({ error: 'not_found' })
-  }
-
   let raw
   try {
-    raw = await readFile(resolved, 'utf-8')
+    raw = await readPrivateDataFile(tenantId, relPath)
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if (err instanceof UnknownTenantError || err.code === 'ENOENT') {
       // Legitimate empty state for files that only exist once a given
       // pipeline stage has run at least once (e.g. gbp-sync.json before
-      // the first API sync), OR a genuinely missing bundled artifact
-      // (export_chunks.py never generated it, or a vercel.json
-      // includeFiles misconfiguration left it out of the deployment) --
-      // callers already treat 404 as "not yet generated", not a hard
-      // error, and the response never distinguishes the two causes.
+      // the first API sync), a genuinely missing bundled/uploaded artifact,
+      // or an unknown/unprovisioned tenant -- callers already treat 404 as
+      // "not yet generated", not a hard error, and the response never
+      // distinguishes the causes.
       return res.status(404).json({ error: 'not_found' })
     }
     console.error(`[api/data] failed to read ${relPath}: ${err.message}`)
@@ -257,7 +279,7 @@ export default async function handler(req, res) {
   // location's own review file. The frontend must derive a scoped
   // account's review counts from the (already location-scoped) review
   // data it fetches, never from meta.totalReviews.
-  if (account.locationIds !== '*' && relPath === 'meta.json') {
+  if (!isWildcardGrant(account) && relPath === 'meta.json') {
     parsed = {
       ...parsed,
       locations: (parsed.locations ?? []).filter(l => requireLocationAccess(account, l.locationId)),
