@@ -108,6 +108,21 @@ jobs:
         if: always()
         run: python export_chunks.py --tenant-id "$TENANT_ID"
 
+      # Make GitHub Actions the single PRYOR production deployment owner:
+      # this pipeline is now the ONLY path that ever regenerates
+      # dashboard/private-data/** before deploying (the hosting platform's
+      # own automatic Git-push deploy trigger has been turned off in the
+      # dashboard project's own config, precisely so this is the only path).
+      # A silent export_chunks.py failure (a caught exception, a tenant/path
+      # mixup, a partial write) must never let the Deploy step further below
+      # ship stale or incomplete private-data -- missing required artifacts
+      # or a meta.json that doesn't look freshly generated fails this step,
+      # which the Deploy step's own condition checks.
+      - name: Verify private-data artifacts before deploy
+        if: always()
+        id: verify-artifacts
+        run: python verify_private_data_artifacts.py --tenant-id "$TENANT_ID"
+
       - name: Verify database integrity before commit
         if: always()
         id: integrity
@@ -146,7 +161,7 @@ jobs:
       # as a pre-flight check that the build succeeds before spending a
       # deploy attempt on it.
       - name: Deploy to Vercel
-        if: always() && steps.integrity.outcome == 'success'
+        if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success'
         run: npx vercel --prod --yes --token=${{ secrets.VERCEL_TOKEN }}
         env:
           # PRYOR OS Controlled Production Release Preparation + Reconciliation:

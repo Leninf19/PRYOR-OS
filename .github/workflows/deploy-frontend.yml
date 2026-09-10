@@ -56,6 +56,17 @@ jobs:
       - name: Export data chunks
         run: python export_chunks.py --tenant-id "$TENANT_ID"
 
+      # Make GitHub Actions the single PRYOR production deployment owner:
+      # same reasoning as update-reviews.yml's identically-named step -- a
+      # silent export_chunks.py failure must never let `vercel --prod` below
+      # ship stale or incomplete private-data. No `if: always()` gate here
+      # (unlike update-reviews.yml): this workflow has none of the
+      # `if: always()` steps that motivated that pattern there, so a failure
+      # here simply fails the job and the Deploy step below never runs, via
+      # GitHub Actions' own default step semantics.
+      - name: Verify private-data artifacts before deploy
+        run: python verify_private_data_artifacts.py --tenant-id "$TENANT_ID"
+
       - uses: actions/setup-node@v6
         with:
           node-version: '24'

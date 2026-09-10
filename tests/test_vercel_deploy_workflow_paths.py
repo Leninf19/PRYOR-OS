@@ -155,6 +155,68 @@ def test_no_workflow_ever_produces_a_doubled_dashboard_path():
         )
 
 
+def _step_names_in_order(source: str) -> list[str]:
+    names = []
+    for block in _steps(source):
+        m = re.search(r"^      - name:\s*(.+)$", block, re.MULTILINE)
+        names.append(m.group(1).strip() if m else None)
+    return names
+
+
+def test_data_generation_pipeline_runs_before_artifact_verification_and_deploy():
+    """Make GitHub Actions the single PRYOR production deployment owner:
+    export_chunks.py must run, THEN verify_private_data_artifacts.py must
+    run, THEN (and only then) the Deploy to Vercel step -- in that order --
+    in both workflows. A reordering here would silently defeat the whole
+    point of the artifact check."""
+    export_step_name_by_workflow = {
+        "update-reviews.yml": "Export intelligence data",
+        "deploy-frontend.yml": "Export data chunks",
+    }
+    for filename in VERCEL_DEPLOY_WORKFLOWS:
+        source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
+        names = _step_names_in_order(source)
+        export_name = export_step_name_by_workflow[filename]
+        assert export_name in names, f"{filename}: expected a {export_name!r} step"
+        assert "Verify private-data artifacts before deploy" in names, (
+            f"{filename}: missing the 'Verify private-data artifacts before deploy' step"
+        )
+        assert "Deploy to Vercel" in names, f"{filename}: missing the 'Deploy to Vercel' step"
+        i_export = names.index(export_name)
+        i_verify = names.index("Verify private-data artifacts before deploy")
+        i_deploy = names.index("Deploy to Vercel")
+        assert i_export < i_verify < i_deploy, (
+            f"{filename}: expected step order export ({i_export}) < verify ({i_verify}) < deploy ({i_deploy})"
+        )
+
+
+def test_verify_artifacts_step_actually_invokes_the_checker():
+    for filename in VERCEL_DEPLOY_WORKFLOWS:
+        source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
+        verify_step = _find_step(_steps(source), "Verify private-data artifacts before deploy")
+        assert "python verify_private_data_artifacts.py" in verify_step, (
+            f"{filename}: the verify-artifacts step no longer appears to invoke verify_private_data_artifacts.py"
+        )
+        assert '--tenant-id "$TENANT_ID"' in verify_step, (
+            f"{filename}: the verify-artifacts step must pass --tenant-id, same as every other tenant-aware entrypoint"
+        )
+
+
+def test_update_reviews_deploy_step_is_gated_on_artifact_verification():
+    """update-reviews.yml's Deploy step uses `if: always()` (so a failure in
+    an earlier step doesn't skip it by GitHub Actions' own default
+    semantics) -- so its own condition must explicitly require the
+    artifact-verification step to have succeeded, on top of the pre-existing
+    integrity check."""
+    source = (WORKFLOWS_DIR / "update-reviews.yml").read_text(encoding="utf-8")
+    deploy_step = _find_step(_steps(source), "Deploy to Vercel")
+    assert "steps.verify-artifacts.outcome == 'success'" in deploy_step, (
+        "update-reviews.yml: 'Deploy to Vercel' must require "
+        "steps.verify-artifacts.outcome == 'success' -- without it, always() "
+        "would let a failed artifact check deploy anyway"
+    )
+
+
 def test_vercel_project_org_ids_unchanged_by_this_fix():
     """Regression guard: this phase explicitly must NOT touch
     VERCEL_TOKEN/VERCEL_PROJECT_ID/VERCEL_ORG_ID/Root Directory -- proves
@@ -179,6 +241,9 @@ def main() -> int:
         ("dashboard's own npm install/build step is still correctly scoped to dashboard/", test_dashboard_install_and_build_still_scoped_to_dashboard),
         ("no workflow contains the literal doubled path 'dashboard/dashboard'", test_no_workflow_ever_produces_a_doubled_dashboard_path),
         ("VERCEL_ORG_ID/VERCEL_PROJECT_ID remain unchanged by this fix", test_vercel_project_org_ids_unchanged_by_this_fix),
+        ("export -> verify-artifacts -> deploy step order holds in both workflows", test_data_generation_pipeline_runs_before_artifact_verification_and_deploy),
+        ("the verify-artifacts step actually invokes verify_private_data_artifacts.py", test_verify_artifacts_step_actually_invokes_the_checker),
+        ("update-reviews.yml's Deploy step is gated on artifact verification success", test_update_reviews_deploy_step_is_gated_on_artifact_verification),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()
