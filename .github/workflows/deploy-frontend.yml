@@ -86,6 +86,7 @@ jobs:
       # this workflow's other steps -- a failure simply fails the job.
       - name: Build and verify serverless bundle includes required artifacts
         run: |
+          npx vercel pull dashboard --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
           npx vercel build --yes --token=${{ secrets.VERCEL_TOKEN }}
           python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --bundle-config dashboard/.vercel/output/functions/api/data.func/.vc-config.json
         env:
