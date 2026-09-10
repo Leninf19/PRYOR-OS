@@ -13,6 +13,7 @@ import { useResponseDrafts } from '../hooks/useIntelligence.js'
 import { useReviewWorkspace } from '../hooks/useReviewWorkspace.js'
 import { useActionWorkspace } from '../hooks/useActionWorkspace.js'
 import { useReviewEmailPreview, useSendReviewEmail } from '../hooks/useReviewEmailWorkflow.js'
+import { useGoogleOAuthStatus } from '../hooks/useGoogleOAuthStatus.js'
 import { useRestaurantContacts } from '../hooks/useRestaurantContacts.js'
 import ContactEditorModal from './settings/ContactEditorModal.jsx'
 import { useAccount } from '../components/AuthGate.jsx'
@@ -170,12 +171,26 @@ async function callRewrite(payload) {
 }
 
 // ─── GBP connection banner ─────────────────────────────────────────────────────
-
+//
+// Multi-Tenant Google Integration Architecture Fix: this used to be a
+// purely static warning, gated ONLY by a per-browser localStorage dismiss
+// flag -- it never checked whether Google was actually connected, so it
+// showed "Google Business Profile not connected" to every user on every
+// fresh browser/device regardless of the organization's real, tenant-scoped
+// connection state (directly contradicting the global header's "Google
+// Connected" pill, which DOES check the real state). It now reads the
+// exact same shared, tenant-scoped /api/google/status response every other
+// surface (Settings, the global header) consumes -- see
+// useGoogleOAuthStatus.js -- so this banner can never disagree with them.
+// The dismiss flag still works, but only ever hides a REAL "not connected"
+// state, never fabricates a false one.
 function GBPBanner() {
+  const { data: status, isLoading } = useGoogleOAuthStatus()
   const [dismissed, setDismissed] = useState(
     () => localStorage.getItem('gbp_banner_v1') === '1'
   )
-  if (dismissed) return null
+  const connected = status?.connected ?? false
+  if (isLoading || connected || dismissed) return null
 
   return (
     <div className="rounded-xl p-4 flex items-start gap-3 border"
@@ -1473,6 +1488,23 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
     [filtered, ws, bridgesData]
   )
 
+  // Google Integration + Reviews End-to-End Validation, Part C -- the
+  // default date range is a ROLLING 7-DAY WINDOW (dataUtils.js's
+  // getDefaultDateRange()), not "all time." A location that genuinely has
+  // hundreds of all-time unanswered reviews can easily show ZERO of them in
+  // that narrow default window on any given day, since none happens to be
+  // dated within the last 7 days -- `filtered`/`processed` below are
+  // already correctly scoped to the CURRENT range, but without this check
+  // the "needsResponseOnly" empty state below would say "You're all caught
+  // up," which is only true for the current range, not for the tenant.
+  // Computed from `allReviews` (never date-filtered) using the exact same
+  // actionable-state logic the current-range counts above use, so this is
+  // a genuine all-time backlog check, not a guess.
+  const hasActionableReviewsOutsideCurrentRange = useMemo(() => {
+    if (replyStateCounts.needs_reply > 0 || replyStateCounts.draft > 0 || replyStateCounts.failed > 0) return false // already visible in the current range -- no discrepancy to explain
+    return allReviews.some(r => isActionableReplyState(computeReplyState(r, ws[reviewId(r)], bridgesData[reviewId(r)])))
+  }, [allReviews, replyStateCounts, ws, bridgesData])
+
   const processed = useMemo(() => {
     let rows = filtered
     if (needsResponseOnly) rows = rows.filter(r => isActionableReplyState(computeReplyState(r, ws[reviewId(r)], bridgesData[reviewId(r)])))
@@ -1680,14 +1712,33 @@ export default function Reviews({ allReviews = [], filtered = [], prevFiltered =
             <div>
               {visible.length === 0 ? (
                 needsResponseOnly && !keyword && !sentiment && !length && !replyStates.length ? (
-                  <EmptyState icon="🎉" title="You're all caught up"
-                              body="Every review has been replied to, published, or is otherwise resolved."
-                              action={
-                                <button onClick={toggleNeedsResponse} className="text-xs font-medium underline"
-                                        style={{ color: 'var(--color-accent)' }}>
-                                  View all reviews / history →
-                                </button>
-                              } />
+                  hasActionableReviewsOutsideCurrentRange ? (
+                    // Google Integration + Reviews End-to-End Validation,
+                    // Part C: this was the misleading case -- the default
+                    // date range is a rolling 7 days, so a tenant with a
+                    // real, non-zero all-time backlog routinely sees zero
+                    // actionable reviews IN that narrow window. Saying
+                    // "you're all caught up" here would be false; this
+                    // reviewer still has work, just outside the visible
+                    // range.
+                    <EmptyState icon="🗓️" title="Nothing needs a reply in this date range"
+                                body="Your currently selected date range has no pending reviews, but there are older ones that still need a reply. Switch to All Time (or widen the date range) to see them."
+                                action={
+                                  <button onClick={toggleNeedsResponse} className="text-xs font-medium underline"
+                                          style={{ color: 'var(--color-accent)' }}>
+                                    View all reviews / history →
+                                  </button>
+                                } />
+                  ) : (
+                    <EmptyState icon="🎉" title="You're all caught up"
+                                body="Every review has been replied to, published, or is otherwise resolved."
+                                action={
+                                  <button onClick={toggleNeedsResponse} className="text-xs font-medium underline"
+                                          style={{ color: 'var(--color-accent)' }}>
+                                    View all reviews / history →
+                                  </button>
+                                } />
+                  )
                 ) : (
                   <EmptyState icon="🔍" title="No reviews match your filters"
                               body="Try adjusting your keyword, sentiment, star filter, or date range." />

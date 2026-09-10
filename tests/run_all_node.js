@@ -122,6 +122,20 @@ const TESTS = [
   'test_approved_locations_panel_ui.js',
   'test_use_tenant_status_hook_ui.js',
   'test_user_store_tenant_isolation.js',
+  // Multi-Tenant Phase 4Q.1 -- self-service registration + access-code onboarding
+  'test_pending_registration_store.js',
+  'test_access_code_store.js',
+  'test_registration.js',
+  'test_tenant_creation_from_registration.js',
+  'test_admin_access_codes_endpoint.js',
+  // Multi-Tenant Google Integration Architecture Fix
+  'test_google_connection_store.js',
+  'test_google_integration_architecture.js',
+  // Google Integration + Reviews End-to-End Validation
+  'test_google_test_connection_permission.js',
+  'test_multi_user_tenant_e2e.js',
+  'test_reviews_date_scope_semantics.js',
+  'test_google_sync_freshness.js',
 ]
 
 const results = {}

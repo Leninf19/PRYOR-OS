@@ -131,8 +131,16 @@ jobs:
           npm run build
           npx vercel --prod --yes --token=${{ secrets.VERCEL_TOKEN }}
         env:
-          VERCEL_ORG_ID: team_mDA28eSShEIgPIQlduF4GJVH
-          VERCEL_PROJECT_ID: prj_8Lj4p2UgPOVVwEZoRuuEpKy9L5gp
+          # PRYOR OS Controlled Production Release Preparation + Reconciliation:
+          # these IDs previously pointed at a stale/legacy Vercel project --
+          # every scheduled sync's deploy was landing somewhere other than
+          # the real, currently-linked "pryor-os" project (see
+          # .vercel/repo.json in this repo for the authoritative link),
+          # which is why a demonstrably healthy, continuously-succeeding
+          # sync pipeline never actually kept the live site's data fresh.
+          # Corrected to the real project.
+          VERCEL_ORG_ID: team_bzqEwLON2tvascgmnOtYAPi8
+          VERCEL_PROJECT_ID: prj_rAhOLFWrKXB94ohCGiAdw3OY1ymo
 
       - name: Send email notification
         # Gated on negative_count (new 1-2 star reviews only), NOT new_count

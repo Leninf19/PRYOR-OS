@@ -126,13 +126,24 @@ function SnapshotBar() {
       })()
     : null
 
+  // Google Integration + Reviews End-to-End Validation, Part C: these two
+  // pills are ALWAYS all-time totals (meta.totalReviews/action-items.json's
+  // unanswered.length for an unscoped account; allReviews itself is never
+  // date-filtered for a scoped one -- see totalRevs/backlog above) -- while
+  // the Reviews page's own stat cards/filters are scoped to whatever date
+  // range is currently selected (default: a rolling 7 days, see
+  // dataUtils.js's getDefaultDateRange()). Without a label, "605 need
+  // reply" here next to a Reviews page reading "Needs Reply (0)" reads as a
+  // contradiction rather than two different, both-correct scopes -- a title
+  // tooltip plus a compact inline qualifier make the distinction
+  // discoverable without lengthening the pill on every render.
   const pills = [
     { label: dateLabel, dimmed: false },
     lastRun && { label: `Updated ${lastRun}`, dimmed: true },
     { label: locationsLabel, dimmed: true },
-    { label: `${totalRevs} reviews`, dimmed: true },
+    { label: `${totalRevs} reviews (all-time)`, dimmed: true, title: 'All-time total across every location, regardless of the date range currently selected on the Reviews page.' },
     alertCount > 0 && { label: `${alertCount} alerts`, color: 'var(--color-warning)', dot: true },
-    backlog > 0 && { label: `${backlog} need reply`, color: 'var(--color-danger)', dot: true },
+    backlog > 0 && { label: `${backlog} need reply (all-time)`, color: 'var(--color-danger)', dot: true, title: 'All-time backlog across every location. The Reviews page\'s own "Needs Reply" count only reflects its currently selected date range, which defaults to the last 7 days.' },
   ].filter(Boolean)
 
   return (
@@ -155,7 +166,7 @@ function SnapshotBar() {
               <span className="w-1.5 h-1.5 rounded-full flex-shrink-0"
                     style={{ background: p.color }} />
             )}
-            <span className="text-[10px] font-medium"
+            <span className="text-[10px] font-medium" title={p.title}
                   style={{ color: p.color ?? (p.dimmed ? 'var(--color-text-3)' : 'var(--color-text-2)') }}>
               {p.label}
             </span>

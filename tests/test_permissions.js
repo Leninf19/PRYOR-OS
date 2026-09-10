@@ -71,6 +71,10 @@ async function testPermissionRegistryIsFrozenAndComplete() {
     'CONTACTS_VIEW', 'CONTACTS_MANAGE', 'EMAIL_VIEW', 'SETTINGS_ADMIN', 'AUDIT_VIEW',
     // Multi-Location Authentication & User Access System
     'USERS_MANAGE',
+    // Multi-Tenant Google Integration Architecture Fix -- INTEGRATIONS_VIEW
+    // (broad: every role) is distinct from SETTINGS_ADMIN above (narrow:
+    // owner-only mutation).
+    'INTEGRATIONS_VIEW',
     // Operations Calendar + Content Library milestone
     'TASK_VIEW', 'TASK_CREATE', 'TASK_ASSIGN', 'TASK_MANAGE',
     'CALENDAR_VIEW', 'CALENDAR_MANAGE',
@@ -123,7 +127,7 @@ const EXPECTED_GRANTS = {
     VIEW_ALL: true, VIEW_ASSIGNED: true, REPLY: true, REPLY_ASSIGNED: false,
     EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: true,
     CONTACTS_VIEW: true, CONTACTS_MANAGE: true, EMAIL_VIEW: true, SETTINGS_ADMIN: true, AUDIT_VIEW: true,
-    USERS_MANAGE: true,
+    USERS_MANAGE: true, INTEGRATIONS_VIEW: true,
     ...CALENDAR_CONTENT_FULL,
   },
   admin: {
@@ -133,28 +137,28 @@ const EXPECTED_GRANTS = {
     VIEW_ALL: true, VIEW_ASSIGNED: true, REPLY: true, REPLY_ASSIGNED: false,
     EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: false,
     CONTACTS_VIEW: false, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
-    USERS_MANAGE: true,
+    USERS_MANAGE: true, INTEGRATIONS_VIEW: true,
     ...CALENDAR_CONTENT_FULL,
   },
   marketing: {
     VIEW_ALL: true, VIEW_ASSIGNED: true, REPLY: true, REPLY_ASSIGNED: false,
     EXPORT: true, EXPORT_ASSIGNED: false, CAMPAIGNS: true, ADMIN: false,
     CONTACTS_VIEW: true, CONTACTS_MANAGE: true, EMAIL_VIEW: true, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
-    USERS_MANAGE: false,
+    USERS_MANAGE: false, INTEGRATIONS_VIEW: true,
     ...CALENDAR_CONTENT_FULL,
   },
   location_manager: {
     VIEW_ALL: false, VIEW_ASSIGNED: true, REPLY: false, REPLY_ASSIGNED: true,
     EXPORT: false, EXPORT_ASSIGNED: true, CAMPAIGNS: false, ADMIN: false,
     CONTACTS_VIEW: true, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
-    USERS_MANAGE: false,
+    USERS_MANAGE: false, INTEGRATIONS_VIEW: true,
     ...CALENDAR_CONTENT_VIEW_ONLY,
   },
   read_only: {
     VIEW_ALL: false, VIEW_ASSIGNED: true, REPLY: false, REPLY_ASSIGNED: false,
     EXPORT: false, EXPORT_ASSIGNED: false, CAMPAIGNS: false, ADMIN: false,
     CONTACTS_VIEW: false, CONTACTS_MANAGE: false, EMAIL_VIEW: false, SETTINGS_ADMIN: false, AUDIT_VIEW: false,
-    USERS_MANAGE: false,
+    USERS_MANAGE: false, INTEGRATIONS_VIEW: true,
     ...CALENDAR_CONTENT_VIEW_ONLY,
   },
 }

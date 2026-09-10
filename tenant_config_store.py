@@ -259,6 +259,15 @@ def upsert_tenant_config(tenant_id: str, patch: dict, expected_version: int | No
             "status": "none", "requestedAt": None, "completedAt": None, "failedAt": None,
             "addedLocationIds": [], "removedLocationIds": [], "lastError": None,
         },
+        # Multi-Tenant Phase 4Q -- see tenantConfigStore.js's own
+        # "commercial" field comment: purely descriptive plan/billing
+        # metadata, additive, optional, and deliberately inert (nothing in
+        # either language's authorization logic ever reads it). A record
+        # created by this function (Python never creates a self-service
+        # tenant's FIRST record today -- see this module's header -- but
+        # mirrors the field for shape parity regardless) simply carries
+        # commercial: None forever unless Node's registration flow set it.
+        "commercial": None,
         **(existing or {}),
         "createdAt": (existing or {}).get("createdAt", now),
         **patch,

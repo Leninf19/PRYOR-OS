@@ -33,7 +33,18 @@ export const Permission = Object.freeze({
   CONTACTS_VIEW:   'contacts_view',
   CONTACTS_MANAGE: 'contacts_manage',
   EMAIL_VIEW:      'email_view',
-  SETTINGS_ADMIN:  'settings_admin', // Google Business Profile connect/disconnect
+  SETTINGS_ADMIN:  'settings_admin', // Google Business Profile connect/disconnect (integration MANAGEMENT)
+  // Multi-Tenant Google Integration Architecture Fix: whether this account
+  // may SEE the tenant's Google connection status (connected/not, account
+  // name, linked-location counts, health) -- deliberately separate from,
+  // and much broader than, SETTINGS_ADMIN above. Viewing status carries no
+  // secret material (no refresh/access token ever reaches the response)
+  // and every tenant member operationally needs to know whether Google is
+  // connected (the Reviews page banner, the global header pill, and the
+  // publish button's own state all depend on it) -- so this is granted to
+  // EVERY real role below, unconditionally. Only SETTINGS_ADMIN gates the
+  // mutating actions (connect/reconnect/disconnect).
+  INTEGRATIONS_VIEW: 'integrations_view',
   AUDIT_VIEW:      'audit_view',
   // Multi-Location Authentication & User Access System: invite/disable/
   // role-and-location-reassign other users. Deliberately separate from
@@ -92,7 +103,7 @@ export const ROLE_PERMISSIONS = Object.freeze({
     Permission.CAMPAIGNS, Permission.EXPORT, Permission.ADMIN,
     Permission.CONTACTS_VIEW, Permission.CONTACTS_MANAGE,
     Permission.EMAIL_VIEW, Permission.SETTINGS_ADMIN, Permission.AUDIT_VIEW,
-    Permission.USERS_MANAGE,
+    Permission.USERS_MANAGE, Permission.INTEGRATIONS_VIEW,
     ...CALENDAR_CONTENT_FULL,
   ]),
   // 'admin': core operational tier (same VIEW_ALL/REPLY/EXPORT/CAMPAIGNS as
@@ -113,23 +124,26 @@ export const ROLE_PERMISSIONS = Object.freeze({
   admin: new Set([
     Permission.VIEW_ALL, Permission.VIEW_ASSIGNED, Permission.REPLY,
     Permission.CAMPAIGNS, Permission.EXPORT,
-    Permission.USERS_MANAGE,
+    Permission.USERS_MANAGE, Permission.INTEGRATIONS_VIEW,
     ...CALENDAR_CONTENT_FULL,
   ]),
   marketing: new Set([
     Permission.VIEW_ALL, Permission.VIEW_ASSIGNED, Permission.REPLY,
     Permission.CAMPAIGNS, Permission.EXPORT,
     Permission.CONTACTS_VIEW, Permission.CONTACTS_MANAGE, Permission.EMAIL_VIEW,
+    Permission.INTEGRATIONS_VIEW,
     ...CALENDAR_CONTENT_FULL,
   ]),
   location_manager: new Set([
     Permission.VIEW_ASSIGNED, Permission.REPLY_ASSIGNED, Permission.EXPORT_ASSIGNED,
     Permission.CONTACTS_VIEW, // scoped to their own location via requireScopedAuth
     Permission.TASK_VIEW, Permission.CALENDAR_VIEW, Permission.CONTENT_VIEW,
+    Permission.INTEGRATIONS_VIEW,
   ]),
   read_only: new Set([
     Permission.VIEW_ASSIGNED,
     Permission.TASK_VIEW, Permission.CALENDAR_VIEW, Permission.CONTENT_VIEW,
+    Permission.INTEGRATIONS_VIEW,
   ]),
 })
 

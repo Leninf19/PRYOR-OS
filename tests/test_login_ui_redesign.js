@@ -3,8 +3,9 @@
 // authentication behavior: same endpoint, same request body shape, same
 // success/failure contract, no invented fields (no "remember me" -- the
 // backend has never accepted one), no Google/OAuth login option, and the
-// register/access-code affordances are inert placeholders (no live route
-// exists yet for either).
+// register/access-code affordances are plain navigation links (real
+// routes as of Multi-Tenant Phase 4Q.1), never a fetch() fired directly
+// from this screen.
 //
 // Plain source-text regex assertions, matching this project's established
 // convention for a file with no React render-test harness (see
@@ -76,15 +77,18 @@ function testPasswordVisibilityToggleExists() {
   assert(/type=\{showPassword \? 'text' : 'password'\}/.test(content), 'the password input type must toggle between text and password')
 }
 
-function testRegisterAndAccessCodePlaceholdersAreInertNotLiveRoutes() {
-  // Multi-Location register/access-code routes do not exist yet -- these
-  // must never fire a network request or navigate anywhere.
+function testRegisterAndAccessCodeLinksAreRealNavigationNotFetchCalls() {
+  // Multi-Tenant Phase 4Q.1: /register and /access-code are now real,
+  // public routes (see AuthGate.jsx's PUBLIC_PATHS) -- these must be plain
+  // navigation links, exactly like the existing Forgot password link,
+  // never a fetch() call fired directly from the login screen itself (all
+  // real registration/redemption logic lives in the new page components).
   assert(/Create an account/.test(content) && /Enter code/.test(content),
-    'both the "create an account" and "access code" affordances must be present as prepared placeholders')
-  assert(!/href="\/register"/.test(content) && !/href="\/access-code"/.test(content),
-    'neither placeholder may link to a route that does not exist yet')
-  assert(!/fetch\(['"`]\/api\/(session\/)?(register|signup|access-code)/i.test(content),
-    'neither placeholder may fire a network call -- no backend route exists for either yet')
+    'both the "create an account" and "access code" affordances must be present')
+  assert(/href="\/register"/.test(content), 'the "create an account" affordance must link to the real /register route')
+  assert(/href="\/access-code"/.test(content), 'the "access code" affordance must link to the real /access-code route')
+  assert(!/fetch\(['"`]\/api\/(session\/)?(register|signup|redeem-access-code)/i.test(content),
+    'the login screen itself must never fire a register/redeem network call directly -- that logic belongs to the dedicated pages')
 }
 
 function testStillUsesTheCorrectAutocompleteHints() {
@@ -100,7 +104,7 @@ const tests = [
   ['Forgot password link is unchanged', testForgotPasswordLinkUnchanged],
   ['no Google/OAuth login option', testNoGoogleOrThirdPartyLoginOption],
   ['password show/hide toggle exists', testPasswordVisibilityToggleExists],
-  ['register/access-code placeholders are inert, not live routes', testRegisterAndAccessCodePlaceholdersAreInertNotLiveRoutes],
+  ['register/access-code links are real navigation, not fetch calls', testRegisterAndAccessCodeLinksAreRealNavigationNotFetchCalls],
   ['autocomplete hints are unchanged', testStillUsesTheCorrectAutocompleteHints],
 ]
 

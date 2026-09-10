@@ -114,7 +114,24 @@ function extractSlugFromRelPath(relPath) {
 // single, shared module-level cache, meaning a Tenant B caller could have
 // been served Tenant A's meta.json locations from a warm cache Tenant A's
 // own earlier request had already populated.
-const metaLocationsCacheByTenant = new Map()
+//
+// Multi-Tenant Google Integration Architecture Fix: this cache previously
+// had NO expiry at all -- once a warm instance read a tenant's meta.json
+// once, it served that SAME locations list forever, for the lifetime of
+// the instance, regardless of how many real approve-locations/provisioning/
+// sync events happened afterward. Because Vercel keeps multiple warm
+// instances alive concurrently and routes requests to whichever is free,
+// two different requests for the SAME tenant (e.g. two different PRYOR
+// users, or the same user reloading the page) could land on instances that
+// cached this list at genuinely different points in that tenant's history
+// -- one instance warmed before a location was approved/synced, another
+// warmed after -- producing exactly the "same organization, different
+// linked-location count depending on who's asking" symptom this fix
+// addresses. A short TTL bounds how long such a split can persist without
+// requiring per-write cache invalidation plumbing into every place that
+// can change a tenant's location catalog.
+const META_LOCATIONS_CACHE_TTL_MS = 60 * 1000
+const metaLocationsCacheByTenant = new Map() // tenantId -> { locations, cachedAtMs }
 let metaLocationsTestOverride = null
 
 // Test-only seam, same pattern as reviewLocationIndex.js's own
@@ -129,7 +146,8 @@ export function _resetMetaLocationsForTests() {
 }
 
 // Returns meta.json's `locations` array (cached per warm instance, per
-// tenant -- see reviewLocationIndex.js's identical reasoning). Used both to
+// tenant, for at most META_LOCATIONS_CACHE_TTL_MS -- see the cache's own
+// header comment for why an unbounded cache was unsafe). Used both to
 // resolve a requested slug's locationId (per-location files) and to filter
 // the locations list itself (meta.json requests). Reads directly off disk,
 // independent of isAllowed()/EXACT_ALLOWLIST -- meta.json is always
@@ -137,7 +155,8 @@ export function _resetMetaLocationsForTests() {
 // allowlist itself wouldn't already permit.
 async function loadMetaLocations(tenantId) {
   if (metaLocationsTestOverride !== null) return metaLocationsTestOverride
-  if (metaLocationsCacheByTenant.has(tenantId)) return metaLocationsCacheByTenant.get(tenantId)
+  const cached = metaLocationsCacheByTenant.get(tenantId)
+  if (cached && Date.now() - cached.cachedAtMs < META_LOCATIONS_CACHE_TTL_MS) return cached.locations
   let locations
   try {
     const raw = await readPrivateDataFile(tenantId, 'meta.json')
@@ -146,7 +165,7 @@ async function loadMetaLocations(tenantId) {
     console.error(`[api/data] could not load meta.json for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
     locations = []
   }
-  metaLocationsCacheByTenant.set(tenantId, locations)
+  metaLocationsCacheByTenant.set(tenantId, { locations, cachedAtMs: Date.now() })
   return locations
 }
 

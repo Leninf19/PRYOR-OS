@@ -7,6 +7,11 @@ import AcceptInvite from './AcceptInvite.jsx'
 import ForgotPassword from './ForgotPassword.jsx'
 import ResetPassword from './ResetPassword.jsx'
 import Onboarding from '../pages/Onboarding.jsx'
+import Register from './Register.jsx'
+import VerifyEmail from './VerifyEmail.jsx'
+import GetStarted from './GetStarted.jsx'
+import Pricing from './Pricing.jsx'
+import AccessCodeEntry from './AccessCodeEntry.jsx'
 
 // Paths reachable WITHOUT a session, checked before any loading/
 // authenticated/unauthenticated branching below -- an invitee/locked-out
@@ -14,10 +19,25 @@ import Onboarding from '../pages/Onboarding.jsx'
 // useSession()'s whoami check still fires in the background on these paths
 // (harmless, ignored; not worth threading a skip-flag through the hook for
 // one wasted 401).
+//
+// Multi-Tenant Phase 4Q.1 -- register/verify-email/get-started/pricing/
+// access-code are ALL reachable without a real lta_session (they carry
+// their own, separate, narrower lta_pending_signup token instead -- see
+// pendingSignupSession.js). None of these five ever mount Onboarding/App;
+// they are pure pre-tenant pages. /get-started, /pricing (in the plan-
+// selection case), and /access-code all read their own state from the
+// server (get-started-status) rather than from anything this file passes
+// them, so they need no special props here, identical to how
+// ForgotPassword/ResetPassword already work.
 const PUBLIC_PATHS = {
   '/accept-invite': AcceptInvite,
   '/forgot-password': ForgotPassword,
   '/reset-password': ResetPassword,
+  '/register': Register,
+  '/verify-email': VerifyEmail,
+  '/get-started': GetStarted,
+  '/pricing': Pricing,
+  '/access-code': AccessCodeEntry,
 }
 
 // The authenticated account (userId/email/role/locationIds/displayName from

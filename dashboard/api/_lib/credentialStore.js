@@ -391,6 +391,12 @@ export async function getStoredCredential(tenantId) {
     lastSuccessfulSyncAt: record.lastSuccessfulSyncAt ?? null,
     lastFailedSyncAt: record.lastFailedSyncAt ?? null,
     lastFailureReason: record.lastFailureReason ?? null,
+    // Google Integration + Reviews End-to-End Validation, Part (sync
+    // freshness) -- see recordConnectionCheckOutcome()'s own header
+    // comment for why this is a SEPARATE pair of fields from
+    // lastSuccessfulSyncAt/lastFailedSyncAt above, not a reuse of them.
+    lastConnectionCheckAt: record.lastConnectionCheckAt ?? null,
+    lastConnectionCheckStatus: record.lastConnectionCheckStatus ?? null,
     health: record.health ?? GoogleHealth.CONNECTED,
     credentialVersion,
   }
@@ -409,6 +415,8 @@ function buildFreshRecord({ refreshToken, connectedAccountName }, credentialVers
     lastSuccessfulSyncAt: null,
     lastFailedSyncAt: null,
     lastFailureReason: null,
+    lastConnectionCheckAt: null,
+    lastConnectionCheckStatus: null,
     health: GoogleHealth.CONNECTED,
     credentialVersion,
   }
@@ -485,14 +493,32 @@ export async function setStoredCredentialIfVersion(tenantId, { refreshToken, con
   return { credentialVersion: next.credentialVersion }
 }
 
-// Records the outcome of any live Google API interaction that exercises
-// the stored refresh token (a status check, test-connection, or a
-// publish/reply attempt) for `tenantId` -- this is the "automatic
-// recovery" mechanism: call this the MOMENT a Google auth failure is
-// detected, from any of those call sites, so the very next status read
-// for THIS tenant reflects "Reconnect Required" immediately, never
-// waiting for a separate user-initiated check. Never affects any other
-// tenant's stored health.
+// Records the outcome of an actual DATA SYNC (importing/reconciling real
+// review or location data FROM Google -- today, exclusively the Python
+// pipeline: gbp_sync.py / provider_sync.py, run via update-reviews.yml).
+//
+// Google Integration + Reviews End-to-End Validation ("Last Successful
+// Sync" investigation) -- READ THIS BEFORE ADDING A NEW CALLER: this
+// function's name and its lastSuccessfulSyncAt/lastFailedSyncAt fields
+// used to be called from EVERY live Google API touch in google/[action].js
+// (status()'s accounts.list check, testConnection()'s full diagnostic
+// walk, publish()'s reply) -- meaning a viewer merely loading Settings, or
+// a background poll, silently overwrote "Last Successful Sync" with "now"
+// even though NOTHING was actually synced. That was the exact production
+// bug reported: the Settings card showed "Last Successful Sync: <a few
+// minutes ago>" while the real GBP sync (Location Sync section's own
+// lastRun, written by export_gbp_sync_status() from gbp-sync.json) hadn't
+// run in days. Node currently has NO code path that performs a genuine
+// data sync at all -- it only DISPATCHES the GitHub Actions workflow
+// (triggerSync()) and returns immediately, never waiting for or recording
+// its result. This function is therefore currently UNUSED by any
+// production caller in this codebase and is kept only as the intended,
+// correctly-named target for a future Node-side sync-completion signal
+// (e.g. a webhook/callback from the workflow) -- see
+// recordConnectionCheckOutcome() below for what every existing
+// status()/testConnection()/publish() call site uses INSTEAD, and
+// dashboard/api/google/[action].js's computeLinkedLocationCounts() for how
+// the REAL sync timestamp (gbp-sync.json's lastRun) reaches the UI today.
 //
 // Multi-Tenant Phase 4I.2: this is a read-then-write, same shape as
 // before, but the write is now a CAS against the version this call itself
@@ -524,6 +550,57 @@ export async function recordSyncOutcome(tenantId, { success, reason, errorDescri
     next.health = GoogleHealth.CONNECTED
   } else {
     next.lastFailedSyncAt = now
+    next.lastFailureReason = reason ?? 'unknown'
+    next.health = healthForFailure(reason, errorDescription)
+  }
+
+  try {
+    await client.eval(CREDENTIAL_CAS_SCRIPT, [resolveCredentialKey(tenantId)], [String(currentVersion), JSON.stringify(next)])
+  } catch (err) {
+    throw new CredentialStoreUnavailableError(`credential store unreachable: ${err.message}`)
+  }
+}
+
+// Records the outcome of a live Google API CONNECTIVITY check (a status
+// read, the test-connection diagnostic, or a publish/reply attempt) for
+// `tenantId` -- this is the "automatic recovery" mechanism recordSyncOutcome()'s
+// own header used to describe: call this the MOMENT a Google auth failure
+// is detected, from any of those call sites, so the very next status read
+// for THIS tenant reflects "Reconnect Required" immediately, never waiting
+// for a separate user-initiated check, AND call it on success so a
+// previously-flagged failure clears the moment the connection is proven
+// healthy again. Never affects any other tenant's stored health.
+//
+// THE FIX this function exists for: it writes health/lastFailureReason
+// (the genuinely valuable "is this credential currently known-good"
+// signal) exactly like recordSyncOutcome() always did -- but it stamps the
+// SEPARATE lastConnectionCheckAt/lastConnectionCheckStatus fields instead
+// of lastSuccessfulSyncAt/lastFailedSyncAt, so a routine connectivity
+// check can never be mistaken for (or silently overwrite the timestamp
+// of) an actual data sync. See recordSyncOutcome()'s own header for the
+// full incident this split resolves.
+//
+// Same CAS-protected, silently-skip-on-conflict discipline as
+// recordSyncOutcome() -- copied deliberately rather than sharing a helper,
+// so each function's own header comment stays the complete, accurate
+// description of what it does without a reader having to cross-reference.
+export async function recordConnectionCheckOutcome(tenantId, { success, reason, errorDescription } = {}) {
+  assertValidTenantId(tenantId, 'recordConnectionCheckOutcome')
+  const client = getClient()
+  if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
+
+  const record = await readRaw(client, tenantId)
+  if (!record) return // nothing connected for this tenant to update
+  const currentVersion = Number.isInteger(record.credentialVersion) ? record.credentialVersion : 0
+
+  const now = new Date().toISOString()
+  const next = { ...record, credentialVersion: currentVersion + 1, lastConnectionCheckAt: now }
+  if (success) {
+    next.lastConnectionCheckStatus = 'success'
+    next.lastFailureReason = null
+    next.health = GoogleHealth.CONNECTED
+  } else {
+    next.lastConnectionCheckStatus = 'failure'
     next.lastFailureReason = reason ?? 'unknown'
     next.health = healthForFailure(reason, errorDescription)
   }

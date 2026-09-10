@@ -155,8 +155,8 @@ export default function Login({ onSuccess }) {
           </div>
 
           <div className="space-y-2.5">
-            <PlaceholderLink label="New to PRYOR?" action="Create an account" />
-            <PlaceholderLink label="Have an access code?" action="Enter code" />
+            <EntryLink href="/register" label="New to PRYOR?" action="Create an account" />
+            <EntryLink href="/access-code" label="Have an access code?" action="Enter code" />
           </div>
         </div>
       </div>
@@ -192,19 +192,21 @@ function Field({ label, trailing, children }) {
   )
 }
 
-// Non-breaking: no /register or /access-code route exists yet. Renders as
-// a visually-prepared, clearly inert affordance rather than a dead link or
-// a fabricated network call -- clicking it does nothing.
-function PlaceholderLink({ label, action }) {
+// Multi-Tenant Phase 4Q.1: /register and /access-code are now real,
+// public (no-lta_session-required) routes -- see AuthGate.jsx's
+// PUBLIC_PATHS. A plain <a> (full navigation), matching this file's own
+// existing "Forgot password?" link exactly -- never a fabricated network
+// call, never any auth/session behavior change here.
+function EntryLink({ href, label, action }) {
   return (
-    <div
-      className="w-full rounded-lg border px-3.5 py-2.5 flex items-center justify-between text-xs cursor-not-allowed select-none"
+    <a
+      href={href}
+      className="w-full rounded-lg border px-3.5 py-2.5 flex items-center justify-between text-xs transition-colors"
       style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-2)' }}
-      title="Coming soon"
     >
-      <span style={{ color: 'var(--color-text-3)' }}>{label}</span>
-      <span className="font-semibold" style={{ color: 'var(--color-text-3)' }}>{action}</span>
-    </div>
+      <span style={{ color: 'var(--color-text-2)' }}>{label}</span>
+      <span className="font-semibold" style={{ color: 'var(--color-accent)' }}>{action}</span>
+    </a>
   )
 }
 

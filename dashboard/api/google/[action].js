@@ -31,10 +31,12 @@ import { Permission, roleHasPermission } from '../_lib/permissions.js'
 import { resolveLocationIdForReview, resolveLocationIdForReviewOrDeny } from '../_lib/reviewLocationIndex.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import {
-  getStoredCredential, setStoredCredentialIfVersion, recordSyncOutcome, recordOAuthRefresh,
+  getStoredCredential, setStoredCredentialIfVersion, recordConnectionCheckOutcome, recordOAuthRefresh,
   clearStoredCredential, GoogleHealth, CredentialStoreUnavailableError, CredentialVersionConflictError,
   isQuotaExceededError, extractQuotaProjectNumber,
 } from '../_lib/credentialStore.js'
+import { listConnectionsMetadata } from '../_lib/googleConnectionStore.js'
+import { readPrivateDataFile, UnknownTenantError } from '../_lib/reviewDataPaths.js'
 import { appendAuditEntry, clientIp } from '../_lib/auditLog.js'
 import {
   writePublishBridge, getPublishBridges, PublishBridgeUnavailableError,
@@ -63,6 +65,14 @@ function credentialMetaFields(credential) {
     lastSuccessfulSyncAt: credential?.lastSuccessfulSyncAt ?? null,
     lastFailedSyncAt: credential?.lastFailedSyncAt ?? null,
     lastFailureReason: credential?.lastFailureReason ?? null,
+    // "Last Successful Sync" investigation fix -- lastSuccessfulSyncAt/
+    // lastFailedSyncAt above are kept for backward compatibility but are no
+    // longer written by any connectivity check (see credentialStore.js's
+    // recordSyncOutcome() header); lastConnectionCheckAt/Status is the
+    // field every status()/testConnection()/publish() call actually
+    // updates now.
+    lastConnectionCheckAt: credential?.lastConnectionCheckAt ?? null,
+    lastConnectionCheckStatus: credential?.lastConnectionCheckStatus ?? null,
   }
 }
 
@@ -499,6 +509,76 @@ async function callback(req, res) {
 // Returns { connected, state, accountName?, accountId?, scopes?, tokenExpiresIn? }
 // ---------------------------------------------------------------------------
 
+// Multi-Tenant Google Integration Architecture Fix, extended by the "Last
+// Successful Sync" investigation -- the ONE tenant-scoped read of
+// gbp-sync.json (written by export_gbp_sync_status() for THIS tenant's own
+// export run), shared by every response branch below. This is the ONLY
+// place in this codebase that reports the REAL last data-sync outcome --
+// gbp-sync.json's `lastRun` is written exclusively by the actual Python
+// sync pipeline (gbp_sync.py / provider_sync.py, dispatched by
+// triggerSync() below or update-reviews.yml's own schedule), never by any
+// live Google API connectivity check in this file (see
+// credentialStore.js's recordSyncOutcome()/recordConnectionCheckOutcome()
+// headers for the full incident this split fixes). A tenant with no sync
+// data yet (gbp-sync.json not written) reports zero/null for every field
+// rather than throwing -- a legitimate, common state (never yet synced),
+// not an error.
+async function computeLinkedLocationCountsAndSyncFreshness(tenantId, account) {
+  let locations = []
+  let lastRun = null
+  try {
+    const raw = await readPrivateDataFile(tenantId, 'gbp-sync.json')
+    const parsed = JSON.parse(raw)
+    locations = parsed.locations ?? []
+    lastRun = parsed.lastRun ?? null
+  } catch (err) {
+    if (!(err instanceof UnknownTenantError) && err.code !== 'ENOENT') {
+      console.error(`[google/status] could not read gbp-sync.json for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+    }
+    return { linkedLocationCount: 0, accessibleLinkedLocationCount: 0, lastDataSyncAt: null, lastDataSyncStatus: null }
+  }
+  const linked = locations.filter(l => l.linked)
+  const accessible = isWildcardGrant(account) ? linked : linked.filter(l => requireLocationAccess(account, l.locationId))
+  return {
+    linkedLocationCount: linked.length,
+    accessibleLinkedLocationCount: accessible.length,
+    // finished_at is null for a run still in progress or one that crashed
+    // before completing -- started_at is still a meaningful "as of" point
+    // for staleness purposes in that case, never fabricated.
+    lastDataSyncAt: lastRun?.finished_at || lastRun?.started_at || null,
+    lastDataSyncStatus: lastRun?.status ?? null,
+  }
+}
+
+// Multi-Tenant Google Integration Architecture Fix -- fields every caller
+// of /api/google/status now receives regardless of connection health, so
+// Settings, the Reviews-page banner, and the global header all read the
+// SAME numbers from the SAME response (requirement: one source of truth
+// for connection status -- see this endpoint's broadened authorization
+// below). `canManageIntegration` lets the frontend hide Disconnect/
+// Reconnect/Sync-Now controls for a viewer who can see status but may not
+// mutate the organization's connection (SETTINGS_ADMIN, still owner-only).
+async function buildIntegrationSummaryFields(tenantId, account) {
+  let connectionCount = 0
+  try {
+    const connections = await listConnectionsMetadata(tenantId)
+    connectionCount = connections.length
+  } catch (err) {
+    console.error(`[google/status] could not list connections for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+  }
+  const { linkedLocationCount, accessibleLinkedLocationCount, lastDataSyncAt, lastDataSyncStatus } =
+    await computeLinkedLocationCountsAndSyncFreshness(tenantId, account)
+  return {
+    connectionCount, linkedLocationCount, accessibleLinkedLocationCount,
+    // "Last Successful Sync" investigation -- the REAL data-sync signal
+    // (gbp-sync.json's own lastRun, written only by the Python pipeline),
+    // deliberately separate from lastConnectionCheckAt (credentialMetaFields()
+    // below) which a routine status()/testConnection() poll DOES update.
+    lastDataSyncAt, lastDataSyncStatus,
+    canManageIntegration: roleHasPermission(account.role, Permission.SETTINGS_ADMIN),
+  }
+}
+
 // Phase 8, Milestone 8.7: `state` is now one of GoogleHealth's five values
 // (connected/token_expired/token_revoked/auth_failed/never_connected) plus
 // 'not_configured' for the one config-level gap (GOOGLE_CLIENT_ID/SECRET
@@ -508,15 +588,26 @@ async function callback(req, res) {
 // Sync/Token Health available, regardless of which branch produced it.
 //
 // This is also the "automatic recovery" mechanism in action: an
-// invalid_grant here calls recordSyncOutcome() BEFORE responding, so the
+// invalid_grant here calls recordConnectionCheckOutcome() BEFORE responding, so the
 // health this same response reports is already the corrected value -- the
 // dashboard never shows a stale "Connected" after a token was just found
 // to be revoked.
+//
+// Multi-Tenant Google Integration Architecture Fix -- AUTHORIZATION: this
+// used to be requireAuth(req, res, ['owner']), meaning any non-Owner
+// tenant member (Admin, Marketing, a Manager, Read Only) got a flat 403
+// merely for asking "is Google connected" -- an org-wide, secret-free
+// status read, not a mutation. It now requires only Permission
+// .INTEGRATIONS_VIEW, which every real role holds (permissions.js) -- the
+// same broadened gate as test-connection() below. Connect/Reconnect/
+// Disconnect/trigger-sync/trigger-import remain SETTINGS_ADMIN-equivalent
+// (Owner-only, unchanged) -- this endpoint never mutates anything.
 async function status(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
 
-  const account = await requireAuth(req, res, ['owner'])
-  if (!account) return
+  const scope = await requireScopedAuth(req, res, { permission: Permission.INTEGRATIONS_VIEW, resolveLocationId: () => null })
+  if (!scope) return
+  const { account } = scope
 
   // Multi-Tenant Phase 4A: every credential/health operation below is
   // scoped to THIS tenant only, derived from the authenticated session --
@@ -526,10 +617,12 @@ async function status(req, res) {
   const allowed = await enforceRateLimit(req, res, `status:${account.userId}`, { requestsPerWindow: 15, windowSeconds: 60 })
   if (!allowed) return
 
+  const summaryFields = await buildIntegrationSummaryFields(tenantId, account)
+
   const hasId     = !!process.env.GOOGLE_CLIENT_ID
   const hasSecret = !!process.env.GOOGLE_CLIENT_SECRET
   if (!hasId || !hasSecret) {
-    return res.status(200).json({ connected: false, state: 'not_configured' })
+    return res.status(200).json({ connected: false, state: 'not_configured', ...summaryFields })
   }
 
   let credential
@@ -537,30 +630,30 @@ async function status(req, res) {
     credential = await getStoredCredential(tenantId)
   } catch (err) {
     if (err instanceof CredentialStoreUnavailableError) {
-      return res.status(200).json({ connected: false, state: GoogleHealth.AUTH_FAILED, error: 'The credential store is temporarily unavailable.' })
+      return res.status(200).json({ connected: false, state: GoogleHealth.AUTH_FAILED, error: 'The credential store is temporarily unavailable.', ...summaryFields })
     }
     throw err
   }
 
   if (!credential) {
-    return res.status(200).json({ connected: false, state: GoogleHealth.NEVER_CONNECTED })
+    return res.status(200).json({ connected: false, state: GoogleHealth.NEVER_CONNECTED, ...summaryFields })
   }
   if (!credential.refreshToken) {
     // A stored credential exists but couldn't be decrypted (e.g.
     // CREDENTIAL_ENCRYPTION_KEY changed) -- credentialStore.js already
     // reflects this as health: auth_failed.
-    return res.status(200).json({ connected: false, state: credential.health, error: 'The stored credential could not be read.', ...credentialMetaFields(credential) })
+    return res.status(200).json({ connected: false, state: credential.health, error: 'The stored credential could not be read.', ...credentialMetaFields(credential), ...summaryFields })
   }
 
   try {
     const tokenData = await exchangeRefreshToken(credential.refreshToken)
     if (!tokenData.access_token) {
-      await recordSyncOutcome(tenantId, { success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
+      await recordConnectionCheckOutcome(tenantId, { success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
       const updated = await getStoredCredential(tenantId)
       return res.status(200).json({
         connected: false, state: updated.health,
         error: tokenData.error_description || tokenData.error || 'Refresh token rejected',
-        ...credentialMetaFields(updated),
+        ...credentialMetaFields(updated), ...summaryFields,
       })
     }
     await recordOAuthRefresh(tenantId)
@@ -585,7 +678,7 @@ async function status(req, res) {
         : r.status === 403 ? 'permission_denied'
         : r.status === 401 ? 'unauthorized'
         : 'api_error'
-      await recordSyncOutcome(tenantId, { success: false, reason, errorDescription: body.error?.message })
+      await recordConnectionCheckOutcome(tenantId, { success: false, reason, errorDescription: body.error?.message })
       const updated = await getStoredCredential(tenantId)
       return res.status(200).json({
         // The Google account connection itself is intact for a quota
@@ -596,13 +689,13 @@ async function status(req, res) {
         state: updated.health,
         error: body.error?.message || `GBP API ${r.status}`,
         quotaProjectNumber: quotaExceeded ? extractQuotaProjectNumber(body.error?.message) : null,
-        ...credentialMetaFields(updated),
+        ...credentialMetaFields(updated), ...summaryFields,
       })
     }
 
     const data       = await r.json()
     const gbpAccount = (data.accounts || [])[0]
-    await recordSyncOutcome(tenantId, { success: true })
+    await recordConnectionCheckOutcome(tenantId, { success: true })
     const updated = await getStoredCredential(tenantId)
 
     return res.status(200).json({
@@ -613,10 +706,10 @@ async function status(req, res) {
       accountCount:   (data.accounts || []).length,
       scopes:         (tokenData.scope || 'https://www.googleapis.com/auth/business.manage').split(' '),
       tokenExpiresIn: tokenData.expires_in || null,
-      ...credentialMetaFields(updated),
+      ...credentialMetaFields(updated), ...summaryFields,
     })
   } catch (err) {
-    return res.status(200).json({ connected: false, state: GoogleHealth.AUTH_FAILED, error: err.message, ...credentialMetaFields(credential) })
+    return res.status(200).json({ connected: false, state: GoogleHealth.AUTH_FAILED, error: err.message, ...credentialMetaFields(credential), ...summaryFields })
   }
 }
 
@@ -648,11 +741,31 @@ function v4LocationPath(accountName, locationApiName) {
   return `${accountName}/locations/${tail}`
 }
 
+// Google Integration + Reviews End-to-End Validation, Part A -- corrected
+// authorization. Unlike status() above (one cheap accounts.list call,
+// booleans/timestamps only), this walks a full live diagnostic chain on
+// every call: token exchange -> accounts.list -> locations.list (per
+// account, up to 100/page) -> reviews.list (5 real review bodies from the
+// tenant's own first location) -- several real Google API requests against
+// the SAME rate-limited surface the production quota incident (project
+// 786038057684) hit, and it returns real customer review content plus
+// infrastructure-level detail (e.g. "Missing GOOGLE_CLIENT_ID/SECRET in
+// Vercel environment variables") no ordinary Manager/Read Only needs. This
+// is an ADMINISTRATIVE DIAGNOSTIC, not a basic "is Google connected" read --
+// it must NOT be reachable via the broad Permission.INTEGRATIONS_VIEW every
+// role holds (status() above is the correct, narrow surface for that).
+// Gated by the SAME Permission.SETTINGS_ADMIN that already restricts
+// Connect/Reconnect/Disconnect (owner-only today, permissions.js) -- reusing
+// that existing permission rather than inventing a new one, per the
+// reviewed policy: "connect, reconnect, disconnect, credential management,
+// and administrative diagnostics stay restricted to appropriate
+// administrative roles."
 async function testConnection(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
 
-  const account = await requireAuth(req, res, ['owner'])
-  if (!account) return
+  const scope = await requireScopedAuth(req, res, { permission: Permission.SETTINGS_ADMIN, resolveLocationId: () => null })
+  if (!scope) return
+  const { account } = scope
 
   // Multi-Tenant Phase 4A: scoped to this tenant only.
   const tenantId = resolveTenantId(account)
@@ -697,7 +810,7 @@ async function testConnection(req, res) {
   }
 
   if (!tokenData.access_token) {
-    await recordSyncOutcome(tenantId, { success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
+    await recordConnectionCheckOutcome(tenantId, { success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
     checks.push(check('token_exchange', 'Exchange refresh token for access token', 'fail',
       tokenData.error_description || tokenData.error || 'Google rejected the refresh token. It may have been revoked -- reconnect from Settings.'))
     return res.status(200).json({ overallStatus: 'fail', checks })
@@ -794,7 +907,7 @@ async function testConnection(req, res) {
   checks.push(check('api_health', 'Google Business Profile API health', 'pass',
     'All API calls in this test completed without errors.'))
 
-  await recordSyncOutcome(tenantId, { success: true })
+  await recordConnectionCheckOutcome(tenantId, { success: true })
   return res.status(200).json({ overallStatus: 'pass', checks })
 }
 
@@ -1127,7 +1240,7 @@ async function publish(req, res) {
   // the frontend can say "published, but local confirmation couldn't be
   // saved" instead of silently claiming full durability it doesn't have.
   async function respondPublishSuccess(resolvedGbpReviewName) {
-    await recordSyncOutcome(tenantId, { success: true })
+    await recordConnectionCheckOutcome(tenantId, { success: true })
     // Notification Center Audit & Fix: a subsequent successful publish
     // resolves any previously-recorded "reply failed" notification for
     // this review -- best-effort, never allowed to affect the actual
@@ -1171,7 +1284,7 @@ async function publish(req, res) {
     await recordOAuthRefresh(tenantId)
   } catch (err) {
     if (err.code === 'invalid_grant') {
-      await recordSyncOutcome(tenantId, { success: false, reason: 'invalid_grant', errorDescription: err.description })
+      await recordConnectionCheckOutcome(tenantId, { success: false, reason: 'invalid_grant', errorDescription: err.description })
     }
     return res.status(503).json({
       error:   'not_connected',

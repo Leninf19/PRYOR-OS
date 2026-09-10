@@ -9,7 +9,7 @@
 // GET /api/session/whoami all still work exactly as before -- only the
 // file layout changed, not the API.
 
-import { setCookie, clearCookie } from '../google/_lib/cookies.js'
+import { setCookie, clearCookie, parseCookies } from '../google/_lib/cookies.js'
 import { getAccountById, getAccountByEmail, listAccounts } from '../_lib/accountStore.js'
 import { verifyPassword, hashPassword, validatePasswordStrength } from '../_lib/password.js'
 import { requireAuth } from '../_lib/auth.js'
@@ -17,16 +17,29 @@ import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError, lookupTenantIdForUserId } from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
-import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
-import { getTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvisioningDispatch } from '../_lib/tenantConfigStore.js'
+import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID, generateTenantId } from '../_lib/tenants.js'
+import { getTenantConfig, upsertTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvisioningDispatch } from '../_lib/tenantConfigStore.js'
 import {
   consumeInviteToken, markInviteConsumedPending, clearInviteConsumedPending, peekInviteToken,
   createResetToken, consumeResetToken, markResetConsumedPending, clearResetConsumedPending, peekResetToken,
+  createVerifyEmailToken, consumeVerifyEmailToken, peekVerifyEmailToken,
+  markVerifyEmailConsumedPending, clearVerifyEmailConsumedPending, revokeVerifyEmailToken,
   TokenStoreUnavailableError,
 } from '../_lib/tokenStore.js'
-import { isValidDisplayName, buildResetUrl } from '../_lib/userManagement.js'
+import { isValidDisplayName, buildResetUrl, buildVerifyUrl, generateUserId } from '../_lib/userManagement.js'
 import { buildResetEmail, buildResetEmailSubject } from '../_lib/accountEmailTemplate.js'
+import { buildVerifyEmail, buildVerifyEmailSubject } from '../_lib/registrationEmailTemplate.js'
 import { sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
+import {
+  createPendingRegistration, getPendingRegistration, updatePendingRegistration, deletePendingRegistration,
+  acquireTenantCreationLock, releaseTenantCreationLock, PendingRegistrationStoreUnavailableError,
+} from '../_lib/pendingRegistrationStore.js'
+import {
+  signPendingSignupToken, verifyPendingSignupToken, PENDING_SIGNUP_COOKIE, PENDING_SIGNUP_TTL_SECONDS,
+} from '../_lib/pendingSignupSession.js'
+import { redeemAccessCode, AccessCodeInvalidError, AccessCodeRestrictedError, AccessCodeStoreUnavailableError } from '../_lib/accessCodeStore.js'
+import { PLANS, isValidPlanId } from '../_lib/plans.js'
+import { createCheckoutSession, PaymentNotConfiguredError } from '../_lib/paymentProvider.js'
 
 const SESSION_TTL_SECONDS = 12 * 60 * 60 // 12h fixed session (Phase 1)
 
@@ -612,6 +625,494 @@ async function resetPassword(req, res) {
   }
 }
 
+// ===========================================================================
+// Multi-Tenant Phase 4Q.1 -- self-service registration, email verification,
+// and tenant creation via access code. No Stripe (selectPlan() below is a
+// stub -- see paymentProvider.js). Every write below goes through the SAME
+// trusted, already-reviewed functions the operator bootstrap script and
+// the invite/accept-invite flow already use (upsertTenantConfig,
+// upsertUser, generateUserId, signSession) -- this phase adds the
+// PRE-tenant identity plumbing that gets a verified registrant TO that
+// point, never a second way of writing tenant/user state.
+// ===========================================================================
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+function isValidEmailAddress(v) {
+  return typeof v === 'string' && EMAIL_RE.test(v.trim())
+}
+
+class EmailNowOccupiedError extends Error {}
+class TenantCreationInProgressError extends Error {}
+class PendingRegistrationNotFoundError extends Error {}
+
+const GENERIC_REGISTER_RESPONSE = {
+  success: true,
+  message: 'If that email is available, we\'ve sent a link to verify your address and continue.',
+}
+
+async function sendVerificationEmail(req, pending) {
+  // Revokes whatever verification token this pending registration
+  // currently has on file BEFORE issuing a new one -- so register()'s own
+  // idempotent re-submission and resendVerification() both leave AT MOST
+  // one live verification link outstanding at any time (see
+  // tests/test_email_verification.js's "revoked after resend" case).
+  if (pending.verifyTokenHash) {
+    try {
+      await revokeVerifyEmailToken(pending.verifyTokenHash)
+    } catch (err) {
+      console.error(`[session] failed to revoke prior verification token: ${err.message}`)
+    }
+  }
+  const { rawToken, tokenHash, expiresAt } = await createVerifyEmailToken({ email: pending.email })
+  await updatePendingRegistration(pending.email, { verifyTokenHash: tokenHash })
+  const verifyUrl = buildVerifyUrl(req, rawToken)
+  try {
+    const subject = buildVerifyEmailSubject()
+    const { html, text } = buildVerifyEmail({ displayName: pending.displayName, verifyUrl, expiresAt })
+    await sendReviewEmail({ to: pending.email, cc: [], replyTo: undefined, subject, html, text })
+  } catch (err) {
+    // Never surfaced to the caller -- would leak "this email is real" the
+    // same way forgotPassword()'s own send failure must not. The raw link
+    // is never logged; only the fact that sending failed is.
+    console.error(`[session] verification email failed to send: ${err.message}`)
+  }
+}
+
+// POST /api/session/register
+// { email, password, passwordConfirmation, displayName, companyName }
+// Unauthenticated, like login/forgot-password. ALWAYS returns the exact
+// same generic response -- whether the email already belongs to a real
+// account (any tenant), already has a pending registration, or is
+// genuinely new -- no enumeration, mirroring forgotPassword()'s own
+// GENERIC_FORGOT_PASSWORD_RESPONSE convention exactly.
+//
+// Server-derived, never client-suppliable: userId (generateUserId()),
+// tenantIdReserved (generateTenantId(), collision-checked against real
+// tenant_config), passwordHash (hashed here, once). The client sends only
+// the four form fields.
+async function register(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const ipAllowed = await enforceRateLimit(req, res, `register:${clientIp(req)}`, { requestsPerWindow: 8, windowSeconds: 60 })
+  if (!ipAllowed) return
+
+  const { email: rawEmail, password, passwordConfirmation, displayName: rawDisplayName, companyName: rawCompanyName } = req.body ?? {}
+  const email = typeof rawEmail === 'string' ? rawEmail.trim() : rawEmail
+  if (!isValidEmailAddress(email)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'A valid email address is required.' })
+  }
+  const strength = validatePasswordStrength(password)
+  if (!strength.valid) {
+    return res.status(400).json({ error: 'invalid_request', message: strength.message })
+  }
+  if (password !== passwordConfirmation) {
+    return res.status(400).json({ error: 'invalid_request', message: 'Passwords do not match.' })
+  }
+  if (!isValidDisplayName(rawDisplayName)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'Your name is required.' })
+  }
+  const companyName = typeof rawCompanyName === 'string' ? rawCompanyName.trim() : ''
+  if (!companyName || companyName.length > 100) {
+    return res.status(400).json({ error: 'invalid_request', message: 'Your company or restaurant group name is required.' })
+  }
+
+  // Per-email limit is intentionally tighter and independent of the
+  // per-IP one -- stops repeated registration attempts against ONE
+  // stranger's inbox regardless of how many different IPs are used.
+  const emailAllowed = await enforceRateLimit(req, res, `register-email:${email.toLowerCase()}`, { requestsPerWindow: 3, windowSeconds: 60 * 60 })
+  if (!emailAllowed) return
+
+  try {
+    const realAccount = await getAccountByEmail(email)
+    if (!realAccount) {
+      let pending = await getPendingRegistration(email)
+      if (!pending) {
+        const userId = generateUserId()
+        const tenantIdReserved = await generateTenantId(companyName)
+        const passwordHash = await hashPassword(password)
+        pending = await createPendingRegistration({
+          email, passwordHash, displayName: rawDisplayName.trim(), companyName, userId, tenantIdReserved,
+        })
+        // A null return here means another concurrent register() call for
+        // this exact email won the create race between our own check and
+        // write -- re-read its record rather than treating this as an error.
+        if (!pending) pending = await getPendingRegistration(email)
+      }
+      if (pending && pending.status === 'pending_verification') {
+        await sendVerificationEmail(req, pending)
+      }
+    }
+  } catch (err) {
+    if (
+      !(err instanceof TokenStoreUnavailableError) &&
+      !(err instanceof PendingRegistrationStoreUnavailableError) &&
+      !(err instanceof TenantConfigStoreUnavailableError) &&
+      !(err instanceof EmailSenderUnavailableError)
+    ) throw err
+    console.error(`[session/register] ${err.message}`)
+  }
+
+  return res.status(200).json(GENERIC_REGISTER_RESPONSE)
+}
+
+// POST /api/session/resend-verification  { email }
+// Same no-enumeration discipline: identical response whether or not a
+// pending registration exists, is already verified, or was never created.
+async function resendVerification(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const allowed = await enforceRateLimit(req, res, `resend-verification:${clientIp(req)}`, { requestsPerWindow: 3, windowSeconds: 60 * 60 })
+  if (!allowed) return
+
+  const { email: rawEmail } = req.body ?? {}
+  const email = typeof rawEmail === 'string' ? rawEmail.trim() : rawEmail
+  if (!isValidEmailAddress(email)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'A valid email address is required.' })
+  }
+
+  try {
+    const pending = await getPendingRegistration(email)
+    if (pending && pending.status === 'pending_verification') {
+      await sendVerificationEmail(req, pending)
+    }
+  } catch (err) {
+    if (!(err instanceof TokenStoreUnavailableError) && !(err instanceof PendingRegistrationStoreUnavailableError) && !(err instanceof EmailSenderUnavailableError)) throw err
+    console.error(`[session/resend-verification] ${err.message}`)
+  }
+
+  return res.status(200).json(GENERIC_REGISTER_RESPONSE)
+}
+
+// GET /api/session/verify-email-status?token=  -- non-consuming peek,
+// mirrors reset-status exactly (deliberately reveals only valid/invalid,
+// nothing else).
+async function verifyEmailStatus(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+  const token = req.query?.token
+  if (typeof token !== 'string' || !token) {
+    return res.status(400).json({ error: 'invalid_request', message: 'A token is required.' })
+  }
+  try {
+    const result = await peekVerifyEmailToken(token)
+    return res.status(200).json({ valid: Boolean(result) })
+  } catch (err) {
+    if (err instanceof TokenStoreUnavailableError) {
+      console.error(`[session/verify-email-status] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// POST /api/session/verify-email  { token }
+// Same atomic-consume/partial-failure-recovery contract as accept-invite/
+// reset-password (tokenStore.js's GETDEL + *-pending safety net). On
+// success, issues the SEPARATE, short-lived lta_pending_signup token --
+// never lta_session, never anything requireAuth()/evaluateSession() will
+// accept -- and returns just enough for the frontend to render
+// /get-started (email, companyName).
+async function verifyEmail(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const allowed = await enforceRateLimit(req, res, `verify-email:${clientIp(req)}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { token } = req.body ?? {}
+  if (typeof token !== 'string' || !token) {
+    return res.status(400).json({ error: 'invalid_request', message: 'A valid verification link is required.' })
+  }
+
+  let consumed
+  try {
+    consumed = await consumeVerifyEmailToken(token)
+  } catch (err) {
+    if (err instanceof TokenStoreUnavailableError) {
+      console.error(`[session/verify-email] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Verification is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+  if (!consumed) {
+    return res.status(400).json({ error: 'invalid_or_expired_token', message: 'This verification link is invalid, expired, or has already been used.' })
+  }
+  const { payload, tokenHash, fromPending } = consumed
+  const { email } = payload
+
+  if (!fromPending) {
+    await markVerifyEmailConsumedPending(tokenHash, payload)
+  }
+
+  try {
+    const pending = await getPendingRegistration(email)
+    if (!pending) {
+      return res.status(404).json({ error: 'not_found', message: 'This registration is no longer available. Please register again.' })
+    }
+    const updated = await updatePendingRegistration(email, {
+      emailVerified: true,
+      verifiedAt: new Date().toISOString(),
+      status: pending.status === 'pending_verification' ? 'verified_awaiting_plan' : pending.status,
+      verifyTokenHash: null,
+    })
+
+    const pendingSignupToken = await signPendingSignupToken({ userId: updated.userId, email: updated.email })
+    setCookie(res, PENDING_SIGNUP_COOKIE, pendingSignupToken, { maxAgeSeconds: PENDING_SIGNUP_TTL_SECONDS })
+
+    await clearVerifyEmailConsumedPending(tokenHash)
+    return res.status(200).json({ email: updated.email, companyName: updated.companyName })
+  } catch (err) {
+    if (err instanceof PendingRegistrationStoreUnavailableError) {
+      console.error(`[session/verify-email] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not finish verifying your email. Please try this link again in a moment.' })
+    }
+    throw err
+  }
+}
+
+// Shared by get-started/pricing/access-code pages: resolves the caller's
+// pending registration from the lta_pending_signup cookie ONLY -- never
+// from a request body/query value. Returns null (caller responds 401) if
+// the cookie is missing, expired, or its registration no longer exists.
+async function requirePendingSignup(req, res) {
+  const cookies = parseCookies(req)
+  const claims = await verifyPendingSignupToken(cookies[PENDING_SIGNUP_COOKIE])
+  if (!claims) {
+    res.status(401).json({ error: 'unauthenticated', message: 'Please verify your email to continue.' })
+    return null
+  }
+  let pending
+  try {
+    pending = await getPendingRegistration(claims.email)
+  } catch (err) {
+    if (err instanceof PendingRegistrationStoreUnavailableError) {
+      console.error(`[session] ${err.message}`)
+      res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+      return null
+    }
+    throw err
+  }
+  if (!pending || pending.userId !== claims.userId) {
+    res.status(404).json({ error: 'not_found', message: 'This registration is no longer available. Please register again.' })
+    return null
+  }
+  return pending
+}
+
+// GET /api/session/get-started-status
+async function getStartedStatus(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+  const pending = await requirePendingSignup(req, res)
+  if (!pending) return
+  return res.status(200).json({
+    email: pending.email, companyName: pending.companyName, displayName: pending.displayName,
+    status: pending.status,
+  })
+}
+
+// The tenant-creation transaction -- the ONE path both redeemAccessCode()
+// and selectPlan() (once Phase 4Q.2 wires real payment) funnel into.
+// `commercial` is plain descriptive metadata (see tenantConfigStore.js's
+// `commercial` field) -- never consulted by any authorization check.
+//
+// ORDER, and why:
+//   1. Acquire a short-lived per-email lock (pendingRegistrationStore.js)
+//      -- closes the "two tenant-creation requests racing" case: the
+//      loser fails closed with TenantCreationInProgressError rather than
+//      both proceeding.
+//   2. Re-read the pending registration FRESH, now that the lock is held
+//      -- a request that was queued behind the lock must never act on a
+//      stale in-memory copy from before it waited.
+//   3. THE explicit re-check: getAccountByEmail(email) AGAIN, even though
+//      register() already checked this once. Registration can sit
+//      unverified/unconverted for up to 7 days -- an operator invite or a
+//      second registration could have created a REAL account for this
+//      email in that window. If one now exists, this fails closed
+//      (EmailNowOccupiedError) rather than creating a second, duplicate
+//      identity under a brand-new tenant.
+//   4. upsertTenantConfig() -- the SAME function every tenant (including
+//      operator-bootstrapped ones) is created through. Skipped if a prior,
+//      partially-failed attempt already created it (idempotent retry,
+//      same pattern as Phase 4O/4P's own reconciliation logic) --
+//      tenantIdReserved was generated at REGISTRATION time specifically so
+//      a retry reuses the same id rather than orphaning a new one.
+//   5. upsertUser() -- role: 'owner', locationIds: '*' (company-wide),
+//      passwordHash carried over UNCHANGED from registration (the user
+//      already set their own password; there is no invite-accept
+//      password-setting step to replay here).
+//   6. Delete the pending registration -- from this point on, the ONLY
+//      record of this identity is the real tenant_config/user pair.
+//   7. Release the lock (always, via finally).
+async function createTenantForVerifiedRegistration(email, commercial) {
+  const lockAcquired = await acquireTenantCreationLock(email)
+  if (!lockAcquired) {
+    throw new TenantCreationInProgressError('Your workspace is already being created. Please wait a moment and try again.')
+  }
+  try {
+    const fresh = await getPendingRegistration(email)
+    if (!fresh) {
+      throw new PendingRegistrationNotFoundError('This registration is no longer available.')
+    }
+    if (fresh.status === 'completed') {
+      throw new TenantCreationInProgressError('This registration has already been completed. Please sign in.')
+    }
+    if (fresh.status !== 'verified_awaiting_plan') {
+      throw new PendingRegistrationNotFoundError('This registration is not ready for tenant creation.')
+    }
+
+    const nowOccupied = await getAccountByEmail(fresh.email)
+    if (nowOccupied) {
+      await updatePendingRegistration(email, { status: 'blocked_email_occupied' })
+      throw new EmailNowOccupiedError('An account for this email already exists. Please sign in instead, or contact support.')
+    }
+
+    await updatePendingRegistration(email, { status: 'creating_tenant' })
+
+    const tenantId = fresh.tenantIdReserved
+    const existingTenantConfig = await getTenantConfig(tenantId)
+    if (!existingTenantConfig) {
+      await upsertTenantConfig(tenantId, { displayName: fresh.companyName, commercial })
+    }
+
+    const now = new Date().toISOString()
+    const userRecord = await upsertUser(tenantId, {
+      userId: fresh.userId, email: fresh.email, passwordHash: fresh.passwordHash,
+      role: 'owner', locationIds: '*', tenantId, sessionVersion: 1, disabled: false,
+      displayName: fresh.displayName, createdAt: now, updatedAt: now, lastLoginAt: null,
+      invitedAt: null, invitedBy: null, lastInviteSentAt: null,
+      inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null,
+      passwordSetAt: fresh.createdAt,
+    })
+
+    await deletePendingRegistration(email)
+
+    return { tenantId, userRecord }
+  } finally {
+    await releaseTenantCreationLock(email)
+  }
+}
+
+async function issueRealSessionAndRespond(res, userRecord, tenantId) {
+  const sessionToken = await signSession({
+    userId: userRecord.userId, email: userRecord.email, role: userRecord.role,
+    locationIds: userRecord.locationIds, tenantId, sessionVersion: userRecord.sessionVersion,
+  }, { expiresInSeconds: SESSION_TTL_SECONDS })
+  setCookie(res, SESSION_COOKIE, sessionToken, { maxAgeSeconds: SESSION_TTL_SECONDS })
+  clearCookie(res, PENDING_SIGNUP_COOKIE)
+  return res.status(200).json({
+    account: {
+      userId: userRecord.userId, email: userRecord.email, role: userRecord.role,
+      locationIds: userRecord.locationIds, displayName: userRecord.displayName ?? userRecord.email,
+    },
+  })
+}
+
+// POST /api/session/redeem-access-code  { code }
+// Identity comes ONLY from the lta_pending_signup cookie -- the client
+// sends the raw code string and nothing else. tenantId/userId used for
+// redemption bookkeeping are the SAME server-derived values used for
+// tenant creation, never request input.
+async function redeemAccessCodeAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const allowed = await enforceRateLimit(req, res, `redeem-access-code:${clientIp(req)}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  const pending = await requirePendingSignup(req, res)
+  if (!pending) return
+
+  const secondAllowed = await enforceRateLimit(req, res, `redeem-access-code-identity:${pending.userId}`, { requestsPerWindow: 10, windowSeconds: 60 * 10 })
+  if (!secondAllowed) return
+
+  const { code } = req.body ?? {}
+  if (typeof code !== 'string' || !code.trim()) {
+    return res.status(400).json({ error: 'invalid_request', message: 'An access code is required.' })
+  }
+
+  let redemption
+  try {
+    redemption = await redeemAccessCode({
+      rawCode: code.trim(), email: pending.email,
+      tenantId: pending.tenantIdReserved, userId: pending.userId,
+    })
+  } catch (err) {
+    if (err instanceof AccessCodeInvalidError || err instanceof AccessCodeRestrictedError) {
+      return res.status(400).json({ error: 'invalid_access_code', message: err.message })
+    }
+    if (err instanceof AccessCodeStoreUnavailableError) {
+      console.error(`[session/redeem-access-code] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+
+  try {
+    const { tenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, {
+      plan: redemption.plan,
+      source: 'access_code',
+      accessCodeHash: redemption.codeHash,
+      trialEndsAt: redemption.trialDays ? new Date(Date.now() + redemption.trialDays * 24 * 60 * 60 * 1000).toISOString() : null,
+    })
+    await appendAuditEntry(tenantId, {
+      actorId: userRecord.userId, actorEmail: userRecord.email, ip: clientIp(req),
+      action: 'tenant.created_via_access_code', entity: 'tenant', entityId: tenantId,
+      result: 'success', message: `Tenant created via access code (plan: ${redemption.plan}).`,
+    })
+    return issueRealSessionAndRespond(res, userRecord, tenantId)
+  } catch (err) {
+    if (err instanceof EmailNowOccupiedError) {
+      return res.status(409).json({ error: 'email_occupied', message: err.message })
+    }
+    if (err instanceof TenantCreationInProgressError) {
+      return res.status(409).json({ error: 'creation_in_progress', message: err.message })
+    }
+    if (err instanceof PendingRegistrationNotFoundError) {
+      return res.status(404).json({ error: 'not_found', message: err.message })
+    }
+    if (err instanceof PendingRegistrationStoreUnavailableError || err instanceof TenantConfigStoreUnavailableError || err instanceof UserStoreUnavailableError) {
+      console.error(`[session/redeem-access-code] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not finish setting up your workspace. Please try again in a moment.' })
+    }
+    throw err
+  }
+}
+
+// POST /api/session/select-plan  { plan }
+// Phase 4Q.1: ALWAYS the stubbed "not available" response -- see
+// paymentProvider.js. No tenant is ever created by this action today.
+// Phase 4Q.2 (separately reviewed) replaces the inside of the try block
+// with a real Stripe checkout redirect; the surrounding shape (validate
+// plan, resolve pending signup, never create a tenant without confirmed
+// payment) does not change.
+async function selectPlan(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const allowed = await enforceRateLimit(req, res, `select-plan:${clientIp(req)}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  const pending = await requirePendingSignup(req, res)
+  if (!pending) return
+
+  const { plan } = req.body ?? {}
+  if (!isValidPlanId(plan)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'Choose a valid plan.' })
+  }
+
+  try {
+    await createCheckoutSession(PLANS[plan], pending.email)
+    // Unreachable today (createCheckoutSession always throws) -- kept so
+    // Phase 4Q.2 only has to change paymentProvider.js's implementation,
+    // not this action's shape.
+    return res.status(200).json({ error: 'not_implemented' })
+  } catch (err) {
+    if (err instanceof PaymentNotConfiguredError) {
+      return res.status(503).json({
+        error: 'checkout_not_available',
+        message: 'Plan checkout isn\'t available yet. Use an access code, or contact sales to get started.',
+      })
+    }
+    throw err
+  }
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
     case 'login':            return login(req, res)
@@ -624,6 +1125,13 @@ export default async function handler(req, res) {
     case 'forgot-password':  return forgotPassword(req, res)
     case 'reset-status':     return resetStatus(req, res)
     case 'reset-password':   return resetPassword(req, res)
+    case 'register':               return register(req, res)
+    case 'resend-verification':    return resendVerification(req, res)
+    case 'verify-email-status':    return verifyEmailStatus(req, res)
+    case 'verify-email':           return verifyEmail(req, res)
+    case 'get-started-status':     return getStartedStatus(req, res)
+    case 'redeem-access-code':     return redeemAccessCodeAction(req, res)
+    case 'select-plan':            return selectPlan(req, res)
     default:                 return res.status(404).json({ error: 'not_found' })
   }
 }

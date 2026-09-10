@@ -50,6 +50,7 @@ import tasksHandler from '../dashboard/api/tasks/[action].js'
 import contentHandler from '../dashboard/api/content/[action].js'
 import tenantOpsHandler from '../dashboard/api/tenant-ops/[action].js'
 import tenantEntitlementsHandler from '../dashboard/api/tenant-entitlements/[action].js'
+import adminHandler from '../dashboard/api/admin/[action].js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -254,20 +255,43 @@ const ENDPOINT_REGISTRY = [
     notes: 'Per the strict location-scoping rule, a company-wide brief can never be handed to a location-scoped role -- Owner/Marketing-only is a PERMANENT design decision, not a pending gap.',
   },
   {
+    // Multi-Tenant Google Integration Architecture Fix: previously flat
+    // Owner-only (currentAllowedRoles: ['owner']) -- a real, non-Owner
+    // tenant member (Admin, Marketing, a location_manager, Read Only) got a
+    // flat 403 merely for asking "is Google connected," even though the
+    // connection itself is a tenant-wide resource none of them can mutate.
+    // Now gated by Permission.INTEGRATIONS_VIEW (permissions.js), held by
+    // every real role -- see test_google_integration_architecture.js for the
+    // full "every role gets 200, no secret ever appears in the body,
+    // canManageIntegration is false for everyone but owner" suite. `null`
+    // here (no flat role gate) matches this registry's own convention for
+    // a permission-gated, non-role-array endpoint (e.g. content/download
+    // above).
     route: 'GET /api/google/status', file: 'api/google/[action].js', method: 'GET', action: 'status',
-    authRequired: true, currentAllowedRoles: ['owner'],
-    scope: 'account-wide administrative (Google connection status)',
-    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    authRequired: true, currentAllowedRoles: null,
+    scope: 'INTEGRATIONS_VIEW (every role) -- read-only tenant connection status, never a secret',
+    unauthorizedShape: 'json', wrongRoleStatus: null,
     locationMilestone: null,
-    notes: 'Owner-only administrative surface; not in scope for any location-aware milestone.',
+    notes: 'See test_google_integration_architecture.js for the full authorization/one-source-of-truth suite.',
   },
   {
+    // Google Integration + Reviews End-to-End Validation, Part A: REVERTED
+    // from the broadened INTEGRATIONS_VIEW gate above -- this is a real,
+    // multi-call diagnostic (token exchange -> accounts.list ->
+    // locations.list -> reviews.list, reading actual review content and
+    // exposing infrastructure-level error text) against the same
+    // rate-limited GBP API surface a real quota incident already hit
+    // (project 786038057684), not a cheap "is Google connected" read. Gated
+    // by Permission.SETTINGS_ADMIN (owner-only today), the SAME permission
+    // that already restricts Connect/Reconnect/Disconnect -- see
+    // test_google_test_connection_permission.js for the dedicated
+    // authorization suite.
     route: 'GET /api/google/test-connection', file: 'api/google/[action].js', method: 'GET', action: 'test-connection',
     authRequired: true, currentAllowedRoles: ['owner'],
-    scope: 'account-wide administrative',
+    scope: 'SETTINGS_ADMIN (owner-only) -- a real multi-call live diagnostic that reads actual review content and infrastructure-level error detail, never a basic status read',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'Owner-only administrative surface.',
+    notes: 'See test_google_test_connection_permission.js.',
   },
   {
     route: 'POST /api/google/trigger-sync', file: 'api/google/[action].js', method: 'POST', action: 'trigger-sync',
@@ -641,6 +665,30 @@ const ENDPOINT_REGISTRY = [
     locationMilestone: null,
     notes: 'Removal revokes authorization immediately (tenantOwnsLocation() reads approvedLocations live); an added location is stamped operational: false and stays unauthorized until apply_entitlement_change.py\'s data-plane follow-up succeeds. See test_tenant_entitlement_change.js for the full adversarial suite.',
   },
+  {
+    route: 'GET /api/admin/list-access-codes', file: 'api/admin/[action].js', method: 'GET', action: 'list-access-codes',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as /api/tenant-ops -- \'owner\' here is necessary but NOT sufficient: a real future Tenant B\'s own Owner (role owner, currentAllowedRoles-eligible by role alone) still gets 403. This is a NEW top-level serverless function (the 13th) -- see this file\'s own header comment for the Vercel Hobby-plan/Pro-upgrade pre-push gate this creates.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'Never returns the raw access code (it is never persisted -- see accessCodeStore.js). See test_admin_access_codes_endpoint.js for the full authorization/raw-code-exposure/audit-log suite.',
+  },
+  {
+    route: 'POST /api/admin/create-access-code', file: 'api/admin/[action].js', method: 'POST', action: 'create-access-code',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as /api/tenant-ops -- not callable by an ordinary tenant Owner regardless of role.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'The raw code is returned in THIS response exactly once, never logged, never persisted -- see test_admin_access_codes_endpoint.js.',
+  },
+  {
+    route: 'POST /api/admin/revoke-access-code', file: 'api/admin/[action].js', method: 'POST', action: 'revoke-access-code',
+    authRequired: true, currentAllowedRoles: ['owner'],
+    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as /api/tenant-ops.',
+    unauthorizedShape: 'json', wrongRoleStatus: 403,
+    locationMilestone: null,
+    notes: 'A revoked code fails closed for every subsequent redemption attempt (accessCodeStore.js\'s redeemAccessCode()) -- see test_admin_access_codes_endpoint.js.',
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -952,6 +1000,7 @@ const HANDLERS = {
   'api/content/[action].js': contentHandler,
   'api/tenant-ops/[action].js': tenantOpsHandler,
   'api/tenant-entitlements/[action].js': tenantEntitlementsHandler,
+  'api/admin/[action].js': adminHandler,
 }
 
 function minimalReqFor(entry, token) {

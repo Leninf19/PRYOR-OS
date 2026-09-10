@@ -67,5 +67,12 @@ jobs:
           npm run build
           npx vercel --prod --yes --token=${{ secrets.VERCEL_TOKEN }}
         env:
-          VERCEL_ORG_ID: team_mDA28eSShEIgPIQlduF4GJVH
-          VERCEL_PROJECT_ID: prj_8Lj4p2UgPOVVwEZoRuuEpKy9L5gp
+          # PRYOR OS Controlled Production Release Preparation + Reconciliation:
+          # these IDs previously pointed at a stale/legacy Vercel project --
+          # every deploy from this workflow was landing somewhere other than
+          # the real, currently-linked "pryor-os" project (see
+          # .vercel/repo.json in this repo for the authoritative link),
+          # meaning a push to main never actually reached the live site.
+          # Corrected to the real project.
+          VERCEL_ORG_ID: team_bzqEwLON2tvascgmnOtYAPi8
+          VERCEL_PROJECT_ID: prj_rAhOLFWrKXB94ohCGiAdw3OY1ymo

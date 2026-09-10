@@ -357,6 +357,15 @@ export async function upsertTenantConfig(tenantId, patch, { expectedVersion } = 
     // and tenants.js's tenantOwnsLocation()) -- a removal-only change has
     // nothing left to do in the data plane and is recorded as settled
     // immediately (status: 'none') by applyEntitlementChange() itself.
+    // Phase 4Q -- purely descriptive commercial/billing metadata (which
+    // plan, how the tenant was created, any trial). Additive, optional,
+    // and deliberately inert: NOTHING in permissions.js, auth.js, or
+    // tenants.js's authorization functions ever reads this field. A
+    // tenant created before Phase 4Q (the operator bootstrap script, or
+    // any tenant created before this field existed) simply has
+    // commercial: null forever unless explicitly set -- never treated as
+    // an error or backfilled.
+    commercial: null,
     entitlementChange: {
       status: 'none', requestedAt: null, completedAt: null, failedAt: null,
       addedLocationIds: [], removedLocationIds: [], lastError: null,

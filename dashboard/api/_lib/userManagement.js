@@ -100,3 +100,8 @@ export function buildInviteUrl(req, rawToken) {
 export function buildResetUrl(req, rawToken) {
   return `${buildOrigin(req)}/reset-password?token=${encodeURIComponent(rawToken)}`
 }
+
+// Phase 4Q -- self-service registration's email-verification link.
+export function buildVerifyUrl(req, rawToken) {
+  return `${buildOrigin(req)}/verify-email?token=${encodeURIComponent(rawToken)}`
+}

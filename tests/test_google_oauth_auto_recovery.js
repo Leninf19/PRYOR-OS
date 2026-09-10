@@ -6,6 +6,13 @@
 // token_expired/token_revoked states), never a silent failure that leaves
 // the dashboard showing a stale "Connected".
 //
+// "Last Successful Sync" investigation (Google Integration + Reviews
+// End-to-End Validation) -- these connectivity checks now write via
+// credentialStore.js's recordConnectionCheckOutcome() (lastConnectionCheckAt/
+// Status + health), NOT recordSyncOutcome() (lastSuccessfulSyncAt/
+// lastFailedSyncAt, reserved for an actual data sync) -- this file's own
+// tests below explicitly prove the two never get conflated.
+//
 // Run directly: node tests/test_google_oauth_auto_recovery.js
 
 process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xyz'
@@ -116,7 +123,13 @@ async function testStatusFlipsToReconnectRequiredOnInvalidGrant() {
   // see it too, without needing a second manual check.
   const after = await getStoredCredential(DEFAULT_TENANT_ID)
   assert(after.health === GoogleHealth.TOKEN_REVOKED, 'the stored health must be updated BEFORE the response is sent, not lazily on a later request')
-  assert(after.lastFailedSyncAt !== null, 'lastFailedSyncAt must be stamped')
+  // "Last Successful Sync" investigation fix: a status() connectivity check
+  // now records via recordConnectionCheckOutcome() -- lastConnectionCheckAt,
+  // never lastFailedSyncAt (reserved for an ACTUAL data-sync outcome, which
+  // nothing in google/[action].js performs -- see credentialStore.js's
+  // recordSyncOutcome() header for the full incident this split fixes).
+  assert(after.lastConnectionCheckAt !== null, 'lastConnectionCheckAt must be stamped')
+  assert(after.lastFailedSyncAt === null, 'a routine connectivity check must NEVER stamp lastFailedSyncAt -- that field is reserved for an actual data-sync failure')
   assert(after.lastFailureReason === 'invalid_grant', 'the failure reason must be recorded')
 }
 
@@ -149,6 +162,13 @@ async function testSubsequentSuccessfulStatusRestoresConnected() {
   const after = await getStoredCredential(DEFAULT_TENANT_ID)
   assert(after.health === GoogleHealth.CONNECTED, 'the stored health must also be restored to connected')
   assert(after.lastFailureReason === null, 'the prior failure reason must be cleared on success')
+  // "Last Successful Sync" investigation fix: a mere connectivity check
+  // succeeding -- even one that RESTORES health after a prior failure --
+  // must never be recorded as a real data sync. This is the exact
+  // production bug: the Settings card's "Last Successful Sync" was being
+  // silently overwritten by ordinary status polls.
+  assert(after.lastSuccessfulSyncAt === null, 'a successful status() connectivity check must NEVER stamp lastSuccessfulSyncAt -- that must remain reserved for an actual data-sync completion')
+  assert(after.lastConnectionCheckAt !== null && after.lastConnectionCheckStatus === 'success', 'the connectivity check itself is recorded on the correct, separate field')
 }
 
 async function testNeverConnectedReturnsCorrectState() {
