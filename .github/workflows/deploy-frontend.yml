@@ -77,6 +77,21 @@ jobs:
           npm ci
           npm run build
 
+      # "Fix confirmed production /api/data 404s" investigation -- same
+      # reasoning as update-reviews.yml's identically-named step: builds
+      # (does not deploy) from the repo root, exactly like the Deploy step
+      # below, purely to inspect and verify the resulting api/data
+      # function's filePathMap includes every required private-data file
+      # before any deploy is attempted. No `if: always()` gate here, same as
+      # this workflow's other steps -- a failure simply fails the job.
+      - name: Build and verify serverless bundle includes required artifacts
+        run: |
+          npx vercel build --yes --token=${{ secrets.VERCEL_TOKEN }}
+          python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --bundle-config dashboard/.vercel/output/functions/api/data.func/.vc-config.json
+        env:
+          VERCEL_ORG_ID: team_bzqEwLON2tvascgmnOtYAPi8
+          VERCEL_PROJECT_ID: prj_rAhOLFWrKXB94ohCGiAdw3OY1ymo
+
       # Final PRYOR Deployment Path Repair: the Vercel PROJECT's own "Root
       # Directory" setting is "dashboard" (deliberately left as-is -- not
       # changed by this fix). Running `vercel --prod` from INSIDE
@@ -92,8 +107,16 @@ jobs:
       # Command) regardless of the local build above, which exists purely
       # as a pre-flight check that the build succeeds before spending a
       # deploy attempt on it.
+      #
+      # --force (Fix confirmed production /api/data 404s): forces a clean,
+      # cache-free remote build for every deploy -- root-caused via a
+      # controlled local reproduction showing a cache-free build correctly
+      # includes every required file while every real deployment log
+      # inspected during that investigation had restored build cache from a
+      # prior deployment, chained back across many deploys. Never combined
+      # with --with-cache, which would defeat the point.
       - name: Deploy to Vercel
-        run: npx vercel --prod --yes --token=${{ secrets.VERCEL_TOKEN }}
+        run: npx vercel --prod --force --yes --token=${{ secrets.VERCEL_TOKEN }}
         env:
           # PRYOR OS Controlled Production Release Preparation + Reconciliation:
           # these IDs previously pointed at a stale/legacy Vercel project --

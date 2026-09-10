@@ -123,20 +123,58 @@ def check_meta_freshness(export_dir: Path, now: datetime, max_age_minutes: int =
     return True, f"{meta_path} generatedAt={generated_at} ({age_minutes:.1f} min old) -- fresh."
 
 
+# --- Post-build serverless-bundle check ------------------------------------
+# "Fix confirmed production /api/data 404s" investigation: files existing in
+# the CI working directory before `vercel --prod` (checked above) does NOT
+# prove the deployed api/data Serverless Function can actually read them at
+# runtime -- dashboard/api/data.js's dynamic path construction
+# (readPrivateDataFile()) is invisible to Vercel's static Node File Trace,
+# which is exactly why dashboard/vercel.json declares an explicit
+# `includeFiles: "private-data/**"` for that function. A `vercel build`
+# (Vercel CLI 59.x+) satisfies that with a `filePathMap` in the built
+# function's own .vc-config.json -- a lazily-resolved mapping, not files
+# physically copied into the function's directory tree. This check proves
+# that map actually lists every file EXACT_ALLOWLIST requires, using the
+# EXACT path shape a monorepo-aware build (invoked from the repository root,
+# exactly like the real "Deploy to Vercel" step) produces:
+# "dashboard/private-data/<relpath>" -> "dashboard/private-data/<relpath>".
+# Root-caused via a controlled local reproduction (a full, freshly generated
+# 113-file export_chunks.py run, built with `vercel build` from the repo
+# root using the same .vercel/repo.json + dashboard/.vercel/project.json
+# linking the real deploy uses) that PASSED even though the real production
+# deployment 404'd on these exact files -- pointing at Vercel's build-cache
+# restoration (every real deploy log inspected during this investigation
+# "Restored build cache from previous deployment", chained back for days)
+# as the likely runtime culprit, not a config or code defect. This check is
+# the second, independent layer that catches a recurrence regardless of
+# which of the two turns out to be the real mechanism.
+def check_bundle_file_path_map(vc_config_path: Path, required: list[str]) -> tuple[bool, list[str]]:
+    """Pure except for the one file read: returns (ok, missing_relative_paths)."""
+    if not vc_config_path.is_file():
+        return False, [f"{vc_config_path} does not exist -- was `vercel build` run first?"]
+    try:
+        config = json.loads(vc_config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return False, [f"{vc_config_path} is not valid JSON: {e}"]
+    file_path_map = config.get("filePathMap") or {}
+    missing = [relpath for relpath in required if f"dashboard/private-data/{relpath}" not in file_path_map]
+    return len(missing) == 0, missing
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tenant-id", required=True,
                          help="Explicit tenant whose export directory to verify. REQUIRED -- no default.")
+    parser.add_argument("--bundle-config", default=None,
+                         help="Path to a built api/data function's .vc-config.json (from `vercel build`). "
+                              "When given, ONLY the serverless-bundle filePathMap check runs (the export "
+                              "directory/freshness checks are assumed already done by an earlier, plain "
+                              "invocation of this same script) -- this is the post-build verification layer, "
+                              "run as its own separate CI step after `vercel build`.")
     args = parser.parse_args()
 
     if not tenant_keys.is_valid_tenant_id(args.tenant_id):
         print(f"::error::verify_private_data_artifacts.py: invalid --tenant-id {args.tenant_id!r}")
-        return 1
-
-    try:
-        export_dir = tenant_paths.resolve_export_dir(args.tenant_id)
-    except tenant_paths.UnknownTenantError as e:
-        print(f"::error::verify_private_data_artifacts.py: {e}")
         return 1
 
     if not DATA_JS_PATH.is_file():
@@ -146,6 +184,22 @@ def main() -> int:
     try:
         required = extract_exact_allowlist(DATA_JS_PATH.read_text(encoding="utf-8"))
     except ValueError as e:
+        print(f"::error::verify_private_data_artifacts.py: {e}")
+        return 1
+
+    if args.bundle_config is not None:
+        ok_bundle, missing = check_bundle_file_path_map(Path(args.bundle_config), required)
+        if not ok_bundle:
+            print(f"::error::verify_private_data_artifacts.py: {len(missing)} of {len(required)} required "
+                  f"private-data files are missing from the built api/data function's filePathMap "
+                  f"({args.bundle_config}): {', '.join(missing)}")
+            return 1
+        print(f"All {len(required)} EXACT_ALLOWLIST files present in the built api/data function's filePathMap.")
+        return 0
+
+    try:
+        export_dir = tenant_paths.resolve_export_dir(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
         print(f"::error::verify_private_data_artifacts.py: {e}")
         return 1
 

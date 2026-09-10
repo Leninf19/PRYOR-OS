@@ -176,8 +176,13 @@ export default function ComplaintIntelligence() {
       {/* Tab switcher */}
       <div className="flex gap-1 p-1 rounded-xl w-fit" style={{ background: 'var(--color-surface-2)' }}>
         {[
-          { id: 'complaints', label: `Complaints (${complaints.length})` },
-          { id: 'praises',    label: `Praise (${praises.length})` },
+          // Confirmed production bug: a 403/404 rendered "Complaints (0)"
+          // and "Praise (0)" next to the ErrorState below, reading as a
+          // legitimate empty result rather than a failed request. Suppress
+          // the count (never claim "0") while loading or errored -- it's
+          // shown again the moment real data (however empty) actually loads.
+          { id: 'complaints', label: isError || isLoading ? 'Complaints' : `Complaints (${complaints.length})` },
+          { id: 'praises',    label: isError || isLoading ? 'Praise' : `Praise (${praises.length})` },
         ].map(t => (
           <button
             key={t.id}

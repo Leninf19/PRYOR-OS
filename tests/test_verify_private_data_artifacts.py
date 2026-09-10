@@ -156,6 +156,56 @@ def test_meta_freshness_within_window_boundary_passes():
         assert ok, message
 
 
+def test_bundle_check_missing_config_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        ok, missing = vpda.check_bundle_file_path_map(Path(tmp) / "does-not-exist.json", ['meta.json'])
+        assert not ok
+        assert any("does not exist" in m for m in missing)
+
+
+def test_bundle_check_invalid_json_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        config_path = Path(tmp) / ".vc-config.json"
+        config_path.write_text("{not valid json", encoding="utf-8")
+        ok, missing = vpda.check_bundle_file_path_map(config_path, ['meta.json'])
+        assert not ok
+        assert any("not valid JSON" in m for m in missing)
+
+
+def test_bundle_check_all_present_passes():
+    with tempfile.TemporaryDirectory() as tmp:
+        config_path = Path(tmp) / ".vc-config.json"
+        _write(config_path, {"filePathMap": {
+            "dashboard/private-data/meta.json": "dashboard/private-data/meta.json",
+            "dashboard/private-data/analytics/kpis.json": "dashboard/private-data/analytics/kpis.json",
+        }})
+        ok, missing = vpda.check_bundle_file_path_map(config_path, ['meta.json', 'analytics/kpis.json'])
+        assert ok, missing
+
+
+def test_bundle_check_reports_every_missing_file():
+    """The exact scenario this investigation found: files present in the
+    export directory but absent from the deployed function's filePathMap."""
+    with tempfile.TemporaryDirectory() as tmp:
+        config_path = Path(tmp) / ".vc-config.json"
+        _write(config_path, {"filePathMap": {
+            "dashboard/private-data/meta.json": "dashboard/private-data/meta.json",
+        }})
+        required = ['meta.json', 'analytics/kpis.json', 'intelligence/complaint-intelligence.json']
+        ok, missing = vpda.check_bundle_file_path_map(config_path, required)
+        assert not ok
+        assert set(missing) == {'analytics/kpis.json', 'intelligence/complaint-intelligence.json'}, missing
+
+
+def test_bundle_check_empty_file_path_map_fails_for_any_required_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        config_path = Path(tmp) / ".vc-config.json"
+        _write(config_path, {"filePathMap": {}})
+        ok, missing = vpda.check_bundle_file_path_map(config_path, ['meta.json'])
+        assert not ok
+        assert missing == ['meta.json']
+
+
 # --- Real-repository checks: no writes, no mutation -------------------------
 
 def test_real_data_js_exact_allowlist_is_parseable():
@@ -202,6 +252,11 @@ def main() -> int:
         ("check_meta_freshness fails for a stale (days-old) timestamp", test_meta_freshness_stale_timestamp_fails),
         ("check_meta_freshness fails for a future timestamp", test_meta_freshness_future_timestamp_fails),
         ("check_meta_freshness passes just inside the freshness window", test_meta_freshness_within_window_boundary_passes),
+        ("check_bundle_file_path_map fails when the config file is missing", test_bundle_check_missing_config_fails),
+        ("check_bundle_file_path_map fails on invalid JSON", test_bundle_check_invalid_json_fails),
+        ("check_bundle_file_path_map passes when every required file is mapped", test_bundle_check_all_present_passes),
+        ("check_bundle_file_path_map reports every missing file -- the exact bug this investigation found", test_bundle_check_reports_every_missing_file),
+        ("check_bundle_file_path_map fails for any required file against an empty map", test_bundle_check_empty_file_path_map_fails_for_any_required_file),
         ("the real data.js EXACT_ALLOWLIST is parseable and non-trivial", test_real_data_js_exact_allowlist_is_parseable),
         ("dashboard/vercel.json disables native Git deployments", test_vercel_json_disables_native_git_deployments),
     ]

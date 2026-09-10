@@ -145,6 +145,32 @@ jobs:
           npm ci
           npm run build
 
+      # "Fix confirmed production /api/data 404s" investigation: real browser
+      # evidence showed analytics/intelligence files 404ing in production
+      # despite export_chunks.py generating them correctly and a controlled
+      # local reproduction (same vercel.json, same fresh 113-file export,
+      # built via `vercel build` from the repo root exactly like the step
+      # below) proving the built function's filePathMap DOES include every
+      # required file. Every real deployment log inspected during that
+      # investigation showed "Restored build cache from previous deployment"
+      # -- chained back across many deploys -- while the clean, cache-free
+      # local reproduction was correct. This step builds the SAME way (from
+      # the repo root, so Root Directory=dashboard resolves once, exactly
+      # like the Deploy step below) purely to inspect and verify the
+      # resulting api/data function's filePathMap before any deploy is
+      # attempted -- catching a recurrence of this exact class of bug
+      # regardless of whether build-cache staleness turns out to be the true
+      # runtime mechanism.
+      - name: Build and verify serverless bundle includes required artifacts
+        if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success'
+        id: verify-bundle
+        run: |
+          npx vercel build --yes --token=${{ secrets.VERCEL_TOKEN }}
+          python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --bundle-config dashboard/.vercel/output/functions/api/data.func/.vc-config.json
+        env:
+          VERCEL_ORG_ID: team_bzqEwLON2tvascgmnOtYAPi8
+          VERCEL_PROJECT_ID: prj_rAhOLFWrKXB94ohCGiAdw3OY1ymo
+
       # Final PRYOR Deployment Path Repair: the Vercel PROJECT's own "Root
       # Directory" setting is "dashboard" (deliberately left as-is -- not
       # changed by this fix). Running `vercel --prod` from INSIDE
@@ -160,9 +186,14 @@ jobs:
       # Command) regardless of the local build above, which exists purely
       # as a pre-flight check that the build succeeds before spending a
       # deploy attempt on it.
+      #
+      # --force (Fix confirmed production /api/data 404s): forces a clean,
+      # cache-free remote build for every deploy -- see the step above's
+      # comment for the build-cache-staleness evidence this responds to.
+      # Never combined with --with-cache, which would defeat the point.
       - name: Deploy to Vercel
-        if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success'
-        run: npx vercel --prod --yes --token=${{ secrets.VERCEL_TOKEN }}
+        if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success' && steps.verify-bundle.outcome == 'success'
+        run: npx vercel --prod --force --yes --token=${{ secrets.VERCEL_TOKEN }}
         env:
           # PRYOR OS Controlled Production Release Preparation + Reconciliation:
           # these IDs previously pointed at a stale/legacy Vercel project --

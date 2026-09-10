@@ -217,6 +217,77 @@ def test_update_reviews_deploy_step_is_gated_on_artifact_verification():
     )
 
 
+def test_deploy_step_uses_force_to_skip_build_cache():
+    """Fix confirmed production /api/data 404s: root-caused (controlled
+    local reproduction vs. every real deployment log showing 'Restored
+    build cache') to Vercel's build-cache restoration, not a vercel.json/
+    code defect. --force skips that cache; --with-cache would defeat the
+    whole point, so this also guards against that ever being added."""
+    for filename in VERCEL_DEPLOY_WORKFLOWS:
+        source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
+        deploy_step = _find_step(_steps(source), "Deploy to Vercel")
+        assert "--force" in deploy_step, f"{filename}: 'Deploy to Vercel' must pass --force to skip the build cache"
+        assert "--with-cache" not in deploy_step, f"{filename}: 'Deploy to Vercel' must never pass --with-cache alongside --force"
+
+
+def test_bundle_verification_step_runs_before_deploy_and_builds_from_repo_root():
+    """The new post-build bundle check must run AFTER export/artifact
+    verification and BEFORE deploy, from the repo root (same reasoning as
+    the Deploy step itself -- see test_deploy_to_vercel_step_never_cds_into_dashboard),
+    so `vercel build`'s monorepo-aware Root Directory resolution matches
+    exactly what the real Deploy step does."""
+    verify_artifacts_step_name_by_workflow = {
+        "update-reviews.yml": "Verify private-data artifacts before deploy",
+        "deploy-frontend.yml": "Verify private-data artifacts before deploy",
+    }
+    for filename in VERCEL_DEPLOY_WORKFLOWS:
+        source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
+        blocks = _steps(source)
+        names = []
+        for block in blocks:
+            m = re.search(r"^      - name:\s*(.+)$", block, re.MULTILINE)
+            names.append(m.group(1).strip() if m else None)
+        bundle_step_name = "Build and verify serverless bundle includes required artifacts"
+        assert bundle_step_name in names, f"{filename}: missing the {bundle_step_name!r} step"
+        assert "Deploy to Vercel" in names, f"{filename}: missing the 'Deploy to Vercel' step"
+        artifacts_name = verify_artifacts_step_name_by_workflow[filename]
+        assert artifacts_name in names, f"{filename}: missing the {artifacts_name!r} step"
+        i_artifacts = names.index(artifacts_name)
+        i_bundle = names.index(bundle_step_name)
+        i_deploy = names.index("Deploy to Vercel")
+        assert i_artifacts < i_bundle < i_deploy, (
+            f"{filename}: expected step order artifacts ({i_artifacts}) < bundle-verify ({i_bundle}) < deploy ({i_deploy})"
+        )
+
+        bundle_step = _find_step(blocks, bundle_step_name)
+        # _steps() attributes trailing comment lines (before the NEXT step's
+        # "- name:") to the current block, same as _find_step's own callers
+        # elsewhere in this file -- exclude comment lines here too (this
+        # step happens to be followed by a comment that legitimately
+        # discusses "cd dashboard" as prose, same reasoning as
+        # test_no_workflow_ever_produces_a_doubled_dashboard_path below).
+        bundle_step_code_only = "\n".join(
+            line for line in bundle_step.split("\n") if not line.strip().startswith("#")
+        )
+        assert "vercel build" in bundle_step_code_only, f"{filename}: the bundle-verify step must actually run `vercel build`"
+        assert "cd dashboard" not in bundle_step_code_only and "working-directory: dashboard" not in bundle_step_code_only, (
+            f"{filename}: the bundle-verify step must build from the repo root, same as the Deploy step -- "
+            f"otherwise Root Directory=dashboard would apply a second time, same class of bug as the doubled-path fix"
+        )
+        assert "--bundle-config" in bundle_step_code_only and "verify_private_data_artifacts.py" in bundle_step_code_only, (
+            f"{filename}: the bundle-verify step must actually check the built function's filePathMap"
+        )
+
+
+def test_update_reviews_deploy_step_is_gated_on_bundle_verification():
+    source = (WORKFLOWS_DIR / "update-reviews.yml").read_text(encoding="utf-8")
+    deploy_step = _find_step(_steps(source), "Deploy to Vercel")
+    assert "steps.verify-bundle.outcome == 'success'" in deploy_step, (
+        "update-reviews.yml: 'Deploy to Vercel' (if: always()) must require "
+        "steps.verify-bundle.outcome == 'success' as well as the artifact/integrity checks"
+    )
+
+
 def test_vercel_project_org_ids_unchanged_by_this_fix():
     """Regression guard: this phase explicitly must NOT touch
     VERCEL_TOKEN/VERCEL_PROJECT_ID/VERCEL_ORG_ID/Root Directory -- proves
@@ -244,6 +315,9 @@ def main() -> int:
         ("export -> verify-artifacts -> deploy step order holds in both workflows", test_data_generation_pipeline_runs_before_artifact_verification_and_deploy),
         ("the verify-artifacts step actually invokes verify_private_data_artifacts.py", test_verify_artifacts_step_actually_invokes_the_checker),
         ("update-reviews.yml's Deploy step is gated on artifact verification success", test_update_reviews_deploy_step_is_gated_on_artifact_verification),
+        ("the Deploy step uses --force to skip the build cache, never --with-cache", test_deploy_step_uses_force_to_skip_build_cache),
+        ("the bundle-verification step runs after artifacts and before deploy, from the repo root", test_bundle_verification_step_runs_before_deploy_and_builds_from_repo_root),
+        ("update-reviews.yml's Deploy step is gated on bundle verification success", test_update_reviews_deploy_step_is_gated_on_bundle_verification),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()
