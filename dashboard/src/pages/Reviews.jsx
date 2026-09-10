@@ -156,7 +156,7 @@ async function fetchPublishBridges(ids) {
 }
 
 async function callRewrite(payload) {
-  const res = await fetch('/api/rewrite', {
+  const res = await fetch('/api/actions/rewrite', {
     method:  'POST',
     headers: { 'content-type': 'application/json' },
     body:    JSON.stringify(payload),
@@ -586,7 +586,8 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess, next
       stars:        r.star_rating   ?? 1,
       // Multi-Location Authentication & User Access System: required for a
       // location-scoped account (location_manager, or a scoped Marketing
-      // account) to be authorized at all -- see dashboard/api/rewrite.js.
+      // account) to be authorized at all -- see the 'rewrite' action in
+      // dashboard/api/actions/[action].js.
       // Owner/Admin/company-wide Marketing continue working unchanged
       // without it.
       localReviewId: rid,

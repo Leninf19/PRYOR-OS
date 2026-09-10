@@ -124,7 +124,7 @@ export function computeReplyStateCounts(reviews, ws, bridges) {
 }
 
 // Mirrors ai_engine.py's _SERIOUS_KEYWORDS/_SERIOUS_RE and
-// dashboard/api/rewrite.js's SERIOUS_KEYWORDS/SERIOUS_RE exactly -- the
+// dashboard/api/_lib/rewriteEngine.js's SERIOUS_KEYWORDS/SERIOUS_RE exactly -- the
 // THIRD independent copy of this word-boundary keyword check, kept in sync
 // by comment reference the same way the other two already were before this
 // milestone. Used only for the Reviews inbox's own "Needs Management

@@ -1,6 +1,8 @@
-// Confirms every one of the 19 routable dashboard/api/** routes (12
-// serverless functions -- the 4 /api/session/* routes share one
-// [action].js file, and the 5 /api/actions/* routes share another) rejects
+// Confirms every one of the 19 routable dashboard/api/** routes (10
+// serverless functions total across the whole api/ tree -- the 4
+// /api/session/* routes share one [action].js file, and the 6
+// /api/actions/* routes (including 'rewrite', merged in by the PRYOR OS
+// Vercel Serverless Function Count Reduction phase) share another) rejects
 // unsupported HTTP methods (including HEAD/OPTIONS -- neither should ever
 // fall through to auth/data logic) with 405, before touching auth or data.
 // Handlers that require auth are exercised unauthenticated here on purpose:
@@ -17,7 +19,6 @@ delete process.env.ACCOUNT_DIRECTORY_JSON
 import dataHandler from '../dashboard/api/data.js'
 import executiveBriefHandler from '../dashboard/api/executive-brief.js'
 import googleHandler from '../dashboard/api/google/[action].js'
-import rewriteHandler from '../dashboard/api/rewrite.js'
 import sessionHandler from '../dashboard/api/session/[action].js'
 import actionsHandler from '../dashboard/api/actions/[action].js'
 
@@ -58,7 +59,6 @@ const ROUTES = [
   ['/api/google/trigger-import', googleHandler, 'POST', { query: { action: 'trigger-import' } }],
   ['/api/google/trigger-sync', googleHandler, 'POST', { query: { action: 'trigger-sync' } }],
   ['/api/google/disconnect', googleHandler, 'POST', { query: { action: 'disconnect' } }],
-  ['/api/rewrite', rewriteHandler, 'POST', {}],
   ['/api/session/login', sessionHandler, 'POST', { query: { action: 'login' } }],
   ['/api/session/logout', sessionHandler, 'POST', { query: { action: 'logout' } }],
   ['/api/session/whoami', sessionHandler, 'GET', { query: { action: 'whoami' } }],
@@ -68,6 +68,7 @@ const ROUTES = [
   ['/api/actions/preview-review-email', actionsHandler, 'GET', { query: { action: 'preview-review-email' } }],
   ['/api/actions/send-review-email', actionsHandler, 'POST', { query: { action: 'send-review-email' } }],
   ['/api/actions/update-email-status', actionsHandler, 'POST', { query: { action: 'update-email-status' } }],
+  ['/api/actions/rewrite', actionsHandler, 'POST', { query: { action: 'rewrite' } }],
 ]
 
 const ALL_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']

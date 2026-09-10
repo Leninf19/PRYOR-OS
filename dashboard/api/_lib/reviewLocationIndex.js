@@ -13,8 +13,9 @@
 // tests/test_authorization_matrix.js's dedicated assertion.
 //
 // Callers: dashboard/api/google/[action].js (publish, publish-bridge),
-// dashboard/api/actions/[action].js (all review-scoped actions),
-// dashboard/api/rewrite.js -- each passes resolveLocationIdForReview as the
+// dashboard/api/actions/[action].js (all review-scoped actions, including
+// the 'rewrite' action, formerly its own standalone dashboard/api/rewrite.js
+// route) -- each passes resolveLocationIdForReview as the
 // resolveLocationId callback to requireScopedAuth() (dashboard/api/_lib/
 // auth.js). Every caller must ALSO have this file's target path in its own
 // dashboard/vercel.json `includeFiles` entry, or the file won't exist in

@@ -26,7 +26,8 @@ import { useTenantOpsList } from '../../hooks/useTenantOps.js'
 // STATE ELIGIBILITY: `eligibility.canProvision`/`canInitialSync` on each
 // row are informational only, mirrored from initial_sync.py's/
 // provision_tenant.py's own precondition sets server-side (see
-// dashboard/api/tenant-ops/[action].js's own comment on why a drift here
+// dashboard/api/admin/[action].js's tenant-list action, formerly its own
+// tenant-ops/[action].js route -- comment there explains why a drift here
 // is a UX bug, not a security bug) -- the Python scripts re-validate every
 // precondition themselves regardless of what this page shows.
 

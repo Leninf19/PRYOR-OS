@@ -1,7 +1,11 @@
-// Multi-Tenant Phase 4H.1 -- regression tests for
-// dashboard/api/tenant-ops/[action].js (the super-admin-only, read-only
-// tenant lifecycle status endpoint) and dashboard/api/_lib/auth.js's
-// isSuperAdmin(). No real Upstash account, no real filesystem access, no
+// Multi-Tenant Phase 4H.1 -- regression tests for the super-admin-only,
+// read-only tenant lifecycle status action (tenant-list) and
+// dashboard/api/_lib/auth.js's isSuperAdmin(). Originally its own
+// standalone route (dashboard/api/tenant-ops/[action].js); merged into
+// dashboard/api/admin/[action].js by the Vercel Serverless Function Count
+// Reduction phase (both shared the identical isSuperAdmin gate, and
+// Vercel Hobby's 12-function ceiling left no room for a standalone
+// route). No real Upstash account, no real filesystem access, no
 // production data.
 //
 // Run directly: node tests/test_tenant_ops_endpoint.js
@@ -13,7 +17,7 @@ import { readFileSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import bcrypt from 'bcryptjs'
-import handler from '../dashboard/api/tenant-ops/[action].js'
+import handler from '../dashboard/api/admin/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 import {
@@ -25,7 +29,19 @@ import {
 import { _setRedisClientForTests as setUserRedis, _resetRedisClientForTests as resetUserRedis } from '../dashboard/api/_lib/userStore.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const TENANT_OPS_SRC = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'api', 'tenant-ops', '[action].js'), 'utf-8')
+const ADMIN_SRC = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'api', 'admin', '[action].js'), 'utf-8')
+// Scoped to JUST the tenantListAction function's own body -- admin/[action].js
+// as a WHOLE legitimately performs writes (create/revoke-access-code,
+// tenant-entitlements-apply), so a whole-file scan is no longer the right
+// invariant post-merge; the real invariant (the read-only tenant-list
+// action itself never mutates tenant_config) is still exactly as testable
+// by scoping the same regex checks to only that function's source text.
+const TENANT_LIST_ACTION_SRC = (() => {
+  const start = ADMIN_SRC.indexOf('async function tenantListAction')
+  const end = ADMIN_SRC.indexOf('\n// --- Cross-tenant entitlement changes', start)
+  if (start === -1 || end === -1) throw new Error('could not locate tenantListAction() source region -- has admin/[action].js been restructured?')
+  return ADMIN_SRC.slice(start, end)
+})()
 
 const TENANT_B = 't_synthetic-tenant-ops-b'
 const TENANT_C = 't_synthetic-tenant-ops-c'
@@ -127,7 +143,7 @@ const tenantBOwnerToken = () => signSession({ userId: 'usr_tenantb_owner', email
 async function invoke({ method = 'GET', token, query = {} } = {}) {
   const req = {
     method,
-    query: { action: 'list', ...query },
+    query: { action: 'tenant-list', ...query },
     body: {},
     headers: token ? { cookie: `lta_session=${token}` } : {},
     socket: {},
@@ -292,20 +308,25 @@ async function testLegacyRepoTenantNeverEligible() {
 // ===========================================================================
 
 function testEndpointNeverMutatesOrDuplicatesLifecycleLogic() {
-  // This file is READ-ONLY -- it must never call upsertTenantConfig()/
-  // markTenantProvisioned()/markTenantActive() (Node) or shell out to
-  // provision_tenant.py/initial_sync.py (Python) itself. Mutation happens
-  // exclusively through the human-operated, confirmation-gated GitHub
-  // Actions workflow (.github/workflows/tenant-lifecycle.yml).
-  assert(!/upsertTenantConfig|markTenantProvisioned|markTenantActive|markTenantInitialSync/.test(TENANT_OPS_SRC),
-    'tenant-ops/[action].js must never call a tenant_config WRITE function -- it is read-only by design')
-  assert(!/status:\s*['"]active['"]/.test(TENANT_OPS_SRC),
-    'tenant-ops/[action].js must contain no literal active-status assignment')
+  // The tenant-list action itself is READ-ONLY -- it must never call
+  // upsertTenantConfig()/markTenantProvisioned()/markTenantActive() (Node)
+  // or shell out to provision_tenant.py/initial_sync.py (Python) itself.
+  // Mutation happens exclusively through the human-operated,
+  // confirmation-gated GitHub Actions workflow
+  // (.github/workflows/tenant-lifecycle.yml) -- or, for entitlements
+  // specifically, the SEPARATE tenant-entitlements-apply action in this
+  // same file, which is why this check is scoped to just
+  // tenantListAction()'s own source region rather than the whole
+  // (post-merge, legitimately-mutating-elsewhere) file.
+  assert(!/upsertTenantConfig|markTenantProvisioned|markTenantActive|markTenantInitialSync|applyEntitlementChange/.test(TENANT_LIST_ACTION_SRC),
+    'tenant-list action must never call a tenant_config WRITE function -- it is read-only by design')
+  assert(!/status:\s*['"]active['"]/.test(TENANT_LIST_ACTION_SRC),
+    'tenant-list action must contain no literal active-status assignment')
   // Checks for actual PROCESS-SPAWNING capability, not a textual mention --
   // this file's own comments legitimately name provision_tenant.py/
   // initial_sync.py to explain where mutation DOES happen instead.
-  assert(!/child_process|require\(['"]child_process['"]\)|\bexec\(|\bspawn\(/.test(TENANT_OPS_SRC),
-    'tenant-ops/[action].js must never shell out to provision_tenant.py/initial_sync.py -- it is read-only by design')
+  assert(!/child_process|require\(['"]child_process['"]\)|\bexec\(|\bspawn\(/.test(TENANT_LIST_ACTION_SRC),
+    'tenant-list action must never shell out to provision_tenant.py/initial_sync.py -- it is read-only by design')
   // The behavioral proof that a raw credential/refreshToken never reaches
   // the response is testResponseNeverIncludesRawSensitiveFields() above --
   // a real end-to-end assertion is more reliable here than a source regex.

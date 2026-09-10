@@ -1,25 +1,16 @@
-// Vercel serverless function — AI tone rewrite for review responses
+// AI tone rewrite for review responses -- the business logic previously
+// living directly in dashboard/api/rewrite.js (its own standalone Vercel
+// function). Relocated here, verbatim, by the PRYOR OS Vercel Serverless
+// Function Count Reduction phase: rewrite.js's authorization model
+// (REWRITE_PERMISSIONS = [Permission.REPLY, Permission.REPLY_ASSIGNED],
+// requireScopedAuth, resolveLocationIdForReviewOrDeny) is IDENTICAL to
+// actions/[action].js's own REPLY_PERMISSIONS/requireScopedAuth pattern,
+// so the endpoint itself was folded into actions/[action].js as a new
+// 'rewrite' action -- see that file for the auth/rate-limit wrapper. This
+// module is a pure `_lib` helper (no default export, never itself a
+// route) holding only the actual prompt-building/Anthropic-call/response-
+// policy logic, unchanged from the original file.
 // Requires ANTHROPIC_API_KEY in Vercel environment variables.
-// POST /api/rewrite  { tone, reviewText, currentDraft, reviewerName, location, stars }
-// Returns           { rewritten: string }
-
-import { requireScopedAuth } from './_lib/auth.js'
-import { Permission } from './_lib/permissions.js'
-import { resolveLocationIdForReviewOrDeny } from './_lib/reviewLocationIndex.js'
-import { enforceRateLimit } from './_lib/rateLimit.js'
-
-// Multi-Location Authentication & User Access System, Commit 4: gated by
-// permission + per-review location (same REPLY/REPLY_ASSIGNED pair as
-// publish()/actions' update()), not a flat role array. This endpoint's
-// request body has no review identifier today -- `localReviewId` below is
-// a new OPTIONAL field; owner/marketing/admin (company-wide) continue
-// working unchanged without it, exactly as before. A location-scoped
-// caller (location_manager, or a scoped Marketing account) REQUIRES it --
-// functionally usable by them once the frontend starts sending it
-// (dashboard/src/pages/Reviews.jsx's rewrite call, wired in the
-// frontend-scoping commit of this same milestone); until then a scoped
-// caller correctly gets 404 rather than an insecure default.
-const REWRITE_PERMISSIONS = [Permission.REPLY, Permission.REPLY_ASSIGNED]
 
 const CONTACT_EMAIL = 'advertising@l3amigos.com'
 
@@ -61,7 +52,7 @@ export function isSeriousIssue(reviewText) {
 // Phase 3 hard safety guard, mirrors ai_engine.py's enforce_response_policy()
 // exactly: for any non-serious response, strip any sentence containing
 // forbidden recovery/escalation language rather than trusting the model not
-// to have generated it. Applied to EVERY /api/rewrite response before it's
+// to have generated it. Applied to EVERY rewrite response before it's
 // returned, regardless of tone requested.
 const FORBIDDEN_RECOVERY_PATTERNS = [
   /contact us[^.!?]*so we can make this right/i,
@@ -97,32 +88,24 @@ const TONE_GUIDES = {
   spanish:      'Warm and professional tone.',
 }
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' })
-  }
-
-  const scope = await requireScopedAuth(req, res, {
-    permission: REWRITE_PERMISSIONS,
-    resolveLocationId: async (req, account) => resolveLocationIdForReviewOrDeny(req.body?.localReviewId, account),
-  })
-  if (!scope) return
-  const { account } = scope
-
-  const allowed = await enforceRateLimit(req, res, `rewrite:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
-  if (!allowed) return
-
+// Runs the full rewrite: builds the prompt, calls Anthropic, applies the
+// Phase 3 safety guard. Returns { ok: true, rewritten } on success, or
+// { ok: false, status, error } (already shaped for the caller's
+// res.status(x).json({ error })) on any failure -- the caller (actions/
+// [action].js's rewrite action) never has to know Anthropic's response
+// shape or this function's internal error handling, matching how every
+// other action in this codebase separates auth/response wiring from
+// business logic.
+export async function generateRewrite(body) {
   const apiKey = process.env.ANTHROPIC_API_KEY
   if (!apiKey) {
-    return res.status(503).json({
-      error: 'ANTHROPIC_API_KEY is not set in Vercel environment variables. Add it at vercel.com → Project → Settings → Environment Variables.',
-    })
+    return { ok: false, status: 503, error: 'ANTHROPIC_API_KEY is not set in Vercel environment variables. Add it at vercel.com → Project → Settings → Environment Variables.' }
   }
 
-  const { tone, reviewText, currentDraft, reviewerName, location, stars } = req.body ?? {}
+  const { tone, reviewText, currentDraft, reviewerName, location, stars } = body ?? {}
 
   if (!tone) {
-    return res.status(400).json({ error: 'Missing required field: tone' })
+    return { ok: false, status: 400, error: 'Missing required field: tone' }
   }
 
   const toneGuide    = TONE_GUIDES[tone] ?? TONE_GUIDES.friendly
@@ -180,20 +163,20 @@ Write ONLY the response text. No quotes, no labels, no preamble. Sign off as '�
 
     if (!upstream.ok) {
       const errBody = await upstream.text().catch(() => upstream.statusText)
-      return res.status(502).json({ error: `Anthropic API error ${upstream.status}: ${errBody}` })
+      return { ok: false, status: 502, error: `Anthropic API error ${upstream.status}: ${errBody}` }
     }
 
     const data      = await upstream.json()
     const rewritten = data?.content?.[0]?.text?.trim() ?? ''
 
     if (!rewritten) {
-      return res.status(502).json({ error: 'Anthropic returned an empty response. Try again.' })
+      return { ok: false, status: 502, error: 'Anthropic returned an empty response. Try again.' }
     }
 
     // Phase 3 hard safety guard -- applied regardless of what the model
     // actually returned, not just relied on via the prompt above.
-    return res.status(200).json({ rewritten: enforceResponsePolicy(rewritten, serious) })
+    return { ok: true, rewritten: enforceResponsePolicy(rewritten, serious) }
   } catch (err) {
-    return res.status(500).json({ error: err?.message ?? 'Unexpected server error' })
+    return { ok: false, status: 500, error: err?.message ?? 'Unexpected server error' }
   }
 }

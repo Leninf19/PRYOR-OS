@@ -40,7 +40,6 @@ import { Permission, ROLE_PERMISSIONS, roleHasPermission } from '../dashboard/ap
 
 import dataHandler from '../dashboard/api/data.js'
 import executiveBriefHandler from '../dashboard/api/executive-brief.js'
-import rewriteHandler from '../dashboard/api/rewrite.js'
 import sessionHandler from '../dashboard/api/session/[action].js'
 import actionsHandler from '../dashboard/api/actions/[action].js'
 import googleHandler from '../dashboard/api/google/[action].js'
@@ -48,8 +47,6 @@ import settingsHandler from '../dashboard/api/settings/[action].js'
 import notificationsHandler from '../dashboard/api/notifications/[action].js'
 import tasksHandler from '../dashboard/api/tasks/[action].js'
 import contentHandler from '../dashboard/api/content/[action].js'
-import tenantOpsHandler from '../dashboard/api/tenant-ops/[action].js'
-import tenantEntitlementsHandler from '../dashboard/api/tenant-entitlements/[action].js'
 import adminHandler from '../dashboard/api/admin/[action].js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
@@ -239,12 +236,12 @@ const ENDPOINT_REGISTRY = [
     notes: 'LANDED (Multi-Location Authentication & User Access System, Commit 4) -- added to the registry now (was previously undocumented here; the file-level scanner did not catch its absence because google/[action].js was already registered via other actions). A location-scoped caller receives only bridge records for reviews within their own locationIds grant; records for other reviews are simply omitted from the response, matching this endpoint\'s existing "absent means no bridge record" contract.',
   },
   {
-    route: 'POST /api/rewrite', file: 'api/rewrite.js', method: 'POST',
+    route: 'POST /api/actions/rewrite', file: 'api/actions/[action].js', method: 'POST', action: 'rewrite',
     authRequired: true, currentAllowedRoles: ['owner', 'admin', 'marketing', 'location_manager'],
     scope: 'permission-gated (REPLY or REPLY_ASSIGNED) + optional per-review location scope via localReviewId',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'REVISED (Multi-Location Authentication & User Access System, Commit 4) -- this endpoint previously had no location dimension at all; it now accepts an OPTIONAL localReviewId, required only for a location-scoped caller (owner/marketing/admin continue working unchanged without it). A scoped caller omitting it is denied (404) rather than silently trusted -- functionally usable by location_manager once the frontend-scoping commit wires Reviews.jsx to send it.',
+    notes: 'REVISED (Multi-Location Authentication & User Access System, Commit 4) -- this endpoint previously had no location dimension at all; it now accepts an OPTIONAL localReviewId, required only for a location-scoped caller (owner/marketing/admin continue working unchanged without it). A scoped caller omitting it is denied (404) rather than silently trusted -- functionally usable by location_manager once the frontend-scoping commit wires Reviews.jsx to send it. MOVED (PRYOR OS Vercel Serverless Function Count Reduction) from its own standalone api/rewrite.js into api/actions/[action].js as the \'rewrite\' action -- same REPLY_PERMISSIONS/requireScopedAuth/resolveLocationIdForReviewOrDeny call, byte-identical business logic (relocated to dashboard/api/_lib/rewriteEngine.js), only the dispatch path changed.',
   },
   {
     route: 'POST /api/executive-brief', file: 'api/executive-brief.js', method: 'POST',
@@ -642,49 +639,49 @@ const ENDPOINT_REGISTRY = [
     notes: 'Campaign CRUD bugfix: cascades to every asset\'s Blob object + metadata and unlinks (never deletes) any Calendar task referencing this campaignId. location_manager/read_only never hold CAMPAIGN_MANAGE via the role table; a direct-id attempt outside the caller\'s location grant returns 404, never 403.',
   },
   {
-    route: 'GET /api/tenant-ops/list', file: 'api/tenant-ops/[action].js', method: 'GET', action: 'list',
+    route: 'GET /api/admin?action=tenant-list', file: 'api/admin/[action].js', method: 'GET', action: 'tenant-list',
     authRequired: true, currentAllowedRoles: ['owner'],
     scope: 'CROSS-TENANT platform-operator status only (Multi-Tenant Phase 4H.1) -- NOT a per-tenant-owner endpoint like every other entry in this registry. \'owner\' here is necessary but NOT sufficient: isSuperAdmin() (auth.js) additionally requires resolveTenantId(account) === DEFAULT_TENANT_ID, so a real future Tenant B\'s own Owner (role owner, currentAllowedRoles-eligible by role alone) still gets 403. Read-only: never mutates tenant_config, never dispatches provision_tenant.py/initial_sync.py -- see .github/workflows/tenant-lifecycle.yml for the actual (human-operated) mutation path.',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'Response is an explicit sanitized allowlist per tenant (status/storageMode/approvedLocationCount/provisioning/initialSync/hasGoogleCredential/eligibility) -- never a raw tenant_config spread, never approvedLocations/locationIdMap/reviewDbBlobKey, never a decrypted credential (getStoredCredential()\'s refreshToken is reduced to a boolean before it reaches the response). See test_tenant_ops_endpoint.js for the full authorization/sanitization/eligibility test suite.',
+    notes: 'Response is an explicit sanitized allowlist per tenant (status/storageMode/approvedLocationCount/provisioning/initialSync/hasGoogleCredential/eligibility) -- never a raw tenant_config spread, never approvedLocations/locationIdMap/reviewDbBlobKey, never a decrypted credential (getStoredCredential()\'s refreshToken is reduced to a boolean before it reaches the response). MOVED (PRYOR OS Vercel Serverless Function Count Reduction) from its own standalone api/tenant-ops/[action].js -- see test_tenant_ops_endpoint.js for the full authorization/sanitization/eligibility test suite.',
   },
   {
-    route: 'GET /api/tenant-entitlements/discover', file: 'api/tenant-entitlements/[action].js', method: 'GET', action: 'discover',
+    route: 'GET /api/admin?action=tenant-entitlements-discover', file: 'api/admin/[action].js', method: 'GET', action: 'tenant-entitlements-discover',
     authRequired: true, currentAllowedRoles: ['owner'],
-    scope: 'CROSS-TENANT platform-operator only (Multi-Tenant Phase 4I.3), same isSuperAdmin() narrowing as /api/tenant-ops -- \'owner\' is necessary but not sufficient; a real tenant\'s own Owner still gets 403. Read-only: discovers a TARGET tenant\'s (tenantId query param, admin-selected, validated against a real tenant_config record before use) currently-visible Google locations via that tenant\'s own stored credential, and returns its current approvedLocations with each entry\'s operational flag.',
+    scope: 'CROSS-TENANT platform-operator only (Multi-Tenant Phase 4I.3), same isSuperAdmin() narrowing as tenant-list above -- \'owner\' is necessary but not sufficient; a real tenant\'s own Owner still gets 403. Read-only: discovers a TARGET tenant\'s (tenantId query param, admin-selected, validated against a real tenant_config record before use) currently-visible Google locations via that tenant\'s own stored credential, and returns its current approvedLocations with each entry\'s operational flag.',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'Never returns locationIdMap, a raw tenant_config spread, or any credential material. See test_tenant_entitlement_change.js for the full authorization/reconciliation/concurrency suite.',
+    notes: 'Never returns locationIdMap, a raw tenant_config spread, or any credential material. MOVED (PRYOR OS Vercel Serverless Function Count Reduction) from its own standalone api/tenant-entitlements/[action].js -- see test_tenant_entitlement_change.js for the full authorization/reconciliation/concurrency suite.',
   },
   {
-    route: 'POST /api/tenant-entitlements/apply', file: 'api/tenant-entitlements/[action].js', method: 'POST', action: 'apply',
+    route: 'POST /api/admin?action=tenant-entitlements-apply', file: 'api/admin/[action].js', method: 'POST', action: 'tenant-entitlements-apply',
     authRequired: true, currentAllowedRoles: ['owner'],
-    scope: 'CROSS-TENANT platform-operator only (Multi-Tenant Phase 4I.3), same isSuperAdmin() narrowing as /api/tenant-ops -- the ONLY supported way to change an already-committed tenant\'s approvedLocations. Requires an exact expectedConfigVersion (CAS); re-verifies every requested addition against a FRESH live discovery at mutation time (never trusts a prior GET); never callable by an ordinary tenant Owner regardless of role.',
+    scope: 'CROSS-TENANT platform-operator only (Multi-Tenant Phase 4I.3), same isSuperAdmin() narrowing as tenant-list above -- the ONLY supported way to change an already-committed tenant\'s approvedLocations. Requires an exact expectedConfigVersion (CAS); re-verifies every requested addition against a FRESH live discovery at mutation time (never trusts a prior GET); never callable by an ordinary tenant Owner regardless of role.',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
-    notes: 'Removal revokes authorization immediately (tenantOwnsLocation() reads approvedLocations live); an added location is stamped operational: false and stays unauthorized until apply_entitlement_change.py\'s data-plane follow-up succeeds. See test_tenant_entitlement_change.js for the full adversarial suite.',
+    notes: 'Removal revokes authorization immediately (tenantOwnsLocation() reads approvedLocations live); an added location is stamped operational: false and stays unauthorized until apply_entitlement_change.py\'s data-plane follow-up succeeds. MOVED (PRYOR OS Vercel Serverless Function Count Reduction) from its own standalone api/tenant-entitlements/[action].js -- see test_tenant_entitlement_change.js for the full adversarial suite.',
   },
   {
-    route: 'GET /api/admin/list-access-codes', file: 'api/admin/[action].js', method: 'GET', action: 'list-access-codes',
+    route: 'GET /api/admin?action=list-access-codes', file: 'api/admin/[action].js', method: 'GET', action: 'list-access-codes',
     authRequired: true, currentAllowedRoles: ['owner'],
-    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as /api/tenant-ops -- \'owner\' here is necessary but NOT sufficient: a real future Tenant B\'s own Owner (role owner, currentAllowedRoles-eligible by role alone) still gets 403. This is a NEW top-level serverless function (the 13th) -- see this file\'s own header comment for the Vercel Hobby-plan/Pro-upgrade pre-push gate this creates.',
+    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as tenant-list above -- \'owner\' here is necessary but NOT sufficient: a real future Tenant B\'s own Owner (role owner, currentAllowedRoles-eligible by role alone) still gets 403. PRYOR OS Vercel Serverless Function Count Reduction: this file now also hosts the former tenant-ops/[action].js and tenant-entitlements/[action].js routes (all three shared the identical isSuperAdmin gate) -- merged specifically to stay under Vercel Hobby\'s 12-function ceiling without a plan upgrade.',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
     notes: 'Never returns the raw access code (it is never persisted -- see accessCodeStore.js). See test_admin_access_codes_endpoint.js for the full authorization/raw-code-exposure/audit-log suite.',
   },
   {
-    route: 'POST /api/admin/create-access-code', file: 'api/admin/[action].js', method: 'POST', action: 'create-access-code',
+    route: 'POST /api/admin?action=create-access-code', file: 'api/admin/[action].js', method: 'POST', action: 'create-access-code',
     authRequired: true, currentAllowedRoles: ['owner'],
-    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as /api/tenant-ops -- not callable by an ordinary tenant Owner regardless of role.',
+    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as tenant-list above -- not callable by an ordinary tenant Owner regardless of role.',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
     notes: 'The raw code is returned in THIS response exactly once, never logged, never persisted -- see test_admin_access_codes_endpoint.js.',
   },
   {
-    route: 'POST /api/admin/revoke-access-code', file: 'api/admin/[action].js', method: 'POST', action: 'revoke-access-code',
+    route: 'POST /api/admin?action=revoke-access-code', file: 'api/admin/[action].js', method: 'POST', action: 'revoke-access-code',
     authRequired: true, currentAllowedRoles: ['owner'],
-    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as /api/tenant-ops.',
+    scope: 'CROSS-TENANT platform-admin only (Multi-Tenant Phase 4Q.1), same isSuperAdmin() narrowing as tenant-list above.',
     unauthorizedShape: 'json', wrongRoleStatus: 403,
     locationMilestone: null,
     notes: 'A revoked code fails closed for every subsequent redemption attempt (accessCodeStore.js\'s redeemAccessCode()) -- see test_admin_access_codes_endpoint.js.',
@@ -990,7 +987,6 @@ async function testNoClaimTrustedPermanentlyFromToken() {
 const HANDLERS = {
   'api/data.js': dataHandler,
   'api/executive-brief.js': executiveBriefHandler,
-  'api/rewrite.js': rewriteHandler,
   'api/session/[action].js': sessionHandler,
   'api/actions/[action].js': actionsHandler,
   'api/google/[action].js': googleHandler,
@@ -998,8 +994,6 @@ const HANDLERS = {
   'api/notifications/[action].js': notificationsHandler,
   'api/tasks/[action].js': tasksHandler,
   'api/content/[action].js': contentHandler,
-  'api/tenant-ops/[action].js': tenantOpsHandler,
-  'api/tenant-entitlements/[action].js': tenantEntitlementsHandler,
   'api/admin/[action].js': adminHandler,
 }
 

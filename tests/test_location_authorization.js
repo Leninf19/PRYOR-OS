@@ -15,7 +15,6 @@
 import bcrypt from 'bcryptjs'
 import googleHandler from '../dashboard/api/google/[action].js'
 import actionsHandler from '../dashboard/api/actions/[action].js'
-import rewriteHandler from '../dashboard/api/rewrite.js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests as setCredentialRedis, setStoredCredential } from '../dashboard/api/_lib/credentialStore.js'
 import { _setRedisClientForTests as setBridgeRedis, _resetRedisClientForTests as resetBridgeRedis, writePublishBridge } from '../dashboard/api/_lib/publishBridgeStore.js'
@@ -207,13 +206,14 @@ async function testDirectApiTamperingWithAForeignLocationIdIsRejected() {
   assert(res.statusCode === 404, `direct API tampering with a foreign location's review id must be rejected (404), got ${res.statusCode}`)
 }
 
-// --- rewrite.js: optional localReviewId gates a scoped caller --------------
+// --- actions/[action].js 'rewrite' (formerly its own standalone
+// rewrite.js): optional localReviewId gates a scoped caller ---------------
 
 async function testRewriteDeniesScopedCallerWithoutLocalReviewId() {
   await seedDirectory()
   process.env.ANTHROPIC_API_KEY = 'fake-key'
   const res = fakeRes()
-  await rewriteHandler({ method: 'POST', body: { tone: 'friendly', reviewText: 'x' }, headers: { cookie: `lta_session=${await lmToken()}` } }, res)
+  await actionsHandler({ method: 'POST', query: { action: 'rewrite' }, body: { tone: 'friendly', reviewText: 'x' }, headers: { cookie: `lta_session=${await lmToken()}` } }, res)
   assert(res.statusCode === 404, `a scoped caller omitting localReviewId must be denied (never treated as company-wide), got ${res.statusCode}`)
 }
 
@@ -223,7 +223,7 @@ async function testRewriteAllowsScopedCallerWithOwnLocationReviewId() {
   _setReviewLocationIndexForTests({ 'r-own': 7 })
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ content: [{ text: 'A generated reply.' }] }) })
   const res = fakeRes()
-  await rewriteHandler({ method: 'POST', body: { tone: 'friendly', reviewText: 'x', localReviewId: 'r-own' }, headers: { cookie: `lta_session=${await lmToken()}` } }, res)
+  await actionsHandler({ method: 'POST', query: { action: 'rewrite' }, body: { tone: 'friendly', reviewText: 'x', localReviewId: 'r-own' }, headers: { cookie: `lta_session=${await lmToken()}` } }, res)
   assert(res.statusCode === 200, `a scoped caller with its own location's localReviewId must be allowed, got ${res.statusCode} (${JSON.stringify(res.body)})`)
 }
 

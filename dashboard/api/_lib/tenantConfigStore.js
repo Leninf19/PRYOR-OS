@@ -831,8 +831,9 @@ export async function markTenantActive(tenantId, { reviewDbEtag, artifactGenerat
 //
 // AUTHORIZATION is NOT this function's job -- exactly like
 // recordLocationApproval() above, this is the data-invariant layer; the
-// caller (dashboard/api/tenant-entitlements/[action].js) is the ONLY place
-// that checks isSuperAdmin() and resolves tenantId from trusted,
+// caller (dashboard/api/admin/[action].js's tenant-entitlements-apply
+// action, formerly its own standalone tenant-entitlements/[action].js
+// route) is the ONLY place that checks isSuperAdmin() and resolves tenantId from trusted,
 // admin-selected server-side context. This function does not, and must
 // not, accept a tenantId from anywhere it could be attacker-influenced --
 // its caller is responsible for that exactly as every other tenant-scoped

@@ -170,9 +170,11 @@ export async function requireAuth(req, res, allowedRoles) {
   return null
 }
 
-// Multi-Tenant Phase 4H.1 -- the authorization boundary for the new
-// cross-tenant tenant-operations status page (dashboard/api/tenant-ops/
-// [action].js). This is DELIBERATELY narrower than a per-tenant 'owner':
+// Multi-Tenant Phase 4H.1 -- the authorization boundary for the
+// cross-tenant tenant-operations status page (dashboard/api/admin/
+// [action].js's tenant-list action, formerly its own standalone
+// tenant-ops/[action].js route before the Vercel Serverless Function
+// Count Reduction merge). This is DELIBERATELY narrower than a per-tenant 'owner':
 // every other role/permission check in this codebase (roleHasPermission(),
 // tenantOwnsLocation(), etc.) is scoped to the CALLER'S OWN tenant, but the
 // tenant-ops page shows OTHER tenants' provisioning/sync state -- a real

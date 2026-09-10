@@ -1,15 +1,20 @@
-// Regression tests for dashboard/api/rewrite.js's isSeriousIssue()/
-// enforceResponsePolicy() -- the live, on-demand mirror of ai_engine.py's
-// classify_response_type()/enforce_response_policy() (see
-// tests/test_response_policy.py's own header for the full root-cause
-// story). Tests the pure policy functions directly (both are named
-// exports specifically for this) rather than the full HTTP handler, since
-// neither touches auth/rate-limit/Anthropic -- see rewrite.js's default
-// export for those, unchanged by this milestone.
+// Regression tests for dashboard/api/_lib/rewriteEngine.js's
+// isSeriousIssue()/enforceResponsePolicy() -- the live, on-demand mirror
+// of ai_engine.py's classify_response_type()/enforce_response_policy()
+// (see tests/test_response_policy.py's own header for the full root-cause
+// story). Originally dashboard/api/rewrite.js (its own standalone route);
+// the pure policy logic moved to this _lib helper when the route itself
+// was merged into actions/[action].js's 'rewrite' action (PRYOR OS Vercel
+// Serverless Function Count Reduction) -- byte-identical logic, only the
+// file location changed. Tests the pure policy functions directly (both
+// are named exports specifically for this) rather than the full HTTP
+// handler, since neither touches auth/rate-limit/Anthropic -- see
+// actions/[action].js's 'rewrite' case for those, unchanged by this
+// milestone.
 //
 // Run directly: node tests/test_rewrite_policy.js
 
-import { isSeriousIssue, enforceResponsePolicy } from '../dashboard/api/rewrite.js'
+import { isSeriousIssue, enforceResponsePolicy } from '../dashboard/api/_lib/rewriteEngine.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)

@@ -136,6 +136,8 @@ const TESTS = [
   'test_multi_user_tenant_e2e.js',
   'test_reviews_date_scope_semantics.js',
   'test_google_sync_freshness.js',
+  // Vercel Serverless Function Count Reduction
+  'test_vercel_function_budget.js',
 ]
 
 const results = {}

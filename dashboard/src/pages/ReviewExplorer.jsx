@@ -93,7 +93,7 @@ function computeTrendAlerts(current, prior) {
 }
 
 async function callRewrite(payload) {
-  const res = await fetch('/api/rewrite', {
+  const res = await fetch('/api/actions/rewrite', {
     method:  'POST',
     headers: { 'content-type': 'application/json' },
     body:    JSON.stringify(payload),

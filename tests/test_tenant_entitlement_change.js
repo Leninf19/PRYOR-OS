@@ -1,7 +1,10 @@
 // Multi-Tenant Phase 4I.3 -- Platform-Controlled Tenant Entitlement Changes.
 //
-// Tests dashboard/api/tenant-entitlements/[action].js (the platform-admin-
-// only mutation endpoint) and tenantConfigStore.js's applyEntitlementChange()/
+// Tests the platform-admin-only mutation actions (tenant-entitlements-discover/
+// tenant-entitlements-apply), originally their own standalone
+// dashboard/api/tenant-entitlements/[action].js route before the Vercel
+// Serverless Function Count Reduction merge into dashboard/api/admin/[action].js,
+// and tenantConfigStore.js's applyEntitlementChange()/
 // markEntitlementChangeCompleted()/markEntitlementChangeFailed() directly.
 // Phase 4I.1/4I.2 already proved a tenant Owner cannot self-service-expand
 // or silently reconnect their way into a wider entitlement; this phase adds
@@ -18,7 +21,7 @@ process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xy
 process.env.CREDENTIAL_ENCRYPTION_KEY = 'test-encryption-key-not-a-real-secret'
 
 import bcrypt from 'bcryptjs'
-import handler from '../dashboard/api/tenant-entitlements/[action].js'
+import handler from '../dashboard/api/admin/[action].js'
 import { signSession, SESSION_COOKIE } from '../dashboard/api/_lib/session.js'
 import { requireLocationAccess, isWildcardGrant } from '../dashboard/api/_lib/auth.js'
 import {
@@ -201,7 +204,7 @@ function mockGoogleFetch(locationsByAccountName) {
 
 async function discover(tokenOrPromise, tenantId) {
   const token = await tokenOrPromise
-  const req = { method: 'GET', query: { action: 'discover', tenantId }, headers: { cookie: `${SESSION_COOKIE}=${token}` } }
+  const req = { method: 'GET', query: { action: 'tenant-entitlements-discover', tenantId }, headers: { cookie: `${SESSION_COOKIE}=${token}` } }
   const res = fakeRes()
   await handler(req, res)
   return res
@@ -209,7 +212,7 @@ async function discover(tokenOrPromise, tenantId) {
 
 async function apply(tokenOrPromise, body) {
   const token = await tokenOrPromise
-  const req = { method: 'POST', query: { action: 'apply' }, body, headers: { cookie: `${SESSION_COOKIE}=${token}` } }
+  const req = { method: 'POST', query: { action: 'tenant-entitlements-apply' }, body, headers: { cookie: `${SESSION_COOKIE}=${token}` } }
   const res = fakeRes()
   await handler(req, res)
   return res
@@ -233,7 +236,7 @@ async function testUnauthenticatedRejected() {
   wireSharedStores()
   const res = await apply(null, { tenantId: TENANT_A, addGoogleLocationIds: [], removeLocationIds: [1], expectedConfigVersion: 1 }).catch(() => null)
   // No cookie at all -- build the request directly to avoid a bad token string.
-  const req = { method: 'POST', query: { action: 'apply' }, body: { tenantId: TENANT_A }, headers: {} }
+  const req = { method: 'POST', query: { action: 'tenant-entitlements-apply' }, body: { tenantId: TENANT_A }, headers: {} }
   const res2 = fakeRes()
   await handler(req, res2)
   assert(res2.statusCode === 401, `expected 401 for an unauthenticated request, got ${res2.statusCode}`)

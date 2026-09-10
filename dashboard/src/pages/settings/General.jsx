@@ -25,7 +25,7 @@ function AIRewriteSection() {
           The tone rewrite buttons in the Customer Experience Center call a serverless function at{' '}
           <code className="text-[10px] px-1.5 py-0.5 rounded"
                 style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)' }}>
-            /api/rewrite
+            /api/actions/rewrite
           </code>.
           The function reads your Anthropic API key from Vercel environment variables — it is NOT
           the same as the GitHub secret. You need to add it separately to Vercel.

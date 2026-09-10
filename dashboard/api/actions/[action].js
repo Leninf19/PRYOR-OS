@@ -35,6 +35,7 @@ import { resolveTenantId } from '../_lib/tenants.js'
 import { getEscalationCcEmails, getReplyToEmail } from '../_lib/reviewEmailConfig.js'
 import { sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildDefaultSubject, buildReviewEmail } from '../_lib/reviewEmailTemplate.js'
+import { generateRewrite } from '../_lib/rewriteEngine.js'
 
 const REPLY_PERMISSIONS = [Permission.REPLY, Permission.REPLY_ASSIGNED]
 
@@ -479,6 +480,37 @@ async function update(req, res) {
   }
 }
 
+// POST /api/actions/rewrite  { tone, reviewText, currentDraft, reviewerName,
+//   location, stars, localReviewId? }
+// Returns { rewritten: string }
+//
+// MOVED (PRYOR OS Vercel Serverless Function Count Reduction) from its own
+// standalone dashboard/api/rewrite.js -- byte-identical authorization
+// (REPLY_PERMISSIONS, the same pair every other action in this file uses)
+// and business logic (relocated verbatim to _lib/rewriteEngine.js), only
+// the dispatch path changed. See rewrite.js's original header comment,
+// preserved in rewriteEngine.js, for why localReviewId is optional
+// (company-wide callers) vs. required (a location-scoped caller, which
+// otherwise gets 404 via resolveLocationIdForReviewOrDeny below, never an
+// insecure default).
+async function rewrite(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  const scope = await requireScopedAuth(req, res, {
+    permission: REPLY_PERMISSIONS,
+    resolveLocationId: async (req, account) => resolveLocationIdForReviewOrDeny(req.body?.localReviewId, account),
+  })
+  if (!scope) return
+  const { account } = scope
+
+  const allowed = await enforceRateLimit(req, res, `rewrite:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
+
+  const result = await generateRewrite(req.body)
+  if (!result.ok) return res.status(result.status).json({ error: result.error })
+  return res.status(200).json({ rewritten: result.rewritten })
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
     case 'list':                 return list(req, res)
@@ -486,6 +518,7 @@ export default async function handler(req, res) {
     case 'preview-review-email':  return previewReviewEmail(req, res)
     case 'send-review-email':     return sendReviewEmailAction(req, res)
     case 'update-email-status':   return updateEmailStatus(req, res)
+    case 'rewrite':               return rewrite(req, res)
     default:                      return res.status(404).json({ error: 'not_found' })
   }
 }

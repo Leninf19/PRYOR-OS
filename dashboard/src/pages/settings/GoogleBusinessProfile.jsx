@@ -426,10 +426,10 @@ function HistoricalImportPanel({ canManage }) {
 //
 // NO mutation control of any kind lives here or anywhere else in this
 // Owner-facing page -- post-commitment entitlement changes are
-// platform-admin-only (Phase 4I.3's dashboard/api/tenant-entitlements/
-// [action].js, isSuperAdmin()-gated), and that endpoint is never called,
-// imported, or even mentioned by path from any ordinary-Owner-facing
-// component. This panel exists so an Owner can always SEE what's
+// platform-admin-only (Phase 4I.3's tenant-entitlements-apply action,
+// merged into dashboard/api/admin/[action].js, isSuperAdmin()-gated), and
+// that action is never called, imported, or even mentioned by path from
+// any ordinary-Owner-facing component. This panel exists so an Owner can always SEE what's
 // currently entitled, with a single explicit line telling them how to
 // request a change, rather than silently offering no visibility at all.
 function ApprovedLocationsPanel() {

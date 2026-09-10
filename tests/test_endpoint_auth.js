@@ -13,7 +13,7 @@ delete process.env.ACCOUNT_DIRECTORY_JSON // unauthenticated by construction
 
 import bcrypt from 'bcryptjs'
 import googleHandler from '../dashboard/api/google/[action].js'
-import rewriteHandler from '../dashboard/api/rewrite.js'
+import actionsHandler from '../dashboard/api/actions/[action].js'
 import executiveBriefHandler from '../dashboard/api/executive-brief.js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests as _setCredentialRedisForTests, _resetRedisClientForTests as _resetCredentialRedisForTests, setStoredCredential } from '../dashboard/api/_lib/credentialStore.js'
@@ -28,6 +28,11 @@ function testConnectionHandler(req, res) { return googleHandler({ ...req, query:
 function triggerSyncHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'trigger-sync' } }, res) }
 function triggerImportHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'trigger-import' } }, res) }
 function disconnectHandler(req, res) { return googleHandler({ ...req, query: { ...req.query, action: 'disconnect' } }, res) }
+// 'rewrite' was merged into actions/[action].js from its own standalone
+// dashboard/api/rewrite.js (PRYOR OS Vercel Serverless Function Count
+// Reduction) -- same wrapper pattern as the google/[action].js wrappers
+// above, routing through req.query.action.
+function rewriteActionHandler(req, res) { return actionsHandler({ ...req, query: { ...req.query, action: 'rewrite' } }, res) }
 
 process.env.CREDENTIAL_ENCRYPTION_KEY = 'test-encryption-key-not-a-real-secret'
 function fakeCredentialRedis(initial = null) {
@@ -73,7 +78,7 @@ async function testAllEndpointsRejectUnauthenticated() {
   await expectUnauthenticated('trigger-sync.js', triggerSyncHandler, 'POST')
   await expectUnauthenticated('trigger-import.js', triggerImportHandler, 'POST', { apply: false })
   await expectUnauthenticated('google/disconnect', disconnectHandler, 'POST', { confirm: 'DISCONNECT' })
-  await expectUnauthenticated('rewrite.js', rewriteHandler, 'POST', { tone: 'friendly' })
+  await expectUnauthenticated('actions/[action].js (rewrite)', rewriteActionHandler, 'POST', { tone: 'friendly' })
   await expectUnauthenticated('executive-brief.js', executiveBriefHandler, 'POST', { totalReviews: 1 })
 }
 
