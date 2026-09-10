@@ -16,7 +16,6 @@
 // self-service onboarding) gets a generated ID; this one is hand-assigned
 // once, here, and never regenerated.
 
-import { randomInt } from 'crypto'
 import { getTenantConfig, TenantConfigStoreUnavailableError } from './tenantConfigStore.js'
 
 export const DEFAULT_TENANT_ID = 't_los-tres-amigos'
@@ -33,43 +32,16 @@ export function isValidTenantId(tenantId) {
   return typeof tenantId === 'string' && /^t_[a-z0-9-]+$/.test(tenantId)
 }
 
-// Phase 4Q -- the self-service-onboarding tenant id generator this file's
-// own header comment anticipated back in Phase 1 ("every tenant created
-// later via self-service onboarding gets a generated ID"). Never called
-// with client input: the caller (the registration/tenant-creation
-// transaction) supplies the company name a REGISTERED, EMAIL-VERIFIED user
-// typed, purely for a human-recognizable prefix -- the actual uniqueness
-// guarantee is the random suffix plus the collision check below, not the
-// slug. Collides astronomically rarely (a 6-character base36 suffix is
-// ~31 bits of entropy); the bounded retry loop exists only as defense in
-// depth, never expected to iterate more than once in practice.
-function slugifyForTenantId(name) {
-  const slug = String(name || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 40)
-  return slug || 'tenant'
-}
-
-function randomTenantSuffix() {
-  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
-  let out = ''
-  for (let i = 0; i < 6; i++) out += alphabet[randomInt(alphabet.length)]
-  return out
-}
-
-export async function generateTenantId(companyName) {
-  const base = `t_${slugifyForTenantId(companyName)}`
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const candidate = `${base}-${randomTenantSuffix()}`
-    if (!isValidTenantId(candidate)) continue // defensive; slugify already guarantees this
-    if (candidate === DEFAULT_TENANT_ID) continue // structurally impossible, checked anyway
-    const existing = await getTenantConfig(candidate)
-    if (existing === null) return candidate
-  }
-  throw new Error('generateTenantId: could not find an unused tenant id after 10 attempts')
-}
+// Phase 4Q's self-service-onboarding tenant id generator (generateTenantId,
+// formerly here) moved to tenantIdGenerator.js -- Vercel Edge Middleware
+// packaging fix. It needed Node's `crypto` module for its random suffix,
+// which cannot be bundled into an Edge Function; this file, in contrast,
+// must stay Edge-safe (dashboard/middleware.js imports it directly, and
+// transitively again through accountStore.js/userStore.js/tenantKeys.js/
+// tenantDualRead.js). generateTenantId() is exclusively a server-side
+// concern (session/[action].js's self-service registration flow, which
+// runs as a Node function, never at the Edge), so splitting it out changes
+// nothing about its behavior -- see tenantIdGenerator.js's header.
 
 export function isValidTenant(tenant) {
   return (
