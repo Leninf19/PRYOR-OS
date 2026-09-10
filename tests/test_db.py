@@ -498,6 +498,162 @@ def test_fresh_database_never_has_the_old_constraint_to_begin_with():
 
 
 # ---------------------------------------------------------------------------
+# Real production incident (2026-09-10): _drop_locations_name_unique_
+# constraint() crashed with sqlite3.IntegrityError ("FOREIGN KEY constraint
+# failed") the first time it ran against a real, long-lived database -- one
+# where `reviews`/`scraper_run_locations`/`validation_flags`/
+# `notifications_log` actually have rows referencing `locations`.
+#
+# WHY THE ABOVE TESTS (test_old_schema_migration_preserves_ids_and_data,
+# test_migration_is_idempotent) NEVER CAUGHT THIS: both of them build a
+# synthetic "old schema" locations table but insert ONLY into `locations`
+# itself -- never into any of its four dependent tables. The prior buggy
+# implementation renamed `locations` away, which silently rewrote every
+# dependent table's stored FK clause to reference the renamed table; SQLite
+# only enforces that as a live constraint violation on DROP TABLE when a
+# dependent table has actual referencing ROWS (proven empirically: the
+# identical DROP succeeds with zero rows, even with foreign_keys=ON) -- so a
+# locations-only fixture could never trigger it, regardless of how many
+# migration tests existed. These new tests seed real rows into all four
+# dependent tables specifically to close that gap.
+# ---------------------------------------------------------------------------
+
+def _build_legacy_db_with_dependents(db_path):
+    """Old-schema locations (inline UNIQUE on name) plus real referencing
+    rows in every table that has a foreign key into locations -- the exact
+    shape the fixed migration must handle."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(
+        "CREATE TABLE locations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, "
+        "city TEXT, brand TEXT, search_query TEXT, is_active INTEGER NOT NULL DEFAULT 1, "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+    )
+    conn.execute(
+        "CREATE TABLE reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, location_id INTEGER NOT NULL REFERENCES locations(id), "
+        "canonical_review_id TEXT, dedup_key TEXT NOT NULL UNIQUE, reviewer_name TEXT, review_date TEXT, "
+        "star_rating INTEGER, review_text TEXT, owner_response TEXT, review_url TEXT, "
+        "first_seen_at TEXT NOT NULL DEFAULT (datetime('now')), last_seen_at TEXT, missing_since TEXT, "
+        "is_deleted INTEGER NOT NULL DEFAULT 0, deleted_detected_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE scraper_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, "
+        "finished_at TEXT, mode TEXT, status TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE scraper_run_locations (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "run_id INTEGER NOT NULL REFERENCES scraper_runs(id), location_id INTEGER NOT NULL REFERENCES locations(id), "
+        "status TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE validation_flags (id INTEGER PRIMARY KEY AUTOINCREMENT, review_id INTEGER REFERENCES reviews(id), "
+        "location_id INTEGER REFERENCES locations(id), flag_type TEXT NOT NULL, detected_at TEXT NOT NULL DEFAULT (datetime('now')), "
+        "resolved_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE notifications_log (id INTEGER PRIMARY KEY AUTOINCREMENT, sent_at TEXT NOT NULL DEFAULT (datetime('now')), "
+        "notification_type TEXT NOT NULL, related_review_id INTEGER REFERENCES reviews(id), "
+        "related_location_id INTEGER REFERENCES locations(id))"
+    )
+    conn.execute("INSERT INTO locations (id, name, city, brand) VALUES (1, 'Los Tres Amigos - Downtown', 'Testtown', 'Los Tres Amigos')")
+    conn.execute("INSERT INTO locations (id, name, city, brand) VALUES (2, 'Los Tres Amigos - Uptown', 'Testtown', 'Los Tres Amigos')")
+    conn.execute("INSERT INTO reviews (id, location_id, dedup_key, reviewer_name, star_rating) VALUES (1, 1, 'k1', 'Alice', 5)")
+    conn.execute("INSERT INTO reviews (id, location_id, dedup_key, reviewer_name, star_rating) VALUES (2, 2, 'k2', 'Bob', 4)")
+    conn.execute("INSERT INTO scraper_runs (id, started_at, mode) VALUES (1, '2026-01-01T00:00:00', 'api_sync')")
+    conn.execute("INSERT INTO scraper_run_locations (id, run_id, location_id, status) VALUES (1, 1, 1, 'success')")
+    conn.execute("INSERT INTO validation_flags (id, review_id, location_id, flag_type) VALUES (1, 1, 1, 'test_flag')")
+    conn.execute("INSERT INTO notifications_log (id, notification_type, related_review_id, related_location_id) VALUES (1, 'test', 1, 1)")
+    conn.commit()
+    conn.close()
+
+
+def test_migration_with_dependent_fk_rows_does_not_crash():
+    tmpdir = tempfile.mkdtemp(prefix="test_db_migration_fk_")
+    db_path = Path(tmpdir) / "reviews.db"
+    _build_legacy_db_with_dependents(db_path)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    db.init_schema(conn)  # must not raise sqlite3.IntegrityError
+
+    # IDs preserved exactly.
+    loc_ids = [r["id"] for r in conn.execute("SELECT id FROM locations ORDER BY id").fetchall()]
+    assert loc_ids == [1, 2], f"expected location ids [1, 2] preserved, got {loc_ids}"
+
+    # Dependent rows preserved (all four tables).
+    assert conn.execute("SELECT COUNT(*) c FROM reviews").fetchone()["c"] == 2
+    assert conn.execute("SELECT COUNT(*) c FROM scraper_run_locations").fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) c FROM validation_flags").fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) c FROM notifications_log").fetchone()["c"] == 1
+
+    # The FK relationship still actually works -- a join resolves correctly,
+    # proving reviews.location_id still points at the real `locations` table
+    # (not a renamed/dangling one).
+    joined = conn.execute(
+        "SELECT r.id, l.name FROM reviews r JOIN locations l ON l.id = r.location_id ORDER BY r.id"
+    ).fetchall()
+    assert [dict(row) for row in joined] == [
+        {"id": 1, "name": "Los Tres Amigos - Downtown"},
+        {"id": 2, "name": "Los Tres Amigos - Uptown"},
+    ], joined
+
+    # Obsolete uniqueness constraint actually removed.
+    assert db._column_level_unique_index_name(conn, "locations", "name") is None
+
+    # Authoritative proof of referential integrity, not just "didn't crash".
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    assert violations == [], f"expected zero foreign_key_check violations, got {violations}"
+    integrity = [tuple(r) for r in conn.execute("PRAGMA integrity_check").fetchall()]
+    assert integrity == [("ok",)], f"expected integrity_check ok, got {integrity}"
+
+
+def test_migration_with_dependent_fk_rows_is_idempotent():
+    tmpdir = tempfile.mkdtemp(prefix="test_db_migration_fk_idempotent_")
+    db_path = Path(tmpdir) / "reviews.db"
+    _build_legacy_db_with_dependents(db_path)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    db.init_schema(conn)  # first pass
+    first = [dict(r) for r in conn.execute("SELECT * FROM locations ORDER BY id").fetchall()]
+
+    db.init_schema(conn)  # second pass -- must be a pure no-op, not a second rebuild
+    db.init_schema(conn)  # third, for good measure
+    second = [dict(r) for r in conn.execute("SELECT * FROM locations ORDER BY id").fetchall()]
+
+    assert first == second, "re-running the migration against already-migrated data with dependent rows must never change it"
+    assert conn.execute("SELECT COUNT(*) c FROM reviews").fetchone()["c"] == 2
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    assert violations == [], f"expected zero foreign_key_check violations after repeated runs, got {violations}"
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+
+
+def test_migration_preserves_later_alter_table_columns():
+    """The rebuild must run AFTER, and preserve the columns added by, every
+    ALTER TABLE ADD COLUMN in _migrate_schema() -- a tenant-aware production
+    database (maps_url, gbp_*, contact_* columns) must not lose them."""
+    tmpdir = tempfile.mkdtemp(prefix="test_db_migration_columns_")
+    db_path = Path(tmpdir) / "reviews.db"
+    _build_legacy_db_with_dependents(db_path)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    db.init_schema(conn)
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(locations)").fetchall()}
+    expected = {"maps_url", "gbp_account_name", "gbp_location_name", "gbp_verification_status",
+                "gbp_last_synced_at", "contact_email", "contact_name", "contact_active"}
+    missing = expected - cols
+    assert not missing, f"columns added by earlier ALTER TABLE migrations must survive the rebuild, missing: {missing}"
+
+    row = conn.execute("SELECT contact_active FROM locations WHERE id = 1").fetchone()
+    assert row["contact_active"] == 1, "DEFAULT values on migrated ALTER TABLE columns must still apply correctly"
+
+
+# ---------------------------------------------------------------------------
 # db.canonical_location_slugs() -- the collision-safe disambiguation itself.
 # ---------------------------------------------------------------------------
 
@@ -542,6 +698,9 @@ def main():
         ("Phase 4P: old-schema migration preserves ids and data", test_old_schema_migration_preserves_ids_and_data),
         ("Phase 4P: migration is idempotent", test_migration_is_idempotent),
         ("Phase 4P: a fresh database never has the old constraint", test_fresh_database_never_has_the_old_constraint_to_begin_with),
+        ("2026-09-10 incident: migration with dependent FK rows does not crash", test_migration_with_dependent_fk_rows_does_not_crash),
+        ("2026-09-10 incident: migration with dependent FK rows is idempotent", test_migration_with_dependent_fk_rows_is_idempotent),
+        ("2026-09-10 incident: migration preserves later ALTER TABLE columns", test_migration_preserves_later_alter_table_columns),
         ("Phase 4P: canonical slugs are clean when unique", test_canonical_slugs_are_clean_when_unique),
         ("Phase 4P: canonical slugs disambiguate with stable locationId", test_canonical_slugs_disambiguate_duplicates_with_stable_location_id),
         ("Phase 4P: canonical slugs use no array position/random suffix", test_canonical_slugs_never_use_array_position_or_random_suffix),

@@ -328,7 +328,7 @@ def _column_level_unique_index_name(conn: sqlite3.Connection, table: str, column
 
 
 def _drop_locations_name_unique_constraint(conn: sqlite3.Connection) -> None:
-    """Multi-Tenant Phase 4P: removes the legacy column-level
+    """Multi-Tenant Phase 4P (hardened): removes the legacy column-level
     `UNIQUE` constraint on locations.name from an EXISTING database --
     see the SCHEMA comment above for why it must not exist at all going
     forward. SQLite has no `ALTER TABLE ... DROP CONSTRAINT`, so this uses
@@ -339,21 +339,70 @@ def _drop_locations_name_unique_constraint(conn: sqlite3.Connection) -> None:
     across by explicit column list (so `id` -- and therefore every
     reviews.location_id / scraper_run_locations.location_id /
     validation_flags.location_id / notifications_log.related_location_id
-    foreign-key reference -- is preserved EXACTLY, never renumbered), drop
-    the old table, rename. Runs inside init_schema()'s own transaction
-    (committed once, in _migrate_schema()'s caller), so a crash mid-
-    migration leaves the ORIGINAL table completely intact, never a
-    half-renamed/half-copied state.
+    foreign-key reference -- is preserved EXACTLY, never renumbered).
+
+    PRIOR IMPLEMENTATION BUG (found against real production-shaped data,
+    not caught by any prior test -- see the regression suite for the
+    reproduction): renaming the OLD table to a temporary name FIRST, then
+    creating the new `locations` under the real name, triggers SQLite's
+    automatic FK-clause rewrite -- ANY other table whose schema text says
+    `REFERENCES locations(...)` gets silently rewritten by SQLite itself
+    to say `REFERENCES locations__pre_name_unique_migration(...)` the
+    moment the rename happens. The final `DROP TABLE
+    locations__pre_name_unique_migration` then fails with
+    sqlite3.IntegrityError whenever any of those referencing tables
+    (reviews, scraper_run_locations, validation_flags, notifications_log)
+    has real rows, since SQLite enforces DROP TABLE as an implicit
+    row-by-row DELETE under `foreign_keys=ON`. Small/fresh test fixtures
+    never had real referencing rows, which is exactly why this was never
+    caught before shipping.  Confirmed empirically: after the crash the
+    connection is left with an EMPTY `locations` table, the ORIGINAL data
+    still sitting in the never-dropped `locations__pre_name_unique_migration`
+    table, and every dependent table's FK clause silently repointed at
+    that renamed table -- this function's prior docstring claimed a crash
+    here left the original table "completely intact"; that claim was
+    WRONG (DDL statements auto-commit independently of the implicit
+    transaction Python's sqlite3 module opens before the DML INSERT, so
+    the rename/create survive even though the insert itself gets rolled
+    back on close).
+
+    THE FIX: never rename the table that other tables' FK clauses
+    currently reference. Build the corrected table under a throwaway name
+    that nothing references yet, copy the data across, drop the OLD table
+    by its REAL name (`locations` -- never renamed, so nothing needed
+    rewriting), then rename the NEW table into the real `locations` name
+    last. Every other table's FK clause text never changes (it always
+    said `REFERENCES locations(id)` and still does -- SQLite resolves FK
+    references by name at enforcement time, not by a stored table
+    identity), so there is nothing left for the auto-rewrite mechanism to
+    touch. Dropping the old table while foreign key rows still point at
+    it requires `PRAGMA foreign_keys = OFF` for the duration of the
+    rebuild (SQLite's own documented 12-step "how to alter a table"
+    procedure for exactly this situation) -- this pragma is a no-op if
+    issued inside a transaction, so it is set OFF before BEGIN and back ON
+    after COMMIT, never in between. The whole rebuild runs inside one
+    explicit transaction (conn.execute('BEGIN') / conn.commit() /
+    conn.rollback(), not reliant on Python's implicit-transaction
+    heuristics) so ANY failure anywhere in the sequence -- including a
+    failed PRAGMA foreign_key_check -- rolls back EVERYTHING, leaving the
+    original `locations` table, under its original name with its original
+    constraint, completely untouched and safe to retry on the next run.
+    PRAGMA foreign_key_check is run immediately before COMMIT as the
+    authoritative proof the rebuild left zero dangling references, and its
+    result is asserted, not merely logged -- a violation here must abort
+    the migration exactly like any other failure, never be silently
+    committed.
 
     Idempotent: a table that has already been migrated (or a brand-new
     table created fresh from the corrected SCHEMA string, which never had
     the constraint to begin with) is detected via
-    _column_level_unique_index_name() and this is a pure no-op. Never
-    invoked against, and carries no special-case exclusion for, any
-    specific tenant -- it is exactly as safe to run against Los Tres
-    Amigos's own storage as any other, since it only ever WIDENS what
-    `name` may hold; this function simply is not called against LTA's
-    production file by anything in this change."""
+    _column_level_unique_index_name() and this is a pure no-op -- checked
+    again after acquiring the transaction is unnecessary since nothing
+    else can concurrently alter this single-process, single-connection
+    pipeline's schema between the check and the BEGIN. Never invoked
+    against, and carries no special-case exclusion for, any specific
+    tenant -- it is exactly as safe to run against Los Tres Amigos's own
+    storage as any other, since it only ever WIDENS what `name` may hold."""
     if _column_level_unique_index_name(conn, "locations", "name") is None:
         return
 
@@ -382,13 +431,40 @@ def _drop_locations_name_unique_constraint(conn: sqlite3.Connection) -> None:
         col_defs.append(" ".join(parts))
     column_list = ", ".join(col_names)
 
-    conn.execute("ALTER TABLE locations RENAME TO locations__pre_name_unique_migration")
-    conn.execute(f"CREATE TABLE locations ({', '.join(col_defs)})")
-    conn.execute(
-        f"INSERT INTO locations ({column_list}) "
-        f"SELECT {column_list} FROM locations__pre_name_unique_migration"
-    )
-    conn.execute("DROP TABLE locations__pre_name_unique_migration")
+    # Must be issued OUTSIDE any transaction -- SQLite silently no-ops this
+    # pragma if a transaction is already open. Nothing before this point in
+    # _migrate_schema() opens one (the ALTER TABLE ADD COLUMN loop above is
+    # pure DDL, which Python's sqlite3 legacy transaction handling never
+    # auto-wraps), so this is always the first statement of its kind here.
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute(f"CREATE TABLE locations__rebuilt ({', '.join(col_defs)})")
+        conn.execute(
+            f"INSERT INTO locations__rebuilt ({column_list}) "
+            f"SELECT {column_list} FROM locations"
+        )
+        # Dropping the OLD table under its REAL, never-renamed name --
+        # every other table's FK clause still says `REFERENCES
+        # locations(id)` and stays untouched by this statement.
+        conn.execute("DROP TABLE locations")
+        # Renaming the NEW table into place LAST: nothing references
+        # `locations__rebuilt` by name, so this rename has nothing to
+        # trigger SQLite's referencing-schema rewrite on.
+        conn.execute("ALTER TABLE locations__rebuilt RENAME TO locations")
+
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise sqlite3.IntegrityError(
+                f"_drop_locations_name_unique_constraint: post-rebuild foreign_key_check "
+                f"found {len(violations)} violation(s), refusing to commit: {violations!r}"
+            )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _migrate_schema(conn: sqlite3.Connection):
