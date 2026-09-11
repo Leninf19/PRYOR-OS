@@ -352,6 +352,43 @@ async function accountAuditSelf(req, res) {
   const canonicalTenantId = DEFAULT_TENANT_ID
   const tenantMismatchConfirmed = account.tenantId !== canonicalTenantId
 
+  // Per-source comparison (extension: "compare Advertising's two records").
+  // The best available Redis record for comparison purposes -- same
+  // precedence as winningRecord, just named for clarity here. A static
+  // account record has no `tenantId` field of its own (accounts.js never
+  // stores one -- resolveTenantId() derives DEFAULT_TENANT_ID for it via
+  // the legacy membership path), so it's reported here as DEFAULT_TENANT_ID
+  // explicitly, matching what it actually resolves to, never `undefined`.
+  const redisRecordForComparison = indexedRecord ?? bootstrapRecordById ?? bootstrapRecordByEmail
+  const redisRecord = redisRecordForComparison ? {
+    accountId: redisRecordForComparison.userId,
+    tenantId: redisRecordForComparison.tenantId ?? null,
+    role: redisRecordForComparison.role,
+    locationIds: redisRecordForComparison.locationIds,
+    disabled: Boolean(redisRecordForComparison.disabled),
+    sessionVersion: redisRecordForComparison.sessionVersion ?? null,
+    createdAt: redisRecordForComparison.createdAt ?? null,
+    updatedAt: redisRecordForComparison.updatedAt ?? null,
+  } : null
+  const staticRecordSafe = staticRecord ? {
+    accountId: staticRecord.userId,
+    tenantId: DEFAULT_TENANT_ID,
+    role: staticRecord.role,
+    locationIds: staticRecord.locationIds,
+    disabled: Boolean(staticRecord.disabled),
+    sessionVersion: staticRecord.sessionVersion ?? null,
+  } : null
+
+  const sameSourceComparison = {
+    sameAccountId: Boolean(redisRecord && staticRecordSafe && redisRecord.accountId === staticRecordSafe.accountId),
+    sameTenantId: Boolean(redisRecord && staticRecordSafe && redisRecord.tenantId === staticRecordSafe.tenantId),
+    sameRole: Boolean(redisRecord && staticRecordSafe && redisRecord.role === staticRecordSafe.role),
+    sameLocationIds: Boolean(redisRecord && staticRecordSafe && JSON.stringify(redisRecord.locationIds) === JSON.stringify(staticRecordSafe.locationIds)),
+    sameDisabledState: Boolean(redisRecord && staticRecordSafe && redisRecord.disabled === staticRecordSafe.disabled),
+    redisHasPasswordCredential: Boolean(redisRecordForComparison?.passwordHash),
+    staticHasPasswordCredential: Boolean(staticRecord?.passwordHash),
+  }
+
   return res.status(200).json({
     email,
     accountId: userId,
@@ -364,6 +401,9 @@ async function accountAuditSelf(req, res) {
     redisAccountExists,
     staticAccountExists,
     duplicateAccountCount,
+    redisRecord,
+    staticRecord: staticRecordSafe,
+    ...sameSourceComparison,
     separateMembershipExists,
     membershipTenantId,
     staleInviteExists,

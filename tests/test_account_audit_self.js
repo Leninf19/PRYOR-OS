@@ -160,6 +160,18 @@ async function testStaticAndRedisCollisionDetectedAsDuplicate() {
   assert(res.body.staticAccountExists === true, 'staticAccountExists must be true -- both sources genuinely have this email')
   assert(res.body.duplicateAccountCount === 2, `expected duplicateAccountCount 2 (two distinct userIds for the same email), got ${res.body.duplicateAccountCount}`)
   assert(res.body.repairAssessment.tenantIdOnlyRepairLikely === false, 'a genuine duplicate must never be assessed as a simple tenantId-only repair')
+
+  // Per-source comparison fields (Advertising vs. Martin control scenario).
+  assert(res.body.redisRecord.accountId === 'usr_redis_side', 'redisRecord.accountId must be the Redis-side userId')
+  assert(res.body.staticRecord.accountId === 'usr_static_side', 'staticRecord.accountId must be the static-side userId')
+  assert(res.body.staticRecord.tenantId === DEFAULT_TENANT_ID, 'a static record must always report DEFAULT_TENANT_ID -- it has no tenantId field of its own')
+  assert(res.body.sameAccountId === false, 'the two records have deliberately different userIds')
+  assert(res.body.sameRole === true, 'both records were given role owner')
+  assert(res.body.sameLocationIds === true, "both records were given locationIds '*'")
+  assert(typeof res.body.redisHasPasswordCredential === 'boolean', 'redisHasPasswordCredential must be a boolean')
+  assert(typeof res.body.staticHasPasswordCredential === 'boolean', 'staticHasPasswordCredential must be a boolean')
+  assert(res.body.redisHasPasswordCredential === true, 'the Redis record does carry a passwordHash')
+  assert(res.body.staticHasPasswordCredential === true, 'the static record does carry a passwordHash')
 }
 
 async function testExtraQueryParametersHaveNoEffect() {
@@ -207,6 +219,9 @@ async function testResponseContainsNoSecretFields() {
   const allowedKeys = new Set([
     'email', 'accountId', 'tenantId', 'role', 'locationIds', 'disabled', 'sessionVersion',
     'authoritativeSource', 'redisAccountExists', 'staticAccountExists', 'duplicateAccountCount',
+    'redisRecord', 'staticRecord',
+    'sameAccountId', 'sameTenantId', 'sameRole', 'sameLocationIds', 'sameDisabledState',
+    'redisHasPasswordCredential', 'staticHasPasswordCredential',
     'separateMembershipExists', 'membershipTenantId', 'staleInviteExists', 'runtimeLookupWinner',
     'repairAssessment',
   ])
