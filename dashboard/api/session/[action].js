@@ -10,14 +10,15 @@
 // file layout changed, not the API.
 
 import { setCookie, clearCookie, parseCookies } from '../google/_lib/cookies.js'
-import { getAccountById, getAccountByEmail, listAccounts, getStaticAccountByEmail } from '../_lib/accountStore.js'
+import { getAccountById, getAccountByEmail, listAccounts, getStaticAccountByEmail, getAccountByIdForTenant } from '../_lib/accountStore.js'
 import { verifyPassword, hashPassword, validatePasswordStrength } from '../_lib/password.js'
 import { requireAuth } from '../_lib/auth.js'
 import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import {
   touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError, lookupTenantIdForUserId,
-  getUserById, getUserByEmail, deriveUserStatus,
+  getUserById, getUserByEmail, deriveUserStatus, lookupIdentityByEmail,
+  _removeUserRecordForOneTimeMigration, _removeIdentityIndexEntriesForOneTimeMigration,
 } from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
 import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
@@ -510,6 +511,243 @@ async function accountRepairAdvertisingTenantOnce(req, res) {
     newTenantId: updated?.tenantId ?? DEFAULT_TENANT_ID,
     newSessionVersion: updated?.sessionVersion ?? REPAIR_NEW_SESSION_VERSION,
     message: 'Tenant repaired. Your session is now stale -- please log in again.',
+  })
+}
+
+// TEMPORARY, ONE-TIME, SINGLE-ACCOUNT STORAGE MIGRATION -- "Implement the
+// complete one-time Advertising storage migration" investigation closure.
+// POST /api/session/account-migrate-advertising-storage-once. Follows
+// account-repair-advertising-tenant-once above (which already fixed the
+// account's own tenantId field): that repair left the record PHYSICALLY
+// stored inside the pilot tenant's own Redis hash
+// (usersKeyV2('t_los-tres-amigos-pilot')), invisible to every tenant-scoped
+// admin lookup/listing for t_los-tres-amigos (getAccountByIdForTenant,
+// listUsers) since neither consults the global identity index. This
+// migrates the record itself: write an exact canonical copy into LTA's
+// LEGACY storage (users:v1/users_email_index:v1), verify it by reading it
+// back, then delete the stale pilot-tenant record and both now-obsolete
+// global identity-index entries (LEGACY tenants never carry index entries
+// at all -- see userStore.js's upsertUser -- so these are removed, never
+// repointed). Every targeting value below is a HARDCODED CONSTANT; the
+// endpoint accepts no request parameters and cannot be pointed at any other
+// account or location. Safely re-invocable: a repeat call after a completed
+// migration detects the already-migrated canonical shape and re-runs only
+// the (naturally idempotent, hdel-based) cleanup step rather than
+// re-writing or erroring -- this also covers resuming after a failure that
+// happened between the canonical write and the source cleanup. There is no
+// Redis MULTI/transaction primitive anywhere in this codebase's
+// @upstash/redis usage, so this cannot be made atomic -- strict ordering is
+// the safety mechanism instead: the canonical write and its read-back
+// verification both complete BEFORE any source data is touched, and any
+// failure before that point leaves the source completely untouched. Remove
+// once this investigation concludes, alongside the audit/repair actions
+// above.
+const MIGRATE_TARGET_EMAIL = 'advertising@l3amigos.com'
+const MIGRATE_EXPECTED_ACCOUNT_ID = 'usr_7a7db167-e1a9-48e0-abb0-1fe62dfa1c7d'
+const MIGRATE_SOURCE_TENANT_ID = 't_los-tres-amigos-pilot'
+const MIGRATE_EXPECTED_ROLE = 'owner'
+const MIGRATE_EXPECTED_LOCATION_IDS = '*'
+const MIGRATE_EXPECTED_DISABLED = false
+const MIGRATE_EXPECTED_SESSION_VERSION = 6
+const MIGRATE_NEW_SESSION_VERSION = 7
+
+function migrateFieldsMatch(record, { tenantId, sessionVersion }) {
+  return Boolean(
+    record &&
+    record.email === MIGRATE_TARGET_EMAIL &&
+    record.userId === MIGRATE_EXPECTED_ACCOUNT_ID &&
+    record.tenantId === tenantId &&
+    record.role === MIGRATE_EXPECTED_ROLE &&
+    JSON.stringify(record.locationIds) === JSON.stringify(MIGRATE_EXPECTED_LOCATION_IDS) &&
+    Boolean(record.disabled) === MIGRATE_EXPECTED_DISABLED &&
+    record.sessionVersion === sessionVersion
+  )
+}
+
+async function accountMigrateAdvertisingStorageOnce(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `session:account-migrate-advertising-storage-once:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
+  if (!allowed) return
+
+  // Self-only, hardcoded target -- any caller other than exactly this
+  // account gets 403, no matter what.
+  if (account.email !== MIGRATE_TARGET_EMAIL || account.userId !== MIGRATE_EXPECTED_ACCOUNT_ID) {
+    return res.status(403).json({ error: 'forbidden', message: 'This one-time migration action is scoped to a single account.' })
+  }
+
+  let canonicalById, canonicalByEmail
+  try {
+    canonicalById = await getUserById(DEFAULT_TENANT_ID, MIGRATE_EXPECTED_ACCOUNT_ID)
+    canonicalByEmail = await getUserByEmail(DEFAULT_TENANT_ID, MIGRATE_TARGET_EMAIL)
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError) {
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not verify the account records. Please try again shortly.' })
+    }
+    throw err
+  }
+
+  // Idempotent-resume / partial-state detection: the canonical record
+  // already exists and is EXACTLY the fully-migrated shape (never a
+  // partial/differing record) -- treat this as "migration already written,
+  // only cleanup remains" rather than erroring or re-writing.
+  const canonicalAlreadyComplete = Boolean(
+    migrateFieldsMatch(canonicalById, { tenantId: DEFAULT_TENANT_ID, sessionVersion: MIGRATE_NEW_SESSION_VERSION }) &&
+    canonicalByEmail?.userId === MIGRATE_EXPECTED_ACCOUNT_ID
+  )
+
+  if (canonicalById && !canonicalAlreadyComplete) {
+    // A record exists at the target identity but does not match the exact
+    // intended shape -- a genuine conflict, not a resumable migration.
+    return res.status(409).json({ error: 'target_collision', message: 'A conflicting account record already exists at the destination -- no change was made.' })
+  }
+  if (canonicalByEmail && canonicalByEmail.userId !== MIGRATE_EXPECTED_ACCOUNT_ID) {
+    return res.status(409).json({ error: 'target_collision', message: 'A conflicting account record already exists at the destination -- no change was made.' })
+  }
+
+  if (!canonicalAlreadyComplete) {
+    // Clean-start path: re-verify every source precondition against a fresh
+    // read, never the caller's own (possibly stale) session claims.
+    let source
+    try {
+      source = await getUserById(MIGRATE_SOURCE_TENANT_ID, MIGRATE_EXPECTED_ACCOUNT_ID)
+    } catch (err) {
+      if (err instanceof UserStoreUnavailableError) {
+        return res.status(503).json({ error: 'service_unavailable', message: 'Could not verify the source account record. Please try again shortly.' })
+      }
+      throw err
+    }
+
+    const sourceMatches = migrateFieldsMatch(source, { tenantId: DEFAULT_TENANT_ID, sessionVersion: MIGRATE_EXPECTED_SESSION_VERSION })
+    if (!sourceMatches) {
+      return res.status(409).json({ error: 'precondition_failed', message: 'The source account record no longer matches the expected pre-migration state -- no change was made.' })
+    }
+
+    let sourceByEmail, indexedTenantId, indexedByEmail
+    try {
+      sourceByEmail = await getUserByEmail(MIGRATE_SOURCE_TENANT_ID, MIGRATE_TARGET_EMAIL)
+      indexedTenantId = await lookupTenantIdForUserId(MIGRATE_EXPECTED_ACCOUNT_ID)
+      indexedByEmail = await lookupIdentityByEmail(MIGRATE_TARGET_EMAIL)
+    } catch (err) {
+      if (err instanceof UserStoreUnavailableError) {
+        return res.status(503).json({ error: 'service_unavailable', message: 'Could not verify the source routing records. Please try again shortly.' })
+      }
+      throw err
+    }
+
+    const sourceIndexesMatch = Boolean(
+      sourceByEmail?.userId === MIGRATE_EXPECTED_ACCOUNT_ID &&
+      indexedTenantId === MIGRATE_SOURCE_TENANT_ID &&
+      indexedByEmail?.tenantId === MIGRATE_SOURCE_TENANT_ID &&
+      indexedByEmail?.userId === MIGRATE_EXPECTED_ACCOUNT_ID
+    )
+    if (!sourceIndexesMatch) {
+      return res.status(409).json({ error: 'precondition_failed', message: 'The source routing records no longer match the expected pre-migration state -- no change was made.' })
+    }
+
+    // Construct the canonical record: an exact copy of the source except the
+    // two fields this migration is explicitly authorized to change.
+    const canonicalRecord = {
+      ...source,
+      tenantId: DEFAULT_TENANT_ID,
+      sessionVersion: MIGRATE_NEW_SESSION_VERSION,
+      updatedAt: new Date().toISOString(),
+    }
+
+    let written
+    try {
+      written = await upsertUser(DEFAULT_TENANT_ID, canonicalRecord)
+    } catch (err) {
+      if (err instanceof UserStoreUnavailableError) {
+        return res.status(503).json({ error: 'service_unavailable', message: 'Could not write the canonical account record. The source record was not modified. Please try again shortly.' })
+      }
+      throw err
+    }
+
+    // Read back BOTH the id-keyed and email-keyed paths and strictly compare
+    // every field against the intended canonical shape BEFORE touching the
+    // source at all -- a failure here stops with the source fully intact.
+    let verifyById, verifyByEmail
+    try {
+      verifyById = await getUserById(DEFAULT_TENANT_ID, MIGRATE_EXPECTED_ACCOUNT_ID)
+      verifyByEmail = await getUserByEmail(DEFAULT_TENANT_ID, MIGRATE_TARGET_EMAIL)
+    } catch (err) {
+      if (err instanceof UserStoreUnavailableError) {
+        return res.status(503).json({ error: 'service_unavailable', message: 'Canonical write succeeded but could not be verified. The source record was not modified -- please retry.' })
+      }
+      throw err
+    }
+
+    const readBackVerified = Boolean(
+      written &&
+      migrateFieldsMatch(verifyById, { tenantId: DEFAULT_TENANT_ID, sessionVersion: MIGRATE_NEW_SESSION_VERSION }) &&
+      verifyByEmail?.userId === MIGRATE_EXPECTED_ACCOUNT_ID &&
+      Boolean(verifyById.passwordHash) === Boolean(source.passwordHash)
+    )
+    if (!readBackVerified) {
+      return res.status(500).json({
+        error: 'verification_failed',
+        message: 'The canonical record was written but failed read-back verification. The source record was NOT deleted. Please report this before retrying.',
+      })
+    }
+  }
+
+  // Only reached once a verified canonical record is confirmed to exist
+  // (either just-written-and-verified above, or already complete from a
+  // prior run) -- safe to remove the stale source data. Both deletes are
+  // hdel-based and naturally idempotent (a no-op if already gone), so this
+  // whole block is safe to repeat.
+  try {
+    await _removeUserRecordForOneTimeMigration(MIGRATE_SOURCE_TENANT_ID, MIGRATE_EXPECTED_ACCOUNT_ID, MIGRATE_TARGET_EMAIL)
+    await _removeIdentityIndexEntriesForOneTimeMigration(MIGRATE_EXPECTED_ACCOUNT_ID, MIGRATE_TARGET_EMAIL)
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError) {
+      return res.status(500).json({
+        error: 'cleanup_failed',
+        message: 'The canonical record is verified and in place, but the stale source records could not be removed. Safe to retry -- the canonical write is already complete, so only cleanup will be re-attempted.',
+      })
+    }
+    throw err
+  }
+
+  // Final server-side resolution checks -- the same lookups production's
+  // own login/admin code paths use, proving the migration is actually
+  // effective rather than just "the writes didn't throw."
+  const [finalByEmail, finalById, finalForTenant, finalSourceLookup] = await Promise.all([
+    getAccountByEmail(MIGRATE_TARGET_EMAIL),
+    getAccountById(MIGRATE_EXPECTED_ACCOUNT_ID),
+    getAccountByIdForTenant(DEFAULT_TENANT_ID, MIGRATE_EXPECTED_ACCOUNT_ID),
+    getUserById(MIGRATE_SOURCE_TENANT_ID, MIGRATE_EXPECTED_ACCOUNT_ID),
+  ])
+  const finalResolutionOk = Boolean(
+    finalByEmail?.tenantId === DEFAULT_TENANT_ID &&
+    finalById?.tenantId === DEFAULT_TENANT_ID &&
+    finalForTenant?.userId === MIGRATE_EXPECTED_ACCOUNT_ID &&
+    !finalSourceLookup
+  )
+
+  await appendAuditEntry(DEFAULT_TENANT_ID, {
+    actorId: account.userId, actorEmail: account.email, ip: clientIp(req),
+    action: 'account.storage_migrated', entity: 'user', entityId: MIGRATE_EXPECTED_ACCOUNT_ID,
+    changes: [
+      { field: 'storageLocation', oldValue: MIGRATE_SOURCE_TENANT_ID, newValue: DEFAULT_TENANT_ID },
+      { field: 'sessionVersion', oldValue: MIGRATE_EXPECTED_SESSION_VERSION, newValue: MIGRATE_NEW_SESSION_VERSION },
+    ],
+    result: finalResolutionOk ? 'success' : 'partial',
+    message: 'One-time Redis storage migration for advertising@l3amigos.com (pilot-tenant hash -> canonical LTA storage).',
+  })
+
+  return res.status(200).json({
+    success: true,
+    migrated: true,
+    verified: finalResolutionOk,
+    newTenantId: DEFAULT_TENANT_ID,
+    newSessionVersion: MIGRATE_NEW_SESSION_VERSION,
+    message: finalResolutionOk
+      ? 'Account storage migrated to canonical LTA storage. Your session is now stale -- please log in again.'
+      : 'Account storage migrated, but a final verification check did not fully pass -- please report this for review.',
   })
 }
 
@@ -1363,6 +1601,7 @@ export default async function handler(req, res) {
     case 'tenant-status':    return tenantStatus(req, res)
     case 'account-audit-self': return accountAuditSelf(req, res)
     case 'account-repair-advertising-tenant-once': return accountRepairAdvertisingTenantOnce(req, res)
+    case 'account-migrate-advertising-storage-once': return accountMigrateAdvertisingStorageOnce(req, res)
     case 'accounts':         return accounts(req, res)
     case 'invite-status':    return inviteStatus(req, res)
     case 'accept-invite':    return acceptInvite(req, res)

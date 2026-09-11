@@ -405,3 +405,40 @@ export async function reconcileAccountGrantsAfterLocationRemoval(tenantId, remov
   }
   return { narrowed, emptied }
 }
+
+// TEMPORARY -- "Implement the complete one-time Advertising storage
+// migration" investigation closure. Deletes exactly one user record + its
+// email-index entry from ONE tenant's own storage (whichever key
+// resolveHashWriteKey() resolves that tenant to -- the flat LEGACY hash for
+// a LEGACY-mode tenant, its own V2 hash otherwise). Never a general-purpose
+// delete API: the one caller (session/[action].js's one-time migration
+// action) uses this ONLY after a canonical copy has already been written
+// AND read-back-verified elsewhere -- this function itself performs no
+// verification of its own. Remove once the investigation concludes.
+export async function _removeUserRecordForOneTimeMigration(tenantId, userId, email) {
+  const client = getClient()
+  if (!client) throw new UserStoreUnavailableError('user store is not configured')
+  const usersKey = resolveHashWriteKey({ v1Key: USERS_KEY, v2Key: usersKeyV2(tenantId), tenantId })
+  const emailIndexKey = resolveHashWriteKey({ v1Key: EMAIL_INDEX_KEY, v2Key: usersEmailIndexKeyV2(tenantId), tenantId })
+  try {
+    await client.hdel(usersKey, userId)
+    await client.hdel(emailIndexKey, normalizeEmail(email))
+  } catch (err) {
+    throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
+  }
+}
+
+// TEMPORARY -- same investigation. Deletes exactly the two global identity-
+// index entries for one userId/email pair, regardless of which tenant they
+// currently point at. Never a general-purpose index API -- see the header
+// comment above.
+export async function _removeIdentityIndexEntriesForOneTimeMigration(userId, email) {
+  const client = getClient()
+  if (!client) throw new UserStoreUnavailableError('user store is not configured')
+  try {
+    await client.hdel(IDENTITY_INDEX_BY_USER_ID_KEY, userId)
+    await client.hdel(IDENTITY_INDEX_BY_EMAIL_KEY, normalizeEmail(email))
+  } catch (err) {
+    throw new UserStoreUnavailableError(`user store unreachable: ${err.message}`)
+  }
+}
