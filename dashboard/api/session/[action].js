@@ -10,12 +10,15 @@
 // file layout changed, not the API.
 
 import { setCookie, clearCookie, parseCookies } from '../google/_lib/cookies.js'
-import { getAccountById, getAccountByEmail, listAccounts } from '../_lib/accountStore.js'
+import { getAccountById, getAccountByEmail, listAccounts, getStaticAccountByEmail } from '../_lib/accountStore.js'
 import { verifyPassword, hashPassword, validatePasswordStrength } from '../_lib/password.js'
 import { requireAuth } from '../_lib/auth.js'
 import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
-import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError, lookupTenantIdForUserId } from '../_lib/userStore.js'
+import {
+  touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError, lookupTenantIdForUserId,
+  getUserById, getUserByEmail, deriveUserStatus,
+} from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
 import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
 import { generateTenantId } from '../_lib/tenantIdGenerator.js'
@@ -269,6 +272,108 @@ async function tenantStatus(req, res) {
       reviewCount: config.initialSync.reviewCount ?? null, locationCount: config.initialSync.locationCount ?? null,
     } : null,
     entitlementChange: config.entitlementChange ? { status: config.entitlementChange.status ?? 'none', lastError: config.entitlementChange.lastError ?? null } : null,
+  })
+}
+
+// TEMPORARY -- "Add ONE temporary authenticated self-audit action" tenant-
+// mismatch investigation. GET /api/session/account-audit-self audits ONLY
+// the CURRENTLY authenticated account's own record shape across the static
+// and Redis-backed directories, to determine whether a tenant mismatch (an
+// account resolving to an unintended tenant, e.g. a stray self-service
+// signup) is a clean single-record defect or something messier (duplicate
+// records, a membership/identity-index disagreement, a stale invite state).
+// Accepts NO email/accountId parameter -- there is no cross-user lookup
+// surface here at all, by construction; `account` below is exclusively the
+// one requireAuth() just verified belongs to this request's own session.
+// Returns only safe metadata computed via the SAME production account-store/
+// user-store functions login and evaluateSession() already use -- never a
+// raw record, never a password hash, session token, invite hash, OAuth
+// token, or any credential material. Remove once this investigation
+// concludes.
+async function accountAuditSelf(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `session:account-audit-self:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  const { email, userId } = account
+
+  async function safeUserStoreLookup(fn) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (err instanceof UserStoreUnavailableError) return null
+      throw err
+    }
+  }
+
+  // Which concrete path is authoritative for THIS session -- re-derived via
+  // the exact same precedence accountStore.js's getAccountById() itself
+  // uses, so this can never silently disagree with what actually logged
+  // this session in.
+  const indexedTenantId = await safeUserStoreLookup(() => lookupTenantIdForUserId(userId))
+  const indexedRecord = indexedTenantId ? await safeUserStoreLookup(() => getUserById(indexedTenantId, userId)) : null
+  const bootstrapRecordById = indexedRecord ? null : await safeUserStoreLookup(() => getUserById(resolveBootstrapTenantId(), userId))
+  // Independent existence check by EMAIL against the bootstrap hash too --
+  // catches a second, different-userId Redis record for the same email the
+  // identity index doesn't point at (e.g. an orphaned pre-migration record),
+  // which a userId-only lookup above would never surface.
+  const bootstrapRecordByEmail = await safeUserStoreLookup(() => getUserByEmail(resolveBootstrapTenantId(), email))
+
+  const staticRecord = getStaticAccountByEmail(email)
+
+  const winningRecord = indexedRecord ?? bootstrapRecordById ?? bootstrapRecordByEmail ?? staticRecord
+  const authoritativeSource = (indexedRecord || bootstrapRecordById || bootstrapRecordByEmail) ? 'redis' : 'static'
+  const runtimeLookupWinner = indexedRecord
+    ? 'redis-identity-index'
+    : (bootstrapRecordById || bootstrapRecordByEmail) ? 'redis-bootstrap-legacy' : 'static-account-directory'
+
+  const distinctUserIds = new Set(
+    [indexedRecord, bootstrapRecordById, bootstrapRecordByEmail, staticRecord]
+      .filter(Boolean)
+      .map(r => r.userId)
+  )
+  const redisAccountExists = Boolean(indexedRecord || bootstrapRecordById || bootstrapRecordByEmail)
+  const staticAccountExists = Boolean(staticRecord)
+  const duplicateAccountCount = distinctUserIds.size
+
+  // Membership/identity-index consistency: does the global identity index's
+  // own answer for this userId agree with the tenantId this session
+  // actually carries? A real, correctly-written account always agrees;
+  // disagreement is exactly the kind of migration artifact this
+  // investigation is checking for.
+  const separateMembershipExists = Boolean(indexedTenantId && indexedTenantId !== account.tenantId)
+  const membershipTenantId = separateMembershipExists ? indexedTenantId : null
+
+  const staleInviteExists = winningRecord ? ['invited', 'expired', 'revoked'].includes(deriveUserStatus(winningRecord)) : false
+
+  const canonicalTenantId = DEFAULT_TENANT_ID
+  const tenantMismatchConfirmed = account.tenantId !== canonicalTenantId
+
+  return res.status(200).json({
+    email,
+    accountId: userId,
+    tenantId: account.tenantId,
+    role: account.role,
+    locationIds: account.locationIds,
+    disabled: Boolean(winningRecord?.disabled),
+    sessionVersion: winningRecord?.sessionVersion ?? null,
+    authoritativeSource,
+    redisAccountExists,
+    staticAccountExists,
+    duplicateAccountCount,
+    separateMembershipExists,
+    membershipTenantId,
+    staleInviteExists,
+    runtimeLookupWinner,
+    repairAssessment: {
+      tenantMismatchConfirmed,
+      canonicalTenantId,
+      tenantIdOnlyRepairLikely: duplicateAccountCount === 1 && !separateMembershipExists && !staleInviteExists,
+      additionalMembershipRepairRequired: separateMembershipExists,
+    },
   })
 }
 
@@ -1120,6 +1225,7 @@ export default async function handler(req, res) {
     case 'logout':           return logout(req, res)
     case 'whoami':           return whoami(req, res)
     case 'tenant-status':    return tenantStatus(req, res)
+    case 'account-audit-self': return accountAuditSelf(req, res)
     case 'accounts':         return accounts(req, res)
     case 'invite-status':    return inviteStatus(req, res)
     case 'accept-invite':    return acceptInvite(req, res)

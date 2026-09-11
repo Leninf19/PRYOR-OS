@@ -116,6 +116,7 @@ const TESTS = [
   'test_credential_cas_concurrency.js',
   'test_tenant_entitlement_change.js',
   'test_session_tenant_status_endpoint.js',
+  'test_account_audit_self.js',
   'test_onboarding_ui.js',
   'test_auth_gate_tenant_lifecycle_gate_ui.js',
   'test_tenant_branding_ui.js',
