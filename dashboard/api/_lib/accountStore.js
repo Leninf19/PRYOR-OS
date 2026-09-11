@@ -154,22 +154,6 @@ export async function getAccountByEmail(email) {
   return findAccountByEmail(accounts, email)
 }
 
-// TEMPORARY -- "Add ONE temporary authenticated self-audit action"
-// investigation: session/[action].js's account-audit-self needs to check
-// the static directory INDEPENDENTLY of the Redis-wins dual-read precedence
-// above (to detect a static+Redis collision, not just report whichever one
-// getAccountByEmail() would return). This is the one place accounts.js's
-// loadAccountDirectory()/findAccountByEmail() are imported -- callers
-// outside this file must go through this wrapper rather than importing
-// accounts.js directly (see test_auth.js's "accountStore.js is the single
-// source used for account lookups" structural guard). Remove once the
-// investigation concludes, alongside account-audit-self itself.
-export function getStaticAccountByEmail(email) {
-  const accounts = loadDirectoryOrWarn()
-  if (!accounts) return null
-  return findAccountByEmail(accounts, email)
-}
-
 // Merged, de-duplicated listing FOR ONE TENANT: every Redis user belonging
 // to `tenantId`, plus (ONLY for Los Tres Amigos, DEFAULT_TENANT_ID) every
 // static-directory account whose normalized email is NOT already present

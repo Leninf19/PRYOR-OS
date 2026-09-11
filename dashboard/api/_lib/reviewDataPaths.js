@@ -28,7 +28,6 @@
 // is BLOB-mode (see tenantConfigStore.js's storageMode default).
 
 import { readFile } from 'fs/promises'
-import { existsSync } from 'fs'
 import { text as streamToText } from 'stream/consumers'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -187,23 +186,12 @@ export async function readPrivateDataFile(tenantId, relPath) {
   const storage = await resolveTenantStorage(tenantId)
   if (storage.mode === 'LEGACY_REPO') {
     const resolved = resolveWithinRoot(storage.root, relPath)
-    // TEMPORARY DIAGNOSTIC -- "Prove deployed /api/data runtime-path
-    // failure" investigation. Server-side console output only (Vercel
-    // Runtime Logs), never returned in any HTTP response. Deliberately logs
-    // booleans and the already-known tenantId/relPath only -- never the
-    // resolved absolute path, never file contents, never anything
-    // credential-shaped. Remove once the investigation concludes.
-    console.error(`[diag] tenantId=${tenantId} storageMode=LEGACY_REPO relPath=${relPath} ` +
-      `cwd=${process.cwd()} rootExists=${existsSync(storage.root)} ` +
-      `parentExists=${existsSync(path.dirname(resolved))} fileExists=${existsSync(resolved)}`)
     try {
       return await readFile(resolved, 'utf-8')
     } catch (err) {
       if (err.code === 'ENOENT') {
-        console.error(`[diag] tenantId=${tenantId} relPath=${relPath} errorCode=${err.code}`)
         throw new PrivateDataFileNotFoundError(`private-data file not found: ${relPath}`)
       }
-      console.error(`[diag] tenantId=${tenantId} relPath=${relPath} errorCode=${err.code ?? 'unknown'}`)
       throw err
     }
   }
