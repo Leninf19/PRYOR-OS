@@ -194,6 +194,33 @@ function buildRequestedRelPath(fileParam) {
   return segments.join('/')
 }
 
+// TEMPORARY DIAGNOSTIC ("Add one temporary branch-level diagnostic to
+// dashboard/api/data.js" investigation) -- restricted to a small, known
+// target set so this never becomes an unbounded per-request log. Covers the
+// 4 specific files this investigation is chasing plus one DYNAMIC_ALLOWLIST
+// shape (reviews/by-location/<slug>.json) as a known-working control for
+// correlation. Server-side console.error only (Vercel Runtime Logs), never
+// returned in any HTTP response. Logs only tenantId/relPath/role/booleans/
+// category/branch name -- never email, userId, cookies, session contents,
+// authorization headers, tokens, credentials, env vars, or file contents.
+// Remove once this investigation concludes.
+const DIAG_TARGET_RELPATHS = new Set([
+  'meta.json',
+  'analytics/location-stats.json',
+  'intelligence/action-center.json',
+  'intelligence/complaint-intelligence.json',
+])
+
+function isDiagTarget(relPath) {
+  return typeof relPath === 'string' && (
+    DIAG_TARGET_RELPATHS.has(relPath) || /^reviews\/by-location\/[a-z0-9]+(?:-[a-z0-9]+)*\.json$/.test(relPath)
+  )
+}
+
+function logApiDataDiag(fields) {
+  console.error(`[api-data-diag] ${Object.entries(fields).map(([k, v]) => `${k}=${v}`).join(' ')}`)
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
 
@@ -219,27 +246,48 @@ export default async function handler(req, res) {
   const tenantId = resolveTenantId(account)
 
   const relPath = buildRequestedRelPath(req.query.file)
+  const diagTarget = isDiagTarget(relPath)
+  const wildcard = isWildcardGrant(account)
   if (!relPath || !isAllowed(relPath)) {
+    if (diagTarget) {
+      logApiDataDiag({ tenantId, relPath, accountRole: account.role, isWildcardGrant: wildcard, allowed: false, category: 'n/a', branch: 'INVALID_OR_NOT_ALLOWLISTED' })
+    }
     return res.status(404).json({ error: 'not_found' })
   }
 
   let requestedLocationId = null // only meaningful for the 'per-location' category
+  const category = categorizeRelPath(relPath)
   if (!isWildcardGrant(account)) {
-    const category = categorizeRelPath(relPath)
     if (category === 'company-wide') {
+      if (diagTarget) {
+        logApiDataDiag({ tenantId, relPath, accountRole: account.role, isWildcardGrant: wildcard, allowed: true, category, branch: 'COMPANY_WIDE_FORBIDDEN' })
+      }
       return res.status(403).json({ error: 'forbidden', message: 'You do not have permission to view company-wide data.' })
     }
     if (category === 'per-location') {
       const slug = extractSlugFromRelPath(relPath)
       requestedLocationId = await resolveLocationIdForSlug(tenantId, slug)
-      if (requestedLocationId === null || !requireLocationAccess(account, requestedLocationId)) {
+      if (requestedLocationId === null) {
+        if (diagTarget) {
+          logApiDataDiag({ tenantId, relPath, accountRole: account.role, isWildcardGrant: wildcard, allowed: true, category, branch: 'LOCATION_SLUG_NOT_RESOLVED' })
+        }
+        return res.status(404).json({ error: 'not_found' })
+      }
+      if (!requireLocationAccess(account, requestedLocationId)) {
         // Existence-hiding, matching the frozen §6 error contract every
         // other location-scope check in this codebase uses -- never 403
         // for an out-of-scope location.
+        if (diagTarget) {
+          logApiDataDiag({ tenantId, relPath, accountRole: account.role, isWildcardGrant: wildcard, allowed: true, category, branch: 'LOCATION_ACCESS_DENIED' })
+        }
         return res.status(404).json({ error: 'not_found' })
       }
     }
     // category === 'meta' falls through -- read + filtered after parsing.
+  }
+
+  if (diagTarget) {
+    logApiDataDiag({ tenantId, relPath, accountRole: account.role, isWildcardGrant: wildcard, allowed: true, category, branch: 'ENTERING_PRIVATE_DATA_READ' })
   }
 
   let raw
