@@ -417,6 +417,102 @@ async function accountAuditSelf(req, res) {
   })
 }
 
+// TEMPORARY, ONE-TIME, SINGLE-ACCOUNT REPAIR -- "Perform the narrowly-scoped
+// production repair for advertising@l3amigos.com" investigation closure.
+// POST /api/session/account-repair-advertising-tenant-once. Every targeting
+// value below is a HARDCODED CONSTANT, not request input -- this endpoint
+// accepts no email/tenantId/accountId parameter and cannot be pointed at any
+// other account, regardless of who calls it or what they pass. It exists
+// solely to flip ONE proven-stray Redis account record's tenantId field back
+// to the real production tenant, after re-verifying every precondition
+// server-side against a fresh read (never the caller's own session claims,
+// which could be stale). A precondition mismatch -- including the second
+// invocation ever, once the first succeeds -- returns 409 and writes
+// nothing. Remove once this investigation concludes, alongside
+// account-audit-self.
+const REPAIR_TARGET_EMAIL = 'advertising@l3amigos.com'
+const REPAIR_EXPECTED_ACCOUNT_ID = 'usr_7a7db167-e1a9-48e0-abb0-1fe62dfa1c7d'
+const REPAIR_EXPECTED_CURRENT_TENANT_ID = 't_los-tres-amigos-pilot'
+const REPAIR_EXPECTED_ROLE = 'owner'
+const REPAIR_EXPECTED_LOCATION_IDS = '*'
+const REPAIR_EXPECTED_DISABLED = false
+const REPAIR_EXPECTED_SESSION_VERSION = 5
+const REPAIR_NEW_SESSION_VERSION = 6
+
+async function accountRepairAdvertisingTenantOnce(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+  const account = await requireAuth(req, res, null)
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `session:account-repair-advertising-tenant-once:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
+  if (!allowed) return
+
+  // Self-only, hardcoded target -- checked against BOTH email and accountId
+  // independently (defense in depth for a one-time repair script, even
+  // though the two are already 1:1 for any real account). Any caller other
+  // than exactly this account gets 403, no matter what.
+  if (account.email !== REPAIR_TARGET_EMAIL || account.userId !== REPAIR_EXPECTED_ACCOUNT_ID) {
+    return res.status(403).json({ error: 'forbidden', message: 'This one-time repair action is scoped to a single account.' })
+  }
+
+  // Fresh, authoritative re-read -- looked up directly via the KNOWN
+  // current (pilot) tenant's own store, never via the caller's own
+  // (possibly stale) session claims, and never via a search.
+  let current
+  try {
+    current = await getUserById(REPAIR_EXPECTED_CURRENT_TENANT_ID, REPAIR_EXPECTED_ACCOUNT_ID)
+  } catch (err) {
+    if (err instanceof UserStoreUnavailableError) {
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not verify the account record. Please try again shortly.' })
+    }
+    throw err
+  }
+
+  const preconditionsMatch = Boolean(
+    current &&
+    current.email === REPAIR_TARGET_EMAIL &&
+    current.userId === REPAIR_EXPECTED_ACCOUNT_ID &&
+    current.tenantId === REPAIR_EXPECTED_CURRENT_TENANT_ID &&
+    current.role === REPAIR_EXPECTED_ROLE &&
+    JSON.stringify(current.locationIds) === JSON.stringify(REPAIR_EXPECTED_LOCATION_IDS) &&
+    Boolean(current.disabled) === REPAIR_EXPECTED_DISABLED &&
+    current.sessionVersion === REPAIR_EXPECTED_SESSION_VERSION
+  )
+
+  if (!preconditionsMatch) {
+    // Existence/content-hiding on mismatch, matching this codebase's own
+    // established error-contract discipline elsewhere -- never echoes back
+    // what actually differs. Covers both "record not found" and "already
+    // repaired" (a second invocation naturally lands here, since
+    // current.tenantId no longer equals the expected pilot value).
+    return res.status(409).json({ error: 'precondition_failed', message: 'The account record no longer matches the expected pre-repair state -- no change was made.' })
+  }
+
+  const updated = await updateUser(REPAIR_EXPECTED_CURRENT_TENANT_ID, REPAIR_EXPECTED_ACCOUNT_ID, {
+    tenantId: DEFAULT_TENANT_ID,
+    sessionVersion: REPAIR_NEW_SESSION_VERSION,
+  })
+
+  await appendAuditEntry(DEFAULT_TENANT_ID, {
+    actorId: account.userId, actorEmail: account.email, ip: clientIp(req),
+    action: 'account.tenant_repaired', entity: 'user', entityId: REPAIR_EXPECTED_ACCOUNT_ID,
+    changes: [
+      { field: 'tenantId', oldValue: REPAIR_EXPECTED_CURRENT_TENANT_ID, newValue: DEFAULT_TENANT_ID },
+      { field: 'sessionVersion', oldValue: REPAIR_EXPECTED_SESSION_VERSION, newValue: REPAIR_NEW_SESSION_VERSION },
+    ],
+    result: 'success',
+    message: 'One-time tenant-mismatch repair for advertising@l3amigos.com.',
+  })
+
+  return res.status(200).json({
+    success: true,
+    repaired: true,
+    newTenantId: updated?.tenantId ?? DEFAULT_TENANT_ID,
+    newSessionVersion: updated?.sessionVersion ?? REPAIR_NEW_SESSION_VERSION,
+    message: 'Tenant repaired. Your session is now stale -- please log in again.',
+  })
+}
+
 // GET /api/session/accounts -- the reusable identity-directory read: every
 // non-disabled account, sanitized (no passwordHash). Lives on the identity
 // layer, not on any one feature, deliberately -- Action Center's assignee
@@ -1266,6 +1362,7 @@ export default async function handler(req, res) {
     case 'whoami':           return whoami(req, res)
     case 'tenant-status':    return tenantStatus(req, res)
     case 'account-audit-self': return accountAuditSelf(req, res)
+    case 'account-repair-advertising-tenant-once': return accountRepairAdvertisingTenantOnce(req, res)
     case 'accounts':         return accounts(req, res)
     case 'invite-status':    return inviteStatus(req, res)
     case 'accept-invite':    return acceptInvite(req, res)
