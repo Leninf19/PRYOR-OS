@@ -51,10 +51,33 @@ import {
 } from '../_lib/campaignStore.js'
 import {
   getAllAssets, getAsset, createAsset, deleteAsset, ContentAssetStoreUnavailableError,
+  acquireContentUploadLock, renewContentUploadLock, releaseContentUploadLock, UPLOAD_LOCK_RENEW_INTERVAL_MS,
 } from '../_lib/contentAssetStore.js'
+
+// "Minimum content cost guardrail" hardening (Phase A6, revenue-abuse
+// containment audit -- content-no-storage-quota): a PLATFORM SAFETY
+// ceiling, not a paid-plan entitlement -- deliberately conservative and
+// the same for every tenant regardless of plan, existing purely to bound
+// worst-case Blob storage/egress cost from one tenant while the real
+// commercial storage-plan system (per-plan quotas, usage UI, upgrade path)
+// is designed separately. Existing per-file MIME/size rules (ALLOWED_ASSET_MIME
+// above) are unchanged and unaffected.
+const MAX_TENANT_STORAGE_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB
+const MAX_TENANT_ASSET_COUNT = 2000
 import {
   getAllTasks, updateTask, TaskStoreUnavailableError,
 } from '../_lib/taskStore.js'
+
+// Test-only override for the upload lock's heartbeat renewal interval
+// (production always uses the real UPLOAD_LOCK_RENEW_INTERVAL_MS, 5s) --
+// lets a test force a renewal (and therefore a possible lease-loss
+// detection) to happen mid-critical-section without a multi-second real
+// wait. Same seam pattern as blobStore.js's _setBlobClientForTests /
+// contentAssetStore.js's _setRedisClientForTests: production code is
+// unaffected unless a test explicitly calls the setter.
+let uploadLockRenewIntervalMsOverride = null
+export function _setUploadLockRenewIntervalMsForTests(ms) { uploadLockRenewIntervalMsOverride = ms }
+export function _resetUploadLockRenewIntervalMsForTests() { uploadLockRenewIntervalMsOverride = null }
 
 const CAMPAIGN_STATUSES = new Set(['Draft', 'Approved', 'Archived'])
 const ASSET_TYPES = new Set([
@@ -450,6 +473,11 @@ async function upload(req, res) {
 
   const allowed = await enforceRateLimit(req, res, `content:upload:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
   if (!allowed) return
+  // Phase A6: a per-TENANT upload budget alongside the per-user one above --
+  // a per-user-only limit is trivially multiplied by inviting more accounts
+  // into the tenant (settings/invite-user has no seat cap).
+  const tenantAllowed = await enforceRateLimit(req, res, `content:upload-tenant:${resolveTenantId(account)}`, { requestsPerWindow: 40, windowSeconds: 60 })
+  if (!tenantAllowed) return
 
   const { campaignId, type, filename, mimeType, fileBase64 } = req.body ?? {}
   if (typeof fileBase64 !== 'string' || !fileBase64) {
@@ -473,18 +501,110 @@ async function upload(req, res) {
     const campaign = await getCampaign(resolveTenantId(account), campaignId)
     if (!campaign || !accountCoversLocations(account, campaign.locationIds)) return res.status(404).json({ error: 'not_found' })
 
-    const pathname = `content/${campaignId}/${randomUUID()}${extOf(filename)}`
-    const blob = await putBlob(pathname, buffer, { contentType: mimeType })
+    const tenantId = resolveTenantId(account)
 
-    const record = await createAsset(resolveTenantId(account), {
-      campaignId, type, filename, mimeType, sizeBytes: buffer.length, blobPathname: blob.pathname, captionText: null,
-    }, account)
-    await appendAuditEntry(resolveTenantId(account), {
-      ...actorFields(account, req), entity: 'content_asset', entityId: record.id,
-      action: 'asset.uploaded', result: 'success', message: `Uploaded "${filename}" to campaign "${campaign.name}".`,
-    })
-    const { blobPathname, ...safe } = record
-    return res.status(201).json({ asset: safe })
+    // "Make content safety ceiling race-safe" hardening (final pre-deploy
+    // review, item 2), REVISED per the follow-up review ("content upload
+    // lock must outlive the critical section"): acquire a per-TENANT LEASE
+    // (a random ownership token, never a fixed sentinel) BEFORE the fresh
+    // usage read below, and hold it -- ACTIVELY RENEWED on an interval,
+    // never merely a fixed TTL hoped to outlast this request -- through the
+    // Blob write and the metadata write. This turns the whole
+    // read-check-write sequence into one atomic unit, so two concurrent
+    // uploads that would each individually fit under the ceiling can never
+    // both pass based on the same stale snapshot. acquireContentUploadLock()
+    // throws ContentAssetStoreUnavailableError on a genuine store outage --
+    // caught by this function's own outer catch below (503) -- so an
+    // unverifiable quota state is NEVER silently treated as "allowed." A
+    // caller that loses the race for the lease itself (another upload for
+    // this tenant is genuinely in flight) gets a 409 telling them to retry,
+    // never a silent bypass.
+    const lockToken = await acquireContentUploadLock(tenantId)
+    if (!lockToken) {
+      return res.status(409).json({ error: 'upload_in_progress', message: 'Another upload is already in progress for this account. Please try again in a moment.' })
+    }
+
+    // "Lock loss during the critical section must not silently allow the
+    // operation to proceed as if exclusivity still exists": the heartbeat
+    // renews the lease well before it could expire (UPLOAD_LOCK_RENEW_INTERVAL_MS
+    // is roughly 1/3 of the lease TTL); if a renewal ever reports the lease
+    // is no longer ours (an outage, or -- vanishingly unlikely given the
+    // margin -- genuine expiry), `leaseLost` is set and checked before
+    // every remaining risky step, so this request stops treating itself as
+    // exclusive the moment that stops being provably true, rather than
+    // continuing on the assumption nothing changed.
+    let leaseLost = false
+    const heartbeat = setInterval(() => {
+      renewContentUploadLock(tenantId, lockToken).then(renewed => { if (!renewed) leaseLost = true })
+    }, uploadLockRenewIntervalMsOverride ?? UPLOAD_LOCK_RENEW_INTERVAL_MS)
+
+    try {
+      if (leaseLost) {
+        return res.status(503).json({ error: 'service_unavailable', message: 'Could not verify exclusive access for this upload. Please try again shortly.' })
+      }
+      // Checked against the tenant's CURRENT total, now impossible for a
+      // second concurrent upload (same or different user) to race past
+      // via a stale snapshot -- see the lease acquired just above.
+      const existingAssets = Object.values(await getAllAssets(tenantId))
+      const existingBytes = existingAssets.reduce((sum, a) => sum + (Number.isFinite(a.sizeBytes) ? a.sizeBytes : 0), 0)
+      if (existingAssets.length >= MAX_TENANT_ASSET_COUNT) {
+        return res.status(413).json({ error: 'storage_limit_exceeded', message: 'This account has reached its content library asset limit. Delete unused assets or contact support.' })
+      }
+      if (existingBytes + buffer.length > MAX_TENANT_STORAGE_BYTES) {
+        return res.status(413).json({ error: 'storage_limit_exceeded', message: 'This account has reached its content library storage limit. Delete unused assets or contact support.' })
+      }
+
+      const pathname = `content/${campaignId}/${randomUUID()}${extOf(filename)}`
+      const blob = await putBlob(pathname, buffer, { contentType: mimeType })
+
+      if (leaseLost) {
+        // Deployment-gate hardening ("verify orphan-Blob cleanup on lease
+        // loss"): the Blob write above already landed -- but with the
+        // lease gone, this request can no longer prove it still holds
+        // exclusive rights to write this tenant's asset metadata, so
+        // metadata must NOT be created (that would be exactly the silent
+        // "proceed as if exclusivity still exists" bypass the whole lease
+        // mechanism exists to prevent). Left alone, that Blob object would
+        // be a permanent orphan -- never referenced by any asset record,
+        // so getAllAssets()/the quota ceiling would never see or reclaim
+        // it. Clean it up best-effort using ONLY `blob.pathname`, the
+        // return value of THIS request's own successful putBlob() call
+        // above -- never a pathname read back from the store or derived
+        // any other way -- so cleanup can only ever target the object this
+        // request itself just created, never another request's Blob
+        // (including a newer request that may already hold the lease).
+        // A cleanup failure is logged for operator follow-up and does NOT
+        // change the outcome: this request still fails closed (503) either
+        // way, and no metadata is written regardless of whether the
+        // orphaned Blob was successfully deleted.
+        try {
+          await deleteBlob(blob.pathname)
+        } catch (cleanupErr) {
+          console.error(`[content/upload] failed to clean up orphaned Blob "${blob.pathname}" after lease loss for tenant ${JSON.stringify(tenantId)}: ${cleanupErr.message}`)
+        }
+        return res.status(503).json({ error: 'service_unavailable', message: 'Could not verify exclusive access for this upload. Please try again shortly.' })
+      }
+
+      const record = await createAsset(tenantId, {
+        campaignId, type, filename, mimeType, sizeBytes: buffer.length, blobPathname: blob.pathname, captionText: null,
+      }, account)
+      await appendAuditEntry(tenantId, {
+        ...actorFields(account, req), entity: 'content_asset', entityId: record.id,
+        action: 'asset.uploaded', result: 'success', message: `Uploaded "${filename}" to campaign "${campaign.name}".`,
+      })
+      const { blobPathname, ...safe } = record
+      return res.status(201).json({ asset: safe })
+    } finally {
+      // Always torn down, success or failure -- including a thrown Blob/
+      // store error, which propagates to the outer catch below AFTER this
+      // finally runs. clearInterval() first, so no further renewal can
+      // fire after release() -- release() itself is ownership-checked
+      // (contentAssetStore.js's RELEASE_SCRIPT), so even a lease this
+      // request no longer owns is released as a harmless no-op rather than
+      // ever deleting a different, newer request's lease.
+      clearInterval(heartbeat)
+      await releaseContentUploadLock(tenantId, lockToken)
+    }
   } catch (err) {
     if (err instanceof ContentAssetStoreUnavailableError || err instanceof CampaignStoreUnavailableError || err instanceof BlobStoreUnavailableError) {
       console.error(`[content/upload] ${err.message}`)
@@ -511,6 +631,24 @@ async function download(req, res) {
 
   const account = await requireAuth(req, res, null)
   if (!account) return
+
+  // Phase A6 ("minimum content cost guardrail"): this endpoint had no rate
+  // limit at all -- an unbounded, authenticated Blob-egress amplifier.
+  const allowed = await enforceRateLimit(req, res, `content:download:${account.userId}`, { requestsPerWindow: 60, windowSeconds: 60 })
+  if (!allowed) return
+  // "Tenant-scope content download abuse protection" hardening (final
+  // pre-deploy review, item 3): the per-user limit above is trivially
+  // multiplied by inviting more seats (settings/invite-user has no seat
+  // cap). 200 requests/60s tenant-wide is a REQUEST-rate ceiling, not a
+  // byte-aware egress budget -- assets already carry a `sizeBytes` field
+  // (contentAssetStore.js), so a true byte-metered tenant egress budget is
+  // a natural Phase B/C follow-up (mirroring the upload-side storage
+  // ceiling's byte accounting), documented here rather than built now to
+  // keep this pass minimal. This still meaningfully bounds a scripted
+  // egress abuser using multiple seats, while comfortably covering several
+  // people concurrently viewing/printing campaign assets.
+  const tenantAllowed = await enforceRateLimit(req, res, `content:download-tenant:${resolveTenantId(account)}`, { requestsPerWindow: 200, windowSeconds: 60 })
+  if (!tenantAllowed) return
 
   const { id, disposition } = req.query ?? {}
   if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'invalid_request', message: 'id is required.' })

@@ -27,6 +27,7 @@ import {
   _setRedisClientForTests, _resetRedisClientForTests, setStoredCredential, getStoredCredential, GoogleHealth,
 } from '../dashboard/api/_lib/credentialStore.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import { _setGbpLocationLinkMapForTests, _resetGbpLocationLinkMapForTests } from '../dashboard/api/_lib/gbpLocationAuthorization.js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
@@ -35,6 +36,11 @@ function assert(cond, msg) {
 
 const results = []
 async function run(name, fn) {
+  // "Require approved location for Google reply" hardening (Phase A2): the
+  // publish() test below uses a fabricated reviewName -- seed it as linked
+  // so this file's actual subject (invalid_grant auto-recovery) is still
+  // reached, unaffected by the new, unrelated location-authorization gate.
+  _setGbpLocationLinkMapForTests({ 'accounts/1/locations/2': 2 })
   try {
     await fn()
     console.log(`PASS: ${name}`)
@@ -45,6 +51,7 @@ async function run(name, fn) {
   } finally {
     _resetRedisClientForTests()
     _resetLimiterFactoryForTests()
+    _resetGbpLocationLinkMapForTests()
   }
 }
 

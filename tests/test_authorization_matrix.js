@@ -1579,6 +1579,11 @@ async function testDataFileRegistryCoversEveryAllowlistedFileExactly() {
 async function testReviewToLocationLookupNeverInPublicAllowlist() {
   const exact = new Set(extractExactAllowlist())
   assert(!exact.has('_internal/review-location-index.json'), 'the review-location index must NEVER be in data.js\'s EXACT_ALLOWLIST')
+  // Phase A2 ("require approved location for Google reply") added a
+  // sibling _internal export -- same guard, same reasoning: the raw Google
+  // resource name is per-location identifying detail a location-scoped
+  // account has no reason to see about OTHER locations.
+  assert(!exact.has('_internal/gbp-location-link-map.json'), 'the BOOTSTRAP-tenant linked-location map must NEVER be in data.js\'s EXACT_ALLOWLIST')
   const dataJsSrc = readFileSync(path.join(API_DIR, 'data.js'), 'utf-8')
   const match = dataJsSrc.match(/DYNAMIC_ALLOWLIST = \[([\s\S]*?)\n\]/)
   assert(match, 'could not find DYNAMIC_ALLOWLIST in data.js')

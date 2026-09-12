@@ -19,6 +19,7 @@ import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests as setCredentialRedis, setStoredCredential } from '../dashboard/api/_lib/credentialStore.js'
 import { _setRedisClientForTests as setBridgeRedis, _resetRedisClientForTests as resetBridgeRedis, writePublishBridge } from '../dashboard/api/_lib/publishBridgeStore.js'
 import { _setReviewLocationIndexForTests, _resetReviewLocationIndexForTests } from '../dashboard/api/_lib/reviewLocationIndex.js'
+import { _setGbpLocationLinkMapForTests, _resetGbpLocationLinkMapForTests } from '../dashboard/api/_lib/gbpLocationAuthorization.js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 process.env.GOOGLE_CLIENT_ID = 'fake-client-id'
@@ -73,6 +74,13 @@ const results = []
 async function run(name, fn) {
   const bridgeClient = fakeBridgeRedis()
   setBridgeRedis(() => bridgeClient) // same instance across every call within this one test
+  // "Require approved location for Google reply" hardening (Phase A2): the
+  // real publish() path now additionally requires the review's location to
+  // be in this (BOOTSTRAP/LTA) tenant's linked-location map -- default every
+  // test to the one location this file's fixtures actually use (accounts/1/
+  // locations/7, usr_lm's own grant) so that requirement is satisfied by
+  // default; individual tests override it when exercising the new check itself.
+  _setGbpLocationLinkMapForTests({ 'accounts/1/locations/7': 7 })
   try {
     await fn()
     console.log(`PASS: ${name}`)
@@ -83,6 +91,7 @@ async function run(name, fn) {
   } finally {
     resetBridgeRedis()
     _resetReviewLocationIndexForTests()
+    _resetGbpLocationLinkMapForTests()
     delete process.env.ANTHROPIC_API_KEY
   }
 }

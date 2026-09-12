@@ -23,12 +23,13 @@
 
 import { randomBytes, randomUUID } from 'crypto'
 import { setCookie, parseCookies, clearCookie } from './_lib/cookies.js'
-import { fetchWithRetry } from './_lib/http.js'
+import { fetchWithRetry, FetchBudgetExceededError } from './_lib/http.js'
 import { exchangeRefreshToken, getAccessToken } from './_lib/googleAuth.js'
 import { signOAuthState, verifyOAuthState } from './_lib/oauthState.js'
 import { requireAuth, requireScopedAuth, requireLocationAccess, isWildcardGrant, evaluateSession, statusForAuthFailure } from '../_lib/auth.js'
 import { Permission, roleHasPermission } from '../_lib/permissions.js'
 import { resolveLocationIdForReview, resolveLocationIdForReviewOrDeny } from '../_lib/reviewLocationIndex.js'
+import { parseGoogleReviewResourceName, isApprovedGoogleLocationForTenant } from '../_lib/gbpLocationAuthorization.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import {
   getStoredCredential, setStoredCredentialIfVersion, recordConnectionCheckOutcome, recordOAuthRefresh,
@@ -1083,10 +1084,14 @@ async function triggerImport(req, res) {
 // ownership via resolveLocationIdForReviewOrDeny().
 const PUBLISH_PERMISSIONS = [Permission.REPLY, Permission.REPLY_ASSIGNED]
 
-async function gbpGet(url, token) {
+// `retryOpts`, when provided, is forwarded verbatim to fetchWithRetry() --
+// see that function's own header for `retryOn429`/`onAttempt`. Every
+// existing caller omits it (undefined), which is fully backward-compatible
+// (fetchWithRetry's own defaults: retry 429/5xx up to 3 times, no budget).
+async function gbpGet(url, token, retryOpts) {
   const r = await fetchWithRetry(url, {
     headers: { Authorization: `Bearer ${token}` },
-  })
+  }, retryOpts)
   if (!r.ok) {
     const e = await r.json().catch(() => ({}))
     throw Object.assign(new Error(e.error?.message || `GBP API ${r.status}`), { status: r.status })
@@ -1094,17 +1099,59 @@ async function gbpGet(url, token) {
   return r.json()
 }
 
+// "Google fallback budget must count actual HTTP attempts" hardening (Phase
+// A final pre-deploy review): re-exported from http.js so callers of
+// gbpGetAllPages don't need a second import -- see that class's own header
+// for the full reasoning. Thrown for a budgeted call the moment ANY real
+// outbound fetch() attempt (the first one, or a retry) would exceed the
+// budget -- never merely "one unit per logical page," which would let a
+// sustained-429/5xx run cost up to `maxRetries` real requests per page.
+export { FetchBudgetExceededError }
+
+// "Google fallback hard budget must cover the whole operation" hardening
+// (final pre-deploy review, item 1): the ONE number that governs the
+// ENTIRE fallback operation end to end -- the OAuth token exchange PLUS
+// accounts.list PLUS every locations.list attempt (initial + any retry)
+// PLUS reviews.list, ALL COMBINED, never "N GBP calls plus however many
+// auxiliary calls happen to occur." getAccessToken() (google/_lib/
+// googleAuth.js) uses a bare fetch() with no retry wrapper, so it is
+// exactly one real request, never more -- but publish()'s fallback branch
+// still charges it against this SAME counter (see the two consumption
+// points below: right before the token exchange, and inside
+// gbpGetAllPages's onAttempt via fetchWithRetry) rather than treating it
+// as free/unbounded auxiliary traffic. Exported so tests can assert
+// against the real configured value rather than a hardcoded duplicate.
+export const FALLBACK_OPERATION_BUDGET = 20
+
 // Follows nextPageToken to completion -- the old version silently stopped
 // at the first page (100 locations / 50 reviews), missing anything beyond it.
 // baseUrl is a full URL (callers pass the correct host per endpoint, since
 // accounts/locations/reviews no longer all live on the same one).
-async function gbpGetAllPages(baseUrl, token, listKey, pageParam = 'pageSize', pageSize = 100) {
+// `budgetTracker`, if provided, is a shared `{ remaining }` object counting
+// REAL outbound HTTP attempts (via fetchWithRetry's `onAttempt`, wired below)
+// -- NOT logical pages. A budgeted call also disables 429 retries entirely
+// (an interactive request must never sit through Google's own backoff) and
+// caps 5xx retries at one, so a configured budget of N can never produce
+// more than N real requests to Google, regardless of how many pages,
+// accounts, or transient failures are involved.
+async function gbpGetAllPages(baseUrl, token, listKey, pageParam = 'pageSize', pageSize = 100, budgetTracker = null) {
   let items = []
   let pageToken = null
+  const retryOpts = budgetTracker
+    ? {
+        retryOn429: false, // never retry a 429 for an interactive, user-triggered fallback
+        maxRetries: 2,     // at most one retry, and only for a transient 5xx
+        onAttempt: () => {
+          if (budgetTracker.remaining <= 0) return false
+          budgetTracker.remaining -= 1
+          return true
+        },
+      }
+    : undefined
   do {
     const sep = baseUrl.includes('?') ? '&' : '?'
     const url = `${baseUrl}${sep}${pageParam}=${pageSize}${pageToken ? `&pageToken=${pageToken}` : ''}`
-    const data = await gbpGet(url, token)
+    const data = await gbpGet(url, token, retryOpts)
     items = items.concat(data[listKey] || [])
     pageToken = data.nextPageToken || null
   } while (pageToken)
@@ -1231,6 +1278,55 @@ async function publish(req, res) {
     })
   }
 
+  // "Contain Google fuzzy fallback" hardening (Phase A5): checked here,
+  // before the token exchange further below (getAccessToken -- a REAL
+  // upstream Google call), so a rate-limited fallback attempt costs zero
+  // Google requests of any kind, not merely zero of the fallback's OWN
+  // accounts/locations/reviews calls. See this same hardening's fuller
+  // comment at the fallback branch itself for why this needs its own,
+  // tighter, per-user AND per-tenant limit distinct from the endpoint's
+  // general publish limit above.
+  let fallbackBudget = null
+  if (!reviewName) {
+    const fallbackUserAllowed = await enforceRateLimit(req, res, `publish-fallback:${account.userId}`, { requestsPerWindow: 3, windowSeconds: 60 })
+    if (!fallbackUserAllowed) return
+    const fallbackTenantAllowed = await enforceRateLimit(req, res, `publish-fallback-tenant:${tenantId}`, { requestsPerWindow: 5, windowSeconds: 60 })
+    if (!fallbackTenantAllowed) return
+    fallbackBudget = { remaining: FALLBACK_OPERATION_BUDGET }
+  }
+
+  // "Require approved location for Google reply" hardening (Phase A2): the
+  // check above (resolveLocationIdForReviewOrDeny, via requireScopedAuth)
+  // answers "is this review one THIS ACCOUNT may reply to" -- it returns
+  // null (skip entirely) for a wildcard-grant account whenever the review
+  // isn't in this tenant's own review-location index, which is exactly
+  // right for "does this account's OWN grant cover it" but says nothing
+  // about whether the location itself still belongs to this tenant's
+  // approved/linked catalog at all. A tenant's Google OAuth credential can
+  // often reach locations the tenant never approved (a manager on other
+  // listings, a since-removed location, a location belonging to a
+  // different business entirely under the same Google user) -- reaching a
+  // location must never be treated as authorization to reply there. This
+  // runs BEFORE any credential/token/Google call for the direct reviewName
+  // path, so a malformed or unapproved reviewName costs zero upstream
+  // Google requests. gbpLocationAuthorization.js's own header explains why
+  // BOOTSTRAP (Los Tres Amigos) and REDIS_ONLY tenants each need a
+  // different, but equally authoritative, source of truth here -- never
+  // tenant_config for BOOTSTRAP, which deliberately has none.
+  if (reviewName) {
+    const parsed = parseGoogleReviewResourceName(reviewName)
+    if (!parsed) {
+      return res.status(400).json({ error: 'invalid_request', message: 'reviewName is not a recognized Google review resource name.' })
+    }
+    const approved = await isApprovedGoogleLocationForTenant(tenantId, parsed.locationResource)
+    if (!approved) {
+      return res.status(403).json({
+        error: 'location_not_approved',
+        message: 'This review does not belong to a location currently linked to your account.',
+      })
+    }
+  }
+
   // Recovery Milestone 6B, Part 2: called ONLY after replyViaReviewName()
   // has already returned successfully -- Google has confirmed the reply
   // before this ever runs, matching the required ordering (send -> Google
@@ -1273,6 +1369,27 @@ async function publish(req, res) {
     }
   }
 
+  // "Google fallback hard budget must cover the whole operation" hardening:
+  // the token exchange below is a REAL outbound Google HTTP request (a
+  // bare fetch(), never retried) -- for a budgeted (fallback) invocation
+  // it must consume a unit from the SAME whole-operation counter the
+  // accounts/locations/reviews calls share, exactly like any of those
+  // calls' own attempts would. Checked (and consumed) BEFORE the exchange
+  // itself, so exhaustion is caught before that next transport call ever
+  // fires -- never after paying for it. This can only ever fail here if a
+  // future change shrinks FALLBACK_OPERATION_BUDGET below 1; kept for
+  // structural symmetry with every other consumption point in this
+  // operation, all of which check-then-consume the identical way.
+  if (fallbackBudget) {
+    if (fallbackBudget.remaining <= 0) {
+      return res.status(409).json({
+        error: 'fallback_resolution_budget_exceeded',
+        message: 'This review could not be resolved automatically. Please open it directly from a synced review list, or contact support to reconcile it.',
+      })
+    }
+    fallbackBudget.remaining -= 1
+  }
+
   // Token acquisition is checked/recorded separately from the reply
   // attempt itself: an invalid_grant here is a CONNECTION health problem
   // (feeds the "automatic recovery" status flip), while a failure further
@@ -1300,24 +1417,56 @@ async function publish(req, res) {
     }
 
     // Fallback: fuzzy-match by location name, then by reviewer display name.
-    const accounts = await gbpGetAllPages(`${ACCOUNTS_BASE}/accounts`, token, 'accounts')
-    if (!accounts.length) {
-      return res.status(404).json({ error: 'location_mismatch', message: 'No GBP accounts found on this Google account.' })
-    }
-
+    //
+    // "Contain Google fuzzy fallback" hardening (Phase A5, tightened by the
+    // final pre-deploy review's "whole operation" correction): this path
+    // can walk every account, every location under each, and a full
+    // reviews page for whichever one matches -- unlike the direct
+    // reviewName path (a single, targeted PUT), it is an open-ended search
+    // across whatever the tenant's credential can reach. Its own, tighter,
+    // per-user AND per-tenant rate limit was already checked earlier
+    // (before even the token exchange above), so a rate-limited attempt
+    // costs zero Google requests of any kind. `fallbackBudget` (created
+    // earlier, already charged once for the token exchange above) is
+    // shared across the accounts/locations/reviews calls below -- it is
+    // the SAME counter for the ENTIRE operation, not a fresh one scoped
+    // only to these calls, so the documented ceiling is genuinely a
+    // whole-invocation total.
+    let accounts
     let targetLocation = null
-    for (const acct of accounts) {
-      const rawLocations = await gbpGetAllPages(
-        `${LOCATIONS_BASE}/${acct.name}/locations?readMask=${encodeURIComponent(LOCATIONS_READ_MASK)}`,
-        token, 'locations'
-      ).catch(() => [])
-      const locations = rawLocations.map(loc => ({
-        ...loc,
-        name: v4LocationPath(acct.name, loc.name),
-        locationName: loc.title,
-      }))
-      targetLocation = locations.find(loc => locationMatches(loc.locationName, locationName))
-      if (targetLocation) break
+    try {
+      accounts = await gbpGetAllPages(`${ACCOUNTS_BASE}/accounts`, token, 'accounts', 'pageSize', 100, fallbackBudget)
+      if (!accounts.length) {
+        return res.status(404).json({ error: 'location_mismatch', message: 'No GBP accounts found on this Google account.' })
+      }
+
+      for (const acct of accounts) {
+        let rawLocations
+        try {
+          rawLocations = await gbpGetAllPages(
+            `${LOCATIONS_BASE}/${acct.name}/locations?readMask=${encodeURIComponent(LOCATIONS_READ_MASK)}`,
+            token, 'locations', 'pageSize', 100, fallbackBudget
+          )
+        } catch (err) {
+          if (err instanceof FetchBudgetExceededError) throw err
+          rawLocations = []
+        }
+        const locations = rawLocations.map(loc => ({
+          ...loc,
+          name: v4LocationPath(acct.name, loc.name),
+          locationName: loc.title,
+        }))
+        targetLocation = locations.find(loc => locationMatches(loc.locationName, locationName))
+        if (targetLocation) break
+      }
+    } catch (err) {
+      if (err instanceof FetchBudgetExceededError) {
+        return res.status(409).json({
+          error: 'fallback_resolution_budget_exceeded',
+          message: 'This review could not be resolved automatically. Please open it directly from a synced review list, or contact support to reconcile it.',
+        })
+      }
+      throw err
     }
 
     if (!targetLocation) {
@@ -1327,7 +1476,33 @@ async function publish(req, res) {
       })
     }
 
-    const reviews = await gbpGetAllPages(`${GBP_BASE}/${targetLocation.name}/reviews`, token, 'reviews', 'pageSize', 50)
+    // "Require approved location for Google reply" hardening (Phase A2):
+    // the fuzzy fallback resolves a location purely by NAME MATCH against
+    // whatever the tenant's Google credential can see -- the exact same gap
+    // as the direct reviewName path, just reached by a different route.
+    // Checked here, before spending a reviews.list call, so an unapproved
+    // match is refused as early as possible; no reply write is ever
+    // attempted regardless.
+    const fallbackApproved = await isApprovedGoogleLocationForTenant(tenantId, targetLocation.name)
+    if (!fallbackApproved) {
+      return res.status(403).json({
+        error: 'location_not_approved',
+        message: 'This location is not currently linked to your account.',
+      })
+    }
+
+    let reviews
+    try {
+      reviews = await gbpGetAllPages(`${GBP_BASE}/${targetLocation.name}/reviews`, token, 'reviews', 'pageSize', 50, fallbackBudget)
+    } catch (err) {
+      if (err instanceof FetchBudgetExceededError) {
+        return res.status(409).json({
+          error: 'fallback_resolution_budget_exceeded',
+          message: 'This review could not be resolved automatically. Please open it directly from a synced review list, or contact support to reconcile it.',
+        })
+      }
+      throw err
+    }
     if (!reviews.length) {
       return res.status(404).json({ error: 'review_gone', message: 'No reviews found for this location on Google.' })
     }
@@ -1864,6 +2039,26 @@ async function approveLocations(req, res) {
       return res.status(409).json({
         error: 'not_eligible',
         message: 'This tenant\'s location catalog is already committed and can no longer be changed from Settings. Contact support to change approved locations.',
+      })
+    }
+    if (err instanceof ConfigVersionConflictError) {
+      // "Fix location approval concurrency" hardening (Phase A3):
+      // recordLocationApproval() now binds its eligibility read and its
+      // write to one CAS generation -- this is the deterministic outcome
+      // for the LOSER of a race (two concurrent approve-locations calls,
+      // or an approval racing a status transition). Never retried
+      // silently here: a retry could resurrect a decision made against
+      // now-stale state (exactly the TOCTOU this hardening closes), so the
+      // caller is told plainly to re-submit against the tenant's current
+      // state instead.
+      await appendAuditEntry(tenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'tenant_location_catalog', entityId: tenantId, action: 'location_catalog.approval_denied_concurrent_update', changes: null, result: 'denied',
+        message: 'Self-service location approval was denied: the tenant\'s configuration changed concurrently.',
+      })
+      return res.status(409).json({
+        error: 'concurrent_update',
+        message: 'Your selection could not be saved because this tenant\'s configuration changed at the same time. Please refresh and try again.',
       })
     }
     return res.status(503).json({ error: 'service_unavailable', message: 'Could not activate the location catalog. Please try again shortly.' })

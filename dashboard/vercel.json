@@ -16,7 +16,7 @@
       "includeFiles": "private-data/{location-contacts.json,meta.json}"
     },
     "api/google/[action].js": {
-      "includeFiles": "private-data/_internal/review-location-index.json"
+      "includeFiles": "private-data/_internal/{review-location-index.json,gbp-location-link-map.json}"
     },
     "api/notifications/[action].js": {
       "includeFiles": "private-data/{meta.json,_internal/review-location-index.json,reviews/by-location/*.json}"

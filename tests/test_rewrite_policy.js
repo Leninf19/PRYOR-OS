@@ -14,16 +14,16 @@
 //
 // Run directly: node tests/test_rewrite_policy.js
 
-import { isSeriousIssue, enforceResponsePolicy } from '../dashboard/api/_lib/rewriteEngine.js'
+import { isSeriousIssue, enforceResponsePolicy, generateRewrite } from '../dashboard/api/_lib/rewriteEngine.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
 }
 
 const results = []
-function run(name, fn) {
+async function run(name, fn) {
   try {
-    fn()
+    await fn()
     console.log(`PASS: ${name}`)
     results.push(true)
   } catch (e) {
@@ -94,6 +94,50 @@ function testGuardNeverReturnsEmpty() {
   assert(cleaned && cleaned.length > 0, 'the guard must never leave the manager with an empty draft')
 }
 
+// --- "Cap AI input before Anthropic" hardening (Phase A4) -------------------
+
+process.env.ANTHROPIC_API_KEY = 'fake-key-for-tests'
+
+function installNeverCalledFetch() {
+  globalThis.fetch = async (url) => { throw new Error(`Anthropic must not be called, but fetch was invoked for: ${url}`) }
+}
+function installSuccessFetch() {
+  let calls = 0
+  globalThis.fetch = async () => { calls++; return { ok: true, json: async () => ({ content: [{ text: 'A generated reply.' }] }) } }
+  return () => calls
+}
+
+async function testOversizedReviewTextRejectedNoFetch() {
+  installNeverCalledFetch()
+  const result = await generateRewrite({ tone: 'friendly', reviewText: 'x'.repeat(5000) })
+  assert(result.ok === false && result.status === 400, `expected a 400 rejection, got ${JSON.stringify(result)}`)
+}
+
+async function testOversizedCurrentDraftRejectedNoFetch() {
+  installNeverCalledFetch()
+  const result = await generateRewrite({ tone: 'friendly', reviewText: 'fine', currentDraft: 'x'.repeat(5000) })
+  assert(result.ok === false && result.status === 400, `expected a 400 rejection, got ${JSON.stringify(result)}`)
+}
+
+async function testOversizedReviewerNameRejectedNoFetch() {
+  installNeverCalledFetch()
+  const result = await generateRewrite({ tone: 'friendly', reviewerName: 'x'.repeat(500) })
+  assert(result.ok === false && result.status === 400, `expected a 400 rejection, got ${JSON.stringify(result)}`)
+}
+
+async function testOversizedLocationRejectedNoFetch() {
+  installNeverCalledFetch()
+  const result = await generateRewrite({ tone: 'friendly', location: 'x'.repeat(500) })
+  assert(result.ok === false && result.status === 400, `expected a 400 rejection, got ${JSON.stringify(result)}`)
+}
+
+async function testWithinLimitsStillSucceeds() {
+  const getCalls = installSuccessFetch()
+  const result = await generateRewrite({ tone: 'friendly', reviewText: 'A perfectly normal review.', currentDraft: 'A draft.', reviewerName: 'Jane', location: 'Casa Tequila' })
+  assert(result.ok === true, `a normal-sized request must still succeed, got ${JSON.stringify(result)}`)
+  assert(getCalls() === 1, 'exactly one upstream call must have been made')
+}
+
 const tests = [
   ['Casa Tequila Prime regression text is never flagged serious', testCasaTequilaPrimeNeverSerious],
   ["'no issues' does not trigger the 'sue' keyword (root cause)", testNoIssuesDoesNotTriggerSueKeyword],
@@ -104,9 +148,14 @@ const tests = [
   ['guard strips a phone number', testGuardStripsPhoneNumber],
   ['guard leaves serious responses untouched', testGuardLeavesSeriousUntouched],
   ['guard never returns an empty string', testGuardNeverReturnsEmpty],
+  ['PHASE A4: oversized reviewText rejected (400), zero Anthropic calls', testOversizedReviewTextRejectedNoFetch],
+  ['PHASE A4: oversized currentDraft rejected (400), zero Anthropic calls', testOversizedCurrentDraftRejectedNoFetch],
+  ['PHASE A4: oversized reviewerName rejected (400), zero Anthropic calls', testOversizedReviewerNameRejectedNoFetch],
+  ['PHASE A4: oversized location rejected (400), zero Anthropic calls', testOversizedLocationRejectedNoFetch],
+  ['PHASE A4: a normal, within-limits request still succeeds', testWithinLimitsStillSucceeds],
 ]
 
-for (const [name, fn] of tests) run(name, fn)
+for (const [name, fn] of tests) await run(name, fn)
 
 console.log()
 if (results.every(Boolean)) {

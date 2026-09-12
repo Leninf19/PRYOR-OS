@@ -35,7 +35,7 @@ import {
   _resetLocationCatalogRegistryForTests,
 } from '../dashboard/api/_lib/tenants.js'
 import {
-  recordLocationApproval, upsertTenantConfig, markTenantProvisioned, getTenantConfig,
+  recordLocationApproval, upsertTenantConfig, markTenantProvisioned, getTenantConfig, ConfigVersionConflictError,
   _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis,
 } from '../dashboard/api/_lib/tenantConfigStore.js'
 
@@ -95,6 +95,27 @@ function makeGatedHashRedis() {
       hgetall: async (key) => ({ ...(store[key] ?? {}) }),
       hset: async (key, fields) => { store[key] = { ...(store[key] ?? {}), ...fields } },
       hdel: async (key, field) => { if (store[key]) delete store[key][field] },
+      // Phase A3 ("fix location approval concurrency"): recordLocationApproval()
+      // now always CAS-writes via client.eval -- faithfully emulates
+      // tenantConfigStore.js's CAS_UPSERT_SCRIPT. Deliberately NOT subject to
+      // the same read-gating as hget() above: a real Lua EVAL is a single
+      // atomic operation against Redis's actual current state at call time,
+      // never a stale, deliberately-delayed read.
+      eval: async (_script, keys, args) => {
+        const key = keys[0]
+        const [field, expectedVersionStr, nextJson] = args
+        const raw = store[key]?.[field] ?? null
+        let currentVersion = '0'
+        if (raw) {
+          try {
+            const decoded = JSON.parse(raw)
+            if (decoded && decoded.configVersion !== undefined) currentVersion = String(decoded.configVersion)
+          } catch { /* treat as version 0 */ }
+        }
+        if (currentVersion !== expectedVersionStr) return raw ?? false
+        store[key] = { ...(store[key] ?? {}), [field]: nextJson }
+        return true
+      },
     },
     // The NEXT hget() call for this field will block until openGate() is
     // called for it.
@@ -117,6 +138,25 @@ function wireConfigRedis() {
   client.hgetall = async (key) => ({ ...(store[key] ?? {}) })
   client.hset = async (key, fields) => { store[key] = { ...(store[key] ?? {}), ...fields } }
   client.hdel = async (key, field) => { if (store[key]) delete store[key][field] }
+  // Phase A3 ("fix location approval concurrency"): recordLocationApproval()
+  // now always CAS-writes via client.eval -- faithfully emulates
+  // tenantConfigStore.js's CAS_UPSERT_SCRIPT (HGET/compare-configVersion/
+  // HSET), mirroring test_tenant_entitlement_change.js's own fake exactly.
+  client.eval = async (_script, keys, args) => {
+    const key = keys[0]
+    const [field, expectedVersionStr, nextJson] = args
+    const raw = store[key]?.[field] ?? null
+    let currentVersion = '0'
+    if (raw) {
+      try {
+        const decoded = JSON.parse(raw)
+        if (decoded && decoded.configVersion !== undefined) currentVersion = String(decoded.configVersion)
+      } catch { /* treat as version 0 */ }
+    }
+    if (currentVersion !== expectedVersionStr) return raw ?? false
+    store[key] = { ...(store[key] ?? {}), [field]: nextJson }
+    return true
+  }
   setConfigRedis(() => client)
   return client
 }
@@ -282,6 +322,81 @@ async function testRedisFailureInOneRequestDoesNotAffectAnother() {
 }
 
 // ===========================================================================
+// 6: "Fix location approval concurrency" (Phase A3) -- two concurrent
+//    recordLocationApproval() calls for the SAME tenant, under GENUINE
+//    (setTimeout-based, real event-loop-interleaving) latency rather than
+//    this file's other tests' purely-synchronous fake timing. A prior
+//    review found that a synchronous fake resolves both calls' awaits in
+//    the same microtask turn, keeping one request permanently "one step
+//    ahead" of the other and never actually exercising the race -- under
+//    real Upstash network latency both requests can genuinely interleave.
+// ===========================================================================
+
+// A hash-shaped fake Redis whose hget/eval both incur a REAL macrotask delay
+// (setTimeout, not a manually-armed gate) -- two calls issued back to back
+// are only ordered by whichever timer the Node event loop happens to fire
+// first, which is exactly the "no synchronous fake timing" requirement.
+function makeLatencyInjectingHashRedis(delayMs = 15) {
+  const store = {}
+  const delay = () => new Promise(resolve => setTimeout(resolve, delayMs))
+  return {
+    hget: async (key, field) => { await delay(); return store[key]?.[field] ?? null },
+    hgetall: async (key) => { await delay(); return { ...(store[key] ?? {}) } },
+    hset: async (key, fields) => { await delay(); store[key] = { ...(store[key] ?? {}), ...fields } },
+    hdel: async (key, field) => { await delay(); if (store[key]) delete store[key][field] },
+    eval: async (_script, keys, args) => {
+      await delay()
+      const key = keys[0]
+      const [field, expectedVersionStr, nextJson] = args
+      const raw = store[key]?.[field] ?? null
+      let currentVersion = '0'
+      if (raw) {
+        try { const decoded = JSON.parse(raw); if (decoded && decoded.configVersion !== undefined) currentVersion = String(decoded.configVersion) } catch { /* treat as version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return raw ?? false
+      store[key] = { ...(store[key] ?? {}), [field]: nextJson }
+      return true
+    },
+  }
+}
+
+async function testConcurrentRecordLocationApprovalsExactlyOneWinsUnderRealLatency() {
+  const client = makeLatencyInjectingHashRedis()
+  setConfigRedis(() => client)
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
+
+  // Two genuinely concurrent approvals for the SAME tenant, each selecting
+  // a DIFFERENT set of locations -- if the race were lost (a plain
+  // read-then-write, no CAS), both would read the same starting
+  // (empty) locationIdMap and the second writer's plain hset would
+  // silently discard whatever the first writer had already assigned ids
+  // to. With the CAS in place, at most one of these may ever commit.
+  const [resultX, resultY] = await Promise.allSettled([
+    recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/x/locations/1', title: 'X1', address: '' }, { googleLocationId: 'accounts/x/locations/2', title: 'X2', address: '' }]),
+    recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/y/locations/1', title: 'Y1', address: '' }]),
+  ])
+
+  const outcomes = [resultX, resultY]
+  const fulfilled = outcomes.filter(r => r.status === 'fulfilled')
+  const rejected = outcomes.filter(r => r.status === 'rejected')
+  assert(fulfilled.length === 1, `exactly one concurrent approval must succeed, got ${fulfilled.length}`)
+  assert(rejected.length === 1, `exactly one concurrent approval must be rejected, got ${rejected.length}`)
+  assert(rejected[0].reason instanceof ConfigVersionConflictError,
+    `the loser must fail with a deterministic ConfigVersionConflictError, got ${rejected[0].reason?.constructor?.name}: ${rejected[0].reason?.message}`)
+
+  // Whichever one won, the final persisted state must be EXACTLY that
+  // winner's own selection -- never a merge of both, never empty, never
+  // the loser's selection silently applied on top.
+  const final = await getTenantConfig(TENANT_A)
+  const winnerGoogleIds = new Set(fulfilled[0].value.approvedLocations.map(l => l.googleLocationId))
+  const finalGoogleIds = new Set(final.approvedLocations.map(l => l.googleLocationId))
+  assert(finalGoogleIds.size === winnerGoogleIds.size && [...winnerGoogleIds].every(id => finalGoogleIds.has(id)),
+    `the persisted config must match exactly the winning request's own selection, got ${JSON.stringify(final.approvedLocations)}`)
+  assert(final.status === 'locations_approved', `status must still be the correct post-approval state, got ${JSON.stringify(final.status)}`)
+  assert(final.configVersion === 2, `exactly one write must have committed on top of the initial create, got configVersion ${final.configVersion}`)
+}
+
+// ===========================================================================
 // 5: No production authorization path depends on a shared mutable Map
 // ===========================================================================
 
@@ -300,6 +415,7 @@ async function main() {
   await run('simultaneous Tenant A / Tenant B requests remain isolated', testSimultaneousDifferentTenantRequestsRemainIsolated)
   await run('a Redis failure in one request cannot make another request inherit stale authorization', testRedisFailureInOneRequestDoesNotAffectAnother)
   await run('no production authorization path depends on a shared mutable Map', testNoProductionAuthorizationPathUsesASharedMutableMap)
+  await run('PHASE A3: concurrent recordLocationApproval() calls under REAL latency -- exactly one wins, loser gets ConfigVersionConflictError', testConcurrentRecordLocationApprovalsExactlyOneWinsUnderRealLatency)
 
   console.log()
   if (results.every(Boolean)) {

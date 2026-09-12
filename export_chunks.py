@@ -488,6 +488,34 @@ def export_gbp_sync_status(conn, locations: dict) -> None:
     })
 
 
+def export_gbp_location_link_map(locations: dict) -> None:
+    """"Require approved location for Google reply" hardening (revenue-abuse
+    audit, Phase A2): a `{gbp_location_name: locationId}` map for every
+    currently-linked location, so dashboard/api/_lib/gbpLocationAuthorization.js
+    can verify a Google review-reply resource name actually belongs to a
+    location this (BOOTSTRAP-mode) tenant currently has linked, without
+    trusting that the tenant's stored Google credential merely being able to
+    REACH that location is itself authorization to reply there.
+
+    Deliberately a SIBLING of export_gbp_sync_status() above, not a change to
+    it: that function already reduces this exact same fact
+    (`gbp_location_name IS NOT NULL`) to a boolean (`linked`) for
+    gbp-sync.json, which IS in data.js's public allowlist -- the raw Google
+    resource name is not secret, but it is per-location identifying detail a
+    location-scoped account has no reason to see about OTHER locations, so
+    it belongs only in an `_internal/` export, exactly like
+    export_review_location_index() above (never added to data.js's
+    allowlist -- see that function's own docstring and this file's own
+    `_internal/` convention).
+    """
+    link_map = {
+        l["gbp_location_name"]: l["id"]
+        for l in locations.values()
+        if l.get("gbp_location_name") and l.get("is_active", True)
+    }
+    write_json("_internal/gbp-location-link-map.json", link_map)
+
+
 def export_scraper_status(conn) -> None:
     runs = conn.execute("SELECT * FROM scraper_runs ORDER BY id DESC LIMIT 30").fetchall()
     run_list = []
@@ -742,6 +770,7 @@ def main(tenant_id: str):
     export_scraper_status(conn)
     export_provider_health(conn, tenant_id)
     export_gbp_sync_status(conn, locations)
+    export_gbp_location_link_map(locations)  # "Require approved location for Google reply" hardening -- never in data.js's public allowlist
     export_weekly_report(conn, locations)
     export_intelligence(conn, locations)
 

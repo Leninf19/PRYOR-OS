@@ -17,7 +17,7 @@ import { verifySession, signSession, SESSION_COOKIE } from '../dashboard/api/_li
 import { requireAuth } from '../dashboard/api/_lib/auth.js'
 import settingsHandler from '../dashboard/api/settings/[action].js'
 import sessionHandler from '../dashboard/api/session/[action].js'
-import { _setRedisClientForTests as setUserStoreClient, _resetRedisClientForTests as resetUserStoreClient, getUserById } from '../dashboard/api/_lib/userStore.js'
+import { _setRedisClientForTests as setUserStoreClient, _resetRedisClientForTests as resetUserStoreClient, getUserById, upsertUser, UserCreationMode } from '../dashboard/api/_lib/userStore.js'
 import { _setRedisClientForTests as setTokenStoreClient, _resetRedisClientForTests as resetTokenStoreClient, hashToken } from '../dashboard/api/_lib/tokenStore.js'
 import { getAccountByEmail } from '../dashboard/api/_lib/accountStore.js'
 import { _setTransportForTests, _resetTransportForTests } from '../dashboard/api/_lib/emailSender.js'
@@ -100,12 +100,31 @@ async function ownerToken() {
 async function marketingToken() {
   return signSession({ userId: 'usr_marketing', email: 'marketing@example.com', role: 'marketing', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
 }
+async function adminToken() {
+  return signSession({ userId: 'usr_admin', email: 'admin@example.com', role: 'admin', locationIds: '*', tenantId: DEFAULT_TENANT_ID, sessionVersion: 1 })
+}
+
+// Directly seeds an ALREADY-ACTIVATED Redis account (passwordSetAt set) --
+// generate-reset-link is scoped to accounts reachable via getUserById()
+// (Redis only), so exercising its admin/owner target-role guard requires a
+// target that's already past the static-directory/invite stage. Mirrors
+// tests/test_user_store_tenant_isolation.js's self-referential
+// sourceIdentity pattern for pure fixture seeding.
+async function seedActiveRedisAccount({ userId, email, role, locationIds = '*' }) {
+  const passwordHash = await bcryptHash()
+  const record = {
+    userId, email, passwordHash, role, locationIds, tenantId: DEFAULT_TENANT_ID,
+    sessionVersion: 1, disabled: false, displayName: userId, passwordSetAt: new Date().toISOString(),
+  }
+  return upsertUser(DEFAULT_TENANT_ID, record, { creationMode: UserCreationMode.MIGRATION, sourceIdentity: record })
+}
 
 async function seedStaticDirectory(overrides = {}) {
   const hash = await bcryptHash()
   const base = {
     usr_owner: { userId: 'usr_owner', email: 'owner@example.com', passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false, displayName: 'Owner' },
     usr_marketing: { userId: 'usr_marketing', email: 'marketing@example.com', passwordHash: hash, role: 'marketing', locationIds: '*', sessionVersion: 1, disabled: false, displayName: 'Marketing' },
+    usr_admin: { userId: 'usr_admin', email: 'admin@example.com', passwordHash: hash, role: 'admin', locationIds: '*', sessionVersion: 1, disabled: false, displayName: 'Admin' },
     usr_disabled: { userId: 'usr_disabled', email: 'disabled@example.com', passwordHash: hash, role: 'read_only', locationIds: [7], sessionVersion: 1, disabled: true, displayName: 'Disabled' },
     usr_legacy_owner: { userId: 'usr_legacy_owner', email: 'legacy@example.com', passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 3, disabled: false, displayName: 'Legacy Owner' },
   }
@@ -327,6 +346,79 @@ async function testGenerateResetLinkForbiddenWithoutUsersManage() {
   assert(res.statusCode === 403, `Marketing must not hold USERS_MANAGE, got ${res.statusCode}`)
 }
 
+// --- "block admin -> owner credential takeover" (Phase A1) ----------------
+
+async function testAdminCannotGenerateResetLinkForOwner() {
+  await seedStaticDirectory()
+  installFakeRedis()
+  const sent = installCapturingEmailTransport()
+  await seedActiveRedisAccount({ userId: 'usr_target_owner', email: 'target-owner@example.com', role: 'owner' })
+  const res = await settingsHandler(
+    reqFor({ action: 'generate-reset-link', method: 'POST', token: await adminToken(), body: { userId: 'usr_target_owner' } }),
+    fakeRes(),
+  )
+  assert(res.statusCode === 403, `an Admin must never be able to mint a password-reset link for an Owner, got ${res.statusCode}`)
+  assert(sent.length === 0, 'no reset email may be sent once the target-role guard rejects the request')
+}
+
+async function testOwnerCanGenerateResetLinkForOwner() {
+  await seedStaticDirectory()
+  installFakeRedis()
+  installCapturingEmailTransport()
+  await seedActiveRedisAccount({ userId: 'usr_target_owner', email: 'target-owner@example.com', role: 'owner' })
+  const res = await settingsHandler(
+    reqFor({ action: 'generate-reset-link', method: 'POST', token: await ownerToken(), body: { userId: 'usr_target_owner' } }),
+    fakeRes(),
+  )
+  assert(res.statusCode === 200, `an Owner must still be able to generate a reset link for another Owner, got ${res.statusCode}`)
+}
+
+async function testAdminCanGenerateResetLinkForNonOwner() {
+  await seedStaticDirectory()
+  installFakeRedis()
+  installCapturingEmailTransport()
+  await seedActiveRedisAccount({ userId: 'usr_target_manager', email: 'target-manager@example.com', role: 'location_manager', locationIds: [1] })
+  const res = await settingsHandler(
+    reqFor({ action: 'generate-reset-link', method: 'POST', token: await adminToken(), body: { userId: 'usr_target_manager' } }),
+    fakeRes(),
+  )
+  assert(res.statusCode === 200, `Admin must retain the ability to generate a reset link for a non-Owner target, got ${res.statusCode}`)
+}
+
+async function testAdminCannotResendInviteForPendingOwner() {
+  await seedStaticDirectory()
+  installFakeRedis()
+  const sent = installCapturingEmailTransport()
+  const inviteRes = await settingsHandler(
+    reqFor({ action: 'invite-user', method: 'POST', token: await ownerToken(), body: { name: 'Pending Owner', email: 'pending-owner@example.com', role: 'owner', locationIds: '*' } }),
+    fakeRes(),
+  )
+  assert(inviteRes.statusCode === 200, 'setup: an Owner inviting a new Owner must succeed')
+  sent.length = 0 // discard the invite email captured above
+  const res = await settingsHandler(
+    reqFor({ action: 'resend-invite', method: 'POST', token: await adminToken(), body: { userId: inviteRes.body.userId } }),
+    fakeRes(),
+  )
+  assert(res.statusCode === 403, `an Admin must never be able to reissue/obtain an invite link for a pending Owner, got ${res.statusCode}`)
+  assert(sent.length === 0, 'no invite email may be resent once the target-role guard rejects the request')
+}
+
+async function testOwnerCanResendInviteForPendingOwner() {
+  await seedStaticDirectory()
+  installFakeRedis()
+  installCapturingEmailTransport()
+  const inviteRes = await settingsHandler(
+    reqFor({ action: 'invite-user', method: 'POST', token: await ownerToken(), body: { name: 'Pending Owner', email: 'pending-owner@example.com', role: 'owner', locationIds: '*' } }),
+    fakeRes(),
+  )
+  assert(inviteRes.statusCode === 200, 'setup: an Owner inviting a new Owner must succeed')
+  const res = await settingsHandler(
+    reqFor({ action: 'resend-invite', method: 'POST', token: await ownerToken(), body: { userId: inviteRes.body.userId } }),
+    fakeRes(),
+  )
+  assert(res.statusCode === 200, `an Owner must retain the ability to resend a pending Owner's invitation, got ${res.statusCode}`)
+}
+
 // --- audit-log privacy (structural, scoped to this commit's functions) ----
 
 function extractFunctionSource(src, functionName) {
@@ -381,6 +473,12 @@ async function main() {
   await run('generate-reset-link: a static-only (not yet promoted) account is not reachable (404)', testGenerateResetLinkForActiveAccount)
   await run('generate-reset-link: rejects a not-yet-activated invite (409)', testGenerateResetLinkRejectsNotYetActivatedInvite)
   await run('generate-reset-link: forbidden without USERS_MANAGE', testGenerateResetLinkForbiddenWithoutUsersManage)
+
+  await run('PHASE A1: Admin cannot generate a reset link for an Owner (403, no token/email)', testAdminCannotGenerateResetLinkForOwner)
+  await run('PHASE A1: Owner can still generate a reset link for another Owner', testOwnerCanGenerateResetLinkForOwner)
+  await run('PHASE A1: Admin retains the ability to generate a reset link for a non-Owner', testAdminCanGenerateResetLinkForNonOwner)
+  await run('PHASE A1: Admin cannot resend/obtain an invite link for a pending Owner (403, no email)', testAdminCannotResendInviteForPendingOwner)
+  await run('PHASE A1: Owner can still resend a pending Owner\'s invitation', testOwnerCanResendInviteForPendingOwner)
 
   await run('audit-log entries in the reset flow never carry a raw token, token hash, or password', testAuditEntriesNeverCarryTokenOrPassword)
 

@@ -506,7 +506,27 @@ async function rewrite(req, res) {
   const allowed = await enforceRateLimit(req, res, `rewrite:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
 
-  const result = await generateRewrite(req.body)
+  // "Tenant-level AI safety circuit breaker" hardening (final pre-deploy
+  // review, item 1): the per-user limit above is trivially multiplied by
+  // inviting more seats into the tenant (settings/invite-user has no seat
+  // cap) -- this is a genuinely SEPARATE bucket, keyed by tenantId, that
+  // every account in the tenant shares regardless of who is calling. 60
+  // requests / 5 minutes: a manager triaging a full page of unanswered
+  // reviews might reasonably regenerate 10-20 replies in a few minutes
+  // (trying different tones, re-rolling a draft); this headroom covers
+  // several managers doing that concurrently, while still bounding a
+  // scripted caller to a finite, auditable rate regardless of how many
+  // accounts it uses. This is a PLATFORM SAFETY circuit breaker, not a
+  // plan entitlement -- see rewriteEngine.js's own MAX_* constants for the
+  // sibling per-request input-size caps this complements.
+  const tenantId = resolveTenantId(account)
+  const tenantAllowed = await enforceRateLimit(req, res, `rewrite-tenant:${tenantId}`, { requestsPerWindow: 60, windowSeconds: 300 })
+  if (!tenantAllowed) {
+    console.log(`[ai-tenant-limit] endpoint=rewrite tenantId=${JSON.stringify(tenantId)}`)
+    return
+  }
+
+  const result = await generateRewrite(req.body, { tenantId, userId: account.userId })
   if (!result.ok) return res.status(result.status).json({ error: result.error })
   return res.status(200).json({ rewritten: result.rewritten })
 }

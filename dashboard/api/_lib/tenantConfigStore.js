@@ -639,6 +639,21 @@ export async function recordLocationApproval(tenantId, selectedLocations) {
   // low-level persistence primitive has no special-cased tenantId of any
   // kind and unconditionally refuses to create a record for ANY tenantId
   // it doesn't already have one for.
+  // "Fix location approval concurrency" hardening (Phase A3): every
+  // duplicate googleLocationId WITHIN one selection collapses to a single
+  // approvedLocations entry before anything else runs -- mirrors
+  // applyEntitlementChange()'s own duplicate rejection for the admin path,
+  // closing the sibling gap on this, the self-service path (a discovery
+  // response, or a caller, listing the same location twice must never
+  // produce two approvedLocations rows sharing one locationId).
+  const dedupedLocations = []
+  const seenGoogleLocationIds = new Set()
+  for (const loc of selectedLocations) {
+    if (seenGoogleLocationIds.has(loc.googleLocationId)) continue
+    seenGoogleLocationIds.add(loc.googleLocationId)
+    dedupedLocations.push(loc)
+  }
+
   const existing = await getTenantConfig(tenantId)
   if (!existing) {
     throw new TenantDoesNotExistError(
@@ -651,10 +666,10 @@ export async function recordLocationApproval(tenantId, selectedLocations) {
       existing.status
     )
   }
-  const locationIdMap = { ...(existing?.locationIdMap ?? {}) }
-  let nextLocationId = Number.isInteger(existing?.nextLocationId) && existing.nextLocationId >= 1 ? existing.nextLocationId : 1
+  const locationIdMap = { ...(existing.locationIdMap ?? {}) }
+  let nextLocationId = Number.isInteger(existing.nextLocationId) && existing.nextLocationId >= 1 ? existing.nextLocationId : 1
 
-  const approvedLocations = selectedLocations.map(loc => {
+  const approvedLocations = dedupedLocations.map(loc => {
     if (!(loc.googleLocationId in locationIdMap)) {
       locationIdMap[loc.googleLocationId] = nextLocationId
       nextLocationId += 1
@@ -667,6 +682,27 @@ export async function recordLocationApproval(tenantId, selectedLocations) {
     }
   })
 
+  // "Fix location approval concurrency" hardening (Phase A3): the
+  // eligibility check above (existing.status) and this write are now bound
+  // to the EXACT SAME configVersion snapshot via CAS -- the same primitive
+  // applyEntitlementChange()/markTenantProvisioningDispatched() already use
+  // (CAS_UPSERT_SCRIPT, above). Before this, existing.status was read, then
+  // this function computed a brand-new locationIdMap/approvedLocations from
+  // it, then wrote with a PLAIN hset -- two concurrent approvals could both
+  // read the same starting state, both compute (different) locationIdMaps
+  // from it, and the second plain write would silently discard the first's
+  // entirely, losing whichever locations only the first writer's map ever
+  // assigned an id to. It also meant a status transition landing between
+  // the eligibility read and the write (a TOCTOU window) could let a
+  // request that read 'locations_approved' overwrite a tenant that had, by
+  // the time of the write, already committed to 'provisioning' or beyond --
+  // rolling its status back and replacing its licensed catalog. Binding the
+  // write to expectedVersion closes both: a losing request's CAS fails with
+  // ConfigVersionConflictError (surfaced by google/[action].js's
+  // approveLocations() as a deterministic 409, never a silent retry-and-
+  // merge), so exactly one write per generation ever commits, no
+  // locationIdMap entry is ever lost, and no committed tenant's status or
+  // catalog can be overwritten by a request that started before it committed.
   return upsertTenantConfig(tenantId, {
     locationCatalogEnabled: true,
     status: 'locations_approved',
@@ -678,7 +714,7 @@ export async function recordLocationApproval(tenantId, selectedLocations) {
     // self-service function is provisioned via Vercel Blob (see
     // provision_tenant.py); LTA never calls this function at all.
     storageMode: 'BLOB',
-  })
+  }, { expectedVersion: existing.configVersion })
   // No `allowCreate` -- see the existence check above. This is a plain
   // update on an already-existing tenant, exactly like every other
   // status-transition write in this file.

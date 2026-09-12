@@ -88,6 +88,34 @@ const TONE_GUIDES = {
   spanish:      'Warm and professional tone.',
 }
 
+// "Cap AI input before Anthropic" hardening (Phase A4, revenue-abuse
+// containment audit -- ai-unbounded-prompt-input): every one of these
+// fields is interpolated directly into the prompt below with no prior
+// length check, so an authenticated caller could previously drive the
+// billed input size arbitrarily high (a review or draft field sized to
+// just under the model's context window, repeated at the rate limit).
+// These ceilings are set generously above any real review/draft/name this
+// product would ever produce -- rejected outright (400), never silently
+// truncated, so a caller always knows their request was refused rather
+// than quietly rewritten.
+const MAX_REVIEW_TEXT_CHARS = 4000
+const MAX_CURRENT_DRAFT_CHARS = 4000
+const MAX_REVIEWER_NAME_CHARS = 200
+const MAX_LOCATION_CHARS = 200
+
+function fieldTooLong(value, max) {
+  return typeof value === 'string' && value.length > max
+}
+
+// Structured, safe usage logging (Phase A4): tenantId/userId/endpoint/
+// input+output character counts only -- NEVER the review text, draft, or
+// generated reply itself. This is the one place spend-attribution logging
+// for this endpoint happens; keep it that way rather than adding ad-hoc
+// console.log calls elsewhere that might carry real content.
+function logAiUsage({ tenantId, userId, endpoint, inputChars, outputChars }) {
+  console.log(`[ai-usage] endpoint=${endpoint} tenantId=${JSON.stringify(tenantId ?? null)} userId=${JSON.stringify(userId ?? null)} inputChars=${inputChars} outputChars=${outputChars ?? 'n/a'}`)
+}
+
 // Runs the full rewrite: builds the prompt, calls Anthropic, applies the
 // Phase 3 safety guard. Returns { ok: true, rewritten } on success, or
 // { ok: false, status, error } (already shaped for the caller's
@@ -96,7 +124,9 @@ const TONE_GUIDES = {
 // shape or this function's internal error handling, matching how every
 // other action in this codebase separates auth/response wiring from
 // business logic.
-export async function generateRewrite(body) {
+// `usage` (optional): { tenantId, userId } -- attached to the structured,
+// content-free usage log line only; never required for the function to work.
+export async function generateRewrite(body, usage = {}) {
   const apiKey = process.env.ANTHROPIC_API_KEY
   if (!apiKey) {
     return { ok: false, status: 503, error: 'ANTHROPIC_API_KEY is not set in Vercel environment variables. Add it at vercel.com â†’ Project â†’ Settings â†’ Environment Variables.' }
@@ -106,6 +136,18 @@ export async function generateRewrite(body) {
 
   if (!tone) {
     return { ok: false, status: 400, error: 'Missing required field: tone' }
+  }
+  if (fieldTooLong(reviewText, MAX_REVIEW_TEXT_CHARS)) {
+    return { ok: false, status: 400, error: `reviewText must be ${MAX_REVIEW_TEXT_CHARS} characters or fewer.` }
+  }
+  if (fieldTooLong(currentDraft, MAX_CURRENT_DRAFT_CHARS)) {
+    return { ok: false, status: 400, error: `currentDraft must be ${MAX_CURRENT_DRAFT_CHARS} characters or fewer.` }
+  }
+  if (fieldTooLong(reviewerName, MAX_REVIEWER_NAME_CHARS)) {
+    return { ok: false, status: 400, error: `reviewerName must be ${MAX_REVIEWER_NAME_CHARS} characters or fewer.` }
+  }
+  if (fieldTooLong(location, MAX_LOCATION_CHARS)) {
+    return { ok: false, status: 400, error: `location must be ${MAX_LOCATION_CHARS} characters or fewer.` }
   }
 
   const toneGuide    = TONE_GUIDES[tone] ?? TONE_GUIDES.friendly
@@ -163,6 +205,7 @@ Write ONLY the response text. No quotes, no labels, no preamble. Sign off as 'â€
 
     if (!upstream.ok) {
       const errBody = await upstream.text().catch(() => upstream.statusText)
+      logAiUsage({ ...usage, endpoint: 'rewrite', inputChars: prompt.length })
       return { ok: false, status: 502, error: `Anthropic API error ${upstream.status}: ${errBody}` }
     }
 
@@ -170,12 +213,15 @@ Write ONLY the response text. No quotes, no labels, no preamble. Sign off as 'â€
     const rewritten = data?.content?.[0]?.text?.trim() ?? ''
 
     if (!rewritten) {
+      logAiUsage({ ...usage, endpoint: 'rewrite', inputChars: prompt.length, outputChars: 0 })
       return { ok: false, status: 502, error: 'Anthropic returned an empty response. Try again.' }
     }
 
     // Phase 3 hard safety guard -- applied regardless of what the model
     // actually returned, not just relied on via the prompt above.
-    return { ok: true, rewritten: enforceResponsePolicy(rewritten, serious) }
+    const finalRewrite = enforceResponsePolicy(rewritten, serious)
+    logAiUsage({ ...usage, endpoint: 'rewrite', inputChars: prompt.length, outputChars: finalRewrite.length })
+    return { ok: true, rewritten: finalRewrite }
   } catch (err) {
     return { ok: false, status: 500, error: err?.message ?? 'Unexpected server error' }
   }

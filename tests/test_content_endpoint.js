@@ -13,13 +13,26 @@
 process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xyz'
 
 import bcrypt from 'bcryptjs'
-import handler from '../dashboard/api/content/[action].js'
+import handler, {
+  _setUploadLockRenewIntervalMsForTests, _resetUploadLockRenewIntervalMsForTests,
+} from '../dashboard/api/content/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests as _setCampaignRedis, _resetRedisClientForTests as _resetCampaignRedis } from '../dashboard/api/_lib/campaignStore.js'
-import { _setRedisClientForTests as _setAssetRedis, _resetRedisClientForTests as _resetAssetRedis, getAsset } from '../dashboard/api/_lib/contentAssetStore.js'
+import {
+  _setRedisClientForTests as _setAssetRedis, _resetRedisClientForTests as _resetAssetRedis, getAsset,
+  acquireContentUploadLock, renewContentUploadLock, releaseContentUploadLock,
+} from '../dashboard/api/_lib/contentAssetStore.js'
 import { _setBlobClientForTests, _resetBlobClientForTests } from '../dashboard/api/_lib/blobStore.js'
-import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import { _setLimiterFactoryForTests, _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
 import { _setRedisClientForTests as _setTaskRedis, _resetRedisClientForTests as _resetTaskRedis, createTask, getTask } from '../dashboard/api/_lib/taskStore.js'
+import {
+  upsertTenantConfig,
+  _setRedisClientForTests as _setConfigRedis, _resetRedisClientForTests as _resetConfigRedis,
+} from '../dashboard/api/_lib/tenantConfigStore.js'
+import {
+  upsertUser, UserCreationMode,
+  _setRedisClientForTests as _setUserStoreRedis, _resetRedisClientForTests as _resetUserStoreRedis,
+} from '../dashboard/api/_lib/userStore.js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
@@ -39,8 +52,11 @@ async function run(name, fn) {
     _resetCampaignRedis()
     _resetAssetRedis()
     _resetTaskRedis()
+    _resetConfigRedis()
+    _resetUserStoreRedis()
     _resetBlobClientForTests()
     _resetLimiterFactoryForTests()
+    _resetUploadLockRenewIntervalMsForTests()
     delete process.env.VERCEL_ENV
   }
 }
@@ -57,13 +73,73 @@ function fakeRes() {
 // One shared Redis-hash-shaped fake, used by both campaignStore.js and
 // contentAssetStore.js independently (they're separate keys/instances in
 // production but a single in-memory object works fine for one test file).
+// Also carries a separate string-keyed store for contentAssetStore.js's
+// per-tenant upload LEASE (SET NX EX, then an ownership-token-checked `eval`
+// for renew/release -- a different key SHAPE than the hash records above,
+// so it needs its own namespace, same dual-shape pattern
+// test_google_integration_architecture.js's fakeCredentialRedis() already
+// uses). `eval` here emulates BOTH contentAssetStore.js's RENEW_SCRIPT (2
+// args: token, ttlSeconds -- renew) and RELEASE_SCRIPT (1 arg: token --
+// release), distinguished by args.length, exactly like the real Lua
+// scripts' GET-then-conditional-act shape: a token that no longer matches
+// what's stored is always a harmless no-op, never able to act on a
+// different (newer) holder's lease. This fake does not model TTL expiry at
+// all (fine for every test using it -- none of them need a lease to
+// actually expire); see fakeExpiringLockRedis() below for the tests that do.
 function fakeRedis(initial = {}) {
   const store = { ...initial }
+  const strings = {}
   return {
     hgetall: async () => ({ ...store }),
     hget: async (_key, field) => store[field] ?? null,
     hset: async (_key, fields) => { Object.assign(store, fields) },
     hdel: async (_key, field) => { const had = field in store; delete store[field]; return had ? 1 : 0 },
+    set: async (key, value, opts) => {
+      if (opts?.nx && key in strings) return null
+      strings[key] = value
+      return 'OK'
+    },
+    del: async (key) => { const had = key in strings; delete strings[key]; return had ? 1 : 0 },
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [token] = args
+      if (strings[key] !== token) return 0
+      if (args.length === 1) delete strings[key] // RELEASE_SCRIPT
+      return 1 // RENEW_SCRIPT (args.length === 2) leaves the value in place -- this fake has no TTL to bump
+    },
+  }
+}
+
+// A dedicated fake for the upload-lock PRIMITIVES themselves (acquire/renew/
+// release), independent of the campaign/asset hash fakes above, with a
+// controllable virtual clock (`_advance(ms)`) so lease-expiry tests never
+// need to actually wait in real time. Models exactly the two operations
+// contentAssetStore.js's lock functions issue: SET NX EX (acquire) and the
+// two ownership-token-checked eval scripts (renew/release) -- both
+// TTL-aware here, unlike fakeRedis() above.
+function fakeExpiringLockRedis() {
+  let now = 0
+  const strings = {} // key -> { value, expiresAt }
+  function isLive(key) {
+    const entry = strings[key]
+    return Boolean(entry) && entry.expiresAt > now
+  }
+  return {
+    set: async (key, value, opts) => {
+      if (opts?.nx && isLive(key)) return null
+      strings[key] = { value, expiresAt: now + (opts?.ex ?? 0) * 1000 }
+      return 'OK'
+    },
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      if (!isLive(key)) return 0
+      const [token] = args
+      if (strings[key].value !== token) return 0
+      if (args.length === 2) { strings[key].expiresAt = now + Number(args[1]) * 1000; return 1 } // RENEW_SCRIPT
+      delete strings[key] // RELEASE_SCRIPT
+      return 1
+    },
+    _advance(ms) { now += ms },
   }
 }
 
@@ -311,6 +387,444 @@ async function testOversizedFileRejected() {
     body: { campaignId: campaign.id, type: 'website_graphic', filename: 'huge.png', mimeType: 'image/png', fileBase64: oversized },
   })
   assert(res.statusCode === 400, `an oversized image must be rejected, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+}
+
+// --- "Minimum content cost guardrail" hardening (Phase A6) ------------------
+// getAllAssets() reads only metadata (sizeBytes), never the actual Blob
+// bytes -- these tests seed synthetic records directly into the fake Redis
+// hash to simulate a tenant near/at the safety ceiling without needing any
+// real large payloads.
+async function seedAssetRecord(client, id, { campaignId, sizeBytes = 1000 }) {
+  await client.hset('content_assets:v1', {
+    [id]: JSON.stringify({
+      id, campaignId, type: 'other', filename: `${id}.png`, mimeType: 'image/png',
+      sizeBytes, blobPathname: `content/${campaignId}/${id}.png`, captionText: null, createdAt: new Date().toISOString(),
+    }),
+  })
+}
+
+async function testUploadAboveTenantStorageCeilingRejectedBeforeBlobWrite() {
+  await setDirectory()
+  setFreshCampaignStore()
+  const assetClient = setFreshAssetStore()
+  const blob = fakeBlob()
+  _setBlobClientForTests(() => blob.client)
+  const campaign = await createCampaignAndApprove(null, 'Draft')
+  await seedAssetRecord(assetClient, 'existing-1', { campaignId: campaign.id, sizeBytes: 2 * 1024 * 1024 * 1024 })
+  const res = await invoke({
+    action: 'upload', method: 'POST', token: ownerToken(),
+    body: { campaignId: campaign.id, type: 'website_graphic', filename: 'new.png', mimeType: 'image/png', fileBase64: FAKE_JPEG() },
+  })
+  assert(res.statusCode === 413, `expected 413 once the tenant storage ceiling is reached, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  assert(Object.keys(blob.blobs).length === 0, 'no Blob write may occur once the storage ceiling is exceeded')
+}
+
+async function testAssetCountCeilingEnforced() {
+  await setDirectory()
+  setFreshCampaignStore()
+  const assetClient = setFreshAssetStore()
+  const blob = fakeBlob()
+  _setBlobClientForTests(() => blob.client)
+  const campaign = await createCampaignAndApprove(null, 'Draft')
+  const fields = {}
+  for (let i = 0; i < 2000; i++) {
+    fields[`existing-${i}`] = JSON.stringify({
+      id: `existing-${i}`, campaignId: campaign.id, type: 'other', filename: `x${i}.png`, mimeType: 'image/png',
+      sizeBytes: 10, blobPathname: `content/${campaign.id}/x${i}.png`, captionText: null, createdAt: new Date().toISOString(),
+    })
+  }
+  await assetClient.hset('content_assets:v1', fields)
+  const res = await invoke({
+    action: 'upload', method: 'POST', token: ownerToken(),
+    body: { campaignId: campaign.id, type: 'website_graphic', filename: 'new.png', mimeType: 'image/png', fileBase64: FAKE_JPEG() },
+  })
+  assert(res.statusCode === 413, `expected 413 once the tenant asset-count ceiling is reached, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  assert(Object.keys(blob.blobs).length === 0, 'no Blob write may occur once the asset-count ceiling is exceeded')
+}
+
+async function testSecondUserInSameTenantCannotBypassTenantCeiling() {
+  await setDirectory()
+  setFreshCampaignStore()
+  const assetClient = setFreshAssetStore()
+  const blob = fakeBlob()
+  _setBlobClientForTests(() => blob.client)
+  const campaign = await createCampaignAndApprove(null, 'Draft')
+  await seedAssetRecord(assetClient, 'existing-1', { campaignId: campaign.id, sizeBytes: 2 * 1024 * 1024 * 1024 })
+  // A DIFFERENT user (Admin, not the Owner who "used up" the ceiling) in
+  // the SAME tenant -- the ceiling is per-tenant, never per-user.
+  const res = await invoke({
+    action: 'upload', method: 'POST', token: adminToken(),
+    body: { campaignId: campaign.id, type: 'website_graphic', filename: 'new.png', mimeType: 'image/png', fileBase64: FAKE_JPEG() },
+  })
+  assert(res.statusCode === 413, `a different user in the same tenant must also be blocked by the tenant-wide ceiling, got ${res.statusCode}`)
+}
+
+// "Make content safety ceiling race-safe" hardening (final pre-deploy
+// review, item 2): a hash-shaped fake whose READ operations (hget/hgetall,
+// what getAllAssets() uses) incur a REAL macrotask delay -- forcing two
+// "concurrent" uploads to genuinely interleave their usage reads, unlike
+// this file's other tests' purely-synchronous fakes. SET NX (the lock)
+// deliberately stays UNDELAYED/atomic: a real Redis SET NX is a single,
+// indivisible server-side command regardless of network latency to reach
+// it -- injecting a delay there would let two "concurrent" callers both
+// see the lock key absent, defeating the very race this test exists to prove.
+function fakeAssetRedisWithReadDelay(delayMs = 15) {
+  const store = {}
+  const strings = {}
+  const delay = () => new Promise(resolve => setTimeout(resolve, delayMs))
+  return {
+    hgetall: async () => { await delay(); return { ...store } },
+    hget: async (_key, field) => { await delay(); return store[field] ?? null },
+    hset: async (_key, fields) => { Object.assign(store, fields) },
+    hdel: async (_key, field) => { const had = field in store; delete store[field]; return had ? 1 : 0 },
+    set: async (key, value, opts) => { if (opts?.nx && key in strings) return null; strings[key] = value; return 'OK' },
+    del: async (key) => { const had = key in strings; delete strings[key]; return had ? 1 : 0 },
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [token] = args
+      if (strings[key] !== token) return 0
+      if (args.length === 1) delete strings[key] // RELEASE_SCRIPT
+      return 1 // RENEW_SCRIPT
+    },
+  }
+}
+
+async function testConcurrentUploadsNearCeilingExactlyOneSucceeds() {
+  await setDirectory()
+  setFreshCampaignStore()
+  const assetClient = fakeAssetRedisWithReadDelay()
+  _setAssetRedis(() => assetClient)
+  const blob = fakeBlob()
+  _setBlobClientForTests(() => blob.client)
+  const campaign = await createCampaignAndApprove(null, 'Draft')
+
+  // Seed existing usage to leave exactly 20MB of headroom under the 2GB
+  // ceiling (avoids allocating real multi-GB buffers in a unit test, while
+  // still proving the real ceiling arithmetic).
+  const HEADROOM_BYTES = 20 * 1024 * 1024
+  await seedAssetRecord(assetClient, 'existing-1', { campaignId: campaign.id, sizeBytes: 2 * 1024 * 1024 * 1024 - HEADROOM_BYTES })
+
+  // Two NEW uploads, each 12MB -- individually well under the 20MB
+  // headroom (and under the 15MB per-file image cap), but together (24MB)
+  // exceed it. Fired truly concurrently via Promise.all.
+  const twelveMb = b64('x'.repeat(12 * 1024 * 1024))
+  const uploadOnce = () => invoke({
+    action: 'upload', method: 'POST', token: ownerToken(),
+    body: { campaignId: campaign.id, type: 'website_graphic', filename: 'new.png', mimeType: 'image/png', fileBase64: twelveMb },
+  })
+  const [resA, resB] = await Promise.all([uploadOnce(), uploadOnce()])
+
+  const successes = [resA, resB].filter(r => r.statusCode === 201)
+  const rejections = [resA, resB].filter(r => r.statusCode !== 201)
+  assert(successes.length === 1, `exactly one of the two concurrent near-ceiling uploads must succeed, got ${successes.length} (statuses: ${resA.statusCode}, ${resB.statusCode})`)
+  assert(rejections.length === 1, `exactly one must be rejected, got ${rejections.length}`)
+  // The loser must be refused outright -- either denied the lock (409,
+  // "try again") or, if it acquired the lock after the winner released it,
+  // correctly re-evaluates against FRESH usage and is over the ceiling
+  // (413) -- never silently allowed through.
+  assert([409, 413].includes(rejections[0].statusCode), `the loser must be refused with a deterministic 409 (lock busy) or 413 (over ceiling on fresh data), got ${rejections[0].statusCode}`)
+  assert(Object.keys(blob.blobs).length === 1, `exactly one Blob object may be written for two uploads that together exceed the ceiling, got ${Object.keys(blob.blobs).length}`)
+}
+
+// --- "Content upload lock must outlive the critical section" hardening
+// (two final safety invariants, item 2) -- tests against the lock
+// PRIMITIVES directly (acquire/renew/release), independent of the full
+// upload() handler, using fakeExpiringLockRedis()'s virtual clock so lease
+// expiry is proven without any real waiting. ---------------------------------
+
+async function testLockGrantsMutualExclusion() {
+  const client = fakeExpiringLockRedis()
+  _setAssetRedis(() => client)
+  const tokenA = await acquireContentUploadLock(DEFAULT_TENANT_ID)
+  assert(typeof tokenA === 'string' && tokenA.length > 0, 'request A must acquire the lock and receive an ownership token')
+  const tokenB = await acquireContentUploadLock(DEFAULT_TENANT_ID)
+  assert(tokenB === null, 'request B must be refused the lock while A still holds it')
+}
+
+async function testStaleExpiredLeaseCannotDeleteANewerLock() {
+  const client = fakeExpiringLockRedis()
+  _setAssetRedis(() => client)
+  const tokenA = await acquireContentUploadLock(DEFAULT_TENANT_ID)
+  assert(tokenA, 'A must acquire the initial lease')
+  // A never renews -- simulate its lease expiring (well past any TTL this
+  // module could plausibly configure) without A ever calling release().
+  client._advance(60_000)
+  const tokenB = await acquireContentUploadLock(DEFAULT_TENANT_ID)
+  assert(tokenB && tokenB !== tokenA, 'B must be able to acquire a fresh lease once A\'s has expired')
+  // A's belated finally/release fires AFTER B already holds a new lease --
+  // its stale token must never match what's currently stored, so this must
+  // be a harmless no-op, never deleting B's lock.
+  await releaseContentUploadLock(DEFAULT_TENANT_ID, tokenA)
+  const stillBlocked = await acquireContentUploadLock(DEFAULT_TENANT_ID)
+  assert(stillBlocked === null, 'A\'s stale release must NEVER delete a newer request\'s (B\'s) still-live lock')
+}
+
+async function testHeartbeatRenewalKeepsLeaseAliveBeyondOriginalTtlWindow() {
+  const client = fakeExpiringLockRedis()
+  _setAssetRedis(() => client)
+  const token = await acquireContentUploadLock(DEFAULT_TENANT_ID)
+  assert(token, 'lock acquired')
+  // Renew partway through the original TTL window (mirrors upload()'s real
+  // heartbeat, which renews well before the lease could expire).
+  client._advance(10_000)
+  const renewed = await renewContentUploadLock(DEFAULT_TENANT_ID, token)
+  assert(renewed === true, 'a renewal with the correct, still-current token must succeed')
+  // Advance far enough that the ORIGINAL fixed-TTL lease (acquired at t=0,
+  // 15s TTL) would already have expired on its own (now: 20s total), but
+  // still within the FRESH TTL window the renewal at t=10s established
+  // (alive until 25s) -- proving it is the RENEWAL, not merely the
+  // original acquire's TTL, that is now the thing keeping this lease alive
+  // for a "long-running" critical section.
+  client._advance(10_000)
+  const competingAcquire = await acquireContentUploadLock(DEFAULT_TENANT_ID)
+  assert(competingAcquire === null, 'a long-running critical section must remain protected for its entire duration via heartbeat renewal, even once the ORIGINAL lease TTL window has fully elapsed')
+}
+
+async function testRenewalWithWrongTokenNeverExtendsSomeoneElsesLease() {
+  const client = fakeExpiringLockRedis()
+  _setAssetRedis(() => client)
+  const tokenA = await acquireContentUploadLock(DEFAULT_TENANT_ID)
+  assert(tokenA, 'A acquires the lease')
+  const forgedRenew = await renewContentUploadLock(DEFAULT_TENANT_ID, 'not-a-real-token')
+  assert(forgedRenew === false, 'renewing with a token that does not match the current holder must fail, never extend the lease on someone else\'s behalf')
+}
+
+async function testBlobFailureDuringUploadReleasesLockWithoutCorruptingMetadata() {
+  await setDirectory()
+  setFreshCampaignStore()
+  setFreshAssetStore()
+  const campaign = await createCampaignAndApprove(null, 'Draft')
+  _setBlobClientForTests(() => ({
+    put: async () => { throw new Error('simulated Blob outage') },
+    get: async () => ({ statusCode: 404, stream: null, blob: null }),
+    del: async () => {},
+  }))
+  const failed = await invoke({
+    action: 'upload', method: 'POST', token: ownerToken(),
+    body: { campaignId: campaign.id, type: 'other', filename: 'x.png', mimeType: 'image/png', fileBase64: FAKE_JPEG() },
+  })
+  // putBlob() (blobStore.js) always re-wraps any underlying client error as
+  // BlobStoreUnavailableError, which upload()'s outer catch classifies as a
+  // 503 (fail-closed "service temporarily unavailable"), not a raw 502.
+  assert(failed.statusCode === 503, `a Blob write failure must surface as a clean 503, got ${failed.statusCode}: ${JSON.stringify(failed.body)}`)
+
+  // The lock must have been released (via `finally`) despite the thrown
+  // error -- a second, otherwise-unrelated upload must not be blocked by a
+  // stuck reservation.
+  const blob = fakeBlob()
+  _setBlobClientForTests(() => blob.client)
+  const succeeded = await invoke({
+    action: 'upload', method: 'POST', token: ownerToken(),
+    body: { campaignId: campaign.id, type: 'other', filename: 'y.png', mimeType: 'image/png', fileBase64: FAKE_JPEG() },
+  })
+  assert(succeeded.statusCode === 201, `after the failed upload releases its lock, a subsequent upload must succeed, got ${succeeded.statusCode}: ${JSON.stringify(succeeded.body)}`)
+
+  // No orphaned/corrupt asset metadata from the failed attempt.
+  const list = await invoke({ action: 'list-assets', token: ownerToken(), query: { campaignId: campaign.id } })
+  assert(list.body.assets.length === 1, `exactly one asset record (the successful second upload) must exist -- the failed attempt must leave no metadata behind, got ${list.body.assets.length}`)
+}
+
+// --- "Verify orphan-Blob cleanup on lease loss" (deployment-gate hardening,
+// item 2) --------------------------------------------------------------------
+// A fake asset-store client shaped like the general-purpose fakeRedis()
+// above, but exposing its raw lock-string store (`_strings`) so the test can
+// simulate an external actor (a genuinely different, newer request) taking
+// over the upload lock WHILE this request's Blob write is still in flight --
+// the exact "lease lost mid-critical-section, after Blob creation, before
+// metadata creation" sequence this hardening item is about.
+function fakeAssetRedisWithHijackableLock() {
+  const store = {}
+  const strings = {}
+  return {
+    hgetall: async () => ({ ...store }),
+    hget: async (_key, field) => store[field] ?? null,
+    hset: async (_key, fields) => { Object.assign(store, fields) },
+    hdel: async (_key, field) => { const had = field in store; delete store[field]; return had ? 1 : 0 },
+    set: async (key, value, opts) => { if (opts?.nx && key in strings) return null; strings[key] = value; return 'OK' },
+    del: async (key) => { const had = key in strings; delete strings[key]; return had ? 1 : 0 },
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [token] = args
+      if (strings[key] !== token) return 0
+      if (args.length === 1) delete strings[key] // RELEASE_SCRIPT
+      return 1 // RENEW_SCRIPT
+    },
+    _strings: strings,
+  }
+}
+
+async function testLeaseLostAfterBlobCreationCleansUpOrphanAndNeverCreatesMetadata() {
+  await setDirectory()
+  setFreshCampaignStore()
+  const assetClient = fakeAssetRedisWithHijackableLock()
+  _setAssetRedis(() => assetClient)
+  const campaign = await createCampaignAndApprove(null, 'Draft')
+
+  // Shorten the heartbeat interval (test-only seam) so a renewal genuinely
+  // fires WHILE the fake Blob write below is still in flight, without a
+  // multi-second real wait for the production 5s interval.
+  _setUploadLockRenewIntervalMsForTests(10)
+
+  const blob = fakeBlob()
+  let putWasAttempted = false
+  _setBlobClientForTests(() => ({
+    put: async (pathname, buffer) => {
+      putWasAttempted = true
+      // Let a couple of heartbeat ticks pass with the lock still intact
+      // (proving those renewals succeed normally), THEN simulate a
+      // genuinely different, newer request taking over the lock (e.g. an
+      // operator-forced expiry, or a store hiccup that let another
+      // acquire() through) -- this must happen strictly AFTER the Blob
+      // write is committed below, mirroring "Blob upload succeeds" (step 5
+      // of the required sequence) happening before "request notices
+      // lockLost" (step 6).
+      await new Promise(resolve => setTimeout(resolve, 25))
+      const result = await blob.client.put(pathname, buffer)
+      const lockKey = Object.keys(assetClient._strings)[0]
+      assetClient._strings[lockKey] = 'a-different-newer-owners-token'
+      // Give the shortened-interval heartbeat time to observe the mismatch
+      // (setting leaseLost) before putBlob() resolves back to upload().
+      await new Promise(resolve => setTimeout(resolve, 30))
+      return result
+    },
+    get: blob.client.get,
+    del: blob.client.del,
+  }))
+
+  const res = await invoke({
+    action: 'upload', method: 'POST', token: ownerToken(),
+    body: { campaignId: campaign.id, type: 'other', filename: 'x.png', mimeType: 'image/png', fileBase64: FAKE_JPEG() },
+  })
+
+  assert(putWasAttempted, 'sanity: the Blob write was actually attempted')
+  assert(res.statusCode === 503, `lease loss discovered after a successful Blob write must fail closed with 503, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  assert(Object.keys(blob.blobs).length === 0, 'the orphaned Blob this request itself created must be cleaned up (deleted), never left behind')
+  const list = await invoke({ action: 'list-assets', token: ownerToken(), query: { campaignId: campaign.id } })
+  assert(list.body.assets.length === 0, `no asset metadata may ever be committed once lease loss is detected, even though the Blob write had already succeeded -- got ${list.body.assets.length} asset(s)`)
+  const remainingLockKey = Object.keys(assetClient._strings)[0]
+  assert(assetClient._strings[remainingLockKey] === 'a-different-newer-owners-token', 'the newer owner\'s lock must remain completely untouched by this request\'s failed cleanup/release -- its stale token can never match, so release() must be a harmless no-op')
+}
+
+// --- "Tenant-scope content download abuse protection" hardening
+// (final pre-deploy review, item 3) ------------------------------------------
+
+const OTHER_TENANT = 't_content-download-other-tenant'
+
+// A properly key-namespaced fake (UNLIKE this file's own fakeRedis() above,
+// which deliberately flattens every hash into one shared object -- fine
+// for campaignStore.js/contentAssetStore.js, which each only ever address
+// ONE logical hash per client, but userStore.js writes to FOUR distinct
+// hash keys through the same client (the user record, the email index,
+// and the two global identity-index hashes) -- a flat namespace would let
+// the identity-index write silently clobber the user record whenever a
+// field name (the userId) collides across those hashes. Mirrors
+// tests/test_ai_tenant_limits.js's own fakeRedisWithEval().
+function fakeNamespacedHashRedis() {
+  const store = {}
+  return {
+    hget: async (key, field) => store[key]?.[field] ?? null,
+    hgetall: async (key) => ({ ...(store[key] ?? {}) }),
+    hset: async (key, fields) => { store[key] = { ...(store[key] ?? {}), ...fields } },
+    hdel: async (key, field) => { if (store[key]) delete store[key][field] },
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [field, expectedVersionStr, nextJson] = args
+      const raw = store[key]?.[field] ?? null
+      let currentVersion = '0'
+      if (raw) {
+        try { const decoded = JSON.parse(raw); if (decoded && decoded.configVersion !== undefined) currentVersion = String(decoded.configVersion) } catch { /* treat as version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return raw ?? false
+      store[key] = { ...(store[key] ?? {}), [field]: nextJson }
+      return true
+    },
+  }
+}
+
+// A genuinely separate tenant (not just a different role in DEFAULT_TENANT_ID)
+// -- required for "Tenant B remains unaffected." Mirrors
+// tests/test_ai_tenant_limits.js's lightweight seeding pattern (an active
+// tenant_config + one Redis-backed Owner account); Content Library
+// authorization itself doesn't need location catalog details, just a
+// resolvable account.
+async function seedOtherTenant(userId, email) {
+  const configClient = fakeNamespacedHashRedis()
+  _setConfigRedis(() => configClient)
+  const userClient = fakeNamespacedHashRedis()
+  _setUserStoreRedis(() => userClient)
+  await upsertTenantConfig(OTHER_TENANT, { status: 'active', locationCatalogEnabled: true }, { allowCreate: true, creationSource: 'migration' })
+  const record = { userId, email, passwordHash: await bcrypt.hash('x', 12), role: 'owner', locationIds: '*', tenantId: OTHER_TENANT, sessionVersion: 1, disabled: false, displayName: userId }
+  await upsertUser(OTHER_TENANT, record, { creationMode: UserCreationMode.MIGRATION, sourceIdentity: record })
+  return signSession({ userId, email, role: 'owner', locationIds: '*', tenantId: OTHER_TENANT, sessionVersion: 1 })
+}
+
+// Simulates a REAL per-identifier limiter, isolated to the tenant-shaped
+// bucket only (200/60s) -- every other shape (the existing per-user 60/60s
+// limiter) always succeeds, so repeatedly calling as the SAME user doesn't
+// also exhaust their own separate bucket and confound the result.
+function makeTenantOnlyDownloadCountingFactory() {
+  const counts = new Map()
+  return (requestsPerWindow, windowSeconds) => {
+    if (requestsPerWindow !== 200 || windowSeconds !== 60) return { limit: async () => ({ success: true, remaining: 99 }) }
+    return {
+      limit: async (identifier) => {
+        const n = (counts.get(identifier) ?? 0) + 1
+        counts.set(identifier, n)
+        return { success: n <= requestsPerWindow, remaining: Math.max(0, requestsPerWindow - n) }
+      },
+    }
+  }
+}
+
+async function testDownloadTenantBucketBlocksSecondUserSameTenant() {
+  await setDirectory()
+  // Deny only the tenant-shaped bucket (200/60s); the per-user bucket
+  // (60/60s) stays healthy for both Owner and Admin.
+  _setLimiterFactoryForTests((requestsPerWindow, windowSeconds) => {
+    if (requestsPerWindow === 200 && windowSeconds === 60) return { limit: async () => ({ success: false, remaining: 0 }) }
+    return { limit: async () => ({ success: true, remaining: 99 }) }
+  })
+  // User A (Owner) "used up" the tenant bucket; User B (Admin, same
+  // tenant, own per-user bucket untouched) must still be blocked.
+  const res = await invoke({ action: 'download', method: 'GET', token: adminToken(), query: { id: 'whatever' } })
+  assert(res.statusCode === 429, `Admin must be blocked by the exhausted TENANT bucket despite an untouched personal bucket, got ${res.statusCode}`)
+}
+
+async function testDownloadTenantBucketIndependentAcrossTenants() {
+  await setDirectory()
+  setFreshCampaignStore()
+  setFreshAssetStore()
+  const otherTenantToken = await seedOtherTenant('usr_other', 'other@example.com')
+  _setLimiterFactoryForTests(makeTenantOnlyDownloadCountingFactory())
+  // Exhaust DEFAULT_TENANT_ID's 200-request tenant bucket (as Owner).
+  for (let i = 0; i < 200; i++) {
+    const r = await invoke({ action: 'download', method: 'GET', token: ownerToken(), query: { id: 'whatever' } })
+    assert(r.statusCode === 404, `setup call ${i} must reach the (nonexistent-asset) 404, not be rate-limited, got ${r.statusCode}`)
+  }
+  const blockedDefault = await invoke({ action: 'download', method: 'GET', token: ownerToken(), query: { id: 'whatever' } })
+  assert(blockedDefault.statusCode === 429, `the default tenant must now be blocked by its own exhausted bucket, got ${blockedDefault.statusCode}`)
+  // A wholly separate tenant must have its own, independent allowance.
+  const okOther = await invoke({ action: 'download', method: 'GET', token: otherTenantToken, query: { id: 'whatever' } })
+  assert(okOther.statusCode === 404, `Tenant B must be unaffected by Tenant A's exhausted bucket (its own request reaches the nonexistent-asset 404, not 429), got ${okOther.statusCode}`)
+}
+
+async function testDownloadPerUserLimiterStillEnforced() {
+  // The per-user limiter (item 3's "do not remove the per-user limiter")
+  // must still independently apply -- denies only the 60/60s shape.
+  await setDirectory()
+  _setLimiterFactoryForTests((requestsPerWindow, windowSeconds) => {
+    if (requestsPerWindow === 60 && windowSeconds === 60) return { limit: async () => ({ success: false, remaining: 0 }) }
+    return { limit: async () => ({ success: true, remaining: 99 }) }
+  })
+  const res = await invoke({ action: 'download', method: 'GET', token: ownerToken(), query: { id: 'whatever' } })
+  assert(res.statusCode === 429, `the existing per-user limiter must still be enforced, got ${res.statusCode}`)
+}
+
+async function testDownloadRateLimitEnforced() {
+  await setDirectory()
+  _setLimiterFactoryForTests(() => ({ limit: async () => ({ success: false, remaining: 0 }) }))
+  const res = await invoke({ action: 'download', method: 'GET', token: ownerToken(), query: { id: 'whatever' } })
+  assert(res.statusCode === 429, `expected 429 from the new download rate limit, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
 }
 
 async function testEmptyFileRejected() {
@@ -652,6 +1166,20 @@ const tests = [
   ['MIME type validation rejects an executable disguised as a marketing file', testMimeTypeValidationRejectsUnsupportedTypes],
   ['a mismatched file extension/MIME type is rejected', testMimeExtensionMismatchRejected],
   ['an oversized file is rejected', testOversizedFileRejected],
+  ['PHASE A6: upload above the tenant storage ceiling is rejected before any Blob write', testUploadAboveTenantStorageCeilingRejectedBeforeBlobWrite],
+  ['PHASE A6: upload above the tenant asset-count ceiling is rejected before any Blob write', testAssetCountCeilingEnforced],
+  ['PHASE A6: a second user in the same tenant cannot bypass the tenant-wide ceiling', testSecondUserInSameTenantCannotBypassTenantCeiling],
+  ['FINAL REVIEW item 2: two concurrent near-ceiling uploads -- exactly one succeeds', testConcurrentUploadsNearCeilingExactlyOneSucceeds],
+  ['FINAL SAFETY INVARIANTS item 2 (1/5): the upload lock grants mutual exclusion', testLockGrantsMutualExclusion],
+  ['FINAL SAFETY INVARIANTS item 2 (2/5): a stale expired lease can never delete a newer lock', testStaleExpiredLeaseCannotDeleteANewerLock],
+  ['FINAL SAFETY INVARIANTS item 2 (3/5): heartbeat renewal keeps the lease alive beyond the original TTL window', testHeartbeatRenewalKeepsLeaseAliveBeyondOriginalTtlWindow],
+  ['FINAL SAFETY INVARIANTS item 2: renewing with the wrong token never extends someone else\'s lease', testRenewalWithWrongTokenNeverExtendsSomeoneElsesLease],
+  ['FINAL SAFETY INVARIANTS item 2 (5/5): a Blob failure releases the lock without corrupting metadata', testBlobFailureDuringUploadReleasesLockWithoutCorruptingMetadata],
+  ['DEPLOYMENT GATE item 2: lease lost after Blob creation cleans up the orphan and never commits metadata', testLeaseLostAfterBlobCreationCleansUpOrphanAndNeverCreatesMetadata],
+  ['PHASE A6: download is now rate-limited', testDownloadRateLimitEnforced],
+  ['FINAL REVIEW item 3: download tenant bucket blocks a second user in the same tenant', testDownloadTenantBucketBlocksSecondUserSameTenant],
+  ['FINAL REVIEW item 3: download tenant bucket is independent across tenants', testDownloadTenantBucketIndependentAcrossTenants],
+  ['FINAL REVIEW item 3: per-user download limiter is still independently enforced', testDownloadPerUserLimiterStillEnforced],
   ['an empty/missing file is rejected', testEmptyFileRejected],
   ['a path-traversal filename is rejected', testPathTraversalFilenameRejected],
   ['an authorized download of an Approved asset succeeds', testAuthorizedDownloadSucceeds],

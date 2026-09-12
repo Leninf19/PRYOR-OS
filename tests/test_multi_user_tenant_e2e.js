@@ -107,6 +107,21 @@ function wireConfigRedis() {
     hgetall: async (key) => ({ ...(store[key] ?? {}) }),
     hset: async (key, fields) => { store[key] = { ...(store[key] ?? {}), ...fields } },
     hdel: async (key, field) => { if (store[key]) delete store[key][field] },
+    // Phase A3 ("fix location approval concurrency"): recordLocationApproval()
+    // now always CAS-writes via client.eval -- faithfully emulates
+    // tenantConfigStore.js's CAS_UPSERT_SCRIPT (HGET/compare-configVersion/HSET).
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [field, expectedVersionStr, nextJson] = args
+      const raw = store[key]?.[field] ?? null
+      let currentVersion = '0'
+      if (raw) {
+        try { const decoded = JSON.parse(raw); if (decoded && decoded.configVersion !== undefined) currentVersion = String(decoded.configVersion) } catch { /* treat as version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return raw ?? false
+      store[key] = { ...(store[key] ?? {}), [field]: nextJson }
+      return true
+    },
   }))
 }
 

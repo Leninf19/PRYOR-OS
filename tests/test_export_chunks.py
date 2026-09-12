@@ -246,6 +246,42 @@ def test_export_gbp_sync_status_still_identifies_only_genuine_gbp_runs():
             "the newer scraper run must not be mistaken for the most recent GBP sync"
 
 
+# --- export_gbp_location_link_map ("require approved location for Google
+# reply" hardening, Phase A2) -------------------------------------------------
+
+def test_export_gbp_location_link_map_includes_only_linked_active_locations():
+    with ScratchExport() as ex:
+        linked_id = _add_location(ex.conn, "Linked Location")
+        unlinked_id = _add_location(ex.conn, "Never Linked")
+        inactive_linked_id = _add_location(ex.conn, "Inactive Linked")
+        ex.conn.execute(
+            "UPDATE locations SET gbp_location_name = ? WHERE id = ?",
+            ("accounts/1/locations/111", linked_id),
+        )
+        ex.conn.execute(
+            "UPDATE locations SET gbp_location_name = ?, is_active = 0 WHERE id = ?",
+            ("accounts/1/locations/333", inactive_linked_id),
+        )
+        ex.conn.commit()
+        locations = _locations_dict(ex.conn)
+
+        export_chunks.export_gbp_location_link_map(locations)
+        link_map = ex.read_json("_internal/gbp-location-link-map.json")
+
+        assert link_map == {"accounts/1/locations/111": linked_id}, \
+            f"expected only the one active, linked location, got {link_map}"
+        assert unlinked_id not in link_map.values(), "a never-linked location must not appear"
+        assert "accounts/1/locations/333" not in link_map, "an inactive location must not appear even if it has a gbp_location_name"
+
+
+def test_export_gbp_location_link_map_empty_when_nothing_linked():
+    with ScratchExport() as ex:
+        _add_location(ex.conn, "Never Linked")
+        locations = _locations_dict(ex.conn)
+        export_chunks.export_gbp_location_link_map(locations)
+        assert ex.read_json("_internal/gbp-location-link-map.json") == {}
+
+
 # --- export_action_items (unanswered list + trend alerts) --------------------
 
 def test_export_action_items_unanswered_reviews_include_locationId():
@@ -583,6 +619,8 @@ def main():
     run("export_meta(): locationId is stable across repeated exports", test_export_meta_locationId_stable_across_repeated_exports)
     run("export_gbp_sync_status(): includes locationId", test_export_gbp_sync_status_includes_locationId)
     run("export_gbp_sync_status(): still identifies only genuine GBP runs after a newer scraper run", test_export_gbp_sync_status_still_identifies_only_genuine_gbp_runs)
+    run("export_gbp_location_link_map(): includes only active, linked locations", test_export_gbp_location_link_map_includes_only_linked_active_locations)
+    run("export_gbp_location_link_map(): empty when nothing is linked", test_export_gbp_location_link_map_empty_when_nothing_linked)
     run("export_action_items(): unanswered reviews include locationId", test_export_action_items_unanswered_reviews_include_locationId)
     run("export_action_items(): trend alerts include locationId", test_export_action_items_trend_alerts_include_locationId)
     run("export_validation(): includes locationId, preserves null for company-wide flags", test_export_validation_includes_locationId_and_preserves_null)

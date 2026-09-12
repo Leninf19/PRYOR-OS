@@ -740,6 +740,15 @@ async function resendInviteAction(req, res) {
   try {
     const target = await getUserById(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
+    // "Block admin -> owner credential takeover" hardening: reissuing an
+    // invite link hands the bearer a fresh, working credential for the
+    // target identity -- structurally identical to assigning that role in
+    // the first place. Reuses canAssignRole()'s existing elevation-of-
+    // privilege rule (only an Owner may act on an Owner) rather than
+    // inventing a second, parallel role-ordering concept.
+    if (!canAssignRole(account.role, target.role)) {
+      return res.status(403).json({ error: 'forbidden', message: 'Only an Owner may reissue an invitation for an Owner account.' })
+    }
     if (target.passwordSetAt) {
       return res.status(409).json({ error: 'already_active', message: 'This account has already been activated -- use password reset instead.' })
     }
@@ -864,6 +873,16 @@ async function generateResetLinkAction(req, res) {
   try {
     const target = await getUserById(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
+    // "Block admin -> owner credential takeover" hardening: a raw reset
+    // link is a working credential for the target identity the moment it's
+    // consumed -- an Admin minting one for an Owner is a full account
+    // takeover, defeating the exact elevation-of-privilege boundary
+    // canAssignRole() exists to enforce elsewhere (invite-user,
+    // update-user-role-locations). No token is created and no email is
+    // sent when this check fails.
+    if (!canAssignRole(account.role, target.role)) {
+      return res.status(403).json({ error: 'forbidden', message: 'Only an Owner may generate a password reset link for an Owner account.' })
+    }
     if (!target.passwordSetAt) {
       return res.status(409).json({ error: 'not_yet_active', message: 'This account has not been activated yet -- resend the invitation instead.' })
     }
