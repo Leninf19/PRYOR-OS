@@ -23,12 +23,17 @@ import { requireLocationAccess } from '../dashboard/api/_lib/auth.js'
 import {
   getUserById, listUsers, upsertUser, getUserIdentityMigrationMode, UserIdentityMigrationMode,
   lookupIdentityByEmail, lookupTenantIdForUserId, reconcileAccountGrantsAfterLocationRemoval,
+  UserCreationMode, UserCreationNotAllowedError,
   _setRedisClientForTests as setUserStoreClient, _resetRedisClientForTests as resetUserStoreClient,
 } from '../dashboard/api/_lib/userStore.js'
 import {
   getAccountById, getAccountByEmail, getAccountByIdForTenant, listAccounts,
 } from '../dashboard/api/_lib/accountStore.js'
 import { _setRedisClientForTests as setTokenStoreClient, _resetRedisClientForTests as resetTokenStoreClient } from '../dashboard/api/_lib/tokenStore.js'
+import {
+  getTenantConfig, upsertTenantConfig,
+  _setRedisClientForTests as setTenantConfigClient, _resetRedisClientForTests as resetTenantConfigClient,
+} from '../dashboard/api/_lib/tenantConfigStore.js'
 
 const TENANT_A = 't_synthetic-user-isolation-a'
 const TENANT_B = 't_synthetic-user-isolation-b'
@@ -50,6 +55,7 @@ async function run(name, fn) {
   } finally {
     resetUserStoreClient()
     resetTokenStoreClient()
+    resetTenantConfigClient()
     delete process.env.ACCOUNT_DIRECTORY_JSON
   }
 }
@@ -72,14 +78,36 @@ function installFakeRedis() {
   const client = fakeRedis()
   setUserStoreClient(() => client)
   setTokenStoreClient(() => client)
+  setTenantConfigClient(() => client)
   return client
 }
 
 async function bcryptHash() { return bcrypt.hash('correct-horse-battery-staple', 12) }
 
+// "Prevent duplicate/shadow tenant creation" hardening: upsertUser() now
+// requires the target tenant to genuinely exist before it will create a
+// brand-new user record (see UserCreationMode's own comment, userStore.js).
+// This file's synthetic TENANT_A/TENANT_B ids have no tenant_config of
+// their own by default (this file tests userStore.js's OWN isolation,
+// independent of tenantConfigStore.js) -- ensureTenantConfig() seeds one,
+// idempotently, exactly like the real self-service flow's own
+// tenant_config-before-owner-user ordering. Never touches DEFAULT_TENANT_ID
+// (Los Tres Amigos never has a tenant_config record by design -- see
+// tenants.js's tenantExists()).
+async function ensureTenantConfig(tenantId) {
+  if (tenantId === DEFAULT_TENANT_ID) return
+  const existing = await getTenantConfig(tenantId)
+  if (!existing) await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+}
+
 async function createTenantUser(tenantId, { userId, email, role = 'owner', locationIds = '*' }) {
+  await ensureTenantConfig(tenantId)
   const passwordHash = await bcryptHash()
-  return upsertUser(tenantId, { userId, email, passwordHash, role, locationIds, tenantId, sessionVersion: 1, disabled: false, displayName: userId })
+  const record = { userId, email, passwordHash, role, locationIds, tenantId, sessionVersion: 1, disabled: false, displayName: userId }
+  // Pure fixture-seeding, no real prior identity to reference -- the
+  // record is its own sourceIdentity (see test_user_store.js's identical
+  // reasoning).
+  return upsertUser(tenantId, record, { creationMode: UserCreationMode.MIGRATION, sourceIdentity: record })
 }
 
 function tokenFor(tenantId, userId, email, role = 'owner', locationIds = '*') {
@@ -342,7 +370,8 @@ async function testLtaRemainsLegacyModeAndUnindexed() {
   // promoting a static account into Redis) must NEVER populate the
   // global identity index -- its resolution path stays exactly as it was
   // before this phase (bootstrap-hash + static-directory fallback only).
-  await upsertUser(DEFAULT_TENANT_ID, { userId: 'usr_lta_promoted', email: 'lta-promoted@example.com', passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false })
+  const ltaPromotedRecord = { userId: 'usr_lta_promoted', email: 'lta-promoted@example.com', passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false }
+  await upsertUser(DEFAULT_TENANT_ID, ltaPromotedRecord, { creationMode: UserCreationMode.MIGRATION, sourceIdentity: ltaPromotedRecord })
 
   const indexed = await lookupIdentityByEmail('lta-promoted@example.com')
   assert(indexed === null, 'an LTA (LEGACY-mode) account must never be written to the global identity index')
@@ -353,6 +382,58 @@ async function testLtaRemainsLegacyModeAndUnindexed() {
   // It must still be fully resolvable via the LEGACY fallback path.
   const found = await getAccountByEmail('lta-promoted@example.com')
   assert(found !== null && found.userId === 'usr_lta_promoted', 'an unindexed LTA account must still resolve correctly via the LEGACY bootstrap fallback')
+}
+
+// ===========================================================================
+// 13. "Close the last tenant-creation exception" final hardening --
+// sourceIdentity's OWN tenant must match the tenantId being written into,
+// for BOTH MIGRATION and ADMIN_MANAGED_UPDATE. A matching userId/email
+// alone (already enforced before this phase) is not enough: without this,
+// a sourceIdentity that genuinely, legitimately resolved for Tenant A could
+// still be handed to upsertUser(TENANT_B, ...) and materialize that same
+// identity into a tenant it has no relationship to, provided TENANT_B
+// already exists. Deterministic rejection, no write performed.
+// ===========================================================================
+
+async function testMigrationRejectsSourceIdentityFromADifferentTenant() {
+  installFakeRedis()
+  const tenantAUser = await createTenantUser(TENANT_A, { userId: 'usr_cross_tenant_migration', email: 'cross-migration@example.com' })
+  await ensureTenantConfig(TENANT_B) // TENANT_B genuinely exists -- this is not a "tenant doesn't exist" rejection
+
+  let threw = null
+  try {
+    await upsertUser(TENANT_B, { ...tenantAUser }, { creationMode: UserCreationMode.MIGRATION, sourceIdentity: tenantAUser })
+  } catch (e) {
+    threw = e
+  }
+  assert(threw instanceof UserCreationNotAllowedError, `expected UserCreationNotAllowedError, got ${threw?.constructor?.name ?? 'nothing (no error thrown!)'}`)
+  assert(/tenant/i.test(threw.message), `error message should explain the tenant mismatch, got: ${threw.message}`)
+
+  const wroteIntoB = await getUserById(TENANT_B, 'usr_cross_tenant_migration')
+  assert(wroteIntoB === null, 'a sourceIdentity genuinely belonging to Tenant A must NEVER result in a written record in Tenant B, even when Tenant B exists')
+}
+
+async function testAdminManagedUpdateRejectsSourceIdentityFromADifferentTenant() {
+  installFakeRedis()
+  const tenantATarget = await createTenantUser(TENANT_A, { userId: 'usr_cross_tenant_admin', email: 'cross-admin@example.com', role: 'location_manager', locationIds: [1] })
+  await ensureTenantConfig(TENANT_B) // TENANT_B genuinely exists
+
+  let threw = null
+  try {
+    // An attacker (or a buggy caller) reusing a Tenant A identity as
+    // "proof" to materialize an admin-authorized change into Tenant B --
+    // even attempting to escalate role/locations in the same call, exactly
+    // the kind of misuse ADMIN_MANAGED_UPDATE's own comment says the
+    // endpoint-level authorization can never re-derive on its own.
+    await upsertUser(TENANT_B, { ...tenantATarget, role: 'owner', locationIds: '*' }, { creationMode: UserCreationMode.ADMIN_MANAGED_UPDATE, sourceIdentity: tenantATarget })
+  } catch (e) {
+    threw = e
+  }
+  assert(threw instanceof UserCreationNotAllowedError, `expected UserCreationNotAllowedError, got ${threw?.constructor?.name ?? 'nothing (no error thrown!)'}`)
+  assert(/tenant/i.test(threw.message), `error message should explain the tenant mismatch, got: ${threw.message}`)
+
+  const wroteIntoB = await getUserById(TENANT_B, 'usr_cross_tenant_admin')
+  assert(wroteIntoB === null, 'a sourceIdentity genuinely belonging to Tenant A must NEVER result in a written record in Tenant B, even when Tenant B exists, and must never be usable to escalate role/locations in the process')
 }
 
 async function main() {
@@ -386,6 +467,10 @@ async function main() {
 
   console.log('\n--- LTA legacy preservation ---')
   await run('LTA remains LEGACY-mode and unindexed', testLtaRemainsLegacyModeAndUnindexed)
+
+  console.log('\n--- Cross-tenant sourceIdentity rejection (final hardening) ---')
+  await run('MIGRATION rejects a sourceIdentity belonging to a different tenant', testMigrationRejectsSourceIdentityFromADifferentTenant)
+  await run('ADMIN_MANAGED_UPDATE rejects a sourceIdentity belonging to a different tenant', testAdminManagedUpdateRejectsSourceIdentityFromADifferentTenant)
 
   console.log()
   if (results.every(Boolean)) {

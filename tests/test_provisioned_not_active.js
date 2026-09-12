@@ -81,6 +81,7 @@ async function assertNotOperational(tenantId, label) {
 
 async function testLocationsApprovedButUnprovisionedIsNotActive() {
   wireConfigRedis()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   await assertNotOperational(TENANT_A, 'locations_approved')
 }
@@ -91,6 +92,7 @@ async function testLocationsApprovedButUnprovisionedIsNotActive() {
 
 async function testProvisioningInProgressIsNotActive() {
   wireConfigRedis()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   await upsertTenantConfig(TENANT_A, {
     status: 'provisioning',
@@ -105,6 +107,7 @@ async function testProvisioningInProgressIsNotActive() {
 
 async function testProvisioningFailedIsNotActive() {
   wireConfigRedis()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   await markTenantProvisioningFailed(TENANT_A, 'simulated failure')
   const config = await getTenantConfig(TENANT_A)
@@ -118,6 +121,7 @@ async function testProvisioningFailedIsNotActive() {
 
 async function testSuccessfullyProvisionedButUnsyncedIsNotFullyActive() {
   wireConfigRedis()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   const config = await markTenantProvisioned(TENANT_A, {
     reviewDbBlobKey: 'tenant-data/x/reviews.db',
@@ -142,6 +146,7 @@ async function testSuccessfullyProvisionedButUnsyncedIsNotFullyActive() {
 
 async function testInitialSyncInProgressIsNotActive() {
   wireConfigRedis()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   await markTenantProvisioned(TENANT_A, {
     reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', provisionedLocationIds: [1],
@@ -153,6 +158,7 @@ async function testInitialSyncInProgressIsNotActive() {
 
 async function testInitialSyncFailedIsNotActive() {
   wireConfigRedis()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   await markTenantProvisioned(TENANT_A, {
     reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', provisionedLocationIds: [1],

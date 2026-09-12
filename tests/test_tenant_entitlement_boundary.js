@@ -188,6 +188,9 @@ async function setupTenant(tenantId, { userId, email }) {
   const hash = await passwordHash()
   const record = { userId, email, passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false, tenantId }
   setUserRedis(() => fakeUserRedis({ [userId]: JSON.stringify(record) }))
+  if (!(await getTenantConfig(tenantId))) {
+    await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+  }
   await setStoredCredential(tenantId, { refreshToken: `fake-refresh-token-${tenantId}`, connectedAccountName: 'Fake Account' })
 }
 
@@ -227,19 +230,21 @@ async function approveFreshLocation(tenantId, accountName, googleLocationId) {
 
 async function testFreshTenantApprovalSucceeds() {
   wireSharedStores()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   const config = await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   assert(config.status === 'locations_approved', `expected 'locations_approved', got ${config.status}`)
 }
 
 async function testOnboardingStatusAllowsApproval() {
   wireSharedStores()
-  await upsertTenantConfig(TENANT_A, { status: 'onboarding' })
+  await upsertTenantConfig(TENANT_A, { status: 'onboarding' }, { allowCreate: true, creationSource: 'migration' })
   const config = await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   assert(config.status === 'locations_approved', `expected 'locations_approved', got ${config.status}`)
 }
 
 async function testLocationsApprovedStatusAllowsRevision() {
   wireSharedStores()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   // Revising the selection BEFORE provisioning begins is still onboarding,
   // not a live entitlement change -- must remain allowed.
@@ -252,6 +257,7 @@ async function testLocationsApprovedStatusAllowsRevision() {
 
 async function assertStatusIsIneligible(status, setup) {
   wireSharedStores()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   if (setup) await setup()
   await upsertTenantConfig(TENANT_A, { status })
@@ -430,11 +436,13 @@ async function testRecordLocationApprovalSourceContainsEligibilityGate() {
 
 async function testGateOnOneTenantDoesNotAffectAnother() {
   wireSharedStores()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/a/locations/1', title: 'A', address: '' }])
   await upsertTenantConfig(TENANT_A, { status: 'active' })
 
   // TENANT_B is untouched, fresh -- its own first approval must succeed
   // regardless of TENANT_A's lifecycle state.
+  await upsertTenantConfig(TENANT_B, {}, { allowCreate: true, creationSource: 'migration' })
   const configB = await recordLocationApproval(TENANT_B, [{ googleLocationId: 'accounts/b/locations/1', title: 'B', address: '' }])
   assert(configB.status === 'locations_approved', `TENANT_B's own approval must be unaffected by TENANT_A's status, got ${configB.status}`)
 
@@ -456,6 +464,7 @@ async function testGateOnOneTenantDoesNotAffectAnother() {
 
 async function testWildcardNeverExceedsTenantApprovedCatalog() {
   wireSharedStores()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   const config = await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/a/locations/1', title: 'A', address: '' }])
   await markTenantProvisioned(TENANT_A, {
     reviewDbBlobKey: `tenant-data/${TENANT_A}/reviews.db`, privateDataPrefix: `tenant-data/${TENANT_A}/private-data/`,
@@ -478,6 +487,7 @@ async function testTenantOwnerCannotSelfServiceExpandAnActiveTenant() {
   // approveLocations() supplies to recordLocationApproval(); this confirms
   // the block is enforced at that layer regardless of caller.
   wireSharedStores()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/a/locations/1', title: 'A', address: '' }])
   await upsertTenantConfig(TENANT_A, { status: 'active' })
   let threw = false

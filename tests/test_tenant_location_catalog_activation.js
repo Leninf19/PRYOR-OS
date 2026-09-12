@@ -160,6 +160,13 @@ async function setupTenant(tenantId, { userId, email }) {
   } else {
     const record = { userId, email, passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false, tenantId }
     setUserRedis(() => fakeUserRedis({ [userId]: JSON.stringify(record) }))
+    // "Prevent duplicate/shadow tenant creation" final review:
+    // recordLocationApproval() (reached via approve-locations below) no
+    // longer creates a tenant_config from nothing -- seed one first, like
+    // the real self-service flow's own tenant_config-before-approval order.
+    if (!(await getTenantConfig(tenantId))) {
+      await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+    }
   }
   await setStoredCredential(tenantId, { refreshToken: `fake-refresh-token-${tenantId}`, connectedAccountName: 'Fake Account' })
 }
@@ -187,6 +194,9 @@ async function setupTenantWithTwoOwners(tenantId, userA, userB) {
   const recordA = { userId: userA.userId, email: userA.email, passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false, tenantId }
   const recordB = { userId: userB.userId, email: userB.email, passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false, tenantId }
   setUserRedis(() => fakeUserRedis({ [userA.userId]: JSON.stringify(recordA), [userB.userId]: JSON.stringify(recordB) }))
+  if (!(await getTenantConfig(tenantId))) {
+    await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+  }
   await setStoredCredential(tenantId, { refreshToken: `fake-refresh-token-${tenantId}`, connectedAccountName: 'Fake Account' })
 }
 
@@ -507,22 +517,43 @@ async function testLtaRemainsFunctionalUnderTransitionalMechanism() {
   const tokenB = await tokenFor('usr_b', 'b@example.com', TENANT_B)
 
   // Activate a second, real, Redis-backed tenant alongside LTA, to prove
-  // LTA's own transitional bootstrap keeps working even once the real
+  // LTA's own compatibility path keeps working even once the real
   // tenant_config store is genuinely in use for someone else.
   globalThis.fetch = mockGoogleFetch({ 'accounts/8': [{ name: 'locations/8', title: 'Tenant B Location' }] })
   const discoverB = await discover(tokenB)
   await approve(tokenB, { discoverySessionId: discoverB.body.discoverySessionId, selectedGoogleLocationIds: [discoverB.body.locations[0].googleLocationId] })
 
-  // Los Tres Amigos has never been migrated into tenant_config:v1 (this
-  // phase writes no production Redis) -- getTenantConfig() for it must
-  // still report "no record," and the explicit LTA-only bootstrap must
-  // still answer true.
-  const ltaConfig = await getTenantConfig(DEFAULT_TENANT_ID)
-  assert(ltaConfig === null, 'sanity: Los Tres Amigos genuinely has no tenant_config record')
-  assert(await ownsCatalog(DEFAULT_TENANT_ID), 'Los Tres Amigos must remain catalog-enabled via the transitional bootstrap')
+  // Los Tres Amigos has never been migrated into tenant_config:v1 and never
+  // will be by this compatibility mechanism -- getTenantConfig() for it
+  // must report "no record" BEFORE, and the explicit BOOTSTRAP-mode
+  // classification (tenants.js's canonical locationCatalogModeFor(), never
+  // a second, independently-maintained check) must answer true.
+  assert((await getTenantConfig(DEFAULT_TENANT_ID)) === null, 'sanity: Los Tres Amigos genuinely has no tenant_config record before its own approve-locations call')
+  assert(await ownsCatalog(DEFAULT_TENANT_ID), 'Los Tres Amigos must remain catalog-enabled via the BOOTSTRAP classification')
 
   const status = await discover(await tokenFor('usr_a', 'a@example.com', DEFAULT_TENANT_ID))
   assert(status.statusCode === 200, `Los Tres Amigos's own discover-locations call must keep working, got ${status.statusCode}`)
+
+  // Final hardening pass: approve-locations itself, run end to end for LTA,
+  // must still succeed -- and must do so WITHOUT ever creating a
+  // tenant_config record (approveLocations() short-circuits at the
+  // application layer via locationCatalogModeFor(), before ever calling
+  // recordLocationApproval() -- see that function's own comment).
+  globalThis.fetch = mockGoogleFetch({ 'accounts/1': [{ name: 'locations/1', title: 'LTA Location' }] })
+  const discoverLta = await discover(await tokenFor('usr_a', 'a@example.com', DEFAULT_TENANT_ID))
+  assert(discoverLta.statusCode === 200, `sanity: LTA's own discover must succeed, got ${discoverLta.statusCode}`)
+  const approveLta = await approve(await tokenFor('usr_a', 'a@example.com', DEFAULT_TENANT_ID), {
+    discoverySessionId: discoverLta.body.discoverySessionId, selectedGoogleLocationIds: [discoverLta.body.locations[0].googleLocationId],
+  })
+  assert(approveLta.statusCode === 200, `Los Tres Amigos's own approve-locations call must still succeed, got ${approveLta.statusCode} ${JSON.stringify(approveLta.body)}`)
+  assert(approveLta.body.success === true && approveLta.body.activatedLocationCount === 1, `expected the same core success response shape a real approval gets, got ${JSON.stringify(approveLta.body)}`)
+  // No `status` field: LTA (BOOTSTRAP-mode) never enters the tenant_config
+  // lifecycle state machine, so it must never report a lifecycle status
+  // value at all -- see test_provisioned_not_active.js's own structural
+  // invariant that `status: 'active'` may only ever be written by
+  // markTenantActive()/initial_sync.py, never google/[action].js.
+  assert(approveLta.body.status === undefined, `LTA's approve-locations response must carry no lifecycle status field, got ${JSON.stringify(approveLta.body.status)}`)
+  assert((await getTenantConfig(DEFAULT_TENANT_ID)) === null, 'Los Tres Amigos must still have NO tenant_config record after its own approve-locations call -- the low-level primitive must never have created one')
 }
 
 // ===========================================================================

@@ -230,7 +230,7 @@ async function testResponseNeverIncludesRawSensitiveFields() {
     approvedLocations: [{ locationId: 1, googleLocationId: 'accounts/1/locations/1', title: 'A', address: '123 Main St' }],
     locationIdMap: { 'accounts/1/locations/1': 1 },
     provisioning: { status: 'provisioned', reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', reviewDbEtag: 'etag-1', artifactGeneration: 'gen-1', provisionedLocationIds: [1], lastAttemptAt: null, lastError: null },
-  })
+  }, { allowCreate: true, creationSource: 'migration' })
   await setStoredCredential(TENANT_B, { refreshToken: 'super-secret-refresh-token-value', connectedAccountName: 'accounts/1' })
 
   const res = await invoke({ token: await ltaOwnerToken() })
@@ -253,7 +253,7 @@ async function testHasGoogleCredentialFalseWhenNeverConnected() {
   await setDirectory()
   wireConfigRedis()
   wireCredentialRedis()
-  await upsertTenantConfig(TENANT_C, { status: 'locations_approved', storageMode: 'BLOB' })
+  await upsertTenantConfig(TENANT_C, { status: 'locations_approved', storageMode: 'BLOB' }, { allowCreate: true, creationSource: 'migration' })
   const res = await invoke({ token: await ltaOwnerToken() })
   const tenantC = res.body.tenants.find(t => t.tenantId === TENANT_C)
   assert(tenantC, 'expected Tenant C to appear in the list')
@@ -268,7 +268,7 @@ async function eligibilityFor(status, storageMode = 'BLOB') {
   await setDirectory()
   wireConfigRedis()
   wireCredentialRedis()
-  await upsertTenantConfig(TENANT_B, { status, storageMode })
+  await upsertTenantConfig(TENANT_B, { status, storageMode }, { allowCreate: true, creationSource: 'migration' })
   const res = await invoke({ token: await ltaOwnerToken() })
   return res.body.tenants.find(t => t.tenantId === TENANT_B).eligibility
 }

@@ -299,7 +299,7 @@ async function testIdempotentRetryReusesReservedTenantIdAfterPartialFailure() {
   // before upsertUser/deletePendingRegistration -- exactly what
   // createTenantForVerifiedRegistration()'s ORDER comment describes as the
   // safe-to-retry partial-failure state.
-  await upsertTenantConfig(pending.tenantIdReserved, { displayName: body.companyName, commercial: { plan: 'core', source: 'access_code' } })
+  await upsertTenantConfig(pending.tenantIdReserved, { displayName: body.companyName, commercial: { plan: 'core', source: 'access_code' } }, { allowCreate: true, creationSource: 'self_service' })
   const configAfterSimulatedPartialFailure = await getTenantConfig(pending.tenantIdReserved)
   assert(configAfterSimulatedPartialFailure.configVersion === 1)
 

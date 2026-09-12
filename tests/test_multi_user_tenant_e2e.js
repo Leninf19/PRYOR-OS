@@ -228,6 +228,7 @@ async function provisionTenant(tenantId) {
     'accounts/1/locations/2/reviews/review-b-1': LOCATION_B,
   })
 
+  await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
   const config = await recordLocationApproval(tenantId, [
     { googleLocationId: 'accounts/1/locations/1', title: 'Location A', address: '' },
     { googleLocationId: 'accounts/1/locations/2', title: 'Location B', address: '' },

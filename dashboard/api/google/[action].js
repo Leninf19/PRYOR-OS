@@ -42,7 +42,7 @@ import {
   writePublishBridge, getPublishBridges, PublishBridgeUnavailableError,
 } from '../_lib/publishBridgeStore.js'
 import { recordReplyFailure, clearReplyFailure } from '../_lib/notificationStore.js'
-import { resolveTenantId, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
+import { resolveTenantId, DEFAULT_TENANT_ID, locationCatalogModeFor, LocationCatalogMigrationMode } from '../_lib/tenants.js'
 import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDiscoveryStore.js'
 import {
   recordLocationApproval, LocationApprovalNotEligibleError, getTenantConfig, LOCATION_APPROVAL_ELIGIBLE_STATUSES,
@@ -1811,6 +1811,37 @@ async function approveLocations(req, res) {
   const selectedLocations = session.discoveredLocations
     .filter(l => selectedGoogleLocationIds.includes(l.googleLocationId))
     .map(l => ({ googleLocationId: l.googleLocationId, title: l.title, address: l.address }))
+
+  // "Prevent duplicate/shadow tenant creation" final hardening: a
+  // BOOTSTRAP-mode tenant (Los Tres Amigos -- see tenants.js's
+  // LocationCatalogMigrationMode/locationCatalogModeFor(), the ONE
+  // canonical place this classification is made) ignores
+  // tenantConfigStore.js entirely by design -- it has no tenant_config
+  // record and unconditionally owns its own catalog. Approving locations
+  // for one must therefore never reach recordLocationApproval() at all
+  // (which, correctly, now refuses to create ANY tenant_config, including
+  // for LTA -- see that function's own header). This is the lifecycle/
+  // application-layer compatibility branch the low-level persistence
+  // primitive must never contain: same success response shape, no
+  // tenant_config write, no automatic-provisioning dispatch (BOOTSTRAP
+  // tenants are Multi-Tenant self-service infrastructure and were never
+  // meant to enter that pipeline), no onboarding-state change, and no
+  // effect whatsoever on LTA's own (separate) Google connection.
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) {
+    await appendAuditEntry(tenantId, {
+      actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+      entity: 'tenant_location_catalog', entityId: tenantId, action: 'location_catalog.activated', changes: null, result: 'success',
+      message: `Activated the location catalog with ${selectedLocations.length} approved location(s) (BOOTSTRAP-mode tenant -- no tenant_config write, no provisioning dispatch).`,
+    })
+    // Deliberately no `status` field: BOOTSTRAP-mode tenants never enter
+    // the tenant_config lifecycle state machine at all (see
+    // test_provisioned_not_active.js's own structural invariant that the
+    // "active" lifecycle status may only ever be written by
+    // markTenantActive()/initial_sync.py), so there is no real lifecycle
+    // status to report here. `success`/`activatedLocationCount` are the
+    // fields this response's caller actually needs.
+    return res.status(200).json({ success: true, tenantId, activatedLocationCount: selectedLocations.length })
+  }
 
   let config
   try {

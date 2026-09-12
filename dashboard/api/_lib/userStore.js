@@ -43,6 +43,7 @@ import { Redis } from '@upstash/redis'
 import { normalizeEmail, isValidLocationIds, ROLES } from './accounts.js'
 import { usersKeyV2, usersEmailIndexKeyV2 } from './tenantKeys.js'
 import { resolveHashReadKey, resolveHashWriteKey, getTenantMigrationMode, TenantMigrationMode } from './tenantDualRead.js'
+import { tenantExists, resolveTenantId, TenantResolutionError } from './tenants.js'
 
 const USERS_KEY = 'users:v1'
 const EMAIL_INDEX_KEY = 'users_email_index:v1'
@@ -158,6 +159,64 @@ export function _resetRedisClientForTests() { testClientFactory = null; redisCli
 
 export class UserStoreUnavailableError extends Error {}
 
+// "Prevent duplicate/shadow tenant creation" hardening -- a bare
+// upsertUser(tenantId, record) call with no other context is exactly the
+// mechanism this phase's investigation found capable of materializing a
+// real, usable owner account into an arbitrary (including entirely
+// nonexistent) tenant, with zero identity/collision checks, the moment a
+// script has real Upstash credentials. Every CREATE (no existing record
+// for this tenantId+userId) now requires an explicit `creationMode`; an
+// UPDATE (a record already exists) is completely unaffected -- see
+// upsertUser()'s own comment below.
+export const UserCreationMode = Object.freeze({
+  // The very first user for a BRAND-NEW tenant -- callable only from
+  // dashboard/api/_lib/tenantCreation.js's createNewTenant(), immediately
+  // after it creates that tenant's tenant_config. Structural invariant
+  // (self-contained, no cross-store dependency): this tenant must not
+  // already have ANY user record -- see the listUsers() check below.
+  INITIAL_TENANT_OWNER: 'initial_tenant_owner',
+  // A brand-new identity being granted access to an ALREADY-EXISTING
+  // tenant -- settings/[action].js's invite-user, which already performs
+  // its own getAccountByEmail() collision check before ever reaching this.
+  // Structural invariant: tenants.js's tenantExists(tenantId) must be true.
+  EXISTING_TENANT_INVITE: 'existing_tenant_invite',
+  // STRICT identity materialization: session/[action].js's reset-password
+  // ONLY -- a static-directory (ACCOUNT_DIRECTORY_JSON) or otherwise
+  // already-resolved account being promoted into Redis for the first time,
+  // with its password (re)set but NOTHING else about who it is or what it
+  // can access allowed to change. Final pre-deploy review hardening:
+  // `sourceIdentity` (the exact account record the caller already
+  // resolved, e.g. via getAccountById()) is now REQUIRED, and this
+  // function verifies userId/email/role/locationIds/disabled all match it
+  // EXACTLY -- creationMode alone is never sufficient permission; the
+  // record being written must provably BE the identity the caller already
+  // authenticated as/resolved, not an arbitrary one sharing the label.
+  MIGRATION: 'migration',
+  // An ALREADY-AUTHORIZED admin action (settings/[action].js's role/
+  // location change, disable/enable, can-create-tasks) that may
+  // legitimately change role/locationIds/disabled/canCreateTasks -- the
+  // authorization for WHETHER a specific change is allowed (Owner-only can
+  // assign Owner, last-active-Owner protection, USERS_MANAGE permission)
+  // is the endpoint's own job (already enforced there, unchanged by this
+  // phase) and cannot be re-derived here without session/permission
+  // context this store layer doesn't have. What THIS function structurally
+  // guarantees instead: `sourceIdentity` (the exact account the endpoint
+  // already resolved via getAccountByIdForTenant() before deciding to
+  // allow the change) is REQUIRED, and the record being written must
+  // correspond to that SAME identity (userId + email match exactly) -- an
+  // admin-authorized mutation can change what an identity is ALLOWED to
+  // do, but this store can never be used to silently swap in a DIFFERENT
+  // identity than the one the endpoint's own authorization check ran
+  // against.
+  ADMIN_MANAGED_UPDATE: 'admin_managed_update',
+})
+
+// Thrown when upsertUser() would CREATE a record (no existing userId in
+// this tenant) without a valid, explicit creationMode, or when the given
+// mode's own structural invariant does not hold. Never thrown for an
+// UPDATE (an existing record found) -- see upsertUser()'s own comment.
+export class UserCreationNotAllowedError extends Error {}
+
 function hasUpstashConfig() {
   return Boolean(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
 }
@@ -268,7 +327,30 @@ function isValidRoleIncludingAdmin(role) {
 // well-formed if present) -- the caller (invitation-accept, user-management
 // actions) is responsible for its own request-body validation; this is a
 // second, defensive layer, matching contactStore.js's division of labor.
-export async function upsertUser(tenantId, record, { previousEmail } = {}) {
+//
+// "Prevent duplicate/shadow tenant creation" hardening -- `creationMode`
+// (optional unless this call is a CREATE): a record already existing for
+// `tenantId`+`record.userId` means this is an UPDATE (role change, location
+// change, disable/enable, password reset, a lastLoginAt touch) -- every one
+// of this codebase's own UPDATE call sites already read the existing
+// record first (directly, or via updateUser() below) precisely because
+// they need its other fields, so `creationMode`/`sourceIdentity` are never
+// required or checked in that case. Only when NO existing record is found
+// (a genuine CREATE) does this function require an explicit, valid
+// `creationMode` and enforce that mode's own structural invariant -- see
+// UserCreationMode's own comments above for exactly what each one guards
+// and why. This is what makes a bare `upsertUser("arbitrary-tenant-id",
+// {...})` call (no mode, or a mode whose invariant doesn't hold) fail
+// loudly instead of silently materializing a new identity.
+//
+// `sourceIdentity` (final pre-deploy review hardening, required for
+// MIGRATION and ADMIN_MANAGED_UPDATE): the account record the CALLER
+// already resolved from authoritative storage (getAccountById()/
+// getAccountByIdForTenant()) before deciding this write is legitimate.
+// `creationMode` alone is never trusted as permission to create a Redis
+// user -- see each mode's own comment above for exactly what is verified
+// against it.
+export async function upsertUser(tenantId, record, { previousEmail, creationMode, sourceIdentity } = {}) {
   const client = getClient()
   if (!client) throw new UserStoreUnavailableError('user store is not configured')
   if (!record || typeof record.userId !== 'string' || !record.userId) {
@@ -283,6 +365,116 @@ export async function upsertUser(tenantId, record, { previousEmail } = {}) {
   // comment). This does not loosen anything for hand-authored config.
   if (!isValidLocationIds(record.locationIds, { allowEmpty: true })) {
     throw new Error('upsertUser: invalid locationIds')
+  }
+
+  const existingRecord = await getUserById(tenantId, record.userId)
+  if (!existingRecord) {
+    if (!Object.values(UserCreationMode).includes(creationMode)) {
+      throw new UserCreationNotAllowedError(
+        `upsertUser: creating a new user for tenant ${JSON.stringify(tenantId)} requires an explicit, valid creationMode -- got ${JSON.stringify(creationMode)}`
+      )
+    }
+    if (creationMode === UserCreationMode.INITIAL_TENANT_OWNER) {
+      const currentUsers = await listUsers(tenantId)
+      if (currentUsers.length > 0) {
+        throw new UserCreationNotAllowedError(
+          `upsertUser: creationMode 'initial_tenant_owner' requires tenant ${JSON.stringify(tenantId)} to have zero existing users -- it already has ${currentUsers.length}`
+        )
+      }
+    } else if (creationMode === UserCreationMode.EXISTING_TENANT_INVITE) {
+      // See tenantExists()'s own comment (tenants.js) for why this
+      // correctly treats Los Tres Amigos as existing despite it having no
+      // tenant_config record.
+      if (!(await tenantExists(tenantId))) {
+        throw new UserCreationNotAllowedError(
+          `upsertUser: creationMode ${JSON.stringify(creationMode)} requires tenant ${JSON.stringify(tenantId)} to already exist -- it does not`
+        )
+      }
+    } else {
+      // MIGRATION and ADMIN_MANAGED_UPDATE: `creationMode` alone is never
+      // sufficient. Both require the target tenant to exist AND a
+      // `sourceIdentity` -- the caller's own already-resolved account --
+      // whose userId/email this write must correspond to EXACTLY. This is
+      // what prevents either mode from being usable as a generic "create
+      // an arbitrary user" mechanism: a caller cannot fabricate a
+      // sourceIdentity for an identity that doesn't already, genuinely
+      // resolve via getAccountById()/getAccountByIdForTenant() elsewhere
+      // in this codebase, since every real caller passes through EXACTLY
+      // the object those functions returned moments earlier.
+      if (!(await tenantExists(tenantId))) {
+        throw new UserCreationNotAllowedError(
+          `upsertUser: creationMode ${JSON.stringify(creationMode)} requires tenant ${JSON.stringify(tenantId)} to already exist -- it does not`
+        )
+      }
+      if (!sourceIdentity || typeof sourceIdentity !== 'object' || typeof sourceIdentity.userId !== 'string') {
+        throw new UserCreationNotAllowedError(
+          `upsertUser: creationMode ${JSON.stringify(creationMode)} requires sourceIdentity -- the already-resolved existing account this write must correspond to`
+        )
+      }
+      // "Close the last tenant-creation exception" final hardening: a
+      // matching userId/email alone is not enough -- without this check, a
+      // sourceIdentity that genuinely, legitimately resolved via
+      // getAccountById()/getAccountByIdForTenant() for TENANT A could still
+      // be handed to upsertUser(TENANT_B, ...) and materialize that same
+      // identity into a tenant it has no relationship to, provided TENANT_B
+      // already exists (the tenantExists() check above says nothing about
+      // WHICH tenant sourceIdentity belongs to). tenants.js's
+      // resolveTenantId() is the single canonical function every other
+      // authorization decision in this codebase already uses to answer
+      // "which tenant does this account belong to" -- reused here rather
+      // than re-deriving the same answer a second way. A sourceIdentity
+      // that cannot be resolved to any tenant at all is rejected the same
+      // as a mismatched one: fail closed, never write.
+      let sourceIdentityTenantId
+      try {
+        sourceIdentityTenantId = resolveTenantId(sourceIdentity)
+      } catch (err) {
+        if (!(err instanceof TenantResolutionError)) throw err
+        throw new UserCreationNotAllowedError(
+          `upsertUser: creationMode ${JSON.stringify(creationMode)} -- sourceIdentity could not be resolved to any tenant (${err.message})`
+        )
+      }
+      if (sourceIdentityTenantId !== tenantId) {
+        throw new UserCreationNotAllowedError(
+          `upsertUser: creationMode ${JSON.stringify(creationMode)} -- sourceIdentity belongs to tenant ${JSON.stringify(sourceIdentityTenantId)}, cannot materialize it into a different tenant ${JSON.stringify(tenantId)}`
+        )
+      }
+      if (sourceIdentity.userId !== record.userId) {
+        throw new UserCreationNotAllowedError(
+          `upsertUser: creationMode ${JSON.stringify(creationMode)} -- record.userId must match sourceIdentity.userId exactly (cannot create a different identity than the one already resolved)`
+        )
+      }
+      if (normalizeEmail(sourceIdentity.email) !== normalizeEmail(record.email)) {
+        throw new UserCreationNotAllowedError(
+          `upsertUser: creationMode ${JSON.stringify(creationMode)} -- record.email must match sourceIdentity.email exactly (cannot swap in a different email than the one already resolved)`
+        )
+      }
+      if (creationMode === UserCreationMode.MIGRATION) {
+        // STRICT: nothing about who this identity is or what it can
+        // access may change via a pure materialization -- only password/
+        // session bookkeeping fields are expected to differ (enforced by
+        // the caller's own field construction, not re-verified here field-
+        // by-field beyond these three, which are exactly what "materialize
+        // this identity unchanged" means).
+        if (sourceIdentity.role !== record.role) {
+          throw new UserCreationNotAllowedError(`upsertUser: creationMode 'migration' must never change role (source ${JSON.stringify(sourceIdentity.role)}, record ${JSON.stringify(record.role)})`)
+        }
+        if (JSON.stringify(sourceIdentity.locationIds) !== JSON.stringify(record.locationIds)) {
+          throw new UserCreationNotAllowedError(`upsertUser: creationMode 'migration' must never change locationIds`)
+        }
+        if (Boolean(sourceIdentity.disabled) !== Boolean(record.disabled)) {
+          throw new UserCreationNotAllowedError(`upsertUser: creationMode 'migration' must never change disabled state`)
+        }
+      }
+      // ADMIN_MANAGED_UPDATE: role/locationIds/disabled/canCreateTasks ARE
+      // permitted to differ from sourceIdentity -- that is this mode's
+      // entire purpose (an authorized admin mutation). The identity-match
+      // checks above are the invariant this mode owns; WHETHER this
+      // specific change is authorized is the calling endpoint's own,
+      // already-enforced job (roleHasPermission/canAssignRole/
+      // assertNotLastActiveOwner -- unchanged by this phase, covered by
+      // the existing authorization-matrix test suite).
+    }
   }
 
   const usersKey = resolveHashWriteKey({ v1Key: USERS_KEY, v2Key: usersKeyV2(tenantId), tenantId })

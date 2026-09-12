@@ -60,7 +60,7 @@ async function testProvisionedTenantResolves() {
     status: 'active',
     storageMode: 'BLOB',
     provisioning: { status: 'provisioned', reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', reviewDbEtag: 'etag-1', artifactGeneration: 'gen-1', provisionedLocationIds: [1], lastAttemptAt: null, lastError: null },
-  })
+  }, { allowCreate: true, creationSource: 'migration' })
   const storage = await resolveProvisionedPrivateDataRoot(TENANT_A)
   assert(storage !== null && storage.mode === 'BLOB' && storage.artifactGeneration === 'gen-1', `expected the provisioned BLOB storage descriptor, got ${JSON.stringify(storage)}`)
 }
@@ -75,14 +75,14 @@ async function testActiveProvisionedTenantWithNoRecordedGenerationResolvesToNull
     status: 'active',
     storageMode: 'BLOB',
     provisioning: { status: 'provisioned', reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', reviewDbEtag: 'etag-1', artifactGeneration: null, provisionedLocationIds: [1], lastAttemptAt: null, lastError: null },
-  })
+  }, { allowCreate: true, creationSource: 'migration' })
   const storage = await resolveProvisionedPrivateDataRoot(TENANT_A)
   assert(storage === null, 'a tenant with no recorded artifactGeneration must resolve to null, never guess one')
 }
 
 async function testLocationsApprovedButNotYetProvisionedReturnsNull() {
   wireConfigRedis()
-  await upsertTenantConfig(TENANT_A, { status: 'locations_approved' })
+  await upsertTenantConfig(TENANT_A, { status: 'locations_approved' }, { allowCreate: true, creationSource: 'migration' })
   const root = await resolveProvisionedPrivateDataRoot(TENANT_A)
   assert(root === null, 'a tenant that has only approved locations, not been provisioned, must resolve to null')
 }
@@ -92,7 +92,7 @@ async function testProvisioningFailedReturnsNull() {
   await upsertTenantConfig(TENANT_A, {
     status: 'provisioning_failed',
     provisioning: { status: 'failed', reviewDbBlobKey: null, privateDataPrefix: null, reviewDbEtag: null, provisionedLocationIds: [], lastAttemptAt: null, lastError: 'boom' },
-  })
+  }, { allowCreate: true, creationSource: 'migration' })
   const root = await resolveProvisionedPrivateDataRoot(TENANT_A)
   assert(root === null, 'a failed provisioning attempt must never resolve to a path')
 }
@@ -103,7 +103,7 @@ async function testSuspendedTenantReturnsNullEvenIfPreviouslyProvisioned() {
     status: 'suspended',
     storageMode: 'BLOB',
     provisioning: { status: 'provisioned', reviewDbBlobKey: 'tenant-data/x/reviews.db', privateDataPrefix: 'tenant-data/x/private-data/', reviewDbEtag: 'etag-1', artifactGeneration: 'gen-1', provisionedLocationIds: [1], lastAttemptAt: null, lastError: null },
-  })
+  }, { allowCreate: true, creationSource: 'migration' })
   const root = await resolveProvisionedPrivateDataRoot(TENANT_A)
   assert(root === null, 'a suspended tenant must resolve to null even if its provisioning record is still marked provisioned')
 }

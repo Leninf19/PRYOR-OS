@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react'
-import { useLocation } from 'react-router-dom'
+import { useLocation, Navigate } from 'react-router-dom'
 import { useSession } from '../hooks/useSession.js'
 import { useTenantStatus } from '../hooks/useTenantStatus.js'
 import Login from './Login.jsx'
@@ -39,6 +39,22 @@ const PUBLIC_PATHS = {
   '/pricing': Pricing,
   '/access-code': AccessCodeEntry,
 }
+
+// "Prevent duplicate/shadow tenant creation" hardening -- a SUBSET of
+// PUBLIC_PATHS above: specifically the pre-tenant, workspace-CREATION
+// pages, never accept-invite/forgot-password/reset-password (those are
+// recovery/invitation flows for an EXISTING identity, not organization
+// creation, and stay reachable while signed in). The real security
+// boundary against a duplicate/shadow tenant is server-side
+// (register()/createTenantForVerifiedRegistration() in
+// session/[action].js, which independently re-check getAccountByEmail()
+// against Redis -- identity index, bootstrap hash -- AND the static
+// ACCOUNT_DIRECTORY_JSON before ever reserving or creating a tenant) --
+// this is UX-only, steering an already-authenticated session back to its
+// own dashboard before it can even reach the "Create your workspace"
+// form, rather than leaving it reachable for no reason once a real
+// session already exists.
+const WORKSPACE_CREATION_PATHS = new Set(['/register', '/verify-email', '/get-started', '/pricing', '/access-code'])
 
 // The authenticated account (userId/email/role/locationIds/displayName from
 // GET /api/session/whoami), available to any component below AuthGate --
@@ -81,6 +97,14 @@ export default function AuthGate({ children }) {
 
   const PublicPage = PUBLIC_PATHS[location.pathname]
   if (PublicPage) {
+    // An already-authenticated session has no reason to be on a
+    // workspace-CREATION page -- send it back to its own dashboard rather
+    // than rendering "Create your workspace" for someone who already has
+    // one. Checked only once status is resolved (never during 'loading',
+    // to avoid a flash of the wrong screen either way).
+    if (status === 'authenticated' && WORKSPACE_CREATION_PATHS.has(location.pathname)) {
+      return <Navigate to="/" replace />
+    }
     return <PublicPage />
   }
 

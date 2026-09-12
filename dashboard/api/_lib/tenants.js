@@ -32,6 +32,30 @@ export function isValidTenantId(tenantId) {
   return typeof tenantId === 'string' && /^t_[a-z0-9-]+$/.test(tenantId)
 }
 
+// "Prevent duplicate/shadow tenant creation" hardening -- the one place
+// this codebase answers "does this tenant genuinely exist" for a tenant
+// that could be EITHER Los Tres Amigos (LEGACY, no tenant_config record at
+// all -- see tenantConfigStore.js's own header, "there is no pre-existing
+// v1 key with real production data... LTA's own resolution is the static
+// registry") OR a self-service/provisioned tenant (a real tenant_config
+// record). A naive `getTenantConfig(tenantId) !== null` check alone would
+// incorrectly treat LTA itself as "not existing" -- exactly the kind of
+// mistake that would make every existing-tenant user-management flow
+// (invite/role-change/disable/enable/reset-password) fail for LTA's own
+// accounts the moment a create-time existence gate is added elsewhere
+// (userStore.js's upsertUser(), tenantConfigStore.js's upsertTenantConfig()).
+// Propagates TenantConfigStoreUnavailableError on a genuine store outage --
+// never swallowed here -- so a caller using this to gate a WRITE (rather
+// than an authorization read, which has its own, deliberately more lenient
+// fail-closed-to-false convention elsewhere in this file) gets an honest
+// "could not verify" signal instead of a silent, incorrect true/false.
+export async function tenantExists(tenantId) {
+  if (!isValidTenantId(tenantId)) return false
+  if (tenantId === DEFAULT_TENANT_ID) return true
+  const config = await getTenantConfig(tenantId)
+  return config !== null
+}
+
 // Phase 4Q's self-service-onboarding tenant id generator (generateTenantId,
 // formerly here) moved to tenantIdGenerator.js -- Vercel Edge Middleware
 // packaging fix. It needed Node's `crypto` module for its random suffix,
@@ -460,7 +484,16 @@ const TENANT_LOCATION_CATALOG_MODE_REGISTRY = Object.freeze({
   [DEFAULT_TENANT_ID]: LocationCatalogMigrationMode.BOOTSTRAP,
 })
 
-function locationCatalogModeFor(tenantId) {
+// Exported (final pre-deploy hardening) so callers OUTSIDE this file --
+// specifically google/[action].js's approveLocations() -- can make their
+// own BOOTSTRAP-vs-REDIS_ONLY routing decision using this exact, canonical
+// classification, rather than a second, independently-maintained check
+// (or, worse, tenantConfigStore.js special-casing a hardcoded tenantId
+// itself -- a low-level persistence primitive must never know about any
+// one tenant's identity). Every existing caller (resolveLocationCatalogAuthz,
+// tenantOwnsLocationCatalog, tenantOwnsLocation, all below) keeps calling
+// it exactly as before.
+export function locationCatalogModeFor(tenantId) {
   return TENANT_LOCATION_CATALOG_MODE_REGISTRY[tenantId] ?? LocationCatalogMigrationMode.REDIS_ONLY
 }
 

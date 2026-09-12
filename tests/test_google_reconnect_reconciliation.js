@@ -189,6 +189,9 @@ async function setupOwner(tenantId, userId = 'usr_owner') {
 // established (recordLocationApproval -> markTenantProvisioned ->
 // status: 'active'), matching every other tenant test file's convention.
 async function commitTenant(tenantId, googleLocationIds) {
+  if (!(await getTenantConfig(tenantId))) {
+    await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+  }
   await recordLocationApproval(tenantId, googleLocationIds.map((id, i) => ({ googleLocationId: id, title: `Location ${i + 1}`, address: '' })))
   const approvedConfig = await getTenantConfig(tenantId)
   await markTenantProvisioned(tenantId, {

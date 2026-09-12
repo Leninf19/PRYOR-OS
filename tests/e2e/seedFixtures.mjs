@@ -15,7 +15,7 @@
 
 import bcrypt from 'bcryptjs'
 import { installFakeInfra, registerGoogleFixture } from './fakeInfra.mjs'
-import { upsertUser } from '../../dashboard/api/_lib/userStore.js'
+import { upsertUser, UserCreationMode } from '../../dashboard/api/_lib/userStore.js'
 import {
   recordLocationApproval, getTenantConfig, markTenantProvisioned, markTenantProvisioningFailed,
   markTenantInitialSyncStarted, markTenantInitialSyncFailed, markTenantActive, upsertTenantConfig,
@@ -62,19 +62,36 @@ async function uploadArtifacts(tenantId, generation, artifacts) {
   }
 }
 
+// "Prevent duplicate/shadow tenant creation" hardening: userStore.js's
+// upsertUser() now requires the target tenant to already exist before
+// creating a brand-new owner user (see UserCreationMode.INITIAL_TENANT_OWNER's
+// own comment) -- this seeds a minimal tenant_config first, exactly
+// mirroring tenantCreation.js's createNewTenant() real ordering
+// (tenant_config THEN owner user). This ALSO makes Stage 1 below more
+// faithful to real production than it was before this phase: tracing the
+// actual self-service flow shows a real tenant NEVER reaches a state where
+// its owner user exists but its tenant_config does not (createNewTenant()
+// always writes the tenant_config first) -- so a fixture claiming
+// otherwise was modeling a state production cannot actually reach.
 async function seedOwnerAccount(tenantId, userId, email) {
+  const existingConfig = await getTenantConfig(tenantId)
+  if (!existingConfig) {
+    await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+  }
   const passwordHash = await ownerPasswordHash()
   await upsertUser(tenantId, {
     userId, email, passwordHash, role: 'owner', locationIds: '*',
     sessionVersion: 1, disabled: false, displayName: 'Pilot Owner',
     tenantId, passwordSetAt: new Date().toISOString(),
-  })
+  }, { creationMode: UserCreationMode.INITIAL_TENANT_OWNER })
   return signSession({ userId, email, role: 'owner', locationIds: '*', tenantId, sessionVersion: 1 })
 }
 
-// Stage 1: brand new tenant -- no tenant_config record at all yet (the real
-// "day zero" state; session/[action].js's tenant-status action synthesizes
-// {status:'onboarding'} for this with ZERO reads/writes needed).
+// Stage 1: a freshly-onboarded tenant -- its tenant_config exists (a bare,
+// still-'onboarding'-status record, seeded above) but no Google connection/
+// location approval has happened yet; session/[action].js's tenant-status
+// action reports {status:'onboarding'} for this exactly as it would for
+// the real thing.
 export async function seedOnboardingTenant({ tenantId, userId, email }) {
   return { tenantId, token: await seedOwnerAccount(tenantId, userId, email) }
 }

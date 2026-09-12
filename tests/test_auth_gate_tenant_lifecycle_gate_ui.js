@@ -69,11 +69,36 @@ function testLoadingTenantStatusNeverFlashesTheRealDashboard() {
   assert(loadingIdx > -1 && childrenIdx > -1 && loadingIdx < childrenIdx, 'the loading check must be evaluated before children could ever render')
 }
 
+function testAuthenticatedSessionRedirectedAwayFromWorkspaceCreationPages() {
+  assert(/from 'react-router-dom'/.test(content) && /Navigate/.test(content.match(/import.*from 'react-router-dom'/)[0]),
+    'must import Navigate from react-router-dom')
+  assert(/WORKSPACE_CREATION_PATHS\s*=\s*new Set\(\[[^\]]*'\/register'[^\]]*\]\)/.test(content),
+    'must define a WORKSPACE_CREATION_PATHS set including /register')
+  for (const path of ['/verify-email', '/get-started', '/pricing', '/access-code']) {
+    assert(content.includes(`'${path}'`), `WORKSPACE_CREATION_PATHS-adjacent code must reference ${path}`)
+  }
+  assert(/status === 'authenticated' && WORKSPACE_CREATION_PATHS\.has\(location\.pathname\)/.test(content),
+    'the redirect must be gated on BOTH an authenticated status and the path being a workspace-creation page')
+  assert(/return <Navigate to="\/" replace \/>/.test(content), 'an authenticated session on a workspace-creation page must redirect to "/"')
+}
+
+function testWorkspaceCreationRedirectNeverCoversRecoveryOrInvitePages() {
+  // accept-invite/forgot-password/reset-password must stay reachable while
+  // authenticated -- they are recovery/invitation flows, not organization
+  // creation, and must not be swept into the same redirect.
+  for (const path of ['/accept-invite', '/forgot-password', '/reset-password']) {
+    assert(!new RegExp(`WORKSPACE_CREATION_PATHS\\s*=\\s*new Set\\(\\[[^\\]]*'${path}'`).test(content),
+      `WORKSPACE_CREATION_PATHS must NOT include ${path}`)
+  }
+}
+
 run('imports useTenantStatus and Onboarding', testImportsTenantStatusAndOnboarding)
 run('the gate sits above children, not as a child route', testGateSitsAboveChildrenNotAsAChildRoute)
 run('the gate fails closed to Onboarding, never defaults to children', testGateFailsClosedToOnboardingNeverToChildren)
 run('the tenant-status query is only enabled once authenticated', testTenantStatusQueryOnlyEnabledOnceAuthenticated)
 run('loading tenant status never flashes the real dashboard', testLoadingTenantStatusNeverFlashesTheRealDashboard)
+run('an authenticated session is redirected away from workspace-creation pages', testAuthenticatedSessionRedirectedAwayFromWorkspaceCreationPages)
+run('the workspace-creation redirect never covers recovery/invite pages', testWorkspaceCreationRedirectNeverCoversRecoveryOrInvitePages)
 
 console.log()
 if (results.every(Boolean)) {

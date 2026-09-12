@@ -36,7 +36,7 @@ import {
 import {
   getStoredCredential, setStoredCredential, _setRedisClientForTests as setCredentialRedis, _resetRedisClientForTests as resetCredentialRedis,
 } from '../dashboard/api/_lib/credentialStore.js'
-import { _setRedisClientForTests as setUserRedis, _resetRedisClientForTests as resetUserRedis, getUserById, upsertUser } from '../dashboard/api/_lib/userStore.js'
+import { _setRedisClientForTests as setUserRedis, _resetRedisClientForTests as resetUserRedis, getUserById, upsertUser, UserCreationMode } from '../dashboard/api/_lib/userStore.js'
 import { _setRedisClientForTests as setAuditRedis, _resetRedisClientForTests as resetAuditRedis, listAuditEntries } from '../dashboard/api/_lib/auditLog.js'
 
 const TENANT_A = 't_synthetic-entitlement-change-a'
@@ -157,6 +157,14 @@ const superAdminToken = () => signSession({ userId: 'usr_super', email: 'super@e
 
 async function setupTenantUser(tenantId, { userId, role = 'owner', locationIds = '*' }) {
   const hash = await passwordHash()
+  // "Prevent duplicate/shadow tenant creation" hardening: upsertUser() now
+  // requires the target tenant to already exist before creating a
+  // brand-new user record -- seed a minimal tenant_config first (idempotent;
+  // every real self-service tenant already has one by the time a user is
+  // created, via createNewTenant()'s own tenant_config-before-owner-user
+  // ordering -- see tenantCreation.js).
+  const existingConfig = await getTenantConfig(tenantId).catch(() => null)
+  if (!existingConfig) await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
   // Multi-Tenant Phase 4K: written via the REAL upsertUser(tenantId, ...) --
   // for a TENANT_SCOPED-mode tenant (any synthetic tenant used in this
   // file), this correctly writes to that tenant's OWN hash
@@ -165,16 +173,28 @@ async function setupTenantUser(tenantId, { userId, role = 'owner', locationIds =
   // requireAuth() on every request) resolve it exactly the way a real
   // invited/promoted user would be resolved in production -- not a
   // hand-rolled write to the bootstrap hash.
-  await upsertUser(tenantId, {
+  const record = {
     userId, email: `${userId}@example.com`, passwordHash: hash, role, locationIds,
     sessionVersion: 1, disabled: false, tenantId,
-  })
+  }
+  // Pure fixture-seeding, no real prior identity to reference -- the
+  // record is its own sourceIdentity (see test_user_store.js's identical
+  // reasoning).
+  await upsertUser(tenantId, record, { creationMode: UserCreationMode.MIGRATION, sourceIdentity: record })
 }
 function tenantUserToken(tenantId, userId, role = 'owner', locationIds = '*') {
   return signSession({ userId, email: `${userId}@example.com`, role, locationIds, tenantId, sessionVersion: 1 })
 }
 
 async function commitTenant(tenantId, googleLocationIds) {
+  // "Prevent duplicate/shadow tenant creation" final review: recordLocationApproval()
+  // no longer creates a tenant_config from nothing -- seed one first,
+  // idempotently, exactly like the real self-service flow's own
+  // tenant_config-before-approval ordering (createNewTenant() then later
+  // approveLocations()).
+  if (!(await getTenantConfig(tenantId))) {
+    await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+  }
   await recordLocationApproval(tenantId, googleLocationIds.map((id, i) => ({ googleLocationId: id, title: `Location ${i + 1}`, address: '' })))
   const approvedConfig = await getTenantConfig(tenantId)
   await markTenantProvisioned(tenantId, {
@@ -495,6 +515,7 @@ async function testIneligibleTenantStatusRejected() {
   await setSuperAdminDirectory()
   // A fresh tenant, still onboarding -- this admin path is for COMMITTED
   // tenants only; a pre-commit tenant uses the ordinary approve-locations flow.
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/A', title: 'A', address: '' }])
   const config = await getTenantConfig(TENANT_A) // status: 'locations_approved'
 

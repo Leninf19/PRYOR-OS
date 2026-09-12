@@ -39,7 +39,7 @@ import {
   _resetLocationCatalogRegistryForTests,
 } from '../dashboard/api/_lib/tenants.js'
 import {
-  recordLocationApproval, upsertTenantConfig, markTenantProvisioned,
+  recordLocationApproval, upsertTenantConfig, markTenantProvisioned, getTenantConfig,
   _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis,
 } from '../dashboard/api/_lib/tenantConfigStore.js'
 
@@ -109,6 +109,13 @@ async function activateWithApprovedCount(tenantId, count) {
   const selectedLocations = Array.from({ length: count }, (_, i) => ({
     googleLocationId: `accounts/${tenantId}/locations/${i + 1}`, title: `Location ${i + 1}`, address: '',
   }))
+  // "Prevent duplicate/shadow tenant creation" final review:
+  // recordLocationApproval() no longer creates a tenant_config from
+  // nothing -- seed one first, idempotently (never re-touch an already-
+  // existing record, which would otherwise bump configVersion needlessly).
+  if (!(await getTenantConfig(tenantId))) {
+    await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+  }
   const config = await recordLocationApproval(tenantId, selectedLocations)
   await markTenantProvisioned(tenantId, {
     reviewDbBlobKey: `tenant-data/${tenantId}/reviews.db`,
@@ -210,7 +217,7 @@ async function testActiveAndEnabledIsAllowed() {
 
 async function testActiveButDisabledIsDenied() {
   wireConfigRedis()
-  await upsertTenantConfig(TENANT_A, { status: 'active', locationCatalogEnabled: false, approvedLocations: [{ locationId: 1, googleLocationId: 'x', title: '', address: '' }] })
+  await upsertTenantConfig(TENANT_A, { status: 'active', locationCatalogEnabled: false, approvedLocations: [{ locationId: 1, googleLocationId: 'x', title: '', address: '' }] }, { allowCreate: true, creationSource: 'migration' })
   const authz = await resolveLocationCatalogAuthz(TENANT_A)
   assert(!tenantOwnsLocationCatalog(TENANT_A, authz), 'status active but locationCatalogEnabled false must be denied')
   assert(!tenantOwnsLocation(TENANT_A, 1, authz), 'a specific location must also be denied when the tenant-level gate is closed, even if it appears in approvedLocations')
@@ -218,14 +225,14 @@ async function testActiveButDisabledIsDenied() {
 
 async function testOnboardingStatusIsDenied() {
   wireConfigRedis()
-  await upsertTenantConfig(TENANT_A, { status: 'onboarding', locationCatalogEnabled: true, approvedLocations: [{ locationId: 1, googleLocationId: 'x', title: '', address: '' }] })
+  await upsertTenantConfig(TENANT_A, { status: 'onboarding', locationCatalogEnabled: true, approvedLocations: [{ locationId: 1, googleLocationId: 'x', title: '', address: '' }] }, { allowCreate: true, creationSource: 'migration' })
   const authz = await resolveLocationCatalogAuthz(TENANT_A)
   assert(!tenantOwnsLocationCatalog(TENANT_A, authz), 'status onboarding must be denied even if locationCatalogEnabled is (incorrectly) true')
 }
 
 async function testSuspendedStatusIsDenied() {
   wireConfigRedis()
-  await upsertTenantConfig(TENANT_A, { status: 'suspended', locationCatalogEnabled: true, approvedLocations: [{ locationId: 1, googleLocationId: 'x', title: '', address: '' }] })
+  await upsertTenantConfig(TENANT_A, { status: 'suspended', locationCatalogEnabled: true, approvedLocations: [{ locationId: 1, googleLocationId: 'x', title: '', address: '' }] }, { allowCreate: true, creationSource: 'migration' })
   const authz = await resolveLocationCatalogAuthz(TENANT_A)
   assert(!tenantOwnsLocationCatalog(TENANT_A, authz), 'a suspended tenant must be denied even though locationCatalogEnabled is still true on the record -- suspension supersedes it')
 }

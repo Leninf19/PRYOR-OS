@@ -162,6 +162,13 @@ async function setupTenant(tenantId, { userId, email }) {
   } else {
     const record = { userId, email, passwordHash: hash, role: 'owner', locationIds: '*', sessionVersion: 1, disabled: false, tenantId }
     setUserRedis(() => fakeUserRedis({ [userId]: JSON.stringify(record) }))
+    // "Prevent duplicate/shadow tenant creation" final review:
+    // recordLocationApproval() no longer creates a tenant_config from
+    // nothing -- seed one first, like the real self-service flow's own
+    // tenant_config-before-approval order.
+    if (!(await getTenantConfig(tenantId))) {
+      await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+    }
   }
   await setStoredCredential(tenantId, { refreshToken: `fake-refresh-token-${tenantId}`, connectedAccountName: 'Fake Account' })
 }
@@ -309,6 +316,7 @@ async function testDoubleSubmitApprovalIsRejectedByTheEligibilityGateBeforeAnySe
 // immediately without ever attempting a dispatch.
 async function testConcurrentDispatchClaimsResultInExactlyOneCasWinner() {
   wireSharedStores()
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   const config = await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
 
   const [r1, r2] = await Promise.allSettled([
@@ -335,6 +343,12 @@ async function testConcurrentDispatchClaimsResultInExactlyOneCasWinner() {
 async function testLtaNeverTriggersAutomaticDispatch() {
   wireSharedStores()
   let dispatchCallCount = 0
+  // sanity precondition, re-verified after too: LTA genuinely has no
+  // tenant_config record before this call -- see tenantConfigStore.js's
+  // header (LTA was never migrated into this store) and
+  // recordLocationApproval()'s own comment (it now has ZERO tenant-specific
+  // knowledge and cannot create one for any tenantId, including LTA's).
+  assert((await getTenantConfig(DEFAULT_TENANT_ID)) === null, 'sanity: Los Tres Amigos has no tenant_config record before its own approve-locations call')
   const { approveRes } = await approveFreshLocation(DEFAULT_TENANT_ID, 'accounts/1', 'locations/1',
     mockFetchRouter({ 'accounts/1': [{ name: 'locations/1', title: 'Location' }] }, {
       githubDispatch: async () => ({ status: 204 }),
@@ -344,6 +358,11 @@ async function testLtaNeverTriggersAutomaticDispatch() {
   assert(dispatchCallCount === 0, 'Los Tres Amigos must NEVER trigger an automatic GitHub dispatch, under any circumstances')
   assert(approveRes.body.status !== 'provisioning' && approveRes.body.status !== 'provisioning_dispatch_failed',
     `LTA's status must never be advanced by the automatic-provisioning path, got ${approveRes.body.status}`)
+  // Final hardening pass: the low-level persistence primitive must never
+  // have been touched for LTA -- approveLocations() short-circuits at the
+  // application layer (tenants.js's locationCatalogModeFor() ===
+  // BOOTSTRAP) before ever calling recordLocationApproval().
+  assert((await getTenantConfig(DEFAULT_TENANT_ID)) === null, 'Los Tres Amigos must still have NO tenant_config record after its own approve-locations call')
 }
 
 // ===========================================================================
@@ -351,6 +370,9 @@ async function testLtaNeverTriggersAutomaticDispatch() {
 // ===========================================================================
 
 async function seedStuckProvisioning(tenantId, { dispatchedAgoMs, lastAttemptAt = null }) {
+  if (!(await getTenantConfig(tenantId))) {
+    await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+  }
   await recordLocationApproval(tenantId, [{ googleLocationId: 'accounts/1/locations/1', title: 'A', address: '' }])
   const dispatchedAt = new Date(Date.now() - dispatchedAgoMs).toISOString()
   const config = await getTenantConfig(tenantId)

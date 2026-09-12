@@ -44,7 +44,7 @@ import { readPrivateDataFile } from '../_lib/reviewDataPaths.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
 import { getAccountByEmail, getAccountByIdForTenant, listAccounts } from '../_lib/accountStore.js'
-import { getUserById, upsertUser, updateUser, deriveUserStatus, UserStoreUnavailableError } from '../_lib/userStore.js'
+import { getUserById, upsertUser, updateUser, deriveUserStatus, UserCreationMode, UserStoreUnavailableError } from '../_lib/userStore.js'
 import { createInviteToken, revokeInviteToken, createResetToken, TokenStoreUnavailableError } from '../_lib/tokenStore.js'
 import { buildInviteEmail, buildInviteEmailSubject, buildResetEmail, buildResetEmailSubject } from '../_lib/accountEmailTemplate.js'
 import {
@@ -673,6 +673,14 @@ async function inviteUserAction(req, res) {
       invitedAt: now, invitedBy: account.userId, lastInviteSentAt: now,
       inviteTokenHash: tokenHash, inviteExpiresAt: expiresAt, inviteRevokedAt: null,
       passwordSetAt: null,
+    }, {
+      // "Prevent duplicate/shadow tenant creation" hardening: a brand-new
+      // identity being granted access to the CALLER'S OWN already-existing
+      // tenant -- the getAccountByEmail() collision check just above (and
+      // canAssignRole()) is this call site's own identity/authorization
+      // gate; userStore.js's own structural invariant for this mode
+      // additionally re-confirms the tenant itself genuinely exists.
+      creationMode: UserCreationMode.EXISTING_TENANT_INVITE,
     })
 
     const inviteUrl = buildInviteUrl(req, rawToken)
@@ -992,6 +1000,18 @@ async function updateUserRoleLocationsAction(req, res) {
       role, locationIds,
       sessionVersion: (Number.isInteger(target.sessionVersion) ? target.sessionVersion : 1) + 1,
       updatedAt: now,
+    }, {
+      // "Prevent duplicate/shadow tenant creation" hardening: `target` came
+      // from getAccountByIdForTenant() above, which may have resolved a
+      // STATIC-directory-only account never before written to Redis. This
+      // is an ADMIN-AUTHORIZED role/location change (already gated above
+      // by USERS_MANAGE + canAssignRole()) -- `sourceIdentity: target` is
+      // REQUIRED (final pre-deploy review hardening); userStore.js verifies
+      // the write's userId/email match `target` exactly (cannot swap
+      // identities), while role/locationIds are correctly left free to
+      // differ, since changing them is this endpoint's entire purpose.
+      creationMode: UserCreationMode.ADMIN_MANAGED_UPDATE,
+      sourceIdentity: target,
     })
 
     await appendAuditEntry(resolveTenantId(account), {
@@ -1059,6 +1079,11 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
       disabled,
       sessionVersion: disabled ? (Number.isInteger(target.sessionVersion) ? target.sessionVersion : 1) + 1 : target.sessionVersion,
       updatedAt: now,
+    }, {
+      // "Prevent duplicate/shadow tenant creation" hardening -- see
+      // updateUserRoleLocationsAction()'s identical comment above.
+      creationMode: UserCreationMode.ADMIN_MANAGED_UPDATE,
+      sourceIdentity: target,
     })
 
     await appendAuditEntry(resolveTenantId(account), {
@@ -1124,6 +1149,11 @@ async function updateUserCanCreateTasksAction(req, res) {
       ...target,
       canCreateTasks,
       updatedAt: now,
+    }, {
+      // "Prevent duplicate/shadow tenant creation" hardening -- see
+      // updateUserRoleLocationsAction()'s identical comment above.
+      creationMode: UserCreationMode.ADMIN_MANAGED_UPDATE,
+      sourceIdentity: target,
     })
 
     await appendAuditEntry(resolveTenantId(account), {

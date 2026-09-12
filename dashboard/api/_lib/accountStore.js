@@ -154,6 +154,39 @@ export async function getAccountByEmail(email) {
   return findAccountByEmail(accounts, email)
 }
 
+// "Prevent duplicate/shadow tenant creation" hardening -- Phase D/5's
+// fail-closed identity check, for TENANT-CREATION-TIME use ONLY (never
+// login/read paths, which correctly keep getAccountByEmail()'s existing
+// graceful degrade above -- a Redis outage must never take down existing
+// Owner accounts trying to sign in, per this file's own header). Creating
+// a brand-new tenant is a fundamentally different risk: if Redis identity
+// state cannot be verified, the only safe answer is "do not create
+// anything," never "assume no account exists." This is IDENTICAL to
+// getAccountByEmail() above except it never swallows
+// UserStoreUnavailableError from the identity-index or bootstrap-hash
+// reads -- it lets it propagate, so the caller (register()/
+// createNewTenant()) can return a 503 and reserve/write nothing, rather
+// than silently falling through to "no Redis account found" and
+// proceeding on an unverified static-directory-only answer. This is not
+// an enumeration leak: a Redis outage produces the identical 503 for
+// every registrant regardless of whether their specific email has an
+// account, so it reveals nothing about any one identity.
+export async function getAccountByEmailRequireRedisHealthy(email) {
+  const indexed = await lookupIdentityByEmail(email) // throws UserStoreUnavailableError, never swallowed
+  if (indexed?.tenantId && indexed?.userId) {
+    const account = await getUserById(indexed.tenantId, indexed.userId)
+    if (account) return account
+  }
+  const redisUser = await getUserByEmail(resolveBootstrapTenantId(), email) // throws, never swallowed
+  if (redisUser) return redisUser
+  // Redis is now PROVEN reachable and PROVEN to have no record for this
+  // identity -- only now is the static directory consulted as an
+  // ADDITIONAL source of truth, never a substitute for an unhealthy Redis.
+  const accounts = loadDirectoryOrWarn()
+  if (!accounts) return null
+  return findAccountByEmail(accounts, email)
+}
+
 // Merged, de-duplicated listing FOR ONE TENANT: every Redis user belonging
 // to `tenantId`, plus (ONLY for Los Tres Amigos, DEFAULT_TENANT_ID) every
 // static-directory account whose normalized email is NOT already present

@@ -178,6 +178,7 @@ async function provisionTenant({ lastRun } = {}) {
   })
   blob.writeJson(generationPrivateDataBlobKey(TENANT, TEST_GENERATION, '_internal/review-location-index.json'), {})
 
+  await upsertTenantConfig(TENANT, {}, { allowCreate: true, creationSource: 'migration' })
   const config = await recordLocationApproval(TENANT, [{ googleLocationId: 'accounts/1/locations/1', title: 'Location One', address: '' }])
   await markTenantProvisioned(TENANT, {
     reviewDbBlobKey: reviewDbBlobKey(TENANT),

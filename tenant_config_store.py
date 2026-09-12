@@ -268,6 +268,13 @@ def upsert_tenant_config(tenant_id: str, patch: dict, expected_version: int | No
         # mirrors the field for shape parity regardless) simply carries
         # commercial: None forever unless Node's registration flow set it.
         "commercial": None,
+        # "Prevent duplicate/shadow tenant creation" hardening -- mirrors
+        # tenantConfigStore.js's own `creation` provenance field for shape
+        # parity only (same reasoning as `commercial` above): Python has no
+        # gated "allowCreate" concept and never mints a tenant's first
+        # record today, so this is always None here unless `existing`
+        # already carries a real value written by Node's createNewTenant().
+        "creation": None,
         **(existing or {}),
         "createdAt": (existing or {}).get("createdAt", now),
         **patch,

@@ -113,6 +113,9 @@ async function invoke(tokenOrPromise) {
 }
 
 async function commitTenant(tenantId, googleLocationIds, { status = 'active' } = {}) {
+  if (!(await getTenantConfig(tenantId))) {
+    await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+  }
   await recordLocationApproval(tenantId, googleLocationIds.map((id, i) => ({ googleLocationId: id, title: `Location ${i + 1}`, address: `${i + 1} Main St` })))
   const config = await getTenantConfig(tenantId)
   await markTenantProvisioned(tenantId, {
@@ -175,6 +178,7 @@ async function testSuspendedTenantReportsSuspended() {
 async function testProvisioningFailedSurfacesLastError() {
   wireConfigRedis()
   await setupTenantUser(TENANT_A, 'usr_a')
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/1/locations/A', title: 'A', address: '' }])
   await upsertTenantConfig(TENANT_A, {
     status: 'provisioning_failed',

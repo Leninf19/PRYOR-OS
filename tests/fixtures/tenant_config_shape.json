@@ -3,7 +3,7 @@
   "topLevelFields": [
     "tenantId", "displayName", "status", "locationCatalogEnabled",
     "approvedLocations", "locationIdMap", "nextLocationId",
-    "brands", "logoUrl", "storageMode", "provisioning", "initialSync", "entitlementChange", "commercial", "configVersion", "createdAt", "updatedAt"
+    "brands", "logoUrl", "storageMode", "provisioning", "initialSync", "entitlementChange", "commercial", "creation", "configVersion", "createdAt", "updatedAt"
   ],
   "provisioningFields": [
     "status", "reviewDbBlobKey", "privateDataPrefix", "reviewDbEtag", "artifactGeneration",

@@ -231,6 +231,22 @@ export class ConfigVersionConflictError extends Error {
   }
 }
 
+// "Prevent duplicate/shadow tenant creation" hardening -- thrown by
+// upsertTenantConfig() when no record exists yet for `tenantId` and the
+// caller did not explicitly opt into creating one (see `allowCreate`
+// below). This is the structural fix for the incident that motivated this
+// phase: a bare `upsertTenantConfig(tenantId, patch)` call -- from a raw
+// script, a REPL, or any future code path that doesn't go through
+// tenantCreation.js's createNewTenant() -- can no longer silently
+// materialize a brand-new tenant merely by writing a patch to an unused id.
+export class TenantDoesNotExistError extends Error {}
+
+// Allowed provenance values for a NEW tenant's `creation.creationSource`
+// (see the `allowCreate` branch in upsertTenantConfig() below) --
+// enumerated, never an arbitrary caller-supplied string, so "how was this
+// tenant created" stays a small, reviewable set of real answers.
+export const TENANT_CREATION_SOURCES = Object.freeze(['self_service', 'admin_provisioning', 'migration', 'bootstrap'])
+
 // Returns null if no config record exists yet for this tenant -- a
 // perfectly normal state for a tenant mid-onboarding (or, transitionally,
 // for Los Tres Amigos, which has never been migrated into this store).
@@ -280,11 +296,51 @@ export async function listTenantConfigs() {
 // the original plain (last-write-wins) behavior -- appropriate for a
 // short, single-step write with no earlier "captured state" to protect
 // (e.g. recordLocationApproval() below).
-export async function upsertTenantConfig(tenantId, patch, { expectedVersion } = {}) {
+//
+// "Prevent duplicate/shadow tenant creation" hardening -- `allowCreate`
+// (optional, default false) + `creationSource`/`createdByType`/
+// `createdByActorId`: when no record exists yet for `tenantId`, this
+// function now REFUSES to create one (TenantDoesNotExistError) unless the
+// caller explicitly passes `allowCreate: true` and a valid `creationSource`
+// (see TENANT_CREATION_SOURCES above). This is the fix for the exact
+// mechanism this phase's investigation found: `upsertTenantConfig()` is a
+// plain exported function reachable by any Node script with real Upstash
+// credentials, and previously created a brand-new tenant from nothing with
+// zero identity/collision checks the moment it was called with an unused
+// id. ONLY dashboard/api/_lib/tenantCreation.js's createNewTenant() passes
+// `allowCreate: true` today -- a structural caller-registry test
+// (tests/test_tenant_creation_callers.js) enumerates exactly this and
+// fails CI if a new, unreviewed caller starts doing the same. Every other
+// caller in this file (recordLocationApproval, markTenantProvisioned,
+// markTenantActive, applyEntitlementChange, etc.) is completely
+// unaffected: they always operate on a tenant that already has a record
+// (recordLocationApproval's own header comment explains why its real
+// production caller can never reach it for a nonexistent tenant, and it
+// now explicitly throws TenantDoesNotExistError rather than creating one),
+// so `existing` is never null for them in any legitimate call, and this
+// change is a no-op there.
+//
+// Provenance (`creation: {createdAt, creationSource, createdByType,
+// createdByActorId, creationVersion}`) is stamped ONCE, only on genuine
+// creation, and is IMMUTABLE afterward: it is spread from `existing`
+// (never from `patch`) below, exactly like `tenantId`/`configVersion`, so
+// no later caller -- however it reaches this function -- can overwrite a
+// tenant's own creation record.
+export async function upsertTenantConfig(tenantId, patch, { expectedVersion, allowCreate = false, creationSource, createdByType = null, createdByActorId = null } = {}) {
   assertValidTenantId(tenantId, 'upsertTenantConfig')
   const client = getClient()
   if (!client) throw new TenantConfigStoreUnavailableError('tenant config store is not configured')
   const existing = await getTenantConfig(tenantId)
+  if (!existing) {
+    if (!allowCreate) {
+      throw new TenantDoesNotExistError(
+        `upsertTenantConfig: tenant ${JSON.stringify(tenantId)} does not exist -- pass { allowCreate: true, creationSource } to create a new tenant (only createNewTenant() and explicitly-reviewed callers may do this)`
+      )
+    }
+    if (!TENANT_CREATION_SOURCES.includes(creationSource)) {
+      throw new TypeError(`upsertTenantConfig: invalid creationSource ${JSON.stringify(creationSource)} -- must be one of ${TENANT_CREATION_SOURCES.join(', ')}`)
+    }
+  }
   const now = new Date().toISOString()
   const next = {
     tenantId,
@@ -381,6 +437,16 @@ export async function upsertTenantConfig(tenantId, patch, { expectedVersion } = 
     // strictly greater than the previous write's, regardless of which
     // fields the patch touched.
     configVersion: (existing?.configVersion ?? 0) + 1,
+    // "Prevent duplicate/shadow tenant creation" hardening -- stamped ONCE,
+    // on genuine creation only (`existing` falsy, which by this point only
+    // happens when `allowCreate` was true -- the throw above already
+    // handled every other case). For an already-existing record, this is
+    // ALWAYS exactly `existing.creation`, whatever that already was --
+    // including `undefined` for any tenant that predates this field
+    // (Python-created, or Node-created before this phase) -- NEVER
+    // backfilled, and never influenced by `patch`, exactly like
+    // tenantId/configVersion.
+    creation: existing ? existing.creation : { createdAt: now, creationSource, createdByType, createdByActorId, creationVersion: 1 },
   }
   if (!isValidStatus(next.status)) {
     throw new Error(`upsertTenantConfig: invalid status ${JSON.stringify(next.status)}`)
@@ -551,8 +617,35 @@ export async function recordLocationApproval(tenantId, selectedLocations) {
     throw new TypeError('recordLocationApproval: every selected location must have a googleLocationId')
   }
 
+  // "Prevent duplicate/shadow tenant creation" hardening (final review):
+  // recordLocationApproval() is a LIFECYCLE-STATE-TRANSITION function, not
+  // a tenant-creation one, and NEVER creates a tenant_config from nothing
+  // -- not even for Los Tres Amigos. Its real production caller
+  // (google/[action].js's approveLocations()) requires an authenticated
+  // session (`requireAuth(req, res, ['owner'])`) resolved to `tenantId` via
+  // `resolveTenantId(account)`, and such a session can only exist for a
+  // tenant whose tenant_config was already created by createNewTenant()
+  // (the self-service flow always writes tenant_config strictly before the
+  // owner user) -- so a real self-service request can never reach this
+  // function for a tenant that doesn't yet exist.
+  //
+  // Los Tres Amigos is BOOTSTRAP-mode (tenants.js's
+  // LocationCatalogMigrationMode) and by design has NO tenant_config
+  // record at all -- its catalog ownership is answered entirely by that
+  // static registry, never by this store. That compatibility distinction
+  // belongs at the LIFECYCLE/APPLICATION layer, not here: approveLocations()
+  // itself checks tenants.js's locationCatalogModeFor() and short-circuits
+  // BEFORE ever calling this function for a BOOTSTRAP-mode tenant -- this
+  // low-level persistence primitive has no special-cased tenantId of any
+  // kind and unconditionally refuses to create a record for ANY tenantId
+  // it doesn't already have one for.
   const existing = await getTenantConfig(tenantId)
-  if (existing && !LOCATION_APPROVAL_ELIGIBLE_STATUSES.has(existing.status)) {
+  if (!existing) {
+    throw new TenantDoesNotExistError(
+      `recordLocationApproval: tenant ${JSON.stringify(tenantId)} does not exist -- location approval is a lifecycle transition for an already-onboarded tenant, never a tenant-creation path`
+    )
+  }
+  if (!LOCATION_APPROVAL_ELIGIBLE_STATUSES.has(existing.status)) {
     throw new LocationApprovalNotEligibleError(
       `recordLocationApproval: tenant ${tenantId} has status ${JSON.stringify(existing.status)} -- the location catalog can only be self-service (re-)approved during onboarding, before provisioning begins. Once a tenant has started provisioning, its approved locations are a committed entitlement and this endpoint cannot change them.`,
       existing.status
@@ -586,6 +679,9 @@ export async function recordLocationApproval(tenantId, selectedLocations) {
     // provision_tenant.py); LTA never calls this function at all.
     storageMode: 'BLOB',
   })
+  // No `allowCreate` -- see the existence check above. This is a plain
+  // update on an already-existing tenant, exactly like every other
+  // status-transition write in this file.
 }
 
 // Multi-Tenant Phase 4F closure -- the ONE place a tenant's status is

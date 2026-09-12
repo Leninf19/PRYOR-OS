@@ -10,16 +10,20 @@
 // file layout changed, not the API.
 
 import { setCookie, clearCookie, parseCookies } from '../google/_lib/cookies.js'
-import { getAccountById, getAccountByEmail, listAccounts } from '../_lib/accountStore.js'
+import { getAccountById, getAccountByEmail, getAccountByEmailRequireRedisHealthy, listAccounts } from '../_lib/accountStore.js'
 import { verifyPassword, hashPassword, validatePasswordStrength } from '../_lib/password.js'
 import { requireAuth } from '../_lib/auth.js'
 import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
-import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError, lookupTenantIdForUserId } from '../_lib/userStore.js'
+import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError, UserCreationMode, lookupTenantIdForUserId } from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
 import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
 import { generateTenantId } from '../_lib/tenantIdGenerator.js'
-import { getTenantConfig, upsertTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvisioningDispatch } from '../_lib/tenantConfigStore.js'
+import { getTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvisioningDispatch } from '../_lib/tenantConfigStore.js'
+import {
+  createNewTenant, TenantCreationMode, TenantCreationModeRequiredError,
+  IdentityAlreadyExistsError, TenantAlreadyExistsError,
+} from '../_lib/tenantCreation.js'
 import {
   consumeInviteToken, markInviteConsumedPending, clearInviteConsumedPending, peekInviteToken,
   createResetToken, consumeResetToken, markResetConsumedPending, clearResetConsumedPending, peekResetToken,
@@ -592,6 +596,22 @@ async function resetPassword(req, res) {
       ...current,
       passwordHash, passwordSetAt: now, updatedAt: now,
       sessionVersion: (Number.isInteger(current.sessionVersion) ? current.sessionVersion : 1) + 1,
+    }, {
+      // "Prevent duplicate/shadow tenant creation" hardening: `current`
+      // came from getAccountById() above, which may have resolved a
+      // STATIC-directory-only account (e.g. Martin/Ruffy) never before
+      // written to Redis -- this call can therefore be userStore.js's
+      // first-ever CREATE for this exact tenantId+userId. `resolvedTenantId`
+      // is `resolveTenantId(current)`, an identity ALREADY established as
+      // legitimate for this tenant by the getAccountById() lookup above,
+      // never attacker-influenced. `sourceIdentity: current` is REQUIRED
+      // (final pre-deploy review hardening) -- userStore.js verifies the
+      // record being written matches it exactly (userId, email, role,
+      // locationIds, disabled) except the password/session bookkeeping
+      // fields this action legitimately changes; creationMode alone is
+      // never treated as sufficient permission.
+      creationMode: UserCreationMode.MIGRATION,
+      sourceIdentity: current,
     })
 
     const tenantId = resolveTenantId(updated)
@@ -723,8 +743,17 @@ async function register(req, res) {
   const emailAllowed = await enforceRateLimit(req, res, `register-email:${email.toLowerCase()}`, { requestsPerWindow: 3, windowSeconds: 60 * 60 })
   if (!emailAllowed) return
 
+  // "Prevent duplicate/shadow tenant creation" hardening (Phase D/5): a
+  // brand-new tenant reservation must never proceed on an UNVERIFIED
+  // identity answer. getAccountByEmailRequireRedisHealthy() throws
+  // UserStoreUnavailableError (caught below, 503) instead of degrading to
+  // "no Redis account found" the way plain getAccountByEmail() correctly
+  // does for LOGIN (see accountStore.js's own header on why that
+  // distinction exists). This is not an enumeration leak: the 503 fires
+  // identically for every registrant during a genuine Redis outage,
+  // regardless of whether their specific email has an account.
   try {
-    const realAccount = await getAccountByEmail(email)
+    const realAccount = await getAccountByEmailRequireRedisHealthy(email)
     if (!realAccount) {
       let pending = await getPendingRegistration(email)
       if (!pending) {
@@ -744,6 +773,10 @@ async function register(req, res) {
       }
     }
   } catch (err) {
+    if (err instanceof UserStoreUnavailableError) {
+      console.error(`[session/register] identity state could not be verified -- refusing to reserve a tenant: ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Registration is temporarily unavailable. Please try again shortly.' })
+    }
     if (
       !(err instanceof TokenStoreUnavailableError) &&
       !(err instanceof PendingRegistrationStoreUnavailableError) &&
@@ -922,26 +955,33 @@ async function getStartedStatus(req, res) {
 //   2. Re-read the pending registration FRESH, now that the lock is held
 //      -- a request that was queued behind the lock must never act on a
 //      stale in-memory copy from before it waited.
-//   3. THE explicit re-check: getAccountByEmail(email) AGAIN, even though
-//      register() already checked this once. Registration can sit
-//      unverified/unconverted for up to 7 days -- an operator invite or a
-//      second registration could have created a REAL account for this
-//      email in that window. If one now exists, this fails closed
-//      (EmailNowOccupiedError) rather than creating a second, duplicate
-//      identity under a brand-new tenant.
-//   4. upsertTenantConfig() -- the SAME function every tenant (including
-//      operator-bootstrapped ones) is created through. Skipped if a prior,
-//      partially-failed attempt already created it (idempotent retry,
-//      same pattern as Phase 4O/4P's own reconciliation logic) --
-//      tenantIdReserved was generated at REGISTRATION time specifically so
-//      a retry reuses the same id rather than orphaning a new one.
-//   5. upsertUser() -- role: 'owner', locationIds: '*' (company-wide),
-//      passwordHash carried over UNCHANGED from registration (the user
-//      already set their own password; there is no invite-accept
-//      password-setting step to replay here).
-//   6. Delete the pending registration -- from this point on, the ONLY
+//   3. createNewTenant() (tenantCreation.js) -- the ONE centralized
+//      tenant-creation primitive every mode (self-service here; future
+//      admin/migration tooling elsewhere) goes through. It performs its
+//      OWN re-check of getAccountByEmailRequireRedisHealthy(email), even
+//      though register() already checked once -- registration can sit
+//      unverified/unconverted for up to 7 days, and an operator invite or
+//      a second registration could have created a REAL account for this
+//      email in that window. If one now exists, createNewTenant() throws
+//      IdentityAlreadyExistsError, translated here to the same
+//      EmailNowOccupiedError this endpoint has always thrown. It is also
+//      the one place FAIL-CLOSED on a Redis identity-verification failure
+//      (UserStoreUnavailableError propagates, never silently treated as
+//      "no account exists").
+//      `reservedTenantId: fresh.tenantIdReserved` is exactly the id
+//      register() minted via generateTenantId() at REGISTRATION time --
+//      passing it through (self-service mode never mints its own id when
+//      one is given) is what makes a retry after a partial failure
+//      idempotent: createNewTenant() finds its own prior tenant_config
+//      write already there (same reasoning as Phase 4O/4P's own
+//      reconciliation logic) and completes only the still-outstanding
+//      owner-user write, rather than orphaning a fresh tenant every retry.
+//      passwordHash/passwordSetAt are carried over UNCHANGED from
+//      registration (the user already set their own password; there is no
+//      invite-accept password-setting step to replay here).
+//   4. Delete the pending registration -- from this point on, the ONLY
 //      record of this identity is the real tenant_config/user pair.
-//   7. Release the lock (always, via finally).
+//   5. Release the lock (always, via finally).
 async function createTenantForVerifiedRegistration(email, commercial) {
   const lockAcquired = await acquireTenantCreationLock(email)
   if (!lockAcquired) {
@@ -959,29 +999,37 @@ async function createTenantForVerifiedRegistration(email, commercial) {
       throw new PendingRegistrationNotFoundError('This registration is not ready for tenant creation.')
     }
 
-    const nowOccupied = await getAccountByEmail(fresh.email)
-    if (nowOccupied) {
-      await updatePendingRegistration(email, { status: 'blocked_email_occupied' })
-      throw new EmailNowOccupiedError('An account for this email already exists. Please sign in instead, or contact support.')
-    }
-
     await updatePendingRegistration(email, { status: 'creating_tenant' })
 
-    const tenantId = fresh.tenantIdReserved
-    const existingTenantConfig = await getTenantConfig(tenantId)
-    if (!existingTenantConfig) {
-      await upsertTenantConfig(tenantId, { displayName: fresh.companyName, commercial })
+    // "Prevent duplicate/shadow tenant creation" hardening: the identity
+    // occupied-check, the tenant-already-exists idempotent-retry handling,
+    // the fail-closed Redis-identity verification, and the actual
+    // tenant_config+owner-user writes all now live in ONE reviewed,
+    // centralized primitive (tenantCreation.js's createNewTenant()) --
+    // this function no longer performs any of those steps by hand.
+    // `reservedTenantId: fresh.tenantIdReserved` is exactly the id
+    // register() minted via generateTenantId() at registration time;
+    // passing it through (rather than letting createNewTenant() mint a
+    // NEW one) is what preserves this exact retry contract: a second
+    // attempt (this same function, called again after a partial failure)
+    // reuses that one id instead of orphaning a fresh one every time.
+    let tenantId, userRecord
+    try {
+      ;({ tenantId, userRecord } = await createNewTenant({
+        mode: TenantCreationMode.SELF_SERVICE,
+        reservedTenantId: fresh.tenantIdReserved,
+        companyName: fresh.companyName,
+        ownerEmail: fresh.email, ownerUserId: fresh.userId, ownerPasswordHash: fresh.passwordHash,
+        ownerDisplayName: fresh.displayName, ownerPasswordSetAt: fresh.createdAt,
+        commercial,
+      }))
+    } catch (err) {
+      if (err instanceof IdentityAlreadyExistsError) {
+        await updatePendingRegistration(email, { status: 'blocked_email_occupied' })
+        throw new EmailNowOccupiedError('An account for this email already exists. Please sign in instead, or contact support.')
+      }
+      throw err
     }
-
-    const now = new Date().toISOString()
-    const userRecord = await upsertUser(tenantId, {
-      userId: fresh.userId, email: fresh.email, passwordHash: fresh.passwordHash,
-      role: 'owner', locationIds: '*', tenantId, sessionVersion: 1, disabled: false,
-      displayName: fresh.displayName, createdAt: now, updatedAt: now, lastLoginAt: null,
-      invitedAt: null, invitedBy: null, lastInviteSentAt: null,
-      inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null,
-      passwordSetAt: fresh.createdAt,
-    })
 
     await deletePendingRegistration(email)
 

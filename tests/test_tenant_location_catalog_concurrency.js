@@ -35,7 +35,7 @@ import {
   _resetLocationCatalogRegistryForTests,
 } from '../dashboard/api/_lib/tenants.js'
 import {
-  recordLocationApproval, upsertTenantConfig, markTenantProvisioned,
+  recordLocationApproval, upsertTenantConfig, markTenantProvisioned, getTenantConfig,
   _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis,
 } from '../dashboard/api/_lib/tenantConfigStore.js'
 
@@ -132,6 +132,9 @@ async function activateWithApprovedCount(tenantId, count) {
   const selectedLocations = Array.from({ length: count }, (_, i) => ({
     googleLocationId: `accounts/${tenantId}/locations/${i + 1}`, title: `Location ${i + 1}`, address: '',
   }))
+  if (!(await getTenantConfig(tenantId))) {
+    await upsertTenantConfig(tenantId, {}, { allowCreate: true, creationSource: 'migration' })
+  }
   const config = await recordLocationApproval(tenantId, selectedLocations)
   await markTenantProvisioned(tenantId, {
     reviewDbBlobKey: `tenant-data/${tenantId}/reviews.db`,
@@ -149,6 +152,7 @@ async function activateWithApprovedCount(tenantId, count) {
 async function testOlderActiveReadFinishingLateCannotRestoreAuthorization() {
   const gated = makeGatedHashRedis()
   setConfigRedis(() => gated.client)
+  await upsertTenantConfig(TENANT_A, {}, { allowCreate: true, creationSource: 'migration' })
   await recordLocationApproval(TENANT_A, [{ googleLocationId: 'accounts/x/locations/1', title: 'X', address: '' }])
   await markTenantProvisioned(TENANT_A, {
     reviewDbBlobKey: 'tenant-data/t_synthetic-concurrency-tenant-a/reviews.db',

@@ -15,6 +15,7 @@ import handler from '../dashboard/api/session/[action].js'
 import { _setRedisClientForTests as setPendingClient, _resetRedisClientForTests as resetPendingClient } from '../dashboard/api/_lib/pendingRegistrationStore.js'
 import { _setRedisClientForTests as setTokenClient, _resetRedisClientForTests as resetTokenClient, hashToken } from '../dashboard/api/_lib/tokenStore.js'
 import { _setRedisClientForTests as setTenantConfigClient, _resetRedisClientForTests as resetTenantConfigClient } from '../dashboard/api/_lib/tenantConfigStore.js'
+import { _setRedisClientForTests as setUserStoreClient, _resetRedisClientForTests as resetUserStoreClient } from '../dashboard/api/_lib/userStore.js'
 import { _setTransportForTests, _resetTransportForTests } from '../dashboard/api/_lib/emailSender.js'
 import { verifyPendingSignupToken, PENDING_SIGNUP_COOKIE } from '../dashboard/api/_lib/pendingSignupSession.js'
 
@@ -35,6 +36,7 @@ async function run(name, fn) {
     resetPendingClient()
     resetTokenClient()
     resetTenantConfigClient()
+    resetUserStoreClient()
     _resetTransportForTests()
     delete process.env.ACCOUNT_DIRECTORY_JSON
   }
@@ -92,6 +94,12 @@ function installFakeRedis() {
   setPendingClient(() => client)
   setTokenClient(() => client)
   setTenantConfigClient(() => client)
+  // "Prevent duplicate/shadow tenant creation" hardening: register() now
+  // calls getAccountByEmailRequireRedisHealthy() (accountStore.js), which
+  // fails closed (503, no reservation) if userStore.js's Redis identity
+  // lookup cannot be verified -- this store must be wired too, or every
+  // register() call in this file would look identical to a genuine outage.
+  setUserStoreClient(() => client)
   return client
 }
 

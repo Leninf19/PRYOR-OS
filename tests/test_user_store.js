@@ -14,7 +14,7 @@ process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xy
 import bcrypt from 'bcryptjs'
 import {
   getUserById, getUserByEmail, listUsers, upsertUser, updateUser, touchLastLogin,
-  deriveUserStatus, UserStoreUnavailableError,
+  deriveUserStatus, UserStoreUnavailableError, UserCreationMode,
   _setRedisClientForTests, _resetRedisClientForTests,
 } from '../dashboard/api/_lib/userStore.js'
 import { getAccountById, getAccountByEmail, listAccounts } from '../dashboard/api/_lib/accountStore.js'
@@ -66,6 +66,15 @@ async function bcryptHash() {
   return bcrypt.hash('correct-horse-battery-staple', 12)
 }
 
+// This file's fixture-seeding calls are pure "put a record in the store"
+// helpers with no real prior static/admin-resolved identity to reference --
+// MIGRATION's structural invariant (sourceIdentity's userId/email/role/
+// locationIds/disabled must match the record exactly) is trivially and
+// correctly satisfied by using the record itself as its own sourceIdentity.
+function seedUser(tenantId, record) {
+  return upsertUser(tenantId, record, { creationMode: UserCreationMode.MIGRATION, sourceIdentity: record })
+}
+
 const BASE_USER = {
   userId: 'usr_lm_1', email: 'lm1@example.com', passwordHash: null,
   role: 'location_manager', locationIds: [3], sessionVersion: 1, disabled: false,
@@ -84,7 +93,7 @@ async function testUnconfiguredStoreThrows() {
 async function testUpsertAndGetById() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client) // same instance every call -- getClient() has no caching for the test-factory path
-  await upsertUser(DEFAULT_TENANT_ID, BASE_USER)
+  await seedUser(DEFAULT_TENANT_ID, BASE_USER)
   const found = await getUserById(DEFAULT_TENANT_ID, 'usr_lm_1')
   assert(found && found.email === 'lm1@example.com', 'upserted user must be retrievable by id')
   assert(JSON.stringify(found.locationIds) === JSON.stringify([3]), 'locationIds must round-trip exactly')
@@ -93,7 +102,7 @@ async function testUpsertAndGetById() {
 async function testUpsertAndGetByEmailCaseInsensitive() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client) // same instance every call -- getClient() has no caching for the test-factory path
-  await upsertUser(DEFAULT_TENANT_ID, { ...BASE_USER, email: 'Mixed.Case@Example.com' })
+  await seedUser(DEFAULT_TENANT_ID, { ...BASE_USER, email: 'Mixed.Case@Example.com' })
   const found = await getUserByEmail(DEFAULT_TENANT_ID, 'mixed.case@example.com')
   assert(found && found.userId === 'usr_lm_1', 'email lookup must be case/whitespace-insensitive, matching normalizeEmail()')
 }
@@ -117,8 +126,8 @@ async function testUpsertRejectsInvalidLocationIds() {
 async function testListUsersReturnsEveryRecord() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client) // same instance every call -- getClient() has no caching for the test-factory path
-  await upsertUser(DEFAULT_TENANT_ID, BASE_USER)
-  await upsertUser(DEFAULT_TENANT_ID, { ...BASE_USER, userId: 'usr_lm_2', email: 'lm2@example.com' })
+  await seedUser(DEFAULT_TENANT_ID, BASE_USER)
+  await seedUser(DEFAULT_TENANT_ID, { ...BASE_USER, userId: 'usr_lm_2', email: 'lm2@example.com' })
   const all = await listUsers(DEFAULT_TENANT_ID)
   assert(all.length === 2, `expected 2 users, got ${all.length}`)
 }
@@ -126,7 +135,7 @@ async function testListUsersReturnsEveryRecord() {
 async function testUpdateUserPartialMergeAndTimestamp() {
   const client = fakeRedis()
   _setRedisClientForTests(() => client) // same instance every call -- getClient() has no caching for the test-factory path
-  await upsertUser(DEFAULT_TENANT_ID, BASE_USER)
+  await seedUser(DEFAULT_TENANT_ID, BASE_USER)
   const updated = await updateUser(DEFAULT_TENANT_ID, 'usr_lm_1', { disabled: true })
   assert(updated.disabled === true, 'patched field must be applied')
   assert(updated.email === BASE_USER.email, 'unpatched fields must be preserved')
@@ -173,7 +182,7 @@ async function testRedisAccountTakesPrecedenceOverStaticForSameEmail() {
   ])
   const client = fakeRedis()
   _setRedisClientForTests(() => client) // same instance every call -- getClient() has no caching for the test-factory path
-  await upsertUser(DEFAULT_TENANT_ID, { ...BASE_USER, userId: 'usr_redis', email: 'shared@example.com', displayName: 'Redis Copy', role: 'owner', locationIds: '*' })
+  await seedUser(DEFAULT_TENANT_ID, { ...BASE_USER, userId: 'usr_redis', email: 'shared@example.com', displayName: 'Redis Copy', role: 'owner', locationIds: '*' })
 
   const byEmail = await getAccountByEmail('shared@example.com')
   assert(byEmail.displayName === 'Redis Copy', `Redis must win for getAccountByEmail on a shared identity, got ${byEmail?.displayName}`)
@@ -220,7 +229,7 @@ async function testListAccountsMergesWithoutDuplicatingSharedIdentity() {
   _setRedisClientForTests(() => client) // same instance every call -- getClient() has no caching for the test-factory path
   // Same normalized email as the static owner above, but a DIFFERENT userId
   // and record -- simulates "this identity was promoted into Redis".
-  await upsertUser(DEFAULT_TENANT_ID, { ...BASE_USER, userId: 'usr_redis_owner', email: 'owner@example.com', displayName: 'Redis Owner Copy', role: 'owner', locationIds: '*' })
+  await seedUser(DEFAULT_TENANT_ID, { ...BASE_USER, userId: 'usr_redis_owner', email: 'owner@example.com', displayName: 'Redis Owner Copy', role: 'owner', locationIds: '*' })
 
   const all = await listAccounts(DEFAULT_TENANT_ID)
   const ownerEmailMatches = all.filter(a => a.email.toLowerCase() === 'owner@example.com')

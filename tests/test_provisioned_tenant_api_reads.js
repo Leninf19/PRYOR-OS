@@ -169,6 +169,7 @@ async function provisionTenantBWithBlobArtifacts() {
   blob.writeJson(generationPrivateDataBlobKey(TENANT_B, TEST_GENERATION, 'gbp-sync.json'), { locations: [], neverSynced: true })
   blob.writeJson(generationPrivateDataBlobKey(TENANT_B, TEST_GENERATION, '_internal/review-location-index.json'), {})
 
+  await upsertTenantConfig(TENANT_B, {}, { allowCreate: true, creationSource: 'migration' })
   const config = await recordLocationApproval(TENANT_B, [{ googleLocationId: 'accounts/1/locations/1', title: 'Tenant B Restaurant', address: '' }])
   await markTenantProvisioned(TENANT_B, {
     reviewDbBlobKey: reviewDbBlobKey(TENANT_B),

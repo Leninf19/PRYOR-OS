@@ -56,7 +56,11 @@ function fakeHashRedis() {
 
 async function freshDefaultRecord(patch = {}) {
   setConfigRedis(() => fakeHashRedis())
-  return upsertTenantConfig(TEST_TENANT_ID, patch)
+  // "Prevent duplicate/shadow tenant creation" hardening: upsertTenantConfig()
+  // now refuses to create a record for an unknown tenant without an
+  // explicit opt-in -- this helper always targets a brand-new fake store,
+  // so every call here is a genuine creation.
+  return upsertTenantConfig(TEST_TENANT_ID, patch, { allowCreate: true, creationSource: 'migration' })
 }
 
 async function testNodeDefaultRecordHasExactlyTheFixturesTopLevelFields() {
