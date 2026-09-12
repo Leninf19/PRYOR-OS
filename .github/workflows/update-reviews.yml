@@ -123,6 +123,25 @@ jobs:
         id: verify-artifacts
         run: python verify_private_data_artifacts.py --tenant-id "$TENANT_ID"
 
+      # Phase A.1 CI hardening: api/google/[action].js has its own private
+      # runtime requirements (_internal/review-location-index.json,
+      # _internal/gbp-location-link-map.json) -- completely separate from
+      # the api/data.js EXACT_ALLOWLIST the step above checks, and
+      # previously verified by NOTHING before this. This is the
+      # deterministic, pre-build half of that coverage: source files exist,
+      # are non-empty valid JSON, are declared in the dashboard build
+      # config's own includeFiles for this function, and are confirmed NOT
+      # exposed via /api/data's allowlist. Needs no external build tooling
+      # at all, so it can be -- and must be -- a real blocking gate (see
+      # Deploy step's condition below), independent of whatever the later
+      # serverless-bundle build step's own reliability turns out to be on a
+      # given day. (See that later step, further down this file, for the
+      # actual physical bundle-packaging check and its own naming.)
+      - name: Verify Google function private-data requirements
+        if: always()
+        id: verify-google-artifacts
+        run: python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --target google
+
       - name: Verify database integrity before commit
         if: always()
         id: integrity
@@ -148,39 +167,47 @@ jobs:
       # "Fix confirmed production /api/data 404s" investigation: real browser
       # evidence showed analytics/intelligence files 404ing in production
       # despite export_chunks.py generating them correctly and a controlled
-      # local reproduction (same vercel.json, same fresh 113-file export,
-      # built via `vercel build` from the repo root exactly like the step
-      # below) proving the built function's filePathMap DOES include every
+      # local reproduction (same vercel.json, same fresh export, built via
+      # `vercel build` from the repo root exactly like the step below)
+      # proving the built function's filePathMap DOES include every
       # required file. Every real deployment log inspected during that
       # investigation showed "Restored build cache from previous deployment"
       # -- chained back across many deploys -- while the clean, cache-free
       # local reproduction was correct. This step builds the SAME way (from
       # the repo root, so Root Directory=dashboard resolves once, exactly
-      # like the Deploy step below) purely to inspect and verify the
-      # resulting api/data function's filePathMap before any deploy is
-      # attempted -- catching a recurrence of this exact class of bug
-      # regardless of whether build-cache staleness turns out to be the true
-      # runtime mechanism.
-      # NON-BLOCKING (corrected after two real dispatches both failed here):
-      # `vercel pull` cannot authenticate under CI's --token-only auth the
-      # same way `vercel --prod` reliably does -- "Error: Could not retrieve
-      # Project Settings", even with the identical VERCEL_TOKEN/org/project
-      # env vars the Deploy step below uses successfully. This step stays
-      # for diagnostics (its output is still visible in the job log) but
-      # must never block a real deploy on an experimental check whose own
-      # CI auth behavior isn't fixed yet -- continue-on-error: true, and the
-      # Deploy step's condition below no longer references its outcome. The
-      # REQUIRED, blocking gate remains "Verify private-data artifacts
-      # before deploy" above, which only depends on the local filesystem
-      # and already proved reliable across every real run.
+      # like the Deploy step below) to inspect and verify the resulting
+      # functions' filePathMaps before any deploy is attempted.
+      #
+      # Phase A.1 CI hardening -- NOW RELIABLE, NOW BLOCKING: the previous
+      # version of this step ran `vercel pull dashboard` first, which is
+      # known to intermittently fail under CI's --token-only auth ("Error:
+      # Could not retrieve Project Settings") for reasons unrelated to the
+      # application, on two separate real dispatches -- so it carried
+      # continue-on-error: true and was diagnostics-only. Root cause: `vercel
+      # pull` was never actually necessary here. `vercel build` (like the
+      # Deploy step below, which has never had this problem) supports
+      # project linking purely via the VERCEL_ORG_ID/VERCEL_PROJECT_ID env
+      # vars already set below -- confirmed by a controlled local
+      # reproduction of this exact commit's build, with no `vercel pull`/
+      # `vercel link` step at all, producing a correct
+      # .vercel/output/functions/api/google/[action].func/.vc-config.json
+      # whose filePathMap contained exactly the two required private files.
+      # Removing the broken command removes the failure mode that motivated
+      # continue-on-error, so this step is now a REAL deployment gate (see
+      # Deploy step's condition below) covering BOTH api/data.js's
+      # EXACT_ALLOWLIST and api/google/[action].js's own private runtime
+      # requirements -- the actual physical "is it in the deployed Lambda"
+      # proof, not just source-directory existence (that's the separate,
+      # always-blocking "Verify Google function private-data requirements"
+      # step above, which stays as the deterministic fallback gate if this
+      # step's Vercel-specific mechanics were ever to regress again).
       - name: Build and verify serverless bundle includes required artifacts
-        if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success'
+        if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success' && steps.verify-google-artifacts.outcome == 'success'
         id: verify-bundle
-        continue-on-error: true
         run: |
-          npx vercel pull dashboard --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
           npx vercel build --yes --token=${{ secrets.VERCEL_TOKEN }}
-          python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --bundle-config dashboard/.vercel/output/functions/api/data.func/.vc-config.json
+          python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --bundle-config .vercel/output/functions/api/data.func/.vc-config.json
+          python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --target google --bundle-config ".vercel/output/functions/api/google/[action].func/.vc-config.json"
         env:
           VERCEL_ORG_ID: team_bzqEwLON2tvascgmnOtYAPi8
           VERCEL_PROJECT_ID: prj_rAhOLFWrKXB94ohCGiAdw3OY1ymo
@@ -206,7 +233,7 @@ jobs:
       # comment for the build-cache-staleness evidence this responds to.
       # Never combined with --with-cache, which would defeat the point.
       - name: Deploy to Vercel
-        if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success'
+        if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success' && steps.verify-google-artifacts.outcome == 'success' && steps.verify-bundle.outcome == 'success'
         run: npx vercel --prod --force --yes --token=${{ secrets.VERCEL_TOKEN }}
         env:
           # PRYOR OS Controlled Production Release Preparation + Reconciliation:

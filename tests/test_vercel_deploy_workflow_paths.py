@@ -279,27 +279,69 @@ def test_bundle_verification_step_runs_before_deploy_and_builds_from_repo_root()
         )
 
 
-def test_bundle_verification_is_non_blocking_and_never_gates_deploy():
-    """Corrected after two real dispatches both failed at `vercel pull`
-    (CI's --token-only auth can't retrieve Project Settings the way it can
-    for the already-proven-reliable `vercel --prod`) -- the experimental
-    bundle check must never again be able to block a real deploy. Requires
-    continue-on-error: true on the bundle-verify step, and the Deploy step
-    must not reference steps.verify-bundle.outcome anywhere. The REQUIRED,
-    still-blocking gate is 'Verify private-data artifacts before deploy',
-    checked separately below."""
+def test_bundle_verification_never_uses_vercel_pull():
+    """Phase A.1 CI hardening root-cause fix: `vercel pull` intermittently
+    failed under CI's --token-only auth on two real dispatches ("Error:
+    Could not retrieve Project Settings"), for reasons unrelated to the
+    application -- and turned out to be unnecessary, since `vercel build`
+    supports project linking purely via the VERCEL_ORG_ID/VERCEL_PROJECT_ID
+    env vars already set on this step (confirmed by a controlled local
+    reproduction with no `pull`/`link` step at all, producing a correct
+    filePathMap). The broken command must never come back."""
     bundle_step_name = "Build and verify serverless bundle includes required artifacts"
     for filename in VERCEL_DEPLOY_WORKFLOWS:
         source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
         bundle_step = _find_step(_steps(source), bundle_step_name)
-        assert "continue-on-error: true" in bundle_step, (
-            f"{filename}: {bundle_step_name!r} must set continue-on-error: true so its own "
-            f"CI-auth failure can never block the Deploy step"
+        assert "vercel pull" not in bundle_step, (
+            f"{filename}: {bundle_step_name!r} must never reintroduce `vercel pull` -- it is the known-broken "
+            f"command this hardening removed; `vercel build` links via VERCEL_ORG_ID/VERCEL_PROJECT_ID instead"
         )
-        deploy_step = _find_step(_steps(source), "Deploy to Vercel")
-        assert "verify-bundle" not in deploy_step, (
-            f"{filename}: 'Deploy to Vercel' must not reference steps.verify-bundle at all -- "
-            f"the bundle check is diagnostics-only, never a deployment gate"
+
+
+def test_bundle_verification_is_now_reliable_and_blocking():
+    """Phase A.1 CI hardening: now that the `vercel pull` failure mode is
+    gone (see test_bundle_verification_never_uses_vercel_pull), this check
+    is a real, physical "is it in the deployed Lambda" proof and MUST be a
+    real deployment gate -- no continue-on-error, and (for update-reviews.yml,
+    which uses if: always() throughout) explicitly referenced by the Deploy
+    step's own condition. deploy-frontend.yml has no if: always() anywhere,
+    so the absence of continue-on-error alone is sufficient -- GitHub
+    Actions' own default "a failed step stops the job" semantics already
+    gate Deploy, exactly like test_required_artifact_assertion_still_blocks_deploy
+    already relies on for that workflow's other gates."""
+    bundle_step_name = "Build and verify serverless bundle includes required artifacts"
+    for filename in VERCEL_DEPLOY_WORKFLOWS:
+        source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
+        bundle_step = _find_step(_steps(source), bundle_step_name)
+        assert "continue-on-error" not in bundle_step, (
+            f"{filename}: {bundle_step_name!r} must no longer set continue-on-error -- it is now a reliable, "
+            f"real deployment gate, not an experimental diagnostic"
+        )
+        if filename == "update-reviews.yml":
+            deploy_step = _find_step(_steps(source), "Deploy to Vercel")
+            assert "steps.verify-bundle.outcome == 'success'" in deploy_step, (
+                f"{filename}: 'Deploy to Vercel' must require steps.verify-bundle.outcome == 'success' -- "
+                f"without it, this workflow's if: always() pattern would let a failed bundle check deploy anyway"
+            )
+
+
+def test_bundle_verification_checks_both_data_and_google_functions():
+    """The old bundle-verify step only ever checked api/data.func --
+    api/google/[action].js's own private runtime requirements
+    (_internal/review-location-index.json, _internal/gbp-location-link-map.json)
+    were never checked by anything. This is the actual gap Phase A.1 closes:
+    the step must invoke verify_private_data_artifacts.py TWICE -- once for
+    each target -- against each function's own built .vc-config.json."""
+    bundle_step_name = "Build and verify serverless bundle includes required artifacts"
+    for filename in VERCEL_DEPLOY_WORKFLOWS:
+        source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
+        bundle_step = _find_step(_steps(source), bundle_step_name)
+        assert "api/data.func/.vc-config.json" in bundle_step, (
+            f"{filename}: {bundle_step_name!r} must still check api/data.func's filePathMap"
+        )
+        assert "--target google" in bundle_step and "api/google/[action].func/.vc-config.json" in bundle_step, (
+            f"{filename}: {bundle_step_name!r} must also check api/google/[action].func's filePathMap "
+            f"via --target google -- this is the exact coverage gap Phase A.1 closes"
         )
 
 
@@ -325,6 +367,36 @@ def test_required_artifact_assertion_still_blocks_deploy():
             assert "continue-on-error" not in artifacts_step, (
                 f"{filename}: 'Verify private-data artifacts before deploy' must stay blocking "
                 f"(no continue-on-error) -- this is the required production gate"
+            )
+
+
+def test_google_artifact_requirements_are_verified_and_blocking():
+    """Phase A.1 CI hardening: api/google/[action].js's own private runtime
+    requirements were previously verified by nothing at all before deploy.
+    This deterministic, pre-build check (no Vercel CLI needed) must exist,
+    run before Deploy, and actually block it -- same blocking discipline as
+    the pre-existing data-target check above."""
+    step_name = "Verify Google function private-data requirements"
+    for filename in VERCEL_DEPLOY_WORKFLOWS:
+        source = (WORKFLOWS_DIR / filename).read_text(encoding="utf-8")
+        blocks = _steps(source)
+        names = _step_names_in_order(source)
+        assert step_name in names, f"{filename}: missing the {step_name!r} step"
+        assert "Deploy to Vercel" in names, f"{filename}: missing the 'Deploy to Vercel' step"
+        assert names.index(step_name) < names.index("Deploy to Vercel"), (
+            f"{filename}: {step_name!r} must run before 'Deploy to Vercel'"
+        )
+        google_step = _find_step(blocks, step_name)
+        assert "continue-on-error" not in google_step, (
+            f"{filename}: {step_name!r} must stay blocking (no continue-on-error)"
+        )
+        assert "--target google" in google_step and "verify_private_data_artifacts.py" in google_step, (
+            f"{filename}: {step_name!r} must actually invoke verify_private_data_artifacts.py --target google"
+        )
+        if filename == "update-reviews.yml":
+            deploy_step = _find_step(blocks, "Deploy to Vercel")
+            assert "steps.verify-google-artifacts.outcome == 'success'" in deploy_step, (
+                f"{filename}: 'Deploy to Vercel' must require steps.verify-google-artifacts.outcome == 'success'"
             )
 
 
@@ -364,8 +436,11 @@ def main() -> int:
         ("update-reviews.yml's Deploy step is gated on artifact verification success", test_update_reviews_deploy_step_is_gated_on_artifact_verification),
         ("the Deploy step uses --force to skip the build cache, never --with-cache", test_deploy_step_uses_force_to_skip_build_cache),
         ("the bundle-verification step runs after artifacts and before deploy, from the repo root", test_bundle_verification_step_runs_before_deploy_and_builds_from_repo_root),
-        ("bundle verification is non-blocking and never gates deploy", test_bundle_verification_is_non_blocking_and_never_gates_deploy),
+        ("bundle verification never reintroduces the known-broken `vercel pull`", test_bundle_verification_never_uses_vercel_pull),
+        ("bundle verification is now reliable and blocking (Phase A.1)", test_bundle_verification_is_now_reliable_and_blocking),
+        ("bundle verification checks both api/data.func and api/google/[action].func", test_bundle_verification_checks_both_data_and_google_functions),
         ("the required private-data artifact assertion still blocks deploy", test_required_artifact_assertion_still_blocks_deploy),
+        ("Google function private-data requirements are verified and blocking (Phase A.1)", test_google_artifact_requirements_are_verified_and_blocking),
         ("the Deploy step still passes --force", test_force_flag_still_present_on_deploy),
     ]
     results = [_run(name, fn) for name, fn in tests]

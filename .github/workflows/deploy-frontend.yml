@@ -67,6 +67,18 @@ jobs:
       - name: Verify private-data artifacts before deploy
         run: python verify_private_data_artifacts.py --tenant-id "$TENANT_ID"
 
+      # Phase A.1 CI hardening: api/google/[action].js's own private runtime
+      # requirements (_internal/review-location-index.json,
+      # _internal/gbp-location-link-map.json), separate from api/data.js's
+      # EXACT_ALLOWLIST above and previously verified by nothing before
+      # this. Deterministic, no Vercel CLI needed -- same reasoning as
+      # update-reviews.yml's identically-named step. No `if: always()`
+      # gate needed here either (see this workflow's own established
+      # pattern): a failure simply fails the job via GitHub Actions'
+      # default step semantics, and the Deploy step below never runs.
+      - name: Verify Google function private-data requirements
+        run: python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --target google
+
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
@@ -77,27 +89,26 @@ jobs:
           npm ci
           npm run build
 
-      # NON-BLOCKING (corrected after two real dispatches both failed here):
-      # `vercel pull` cannot authenticate under CI's --token-only auth the
-      # same way `vercel --prod` reliably does -- "Error: Could not retrieve
-      # Project Settings", even with the identical VERCEL_TOKEN/org/project
-      # env vars the Deploy step below uses successfully. This step stays
-      # for diagnostics (its output is still visible in the job log) but
-      # must never block a real deploy on an experimental check whose own
-      # CI auth behavior isn't fixed yet -- continue-on-error: true. The
-      # REQUIRED, blocking gate remains "Verify private-data artifacts
-      # before deploy" above, which only depends on the local filesystem
-      # and already proved reliable across every real run. Unlike
-      # update-reviews.yml, this workflow's other steps have no `if` gate
-      # either -- continue-on-error is the only mechanism needed here to
-      # keep GitHub Actions' own default "failed step stops the job"
-      # semantics from taking down the Deploy step below.
+      # Phase A.1 CI hardening -- NOW RELIABLE, NOW BLOCKING (see
+      # update-reviews.yml's identically-named step for the full root-cause
+      # writeup): `vercel pull` was never actually necessary -- `vercel
+      # build` supports project linking purely via the VERCEL_ORG_ID/
+      # VERCEL_PROJECT_ID env vars already set below, confirmed by a
+      # controlled local reproduction with no `pull`/`link` step at all.
+      # Removing it removes the failure mode that motivated
+      # continue-on-error, so this is now a real gate: like every other
+      # step in this workflow, a failure here fails the job via GitHub
+      # Actions' own default semantics, and the Deploy step below never
+      # runs. Covers both api/data.js's EXACT_ALLOWLIST and
+      # api/google/[action].js's own private runtime requirements -- the
+      # actual physical "is it in the deployed Lambda" proof, on top of the
+      # deterministic "Verify Google function private-data requirements"
+      # step above.
       - name: Build and verify serverless bundle includes required artifacts
-        continue-on-error: true
         run: |
-          npx vercel pull dashboard --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
           npx vercel build --yes --token=${{ secrets.VERCEL_TOKEN }}
-          python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --bundle-config dashboard/.vercel/output/functions/api/data.func/.vc-config.json
+          python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --bundle-config .vercel/output/functions/api/data.func/.vc-config.json
+          python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --target google --bundle-config ".vercel/output/functions/api/google/[action].func/.vc-config.json"
         env:
           VERCEL_ORG_ID: team_bzqEwLON2tvascgmnOtYAPi8
           VERCEL_PROJECT_ID: prj_rAhOLFWrKXB94ohCGiAdw3OY1ymo
