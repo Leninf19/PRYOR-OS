@@ -48,6 +48,7 @@ import {
   getUserById, upsertUser, updateUser, deriveUserStatus, countActiveOrInvitedUsers, UserCreationMode, UserStoreUnavailableError,
 } from '../_lib/userStore.js'
 import { resolveTenantEntitlements } from '../_lib/entitlements.js'
+import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
 import {
   acquireSeatAllocationLock, releaseSeatAllocationLock, SeatAllocationLockUnavailableError,
 } from '../_lib/seatAllocationLock.js'
@@ -55,7 +56,7 @@ import { createInviteToken, revokeInviteToken, createResetToken, TokenStoreUnava
 import { buildInviteEmail, buildInviteEmailSubject, buildResetEmail, buildResetEmailSubject } from '../_lib/accountEmailTemplate.js'
 import {
   generateUserId, isValidDisplayName, validateRoleAndLocations, canAssignRole,
-  buildInviteUrl, buildResetUrl, assertNotLastActiveOwner,
+  buildInviteUrl, buildResetUrl, assertNotLastActiveOwner, classifyAuthorityChange,
 } from '../_lib/userManagement.js'
 
 function actorFields(account, req) {
@@ -209,6 +210,15 @@ async function upsertContactAction(req, res) {
   const allowed = await enforceRateLimit(req, res, `settings:contacts-upsert:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
 
+  // Phase B.7 (Part L) -- OPERATIONAL_WRITE: an ordinary operational
+  // mutation, no capacity/external-cost implication.
+  const contactsUpsertEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const contactsUpsertOpCheck = requireCommercialOperation(contactsUpsertEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (!contactsUpsertOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(contactsUpsertOpCheck)
+    return res.status(status).json(body)
+  }
+
   const { patch, logAction } = req.body ?? {}
   if (logAction !== undefined && typeof logAction !== 'string') {
     return res.status(400).json({ error: 'invalid_request', message: 'logAction must be a string when provided.' })
@@ -318,6 +328,18 @@ async function toggleContactActiveAction(req, res) {
 
   const allowed = await enforceRateLimit(req, res, `settings:contacts-toggle-active:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
+
+  // Phase B.7 (Part L) -- only the ENABLING direction is gated
+  // (OPERATIONAL_WRITE); disabling only ever shrinks operational surface
+  // (RESOURCE_REDUCTION) and must remain unconditionally allowed.
+  if (req.body.active === true) {
+    const toggleEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+    const toggleOpCheck = requireCommercialOperation(toggleEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+    if (!toggleOpCheck.allowed) {
+      const { status, body } = commercialDenialResponse(toggleOpCheck)
+      return res.status(status).json(body)
+    }
+  }
 
   try {
     const existing = await getContact(resolveTenantId(account), locationId)
@@ -544,6 +566,16 @@ async function sendTestEmailAction(req, res) {
   const allowed = await enforceRateLimit(req, res, `settings:contacts-send-test-email:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
   if (!allowed) return
 
+  // Phase B.7 (Part N) -- a real customer-triggered email send is
+  // COST_GENERATING; denied for suspended/canceled, allowed for past_due
+  // (ordinary operational notifications continue during billing grace).
+  const testEmailEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const testEmailOpCheck = requireCommercialOperation(testEmailEntitlements, CommercialOperationClass.COST_GENERATING)
+  if (!testEmailOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(testEmailOpCheck)
+    return res.status(status).json(body)
+  }
+
   let contact
   try {
     contact = await getContact(resolveTenantId(account), locationId)
@@ -700,6 +732,21 @@ async function inviteUserAction(req, res) {
     // misconfigured resolution), is enforced literally: 0 correctly
     // rejects every invitation outright, never interpreted as unlimited.
     const entitlements = await resolveTenantEntitlements(tenantId)
+
+    // Phase B.7 (Part F) -- commercial-status gate, structurally SEPARATE
+    // from the numeric maxActiveUsers check below so a denial here reports
+    // 'commercial_access_restricted', never overloaded onto
+    // 'seat_limit_reached'. A new invitation is CAPACITY_EXPANSION (it
+    // reserves a seat the moment it's issued, per the comment above) --
+    // denied for past_due/suspended/canceled even if the tenant is
+    // numerically still under its plan's seat limit. Resolved from the
+    // SAME `entitlements` object the numeric check below also uses.
+    const capacityCheck = requireCommercialOperation(entitlements, CommercialOperationClass.CAPACITY_EXPANSION)
+    if (!capacityCheck.allowed) {
+      const { status, body } = commercialDenialResponse(capacityCheck)
+      return res.status(status).json(body)
+    }
+
     const maxActiveUsers = entitlements.limits.maxActiveUsers
     if (maxActiveUsers !== null) {
       const currentSeats = await countActiveOrInvitedUsers(tenantId)
@@ -791,6 +838,17 @@ async function resendInviteAction(req, res) {
 
   const allowed = await enforceRateLimit(req, res, `settings:resend-invite:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
   if (!allowed) return
+
+  // Phase B.7 (Part F/N) -- resending does not consume a NEW seat (the
+  // invitation was already counted at issue time), so this is
+  // COST_GENERATING (the real email send), not CAPACITY_EXPANSION: denied
+  // for suspended/canceled, allowed for past_due.
+  const resendEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const resendOpCheck = requireCommercialOperation(resendEntitlements, CommercialOperationClass.COST_GENERATING)
+  if (!resendOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(resendOpCheck)
+    return res.status(status).json(body)
+  }
 
   const { userId } = req.body ?? {}
   if (typeof userId !== 'string' || !userId) {
@@ -1064,6 +1122,32 @@ async function updateUserRoleLocationsAction(req, res) {
     const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
 
+    // Phase B.7 pre-commit correction (Part 3) -- this single endpoint can
+    // either EXPAND an existing user's authority (a promotion, or granting
+    // additional locations) or REDUCE it (a demotion, or narrowing
+    // locations), and the two must be gated differently: an expansion is
+    // CAPACITY_EXPANSION-shaped (denied past_due/suspended/canceled), a
+    // reduction is RESOURCE_REDUCTION-shaped (always allowed, even on a
+    // resolver failure -- revoking authority must never become impossible
+    // during an outage). Decided from the ACTUAL before/after state via
+    // classifyAuthorityChange(), never from the endpoint's name -- see that
+    // function's own header for the exact role-rank/location-set rules.
+    const direction = classifyAuthorityChange(
+      { role: target.role, locationIds: target.locationIds },
+      { role, locationIds }
+    )
+    if (direction !== 'unchanged') {
+      const directionEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+      const directionOpCheck = requireCommercialOperation(
+        directionEntitlements,
+        direction === 'expansion' ? CommercialOperationClass.CAPACITY_EXPANSION : CommercialOperationClass.RESOURCE_REDUCTION
+      )
+      if (!directionOpCheck.allowed) {
+        const { status, body } = commercialDenialResponse(directionOpCheck)
+        return res.status(status).json(body)
+      }
+    }
+
     if (target.role === 'owner' && role !== 'owner') {
       const lastOwnerCheck = await assertNotLastActiveOwner(resolveTenantId(account), userId)
       if (!lastOwnerCheck.safe) {
@@ -1182,6 +1266,21 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
     // consumes one.
     if (!disabled && target.disabled) {
       const entitlements = await resolveTenantEntitlements(tenantId)
+
+      // Phase B.7 (Part F) -- commercial-status gate, structurally SEPARATE
+      // from the numeric maxActiveUsers check below (distinct
+      // 'commercial_access_restricted' error, never overloaded onto
+      // 'seat_limit_reached'). Only reached for a genuine disabled->enabled
+      // transition, which adds a seat back -- CAPACITY_EXPANSION denies it
+      // for past_due/suspended/canceled even if numerically under the plan
+      // limit. `disable-user` itself is never gated (RESOURCE_REDUCTION,
+      // always allowed).
+      const capacityCheck = requireCommercialOperation(entitlements, CommercialOperationClass.CAPACITY_EXPANSION)
+      if (!capacityCheck.allowed) {
+        const { status, body } = commercialDenialResponse(capacityCheck)
+        return res.status(status).json(body)
+      }
+
       const maxActiveUsers = entitlements.limits.maxActiveUsers
       if (maxActiveUsers !== null) {
         const currentSeats = await countActiveOrInvitedUsers(tenantId)
@@ -1263,6 +1362,27 @@ async function updateUserCanCreateTasksAction(req, res) {
     // updateUserRoleLocationsAction()'s identical comment above.
     const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
+
+    // Phase B.7 pre-commit correction (Part 3) -- granting the capability
+    // is an ACCESS EXPANSION (CAPACITY_EXPANSION-shaped: denied past_due/
+    // suspended/canceled); revoking it is a REDUCTION (always allowed,
+    // even on a resolver failure). Decided from the actual before/after
+    // boolean, never assumed from the endpoint name.
+    const direction = classifyAuthorityChange(
+      { canCreateTasks: Boolean(target.canCreateTasks) },
+      { canCreateTasks }
+    )
+    if (direction !== 'unchanged') {
+      const directionEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+      const directionOpCheck = requireCommercialOperation(
+        directionEntitlements,
+        direction === 'expansion' ? CommercialOperationClass.CAPACITY_EXPANSION : CommercialOperationClass.RESOURCE_REDUCTION
+      )
+      if (!directionOpCheck.allowed) {
+        const { status, body } = commercialDenialResponse(directionOpCheck)
+        return res.status(status).json(body)
+      }
+    }
 
     const now = new Date().toISOString()
     const updated = await upsertUser(resolveTenantId(account), {

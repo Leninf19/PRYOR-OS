@@ -48,10 +48,12 @@ import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDis
 import {
   recordLocationApproval, LocationApprovalNotEligibleError, getTenantConfig, LOCATION_APPROVAL_ELIGIBLE_STATUSES,
   markTenantProvisioningDispatched, markTenantProvisioningDispatchFailed, ConfigVersionConflictError,
-  MaxLocationsExceededError,
+  MaxLocationsExceededError, CommercialCapacityRestrictedError,
 } from '../_lib/tenantConfigStore.js'
 import { reconcileApprovedLocationsAgainstDiscovery, UnreconciledApprovedLocationError } from '../_lib/tenantLocationReconciliation.js'
 import { discoverGoogleLocationIdsForReconciliation } from '../_lib/googleLocationDiscovery.js'
+import { resolveTenantEntitlements } from '../_lib/entitlements.js'
+import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -151,6 +153,33 @@ async function auth(req, res) {
   // This is the tenant the callback will later be required to prove it's
   // still acting for.
   const tenantId = resolveTenantId(account)
+
+  // Phase B.7 (pre-commit correction) -- connect/reconnect creates a NEW
+  // external operational capability (a fresh, usable Google credential) and
+  // is classified INTEGRATION_EXPANSION, like discover-locations (denies
+  // past_due too): there is no legitimate reason to establish a new
+  // connection while capacity/integration changes are frozen, and B.7
+  // builds no reactivation/billing endpoint that would need this to stay
+  // open for a suspended tenant. Disconnect (below, in disconnect())
+  // remains unconditionally allowed -- only NEW connection is restricted
+  // here. Deliberately NOT the (narrower, past_due-allowed)
+  // INTEGRATION_OPERATION class -- that class is reserved for ordinary use
+  // of an ALREADY-established integration (sync/import), never for
+  // establishing/replacing the integration itself.
+  const authEntitlements = await resolveTenantEntitlements(tenantId)
+  const authOpCheck = requireCommercialOperation(authEntitlements, CommercialOperationClass.INTEGRATION_EXPANSION)
+  if (!authOpCheck.allowed) {
+    const denialMessage = authOpCheck.denialKind === 'resolver_failure'
+      ? 'Service is temporarily unavailable. Please try again shortly.'
+      : 'Connecting Google Business Profile is not available while your account is restricted. Contact support to resolve your billing status.'
+    return res.status(authOpCheck.denialKind === 'resolver_failure' ? 503 : 403).send(`
+      <html><body style="font-family:system-ui;max-width:520px;margin:60px auto;padding:0 20px">
+        <h2>Connection unavailable</h2>
+        <p>${denialMessage}</p>
+        <a href="/settings">← Back to Settings</a>
+      </body></html>
+    `)
+  }
 
   // CSRF protection, hardened: a random nonce plus the initiating tenant
   // and user identity are signed together (google/_lib/oauthState.js) into
@@ -945,6 +974,23 @@ async function triggerSync(req, res) {
     })
   }
 
+  // Phase B.7 (pre-commit correction) -- defensive commercial-status gate.
+  // Currently a no-op in practice: the DEFAULT_TENANT_ID-only check above
+  // means only Los Tres Amigos (always LEGACY_UNMANAGED_PLAN, always
+  // allowed) can ever reach this line today. Added anyway so this endpoint
+  // fails safely the moment a real per-tenant sync pipeline replaces the
+  // hardcoded one. Classified INTEGRATION_OPERATION, NOT INTEGRATION_EXPANSION
+  // or COST_GENERATING -- this syncs an ALREADY-CONNECTED tenant's existing
+  // integration (no new capability, no new capacity), so approved product
+  // policy is "normal existing sync may continue" during past_due; only
+  // suspended/canceled deny it.
+  const syncEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const syncOpCheck = requireCommercialOperation(syncEntitlements, CommercialOperationClass.INTEGRATION_OPERATION)
+  if (!syncOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(syncOpCheck)
+    return res.status(status).json(body)
+  }
+
   const allowed = await enforceRateLimit(req, res, `trigger-sync:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
   if (!allowed) return
 
@@ -1011,6 +1057,20 @@ async function triggerImport(req, res) {
       error:   'forbidden',
       message: 'This action is not available for your organization yet.',
     })
+  }
+
+  // Phase B.7 (pre-commit correction) -- defensive commercial-status gate
+  // (same reasoning as triggerSync() above: currently inert since only LTA,
+  // always legacy/allowed, can reach this line, but correct once a real
+  // per-tenant import pipeline exists). Classified INTEGRATION_OPERATION --
+  // an import against an already-established integration is explicitly
+  // listed as an INTEGRATION_OPERATION example in the approved policy,
+  // allowed during past_due.
+  const importEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const importOpCheck = requireCommercialOperation(importEntitlements, CommercialOperationClass.INTEGRATION_OPERATION)
+  if (!importOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(importOpCheck)
+    return res.status(status).json(body)
   }
 
   const allowed = await enforceRateLimit(req, res, `trigger-import:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
@@ -1237,6 +1297,20 @@ async function publish(req, res) {
 
   const allowed = await enforceRateLimit(req, res, `publish:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
   if (!allowed) return
+
+  // Phase B.7 -- commercial status enforcement. Resolved FRESH here,
+  // immediately after Phase A's rate limit and before ANYTHING that could
+  // cause Google traffic (the env-var check just below is config-only, but
+  // the credential lookup, OAuth token refresh/exchange, and the actual
+  // publish PUT all come after this) -- a suspended/canceled tenant's
+  // denied publish attempt costs Google ZERO requests. past_due/trial/
+  // active/legacy are unaffected (OPERATIONAL_WRITE allows all of those).
+  const publishEntitlements = await resolveTenantEntitlements(tenantId)
+  const publishOpCheck = requireCommercialOperation(publishEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (!publishOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(publishOpCheck)
+    return res.status(status).json(body)
+  }
 
   if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
     return res.status(503).json({
@@ -1723,6 +1797,21 @@ async function discoverLocations(req, res) {
   const allowed = await enforceRateLimit(req, res, `discover-locations:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
   if (!allowed) return
 
+  // Phase B.7 (pre-commit correction) -- this action spends real Google API
+  // quota (accounts.list + locations.list) purely to LOOK for more
+  // capacity, with no path to act on the result while capacity expansion is
+  // itself frozen. Classified INTEGRATION_EXPANSION (denies past_due too,
+  // not just suspended/canceled) -- there is no legitimate reason to browse
+  // for locations to add during a billing-grace period where adding one is
+  // already forbidden by CAPACITY_EXPANSION. Must run before ANY Google
+  // network call, same discipline as publish() above.
+  const discoverEntitlements = await resolveTenantEntitlements(tenantId)
+  const discoverOpCheck = requireCommercialOperation(discoverEntitlements, CommercialOperationClass.INTEGRATION_EXPANSION)
+  if (!discoverOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(discoverOpCheck)
+    return res.status(status).json(body)
+  }
+
   let credential
   try {
     credential = await getStoredCredential(tenantId)
@@ -2073,6 +2162,24 @@ async function approveLocations(req, res) {
         message: `Self-service location approval was denied: requested ${err.requested} location(s) exceeds the plan limit of ${err.limit} (currently ${err.current}).`,
       })
       return res.status(409).json({ error: 'location_limit_reached', current: err.current, limit: err.limit, requested: err.requested })
+    }
+    if (err instanceof CommercialCapacityRestrictedError) {
+      // Phase B.7 (Part E) -- a real commercial-status denial or a
+      // resolver failure, never conflated with the numeric limit case
+      // above. Audited the same way as the other denied-entitlement-action
+      // branches; response shape matches the module's own
+      // commercialDenialResponse() contract (safe enums only).
+      await appendAuditEntry(tenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'tenant_location_catalog', entityId: tenantId, action: 'location_catalog.approval_denied_commercial_status', changes: null, result: 'denied',
+        message: err.resolverFailure
+          ? 'Self-service location approval was denied: commercial entitlements could not be resolved.'
+          : `Self-service location approval was denied: commercialStatus is ${err.commercialStatus}.`,
+      })
+      if (err.resolverFailure) {
+        return res.status(503).json({ error: 'service_unavailable' })
+      }
+      return res.status(403).json({ error: 'commercial_access_restricted', commercialStatus: err.commercialStatus, reason: err.reason })
     }
     return res.status(503).json({ error: 'service_unavailable', message: 'Could not activate the location catalog. Please try again shortly.' })
   }

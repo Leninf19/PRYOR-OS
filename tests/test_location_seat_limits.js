@@ -27,7 +27,7 @@ import settingsHandler from '../dashboard/api/settings/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import {
   recordLocationApproval, applyEntitlementChange, upsertTenantConfig, getTenantConfig,
-  MaxLocationsExceededError, ConfigVersionConflictError, LocationApprovalNotEligibleError,
+  MaxLocationsExceededError, CommercialCapacityRestrictedError, ConfigVersionConflictError, LocationApprovalNotEligibleError,
   _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis,
 } from '../dashboard/api/_lib/tenantConfigStore.js'
 import {
@@ -226,17 +226,27 @@ async function testResolverFailureNeverFailsOpenIntoUnlimitedAdditions() {
   // resolves to a fail-closed bundle (maxLocations: 0) -- but
   // recordLocationApproval() itself already refuses a nonexistent tenant
   // (TenantDoesNotExistError) before ever reaching the limit check, which
-  // is itself a stronger fail-closed guarantee. This test instead proves
-  // the actual maxLocations:0 fail-closed VALUE rejects any addition, by
-  // seeding a MALFORMED commercial shape (resolves to 'unconfigured',
-  // limits all zero) on an already-existing tenant.
+  // is itself a stronger fail-closed guarantee. This test instead proves a
+  // MALFORMED commercial shape (resolves to commercialStatus:
+  // 'unconfigured', a RESOLUTION_FAILURE_STATUSES sentinel) on an
+  // already-existing tenant still rejects an addition.
+  //
+  // Phase B.7 correction: recordLocationApproval() now runs its
+  // CAPACITY_EXPANSION commercial-status gate BEFORE the numeric
+  // maxLocations check (see that function's own comment for why -- a
+  // resolver failure must be reported as service_unavailable-shaped, never
+  // conflated with an ordinary 'location_limit_reached' business response).
+  // A malformed/unresolvable commercial shape is exactly a resolver
+  // failure, so this now throws CommercialCapacityRestrictedError
+  // (resolverFailure: true) instead of the old MaxLocationsExceededError
+  // (limit: 0) -- still a hard deny either way, never fails open.
   await seedTenant({ commercialStatus: 'not-a-real-status', plan: 'growth' })
   try {
     await recordLocationApproval(TENANT, [loc(1)])
-    throw new Error('expected MaxLocationsExceededError')
+    throw new Error('expected CommercialCapacityRestrictedError')
   } catch (err) {
-    assert(err instanceof MaxLocationsExceededError, `a fail-closed (0-limit) resolution must still reject an addition, got ${err.constructor.name}: ${err.message}`)
-    assert(err.limit === 0, `fail-closed must mean limit 0, never unlimited, got ${err.limit}`)
+    assert(err instanceof CommercialCapacityRestrictedError, `a fail-closed resolution must still reject an addition, got ${err.constructor.name}: ${err.message}`)
+    assert(err.resolverFailure === true, `a malformed/unresolvable commercial shape must be reported as a resolver failure, got ${JSON.stringify({ resolverFailure: err.resolverFailure, commercialStatus: err.commercialStatus })}`)
   }
 }
 
@@ -600,8 +610,18 @@ async function testOverLimitTenantCanStillDisableUsers() {
 }
 
 async function testResolverFailureCannotBecomeUnlimitedSeats() {
-  // A malformed commercial shape resolves to a fail-closed bundle
-  // (maxActiveUsers: 0) -- never null/unlimited.
+  // A malformed commercial shape resolves to commercialStatus:
+  // 'unconfigured' (a RESOLUTION_FAILURE_STATUSES sentinel) and a
+  // fail-closed bundle (maxActiveUsers: 0) -- never null/unlimited.
+  //
+  // Phase B.7 correction: invite-user's CAPACITY_EXPANSION commercial-
+  // status gate runs BEFORE the numeric maxActiveUsers check (see that
+  // action's own comment) -- a resolver failure must be reported as
+  // service_unavailable, never conflated with an ordinary
+  // 'seat_limit_reached' business response (which would incorrectly imply
+  // the tenant just has 0 real seats rather than an unresolvable
+  // commercial state). This still hard-denies the invite either way, never
+  // fails open into an unlimited seat count.
   await seedTenantForSeats(TENANT, { commercialStatus: 'not-a-real-status', plan: 'growth' })
   const userClient = fakeUserRedis()
   setUserRedis(() => userClient)
@@ -610,7 +630,7 @@ async function testResolverFailureCannotBecomeUnlimitedSeats() {
   noopRateLimit()
   const ownerToken = await seedOwner(TENANT)
   const res = await invoke({ action: 'invite-user', method: 'POST', token: ownerToken, body: { name: 'New', email: 'new@example.com', role: 'read_only', locationIds: [1] } })
-  assert(res.statusCode === 409 && res.body.limit === 0, `a fail-closed resolution must deny with limit 0, never allow unlimited seats -- got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  assert(res.statusCode === 503 && res.body.error === 'service_unavailable', `a resolver failure must deny via service_unavailable, never allow unlimited seats or a business seat_limit_reached response -- got ${res.statusCode}: ${JSON.stringify(res.body)}`)
 }
 
 async function testSeatLockStoreOutageFailsClosed() {

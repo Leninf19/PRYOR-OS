@@ -216,18 +216,29 @@ async function testCanceledDeniesFeaturesAndZeroesLimits() {
   assert(e.limits.maxLocations === 0, JSON.stringify(e.limits))
 }
 
-async function testPastDueDeniesFeaturesAndZeroesLimits() {
-  // No production endpoint can ever WRITE past_due yet (no billing signal
-  // exists) -- this proves the resolver still handles it correctly via
-  // direct test-fixture store setup, per Phase B.2's explicit instruction
-  // not to build an admin endpoint solely to simulate it.
+async function testPastDueGrantsNormalPlanLimitsAndFeatures() {
+  // Phase B.7 correction: past_due is a TEMPORARY billing-grace state, not
+  // a restriction state -- B.2 originally zeroed it (there was no
+  // production writer of past_due yet, so it defaulted to the same
+  // deny-all shape as suspended/canceled). B.7's approved policy requires
+  // the OPPOSITE: existing operations continue normally while past_due
+  // (reads, tasks, review publishing, AI/Content subject to normal plan
+  // quota); it is the SEPARATE commercialOperationPolicy.js module, not
+  // this resolver, that blocks CAPACITY-EXPANDING mutations specifically
+  // while past_due. No production endpoint can ever WRITE past_due yet (no
+  // billing signal exists) -- this proves the resolver handles it correctly
+  // via direct test-fixture store setup, per Phase B.2's explicit
+  // instruction not to build an admin endpoint solely to simulate it.
   setConfigRedis(() => fakeConfigRedis({
     't_test-pastdue': baseConfig({ tenantId: 't_test-pastdue', commercial: newShapeCommercial({ commercialStatus: 'past_due', plan: 'growth' }) }),
   }))
   const e = await resolveTenantEntitlements('t_test-pastdue')
   assert(e.commercialStatus === 'past_due', e.commercialStatus)
-  assert(Object.values(e.features).every(v => v === false), JSON.stringify(e.features))
-  assert(e.limits.maxActiveUsers === 0, JSON.stringify(e.limits))
+  assert(e.reason === 'past_due_grace', e.reason)
+  assert(e.plan === 'growth' && e.effectivePlan === 'growth', 'plan must be reported normally')
+  assert(e.features.advancedExecutiveBrief === true && e.features.advancedIntelligence === true, `past_due must retain the plan's real features, got ${JSON.stringify(e.features)}`)
+  assert(e.limits.maxActiveUsers === 10 && e.limits.maxLocations === 5, `past_due must retain the plan's REAL numeric limits (Growth: 5 locations / 10 seats), got ${JSON.stringify(e.limits)}`)
+  assert(e.limits.aiAllowanceMonthly.usageUnits === 4_000_000, 'past_due must retain the plan\'s real AI allowance')
 }
 
 // --- Bootstrap / legacy / unconfigured differentiation -----------------------
@@ -468,7 +479,7 @@ const tests = [
   ['An expired trial resolves to suspended with reason trial_expired', testExpiredTrialResolvesToSuspended],
   ['Suspended status denies every feature and zeroes every limit', testSuspendedDeniesFeaturesAndZeroesLimits],
   ['Canceled status denies every feature and zeroes every limit', testCanceledDeniesFeaturesAndZeroesLimits],
-  ['past_due status denies every feature and zeroes every limit (fixture-only, no admin endpoint)', testPastDueDeniesFeaturesAndZeroesLimits],
+  ['past_due status grants normal plan limits/features (Phase B.7 correction; fixture-only, no admin endpoint)', testPastDueGrantsNormalPlanLimitsAndFeatures],
   ['BOOTSTRAP LTA resolves to the legacy-unmanaged bundle, unenforced limits', testBootstrapLtaResolvesToLegacyUnmanaged],
   ['CORRECTION #1 (disabled cutoff): commercial=null resolves to legacy compatibility while enforcement is not yet activated', testCommercialNullResolvesToLegacyCompatibilityWhileCutoffDisabled],
   ['CORRECTION #1 (cutoff activated): a pre-cutoff tenant with commercial=null is grandfathered', testGrandfatheredPreCutoffTenantResolvesToLegacyUnmanagedOnceCutoffActivated],

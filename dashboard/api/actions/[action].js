@@ -36,6 +36,8 @@ import { getEscalationCcEmails, getReplyToEmail } from '../_lib/reviewEmailConfi
 import { sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildDefaultSubject, buildReviewEmail } from '../_lib/reviewEmailTemplate.js'
 import { generateRewrite } from '../_lib/rewriteEngine.js'
+import { resolveTenantEntitlements } from '../_lib/entitlements.js'
+import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
 
 const REPLY_PERMISSIONS = [Permission.REPLY, Permission.REPLY_ASSIGNED]
 
@@ -244,6 +246,16 @@ async function sendReviewEmailAction(req, res) {
   const allowed = await enforceRateLimit(req, res, `actions:send-review-email:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
   if (!allowed) return
 
+  // Phase B.7 (Part N) -- a real customer-triggered email to the
+  // restaurant's own contact is COST_GENERATING; denied for suspended/
+  // canceled, allowed for past_due.
+  const sendReviewEmailEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const sendReviewEmailOpCheck = requireCommercialOperation(sendReviewEmailEntitlements, CommercialOperationClass.COST_GENERATING)
+  if (!sendReviewEmailOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(sendReviewEmailOpCheck)
+    return res.status(status).json(body)
+  }
+
   const {
     id, locationId: locationIdRaw, review, subject: subjectRaw,
     internalNote, followUpDueAt, confirmResend,
@@ -376,6 +388,15 @@ async function updateEmailStatus(req, res) {
   const allowed = await enforceRateLimit(req, res, `actions:update-email-status:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
 
+  // Phase B.7 (Part G) -- OPERATIONAL_WRITE: a manual status-transition
+  // mutation, denied for suspended/canceled, allowed for past_due.
+  const emailStatusEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const emailStatusOpCheck = requireCommercialOperation(emailStatusEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (!emailStatusOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(emailStatusOpCheck)
+    return res.status(status).json(body)
+  }
+
   const { id, emailStatus } = req.body ?? {}
   if (typeof id !== 'string' || !id.trim()) {
     return res.status(400).json({ error: 'invalid_request', message: 'id is required.' })
@@ -455,6 +476,15 @@ async function update(req, res) {
 
   const allowed = await enforceRateLimit(req, res, `actions:update:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
+
+  // Phase B.7 (Part G) -- OPERATIONAL_WRITE: denied for suspended/canceled,
+  // allowed for past_due.
+  const actionUpdateEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const actionUpdateOpCheck = requireCommercialOperation(actionUpdateEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (!actionUpdateOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(actionUpdateOpCheck)
+    return res.status(status).json(body)
+  }
 
   const { id, patch, logAction } = req.body ?? {}
   if (typeof id !== 'string' || !id.trim()) {

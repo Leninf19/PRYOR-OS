@@ -22,6 +22,7 @@ import { generateTenantId } from '../_lib/tenantIdGenerator.js'
 import { getTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvisioningDispatch } from '../_lib/tenantConfigStore.js'
 import { resolveTenantEntitlements } from '../_lib/entitlements.js'
 import { resolveTenantEntitlementsFromConfig } from '../_lib/entitlementResolution.js'
+import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
 import { maybeStartTrial } from '../_lib/trialLifecycle.js'
 import {
   createNewTenant, TenantCreationMode, TenantCreationModeRequiredError,
@@ -400,6 +401,46 @@ async function inviteStatus(req, res) {
 // but before the account is fully set up is recoverable by the client
 // resubmitting the identical token -- it will be found via the pending
 // safety-net record rather than rejected as invalid.
+//
+// Phase B.7 pre-commit correction (Part 2): commercial eligibility is now
+// checked via a NON-DESTRUCTIVE peekInviteToken() BEFORE the real,
+// irreversible consumeInviteToken() (GETDEL) -- a suspended/canceled/
+// resolver-failure denial must never burn the invite's single use, since a
+// legitimate reactivation later must be able to use the SAME link. The
+// actual single-use/replay guarantee is unchanged: it still lives entirely
+// in the one atomic consumeInviteToken() call below, reached only once
+// commercial eligibility is confirmed -- two concurrent accepts still race
+// on that same GETDEL exactly as before, so replay protection is not
+// weakened by adding a read-only check ahead of it.
+// Phase B.7 pre-commit correction (Part 2) helper -- given an invite
+// token's payload (from either a fresh peekInviteToken() or a
+// consumeInviteToken() resolution), returns null if commercial eligibility
+// allows activation, or an already-audited { status, body } to send back
+// if not. Shared by both branches of acceptInvite() below (fresh-token and
+// retry-via-pending-record), so the SAME check runs regardless of which
+// path resolved the payload.
+async function resolveAcceptInviteDenial(payload, req) {
+  const userId = payload.userId
+  const indexedTenantIdForCheck = await lookupTenantIdForUserId(userId)
+  const tenantIdForCheck = indexedTenantIdForCheck ?? resolveBootstrapTenantId()
+
+  // Phase B.7 (Part F/B) -- OPERATIONAL_WRITE: accepting an invite does NOT
+  // consume a NEW seat (the invitation was already counted as a seat at
+  // issue time, per countActiveOrInvitedUsers()), so past_due allows it
+  // (OPERATIONAL_WRITE's own policy shape) -- but a suspended/canceled
+  // tenant must not gain a newly-USABLE session.
+  const entitlements = await resolveTenantEntitlements(tenantIdForCheck)
+  const opCheck = requireCommercialOperation(entitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (opCheck.allowed) return null
+
+  await appendAuditEntry(tenantIdForCheck, {
+    actorId: userId, actorEmail: payload.email, ip: clientIp(req),
+    action: 'invitation.accept_denied_commercial_status', entity: 'user', entityId: userId,
+    result: 'denied', message: `Invitation acceptance was denied: commercialStatus is ${opCheck.commercialStatus ?? 'unresolvable'}. The invitation link remains valid for a future retry.`,
+  })
+  return commercialDenialResponse(opCheck)
+}
+
 async function acceptInvite(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
 
@@ -415,9 +456,24 @@ async function acceptInvite(req, res) {
     return res.status(400).json({ error: 'invalid_request', message: strength.message })
   }
 
-  let consumed
+  // Phase B.7 pre-commit correction (Part 2) -- a non-destructive
+  // peekInviteToken() first, so a FRESH (not-yet-consumed) token's
+  // commercial eligibility can be checked and, if denied, the token is
+  // NEVER touched at all. peekInviteToken() only ever resolves the primary
+  // key (tokenStore.js's own contract -- it deliberately never checks the
+  // pending-retry fallback), so `peeked === null` here does not yet mean
+  // "invalid" -- it may equally mean "already consumed by an earlier
+  // attempt of THIS SAME accept, now recoverable via the pending safety-net
+  // record" (see tokenStore.js's header for that contract). That case is
+  // resolved below by calling the real consumeInviteToken() directly,
+  // which DOES check the pending fallback -- a safe, non-destructive
+  // resolution for a genuine retry (nothing is deleted when it resolves
+  // via the pending record), so running the SAME commercial check after
+  // that resolution is equally harmless: a denial there leaves the pending
+  // record intact for a further retry.
+  let peeked
   try {
-    consumed = await consumeInviteToken(token)
+    peeked = await peekInviteToken(token)
   } catch (err) {
     if (err instanceof TokenStoreUnavailableError) {
       console.error(`[session/accept-invite] ${err.message}`)
@@ -425,9 +481,52 @@ async function acceptInvite(req, res) {
     }
     throw err
   }
-  if (!consumed) {
-    return res.status(400).json({ error: 'invalid_or_expired_token', message: 'This invitation link is invalid, expired, or has already been used.' })
+
+  let consumed
+  if (peeked) {
+    // Fresh token -- check eligibility BEFORE ever consuming it.
+    const denial = await resolveAcceptInviteDenial(peeked.payload, req)
+    if (denial) return res.status(denial.status).json(denial.body)
+
+    try {
+      consumed = await consumeInviteToken(token)
+    } catch (err) {
+      if (err instanceof TokenStoreUnavailableError) {
+        console.error(`[session/accept-invite] ${err.message}`)
+        return res.status(503).json({ error: 'service_unavailable', message: 'Account setup is temporarily unavailable. Please try again shortly.' })
+      }
+      throw err
+    }
+    if (!consumed) {
+      // Lost a race against a concurrent accept between the peek above and
+      // this consume -- never a commercial denial, the same generic
+      // invalid/expired response as any other exhausted token.
+      return res.status(400).json({ error: 'invalid_or_expired_token', message: 'This invitation link is invalid, expired, or has already been used.' })
+    }
+  } else {
+    // No fresh primary key -- resolve via consumeInviteToken() itself,
+    // which additionally checks the pending-retry fallback.
+    try {
+      consumed = await consumeInviteToken(token)
+    } catch (err) {
+      if (err instanceof TokenStoreUnavailableError) {
+        console.error(`[session/accept-invite] ${err.message}`)
+        return res.status(503).json({ error: 'service_unavailable', message: 'Account setup is temporarily unavailable. Please try again shortly.' })
+      }
+      throw err
+    }
+    if (!consumed) {
+      return res.status(400).json({ error: 'invalid_or_expired_token', message: 'This invitation link is invalid, expired, or has already been used.' })
+    }
+    // Resolved via the pending record (or, vanishingly unlikely, a fresh
+    // key that appeared between the peek and this consume) -- check
+    // eligibility now. A denial here does not burn anything further: the
+    // pending record is untouched by a from-pending resolution, so it
+    // remains available for yet another retry.
+    const denial = await resolveAcceptInviteDenial(consumed.payload, req)
+    if (denial) return res.status(denial.status).json(denial.body)
   }
+
   const { payload, tokenHash, fromPending } = consumed
   const { userId } = payload
 
@@ -461,6 +560,7 @@ async function acceptInvite(req, res) {
     }
 
     const tenantId = resolveTenantId(updated)
+
     const sessionToken = await signSession({
       userId: updated.userId, email: updated.email, role: updated.role,
       locationIds: updated.locationIds, tenantId, sessionVersion: updated.sessionVersion,

@@ -26,6 +26,8 @@ import {
 import { resolveLocationIdForReview } from '../_lib/reviewLocationIndex.js'
 import { computeReviewAssignmentProgress } from '../_lib/reviewAssignmentProgress.js'
 import { resolveTenantId } from '../_lib/tenants.js'
+import { resolveTenantEntitlements } from '../_lib/entitlements.js'
+import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
 
 const TASK_TYPES = new Set([
   'promotion', 'social_media', 'review_assignment', 'operations',
@@ -302,6 +304,16 @@ async function create(req, res) {
   const allowed = await enforceRateLimit(req, res, `tasks:create:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
 
+  // Phase B.7 (Part G) -- OPERATIONAL_WRITE: denied for suspended/canceled,
+  // allowed for past_due/trial/active/legacy (normal task work continues
+  // during billing grace).
+  const createTaskEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const createTaskOpCheck = requireCommercialOperation(createTaskEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (!createTaskOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(createTaskOpCheck)
+    return res.status(status).json(body)
+  }
+
   const validation = validateCreateFields(req.body)
   if (!validation.valid) return res.status(400).json({ error: 'invalid_request', message: validation.message })
   const { fields } = validation
@@ -359,6 +371,16 @@ async function update(req, res) {
 
   const allowed = await enforceRateLimit(req, res, `tasks:update:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
+
+  // Phase B.7 (Part G) -- OPERATIONAL_WRITE, applied uniformly to both the
+  // full-manage and self-service update paths below (both are operational
+  // mutations); denied for suspended/canceled, allowed for past_due.
+  const updateTaskEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const updateTaskOpCheck = requireCommercialOperation(updateTaskEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (!updateTaskOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(updateTaskOpCheck)
+    return res.status(status).json(body)
+  }
 
   const { id, patch, logAction } = req.body ?? {}
   if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'invalid_request', message: 'id is required.' })

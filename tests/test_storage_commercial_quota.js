@@ -25,7 +25,7 @@ import {
 } from '../dashboard/api/_lib/contentAssetStore.js'
 import { _setBlobClientForTests, _resetBlobClientForTests } from '../dashboard/api/_lib/blobStore.js'
 import {
-  upsertTenantConfig,
+  upsertTenantConfig, getTenantConfig,
   _setRedisClientForTests as _setConfigRedis, _resetRedisClientForTests as _resetConfigRedis,
 } from '../dashboard/api/_lib/tenantConfigStore.js'
 import {
@@ -361,9 +361,23 @@ async function testLtaBootstrapTenantCompletelyUnaffected() {
 }
 
 async function testResolverFailureDeniesUploadIncludingTheVeryFirstOne() {
-  // Malformed commercial state (unrecognized plan id) -- resolves to
-  // unresolvedBundle('unknown_plan'), 0/0 limits, fail-closed.
-  const { token, campaign } = await setUpTenant(newShapeCommercial({ plan: 'not_a_real_plan' }))
+  // Phase B.7 correction: upsert-campaign (used by setUpTenant()'s own
+  // createCampaign() setup helper) is now itself gated by
+  // requireCommercialOperation()'s OPERATIONAL_WRITE class, which fails
+  // closed on a resolver failure -- so seeding the tenant directly with a
+  // malformed commercial state (as this test did pre-B.7) would deny
+  // campaign creation itself, before ever reaching the upload this test
+  // means to exercise. Fixed by seeding a VALID commercial state first (so
+  // setup succeeds normally, matching every other test in this file), then
+  // corrupting the tenant's commercial config directly via
+  // upsertTenantConfig() -- simulating a resolver failure that begins
+  // AFTER the campaign already exists (the realistic production sequence:
+  // a tenant's entitlements can become unresolvable at any moment, not
+  // only before its first campaign) -- immediately before the upload call
+  // this test actually asserts on.
+  const { tenantId, token, campaign } = await setUpTenant(newShapeCommercial({ plan: 'core' }))
+  const existing = await getTenantConfig(tenantId)
+  await upsertTenantConfig(tenantId, { commercial: newShapeCommercial({ plan: 'not_a_real_plan' }) }, { expectedVersion: existing.configVersion })
   const res = await invoke({ action: 'upload', method: 'POST', token, body: { campaignId: campaign.id, type: 'website_graphic', filename: 'new.png', mimeType: 'image/png', fileBase64: SMALL_FILE() } })
   assert(res.statusCode === 409 && res.body.error === 'storage_limit_reached' && res.body.limitBytes === 0 && res.body.assetLimit === 0,
     `a resolver failure must fail closed (0/0) and deny even the very first upload, got ${res.statusCode}: ${JSON.stringify(res.body)}`)

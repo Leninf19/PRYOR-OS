@@ -211,6 +211,22 @@ function resolveNewShapeCommercial(commercial) {
   const effectiveStatus = trialExpired ? 'suspended' : commercial.commercialStatus
   const isTrialing = effectiveStatus === 'trial'
   const isActive = effectiveStatus === 'active'
+  // Phase B.7 correction: `past_due` is a TEMPORARY billing-grace state,
+  // not a restriction state -- existing restaurant operations (reads,
+  // tasks, review publishing, AI/Content subject to their normal plan
+  // quota, normal Google sync) must continue exactly as if the plan were
+  // active. B.2 originally zeroed past_due's limits/features (there was no
+  // production writer of past_due yet, so it defaulted to the same
+  // deny-all shape as suspended/canceled) -- B.7's own approved policy
+  // requires the OPPOSITE: past_due gets the plan's REAL numeric limits
+  // and REAL feature set here, and it is the SEPARATE, centralized
+  // commercialOperationPolicy.js module (never this resolver) that blocks
+  // specifically CAPACITY-EXPANDING mutations (new locations, new seats)
+  // while past_due, regardless of whether the tenant is still numerically
+  // under its plan's limit. suspended/canceled (and an expired trial,
+  // which collapses to 'suspended' above) remain fully denied here --
+  // unchanged from B.2/B.3/B.4/B.5's existing, already-tested behavior.
+  const isPastDue = effectiveStatus === 'past_due'
 
   const base = isTrialing ? TRIAL_ENTITLEMENTS : PLAN_ENTITLEMENTS[commercial.plan]
 
@@ -227,12 +243,12 @@ function resolveNewShapeCommercial(commercial) {
     planLimits = clampToSafetyCeiling({ ...base.limits, ...overrideLimits })
   }
 
-  // Commercial-status effect table: only 'active' and 'trial' grant real
-  // features/limits. Every other status (past_due, suspended, canceled, or
-  // a just-computed trial_expired->suspended) collapses to deny-all --
+  // Commercial-status effect table: 'active', 'trial', AND (Phase B.7)
+  // 'past_due' grant real features/limits. Only 'suspended'/'canceled' (or
+  // a just-computed trial_expired->suspended) collapse to deny-all --
   // WITHOUT changing `plan`/`effectivePlan` (an owner should see "you're on
   // Growth, suspended," never "you have no plan").
-  const writesAllowed = isActive || isTrialing
+  const writesAllowed = isActive || isTrialing || isPastDue
   const limits = writesAllowed ? planLimits : zeroLimits()
   const features = writesAllowed ? base.features : denyAllFeatures()
 
@@ -240,7 +256,8 @@ function resolveNewShapeCommercial(commercial) {
   if (trialExpired) reason = 'trial_expired'
   else if (isActive) reason = 'active_plan'
   else if (isTrialing) reason = 'trial_active'
-  else reason = effectiveStatus // past_due / suspended / canceled
+  else if (isPastDue) reason = 'past_due_grace'
+  else reason = effectiveStatus // suspended / canceled
 
   // Phase B.6: `trialStatus` must be TIME-AUTHORITATIVE, not a passthrough
   // of the raw stored value -- a trial past its trialEndsAt is EFFECTIVELY
