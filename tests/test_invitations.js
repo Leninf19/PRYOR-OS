@@ -20,6 +20,7 @@ import settingsHandler from '../dashboard/api/settings/[action].js'
 import sessionHandler from '../dashboard/api/session/[action].js'
 import { _setRedisClientForTests as setUserStoreClient, _resetRedisClientForTests as resetUserStoreClient, getUserById } from '../dashboard/api/_lib/userStore.js'
 import { _setRedisClientForTests as setTokenStoreClient, _resetRedisClientForTests as resetTokenStoreClient } from '../dashboard/api/_lib/tokenStore.js'
+import { _setRedisClientForTests as setSeatLockClient, _resetRedisClientForTests as resetSeatLockClient } from '../dashboard/api/_lib/seatAllocationLock.js'
 import { _setTransportForTests, _resetTransportForTests } from '../dashboard/api/_lib/emailSender.js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
@@ -42,8 +43,32 @@ async function run(name, fn) {
   } finally {
     resetUserStoreClient()
     resetTokenStoreClient()
+    resetSeatLockClient()
     _resetTransportForTests()
     delete process.env.ACCOUNT_DIRECTORY_JSON
+  }
+}
+
+// Phase B.3 -- Seat limit enforcement (Part B): a minimal, dedicated fake
+// for seatAllocationLock.js's own primitives (SET NX EX + an ownership-
+// token-checked eval release), kept separate from this file's shared
+// fakeRedis() above (whose plain `set` does not honor `nx`, since nothing
+// before Phase B.3 needed it to).
+function fakeSeatLockRedis() {
+  const strings = {}
+  return {
+    set: async (key, value, opts) => {
+      if (opts?.nx && key in strings) return null
+      strings[key] = value
+      return 'OK'
+    },
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [token] = args
+      if (strings[key] !== token) return 0
+      delete strings[key]
+      return 1
+    },
   }
 }
 
@@ -103,6 +128,8 @@ function installFakeRedis() {
   const client = fakeRedis()
   setUserStoreClient(() => client)
   setTokenStoreClient(() => client)
+  const seatLockClient = fakeSeatLockRedis()
+  setSeatLockClient(() => seatLockClient)
   return client
 }
 

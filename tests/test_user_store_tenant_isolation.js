@@ -30,6 +30,7 @@ import {
   getAccountById, getAccountByEmail, getAccountByIdForTenant, listAccounts,
 } from '../dashboard/api/_lib/accountStore.js'
 import { _setRedisClientForTests as setTokenStoreClient, _resetRedisClientForTests as resetTokenStoreClient } from '../dashboard/api/_lib/tokenStore.js'
+import { _setRedisClientForTests as setSeatLockClient, _resetRedisClientForTests as resetSeatLockClient } from '../dashboard/api/_lib/seatAllocationLock.js'
 import {
   getTenantConfig, upsertTenantConfig,
   _setRedisClientForTests as setTenantConfigClient, _resetRedisClientForTests as resetTenantConfigClient,
@@ -56,7 +57,30 @@ async function run(name, fn) {
     resetUserStoreClient()
     resetTokenStoreClient()
     resetTenantConfigClient()
+    resetSeatLockClient()
     delete process.env.ACCOUNT_DIRECTORY_JSON
+  }
+}
+
+// Phase B.3 -- Seat limit enforcement (Part B): a minimal, dedicated fake
+// for seatAllocationLock.js's own primitives (matching test_invitations.js's
+// identical helper), kept separate from this file's shared fakeRedis()
+// above, whose plain `set` does not honor `nx`.
+function fakeSeatLockRedis() {
+  const strings = {}
+  return {
+    set: async (key, value, opts) => {
+      if (opts?.nx && key in strings) return null
+      strings[key] = value
+      return 'OK'
+    },
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [token] = args
+      if (strings[key] !== token) return 0
+      delete strings[key]
+      return 1
+    },
   }
 }
 
@@ -79,6 +103,8 @@ function installFakeRedis() {
   setUserStoreClient(() => client)
   setTokenStoreClient(() => client)
   setTenantConfigClient(() => client)
+  const seatLockClient = fakeSeatLockRedis()
+  setSeatLockClient(() => seatLockClient)
   return client
 }
 

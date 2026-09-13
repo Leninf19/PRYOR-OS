@@ -379,6 +379,7 @@ async function testNoEndpointReimplementsPlanBranchingOutsideTheResolver() {
   const apiDir = path.join(REPO_ROOT, 'dashboard', 'api')
   const exemptFiles = new Set([
     path.join(apiDir, '_lib', 'entitlements.js'),
+    path.join(apiDir, '_lib', 'entitlementResolution.js'),
     path.join(apiDir, '_lib', 'planEntitlements.js'),
   ])
   const offenders = []

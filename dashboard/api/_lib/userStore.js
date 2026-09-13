@@ -312,6 +312,25 @@ export async function listUsers(tenantId) {
   return out
 }
 
+// Phase B.3 -- Seat limit enforcement (Part B). The single, authoritative
+// seat count: a user record consumes a seat if and only if deriveUserStatus()
+// resolves to 'active' or 'invited' -- 'disabled', 'revoked', and 'expired'
+// never count. Deliberately NOT a separate persisted counter -- always
+// computed live off listUsers()'s real records (the single source of
+// truth), so it can never drift from what actually exists. Callers that
+// need this count to be race-safe against concurrent seat allocation
+// (invite-user/enable-user) must call this while holding
+// seatAllocationLock.js's per-tenant lock -- this function itself performs
+// no locking (it is a plain read, reusable anywhere a seat count is simply
+// informational).
+export async function countActiveOrInvitedUsers(tenantId) {
+  const users = await listUsers(tenantId)
+  return users.filter(u => {
+    const status = deriveUserStatus(u)
+    return status === 'active' || status === 'invited'
+  }).length
+}
+
 function isValidRoleIncludingAdmin(role) {
   return ROLES.includes(role) // 'admin' is added to accounts.js's ROLES in this same commit
 }

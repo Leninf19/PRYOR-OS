@@ -66,6 +66,7 @@ import { isValidTenantId } from '../_lib/tenants.js'
 import {
   getTenantConfig, listTenantConfigs, applyEntitlementChange,
   EntitlementChangeNotEligibleError, UnknownLocationRemovalError, LocationAlreadyApprovedError, ConfigVersionConflictError,
+  MaxLocationsExceededError,
   TenantConfigStoreUnavailableError,
 } from '../_lib/tenantConfigStore.js'
 import { getStoredCredential, CredentialStoreUnavailableError } from '../_lib/credentialStore.js'
@@ -474,6 +475,11 @@ async function tenantEntitlementsApplyAction(req, res) {
     if (err instanceof ConfigVersionConflictError) {
       await auditEntitlementFailure(tenantId, account, req, 'entitlement.change_rejected_stale_version', `Rejected: expected configVersion ${expectedConfigVersion}, tenant config has moved on.`, { expectedConfigVersion })
       return res.status(409).json({ error: 'stale_config_version', message: 'This tenant\'s configuration has changed since it was last read. Reload and try again.' })
+    }
+    if (err instanceof MaxLocationsExceededError) {
+      // Phase B.3 -- location-limit enforcement (Part A).
+      await auditEntitlementFailure(tenantId, account, req, 'entitlement.change_rejected_limit_reached', err.message, { current: err.current, limit: err.limit, requested: err.requested })
+      return res.status(409).json({ error: 'location_limit_reached', current: err.current, limit: err.limit, requested: err.requested })
     }
     if (err instanceof TenantConfigStoreUnavailableError) {
       return res.status(503).json({ error: 'service_unavailable', message: 'The tenant configuration store is temporarily unavailable.' })
