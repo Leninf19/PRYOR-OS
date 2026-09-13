@@ -20,6 +20,7 @@ import { appendAuditEntry } from '../_lib/auditLog.js'
 import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
 import { generateTenantId } from '../_lib/tenantIdGenerator.js'
 import { getTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvisioningDispatch } from '../_lib/tenantConfigStore.js'
+import { resolveTenantEntitlements } from '../_lib/entitlements.js'
 import {
   createNewTenant, TenantCreationMode, TenantCreationModeRequiredError,
   IdentityAlreadyExistsError, TenantAlreadyExistsError,
@@ -204,6 +205,24 @@ async function whoami(req, res) {
 // from "no record found" (see the `config === null` branch below, which
 // answers the OPPOSITE way for every other tenant) -- the two must never
 // be conflated.
+// Phase B.2 -- Commercial Entitlement Foundation: the safe, UI-facing
+// projection of resolveTenantEntitlements()'s full internal bundle.
+// Deliberately excludes nothing sensitive (there is nothing sensitive in
+// the resolver's output -- no tokens, no payment details, no other
+// tenant's data) but is kept as its own function so tenantStatus()'s
+// response shape doesn't silently change if entitlements.js's internal
+// bundle shape ever grows a field this endpoint shouldn't surface yet.
+function toSafeCommercialView(entitlements) {
+  return {
+    plan: entitlements.effectivePlan,
+    commercialStatus: entitlements.commercialStatus,
+    trialStatus: entitlements.trialStatus,
+    limits: entitlements.limits,
+    features: entitlements.features,
+    reason: entitlements.reason,
+  }
+}
+
 async function tenantStatus(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
   const account = await requireAuth(req, res, null)
@@ -213,11 +232,18 @@ async function tenantStatus(req, res) {
   if (!allowed) return
 
   const tenantId = resolveTenantId(account)
+  // resolveTenantEntitlements() never throws (fails closed internally) --
+  // safe to call unconditionally, ahead of every branch below, so every
+  // tenantStatus() response shape (LTA/bootstrap, never-onboarded, and the
+  // full record) exposes the exact same `commercial` shape rather than
+  // three independently hand-built ones.
+  const commercial = toSafeCommercialView(await resolveTenantEntitlements(tenantId))
 
   if (tenantId === DEFAULT_TENANT_ID) {
     return res.status(200).json({
       tenantId, status: 'active', displayName: 'Los Tres Amigos', logoUrl: null, brands: [],
       approvedLocations: null, provisioning: null, initialSync: null, entitlementChange: null,
+      commercial,
     })
   }
 
@@ -238,6 +264,7 @@ async function tenantStatus(req, res) {
     return res.status(200).json({
       tenantId, status: 'onboarding', displayName: tenantId, logoUrl: null, brands: [],
       approvedLocations: [], provisioning: null, initialSync: null, entitlementChange: null,
+      commercial,
     })
   }
 
@@ -273,6 +300,7 @@ async function tenantStatus(req, res) {
       reviewCount: config.initialSync.reviewCount ?? null, locationCount: config.initialSync.locationCount ?? null,
     } : null,
     entitlementChange: config.entitlementChange ? { status: config.entitlementChange.status ?? 'none', lastError: config.entitlementChange.lastError ?? null } : null,
+    commercial,
   })
 }
 
