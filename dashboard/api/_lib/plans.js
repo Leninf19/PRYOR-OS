@@ -12,7 +12,13 @@ export const PLANS = Object.freeze({
     stripePriceId: null, contactSales: false,
   },
   growth: {
-    id: 'growth', name: 'Growth', priceCents: 34900, billingPeriod: 'month',
+    // Phase B.2 pre-commit correction: product decision finalized Growth at
+    // $249/month (was $349 -- a pre-Phase-B placeholder). This table
+    // remains presentation metadata only -- it must never become an
+    // authorization source; planEntitlements.js's PLAN_ENTITLEMENTS (limits/
+    // features) is the sole authorization/limits source, unaffected by
+    // pricing changes here.
+    id: 'growth', name: 'Growth', priceCents: 24900, billingPeriod: 'month',
     stripePriceId: null, contactSales: false,
   },
   enterprise: {
