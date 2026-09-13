@@ -21,6 +21,8 @@ import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAU
 import { generateTenantId } from '../_lib/tenantIdGenerator.js'
 import { getTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvisioningDispatch } from '../_lib/tenantConfigStore.js'
 import { resolveTenantEntitlements } from '../_lib/entitlements.js'
+import { resolveTenantEntitlementsFromConfig } from '../_lib/entitlementResolution.js'
+import { maybeStartTrial } from '../_lib/trialLifecycle.js'
 import {
   createNewTenant, TenantCreationMode, TenantCreationModeRequiredError,
   IdentityAlreadyExistsError, TenantAlreadyExistsError,
@@ -212,11 +214,28 @@ async function whoami(req, res) {
 // tenant's data) but is kept as its own function so tenantStatus()'s
 // response shape doesn't silently change if entitlements.js's internal
 // bundle shape ever grows a field this endpoint shouldn't surface yet.
+// Phase B.6: presentational-only mapping of the resolver's raw `trialStatus`
+// (null | 'active' | 'expired' | 'converted' -- entitlementResolution.js)
+// onto the frontend-facing 'not_started' sentinel for "no trial exists yet
+// or ever." This is a display translation, never a resolver contract
+// change -- the resolver's own bundle keeps using null internally (every
+// existing B.2-B.5 test that reads the raw bundle is unaffected).
+// Deliberately exposes ONLY the fields a future UI needs -- never a claim
+// token, the GBP trial-claim internal key, commercialIdentityKey, an
+// access-code hash, or any other internal anti-fraud metadata.
 function toSafeCommercialView(entitlements) {
+  const trialStatus = entitlements.trialStatus ?? 'not_started'
+  let trialSecondsRemaining = null
+  if (trialStatus === 'active' && entitlements.trialEndsAt) {
+    trialSecondsRemaining = Math.max(0, Math.round((Date.parse(entitlements.trialEndsAt) - Date.now()) / 1000))
+  }
   return {
     plan: entitlements.effectivePlan,
     commercialStatus: entitlements.commercialStatus,
-    trialStatus: entitlements.trialStatus,
+    trialStatus,
+    trialStartedAt: entitlements.trialStartedAt ?? null,
+    trialEndsAt: entitlements.trialEndsAt ?? null,
+    trialSecondsRemaining,
     limits: entitlements.limits,
     features: entitlements.features,
     reason: entitlements.reason,
@@ -285,6 +304,19 @@ async function tenantStatus(req, res) {
     }
   }
 
+  // Phase B.6 -- 7-day Growth trial: a lazy, read-time reaction, exactly
+  // like the provisioning-reconciliation check just above. maybeStartTrial()
+  // is a no-op unless this tenant is genuinely eligible (status === 'active'
+  // for the first time, no commercial decision yet) and never throws for an
+  // ordinary "not eligible"/"already decided" case. If it DOES start a
+  // trial, `config` here is the freshly-written record -- recompute
+  // `commercial` from THIS SAME object (the pure, no-I/O resolver, never a
+  // second independent read) so this response reflects the trial
+  // immediately rather than on the next poll.
+  const configBeforeTrialCheck = config
+  config = await maybeStartTrial(tenantId, config)
+  const commercialForResponse = config === configBeforeTrialCheck ? commercial : toSafeCommercialView(resolveTenantEntitlementsFromConfig(config))
+
   return res.status(200).json({
     tenantId,
     status: config.status,
@@ -300,7 +332,7 @@ async function tenantStatus(req, res) {
       reviewCount: config.initialSync.reviewCount ?? null, locationCount: config.initialSync.locationCount ?? null,
     } : null,
     entitlementChange: config.entitlementChange ? { status: config.entitlementChange.status ?? 'none', lastError: config.entitlementChange.lastError ?? null } : null,
-    commercial,
+    commercial: commercialForResponse,
   })
 }
 

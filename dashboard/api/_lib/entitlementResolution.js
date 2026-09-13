@@ -148,6 +148,9 @@ export function unresolvedBundle({ commercialStatus, reason }) {
     commercialStatus,
     billingStatus: 'none',
     trialStatus: null,
+    trialStartedAt: null,
+    trialEndsAt: null,
+    trialConsumedAt: null,
     limits: zeroLimits(),
     features: denyAllFeatures(),
     effectiveAt: new Date().toISOString(),
@@ -168,6 +171,9 @@ export function legacyUnmanagedBundle(reason) {
     commercialStatus: 'active',
     billingStatus: 'none',
     trialStatus: null,
+    trialStartedAt: null,
+    trialEndsAt: null,
+    trialConsumedAt: null,
     limits: unenforcedLimits(),
     features: PLAN_ENTITLEMENTS.growth.features,
     effectiveAt: new Date().toISOString(),
@@ -236,12 +242,31 @@ function resolveNewShapeCommercial(commercial) {
   else if (isTrialing) reason = 'trial_active'
   else reason = effectiveStatus // past_due / suspended / canceled
 
+  // Phase B.6: `trialStatus` must be TIME-AUTHORITATIVE, not a passthrough
+  // of the raw stored value -- a trial past its trialEndsAt is EFFECTIVELY
+  // expired the instant this function runs, regardless of whether any
+  // background job has ever observed or persisted that fact. The raw
+  // stored `trial.status` (e.g. 'trialing') is only surfaced as-is when
+  // trialExpired is false; once expired, this always reports 'expired'
+  // here, even though nothing on disk changed. This is deliberately
+  // computed fresh on EVERY resolution (never cached), exactly like
+  // trialExpired/effectiveStatus above.
+  const effectiveTrialStatus = trialExpired ? 'expired' : (trial?.status ?? null)
+
   return Object.freeze({
     plan: commercial.plan,
     effectivePlan: isTrialing ? 'growth' : commercial.plan,
     commercialStatus: effectiveStatus,
     billingStatus: commercial.billingStatus ?? 'none',
-    trialStatus: trial?.status ?? null,
+    trialStatus: effectiveTrialStatus,
+    // Raw trial timestamps, exposed so a caller (session/[action].js's safe
+    // frontend view) never needs to reach into raw tenant_config.commercial
+    // itself -- the resolver stays the one source of truth for anything
+    // trial-shaped. Never client-writable; these are always whatever this
+    // tenant's OWN commercial.trial object already holds.
+    trialStartedAt: trial?.startedAt ?? null,
+    trialEndsAt: trial?.endsAt ?? null,
+    trialConsumedAt: trial?.consumedAt ?? null,
     limits,
     features,
     effectiveAt: new Date().toISOString(),
