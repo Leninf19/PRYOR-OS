@@ -12,6 +12,13 @@
 // policy logic, unchanged from the original file.
 // Requires ANTHROPIC_API_KEY in Vercel environment variables.
 
+import { resolveTenantEntitlements } from './entitlements.js'
+import { getAiUsage, recordAiUsage, currentUsagePeriod, AiUsageStoreUnavailableError } from './aiUsageStore.js'
+import { calculateAiUsageUnits, resolveTokenCounts } from './aiUsageUnits.js'
+
+const REWRITE_MODEL = 'claude-haiku-4-5-20251001'
+const REWRITE_MAX_TOKENS = 300
+
 const CONTACT_EMAIL = 'advertising@l3amigos.com'
 
 // Recovery Milestone 4 (Review Reply Inbox + AI Response Quality): mirrors
@@ -150,6 +157,38 @@ export async function generateRewrite(body, usage = {}) {
     return { ok: false, status: 400, error: `location must be ${MAX_LOCATION_CHARS} characters or fewer.` }
   }
 
+  // Phase B.4 -- commercial AI usage quota. An ADDITIONAL layer on top of
+  // the Phase A per-user/per-tenant rolling rate limits and the per-request
+  // input-size caps above (actions/[action].js's rewrite action enforces
+  // the rate limits before ever calling this function; the caps above are
+  // unchanged) -- never a replacement for either. Entitlements are resolved
+  // FRESH here, immediately before the quota decision and immediately
+  // before the (billed) Anthropic call below, never a value captured
+  // earlier in the request. `aiAllowanceMonthly.usageUnits === null` means
+  // the commercial layer is deliberately UNENFORCED for this tenant
+  // (legacy/bootstrap/grandfathered, matching every other null-limit
+  // convention in this codebase) -- skip the check entirely. Any other
+  // value, including 0 (a fail-closed/unconfigured resolution), is
+  // enforced literally: 0 correctly rejects every request outright, never
+  // interpreted as unlimited.
+  const { tenantId } = usage
+  const period = currentUsagePeriod()
+  const entitlements = await resolveTenantEntitlements(tenantId)
+  const monthlyLimit = entitlements.limits.aiAllowanceMonthly.usageUnits
+  if (monthlyLimit !== null) {
+    let currentUsage
+    try {
+      currentUsage = await getAiUsage(tenantId, period)
+    } catch (err) {
+      if (!(err instanceof AiUsageStoreUnavailableError)) throw err
+      console.error(`[rewrite] AI usage store unavailable: ${err.message}`)
+      return { ok: false, status: 503, error: 'service_unavailable' }
+    }
+    if (currentUsage.usageUnits >= monthlyLimit) {
+      return { ok: false, status: 403, error: 'ai_quota_exhausted', current: currentUsage.usageUnits, limit: monthlyLimit }
+    }
+  }
+
   const toneGuide    = TONE_GUIDES[tone] ?? TONE_GUIDES.friendly
   const locationName = location || 'our restaurant'
   const serious      = isSeriousIssue(reviewText)
@@ -197,13 +236,17 @@ Write ONLY the response text. No quotes, no labels, no preamble. Sign off as 'â€
         'content-type':      'application/json',
       },
       body: JSON.stringify({
-        model:      'claude-haiku-4-5-20251001',
-        max_tokens: 300,
+        model:      REWRITE_MODEL,
+        max_tokens: REWRITE_MAX_TOKENS,
         messages:   [{ role: 'user', content: prompt }],
       }),
     })
 
     if (!upstream.ok) {
+      // Phase B.4: no AI usage is recorded here -- Anthropic did not
+      // successfully generate anything, so nothing was actually billed/
+      // consumed against this tenant's monthly allowance ("provider
+      // failure does not record successful usage").
       const errBody = await upstream.text().catch(() => upstream.statusText)
       logAiUsage({ ...usage, endpoint: 'rewrite', inputChars: prompt.length })
       return { ok: false, status: 502, error: `Anthropic API error ${upstream.status}: ${errBody}` }
@@ -211,6 +254,26 @@ Write ONLY the response text. No quotes, no labels, no preamble. Sign off as 'â€
 
     const data      = await upstream.json()
     const rewritten = data?.content?.[0]?.text?.trim() ?? ''
+
+    // Phase B.4 final cost-metering correction: the upstream call itself
+    // succeeded (upstream.ok), so Anthropic actually processed and billed
+    // this request regardless of what text (if any) came back or whether
+    // its OWN usage metadata is trustworthy -- a successful, already-billed
+    // call must never be recorded as zero cost. resolveTokenCounts() falls
+    // back to a conservative per-field estimate (never silently 0) whenever
+    // input_tokens/output_tokens is missing, non-numeric, or negative; a
+    // genuinely valid provider-reported 0 is accepted as-is, never
+    // replaced. record usage here, unconditionally, BEFORE branching on
+    // whether the extracted text was usable.
+    const { inputTokens, outputTokens, inputEstimated, outputEstimated } = resolveTokenCounts({
+      rawUsage: data?.usage, promptChars: prompt.length, maxTokens: REWRITE_MAX_TOKENS,
+    })
+    const usageUnits = calculateAiUsageUnits({ model: REWRITE_MODEL, inputTokens, outputTokens })
+    const estimated = inputEstimated || outputEstimated
+    if (estimated) {
+      console.log(`[ai-usage] endpoint=rewrite tenantId=${JSON.stringify(tenantId ?? null)} usage metadata was incomplete/malformed -- recorded a conservative fallback estimate (inputEstimated=${inputEstimated} outputEstimated=${outputEstimated})`)
+    }
+    await recordAiUsage(tenantId, period, { inputTokens, outputTokens, usageUnits, estimated })
 
     if (!rewritten) {
       logAiUsage({ ...usage, endpoint: 'rewrite', inputChars: prompt.length, outputChars: 0 })

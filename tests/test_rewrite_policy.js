@@ -15,6 +15,7 @@
 // Run directly: node tests/test_rewrite_policy.js
 
 import { isSeriousIssue, enforceResponsePolicy, generateRewrite } from '../dashboard/api/_lib/rewriteEngine.js'
+import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -133,7 +134,15 @@ async function testOversizedLocationRejectedNoFetch() {
 
 async function testWithinLimitsStillSucceeds() {
   const getCalls = installSuccessFetch()
-  const result = await generateRewrite({ tone: 'friendly', reviewText: 'A perfectly normal review.', currentDraft: 'A draft.', reviewerName: 'Jane', location: 'Casa Tequila' })
+  // Phase B.4: generateRewrite() now resolves commercial AI entitlements
+  // before calling Anthropic -- tenantId: DEFAULT_TENANT_ID (Los Tres
+  // Amigos' BOOTSTRAP tenant) short-circuits that resolution to the
+  // legacy-unmanaged bundle with NO Redis read at all (see entitlements.js),
+  // so this pure-policy test file still needs no fake Redis setup.
+  const result = await generateRewrite(
+    { tone: 'friendly', reviewText: 'A perfectly normal review.', currentDraft: 'A draft.', reviewerName: 'Jane', location: 'Casa Tequila' },
+    { tenantId: DEFAULT_TENANT_ID },
+  )
   assert(result.ok === true, `a normal-sized request must still succeed, got ${JSON.stringify(result)}`)
   assert(getCalls() === 1, 'exactly one upstream call must have been made')
 }
