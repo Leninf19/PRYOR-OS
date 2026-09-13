@@ -118,6 +118,7 @@ const TESTS = [
   'test_tenant_entitlement_boundary.js',
   'test_entitlements.js',
   'test_plans.js',
+  'test_location_seat_limits.js',
   'test_google_reconnect_reconciliation.js',
   'test_credential_cas_concurrency.js',
   'test_tenant_entitlement_change.js',

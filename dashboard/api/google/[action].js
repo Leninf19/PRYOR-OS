@@ -48,6 +48,7 @@ import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDis
 import {
   recordLocationApproval, LocationApprovalNotEligibleError, getTenantConfig, LOCATION_APPROVAL_ELIGIBLE_STATUSES,
   markTenantProvisioningDispatched, markTenantProvisioningDispatchFailed, ConfigVersionConflictError,
+  MaxLocationsExceededError,
 } from '../_lib/tenantConfigStore.js'
 import { reconcileApprovedLocationsAgainstDiscovery, UnreconciledApprovedLocationError } from '../_lib/tenantLocationReconciliation.js'
 import { discoverGoogleLocationIdsForReconciliation } from '../_lib/googleLocationDiscovery.js'
@@ -2060,6 +2061,18 @@ async function approveLocations(req, res) {
         error: 'concurrent_update',
         message: 'Your selection could not be saved because this tenant\'s configuration changed at the same time. Please refresh and try again.',
       })
+    }
+    if (err instanceof MaxLocationsExceededError) {
+      // Phase B.3 -- location-limit enforcement (Part A). current/limit/
+      // requested are plain integers only -- no provider/credential
+      // information. Audited with the same denied-entitlement-action
+      // convention as the two cases above.
+      await appendAuditEntry(tenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'tenant_location_catalog', entityId: tenantId, action: 'location_catalog.approval_denied_limit_reached', changes: null, result: 'denied',
+        message: `Self-service location approval was denied: requested ${err.requested} location(s) exceeds the plan limit of ${err.limit} (currently ${err.current}).`,
+      })
+      return res.status(409).json({ error: 'location_limit_reached', current: err.current, limit: err.limit, requested: err.requested })
     }
     return res.status(503).json({ error: 'service_unavailable', message: 'Could not activate the location catalog. Please try again shortly.' })
   }

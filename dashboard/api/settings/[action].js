@@ -44,7 +44,13 @@ import { readPrivateDataFile } from '../_lib/reviewDataPaths.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
 import { getAccountByEmail, getAccountByIdForTenant, listAccounts } from '../_lib/accountStore.js'
-import { getUserById, upsertUser, updateUser, deriveUserStatus, UserCreationMode, UserStoreUnavailableError } from '../_lib/userStore.js'
+import {
+  getUserById, upsertUser, updateUser, deriveUserStatus, countActiveOrInvitedUsers, UserCreationMode, UserStoreUnavailableError,
+} from '../_lib/userStore.js'
+import { resolveTenantEntitlements } from '../_lib/entitlements.js'
+import {
+  acquireSeatAllocationLock, releaseSeatAllocationLock, SeatAllocationLockUnavailableError,
+} from '../_lib/seatAllocationLock.js'
 import { createInviteToken, revokeInviteToken, createResetToken, TokenStoreUnavailableError } from '../_lib/tokenStore.js'
 import { buildInviteEmail, buildInviteEmailSubject, buildResetEmail, buildResetEmailSubject } from '../_lib/accountEmailTemplate.js'
 import {
@@ -650,13 +656,63 @@ async function inviteUserAction(req, res) {
   const userId = generateUserId()
   const now = new Date().toISOString()
   const trimmedName = name.trim()
+  const tenantId = resolveTenantId(account)
 
+  // Phase B.3 -- Seat limit enforcement (Part B): an invitation consumes a
+  // seat the moment it is ISSUED (deriveUserStatus() resolves a
+  // passwordHash:null/passwordSetAt:null record to 'invited', which counts
+  // identically to 'active' -- see countActiveOrInvitedUsers()). The lock
+  // below serializes this whole "count current seats -> decide -> create"
+  // sequence per tenant, and entitlements are re-resolved FRESH (never a
+  // value captured before the lock) immediately before deciding, so two
+  // concurrent invite-user calls (or an invite racing an enable-user call)
+  // can never both pass based on the same stale count.
+  let lockToken
   try {
-    const { rawToken, tokenHash, expiresAt } = await createInviteToken({
-      userId, email: email.toLowerCase(), role, locationIds, invitedBy: account.userId,
-    })
+    lockToken = await acquireSeatAllocationLock(tenantId)
+  } catch (err) {
+    if (err instanceof SeatAllocationLockUnavailableError) {
+      console.error(`[settings/invite-user] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+  if (!lockToken) {
+    return res.status(409).json({ error: 'seat_allocation_in_progress', message: 'Another change to this account\'s users is already in progress. Please try again in a moment.' })
+  }
 
-    await upsertUser(resolveTenantId(account), {
+  // Phase B.3 pre-commit correction: the lock's critical section is
+  // limited to the MINIMUM authoritative work -- the seat check and the
+  // two writes that actually reserve the seat (createInviteToken() +
+  // upsertUser()). Email delivery, audit logging, and the response are all
+  // deliberately OUTSIDE this try/finally, running only AFTER the lock has
+  // already been released -- an invitation email is never sent (an
+  // external SMTP/provider network call) while this per-tenant lock is
+  // held. The seat allocation itself, once committed here, is never rolled
+  // back merely because the best-effort email below fails to send (see
+  // that section's own try/catch, unchanged from before this correction) --
+  // this is an existing, deliberate invariant, not a new one.
+  let rawToken, tokenHash, expiresAt
+  try {
+    // maxActiveUsers === null means enforcement is deliberately unenforced
+    // for this tenant (bootstrap/legacy/grandfathered) -- NEVER converted
+    // into a large integer. Any other value, including 0 (a fail-closed/
+    // misconfigured resolution), is enforced literally: 0 correctly
+    // rejects every invitation outright, never interpreted as unlimited.
+    const entitlements = await resolveTenantEntitlements(tenantId)
+    const maxActiveUsers = entitlements.limits.maxActiveUsers
+    if (maxActiveUsers !== null) {
+      const currentSeats = await countActiveOrInvitedUsers(tenantId)
+      if (currentSeats >= maxActiveUsers) {
+        return res.status(409).json({ error: 'seat_limit_reached', current: currentSeats, limit: maxActiveUsers })
+      }
+    }
+
+    ;({ rawToken, tokenHash, expiresAt } = await createInviteToken({
+      userId, email: email.toLowerCase(), role, locationIds, invitedBy: account.userId,
+    }))
+
+    await upsertUser(tenantId, {
       // Multi-Tenant Phase 4K: `tenantId` is now stamped EXPLICITLY on the
       // record itself, not just implied by which physical hash it's
       // written to. resolveTenantId() (tenants.js) resolves an account's
@@ -667,7 +723,7 @@ async function inviteUserAction(req, res) {
       // hash) but then be silently treated as an LTA account by
       // resolveTenantId(), since it has no way to tell tenants apart
       // without an explicit field to read.
-      userId, email, passwordHash: null, role, locationIds, tenantId: resolveTenantId(account),
+      userId, email, passwordHash: null, role, locationIds, tenantId,
       sessionVersion: 1, disabled: false, displayName: trimmedName,
       createdAt: now, updatedAt: now, lastLoginAt: null,
       invitedAt: now, invitedBy: account.userId, lastInviteSentAt: now,
@@ -682,38 +738,42 @@ async function inviteUserAction(req, res) {
       // additionally re-confirms the tenant itself genuinely exists.
       creationMode: UserCreationMode.EXISTING_TENANT_INVITE,
     })
-
-    const inviteUrl = buildInviteUrl(req, rawToken)
-    let emailWarning = null
-    try {
-      const locationNames = await resolveLocationNames(resolveTenantId(account), locationIds)
-      const subject = buildInviteEmailSubject()
-      const { html, text } = buildInviteEmail({ name: trimmedName, role, locationIds, locationNames, inviteUrl, expiresAt })
-      await sendReviewEmail({ to: email, cc: [], replyTo: undefined, subject, html, text })
-    } catch (err) {
-      emailWarning = err instanceof EmailSenderUnavailableError
-        ? 'Email is not configured -- share the invitation link manually.'
-        : 'The invitation email could not be sent -- share the invitation link manually.'
-      console.error(`[settings/invite-user] invite email failed: ${sanitizeErrorMessage(err.message)}`)
-    }
-
-    await appendAuditEntry(resolveTenantId(account), {
-      ...actorFields(account, req),
-      entity: 'user', entityId: userId,
-      action: 'invitation.created',
-      changes: [{ field: 'role', oldValue: null, newValue: role }, { field: 'locationIds', oldValue: null, newValue: locationIds }],
-      result: 'success',
-      message: `Invited ${email} as ${role}.`,
-    })
-
-    return res.status(200).json({ userId, email, role, locationIds, inviteUrl, expiresAt, emailWarning })
   } catch (err) {
     if (err instanceof UserStoreUnavailableError || err instanceof TokenStoreUnavailableError) {
       console.error(`[settings/invite-user] ${err.message}`)
       return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
     }
     throw err
+  } finally {
+    await releaseSeatAllocationLock(tenantId, lockToken)
   }
+
+  // The seat allocation lock is already released by this point -- nothing
+  // below is part of the authoritative seat-allocation critical section.
+  const inviteUrl = buildInviteUrl(req, rawToken)
+  let emailWarning = null
+  try {
+    const locationNames = await resolveLocationNames(tenantId, locationIds)
+    const subject = buildInviteEmailSubject()
+    const { html, text } = buildInviteEmail({ name: trimmedName, role, locationIds, locationNames, inviteUrl, expiresAt })
+    await sendReviewEmail({ to: email, cc: [], replyTo: undefined, subject, html, text })
+  } catch (err) {
+    emailWarning = err instanceof EmailSenderUnavailableError
+      ? 'Email is not configured -- share the invitation link manually.'
+      : 'The invitation email could not be sent -- share the invitation link manually.'
+    console.error(`[settings/invite-user] invite email failed: ${sanitizeErrorMessage(err.message)}`)
+  }
+
+  await appendAuditEntry(tenantId, {
+    ...actorFields(account, req),
+    entity: 'user', entityId: userId,
+    action: 'invitation.created',
+    changes: [{ field: 'role', oldValue: null, newValue: role }, { field: 'locationIds', oldValue: null, newValue: locationIds }],
+    result: 'success',
+    message: `Invited ${email} as ${role}.`,
+  })
+
+  return res.status(200).json({ userId, email, role, locationIds, inviteUrl, expiresAt, emailWarning })
 }
 
 // POST /api/settings/resend-invite  { userId }
@@ -1076,22 +1136,63 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
     return res.status(400).json({ error: 'invalid_request', message: 'userId is required.' })
   }
 
+  const tenantId = resolveTenantId(account)
+  // Phase B.3 -- Seat limit enforcement (Part B): re-enabling a disabled
+  // user adds a seat back. Locked for the SAME reason as invite-user (see
+  // that function's comment) -- but ONLY when this is genuinely an
+  // enable-a-currently-disabled-user transition; a disable (disabled:true)
+  // never consumes a seat (it can only reduce the count, always allowed,
+  // matching "an over-limit tenant can still disable/remove seats"), and
+  // an idempotent enable of an already-enabled user must not consume a
+  // seat twice -- both of those are decided AFTER loading `target` below,
+  // so the lock is still acquired unconditionally up front (its own
+  // acquisition is cheap and uniform), but the seat COUNT CHECK only runs
+  // for the genuine disabled->enabled transition.
+  let lockToken
+  try {
+    lockToken = await acquireSeatAllocationLock(tenantId)
+  } catch (err) {
+    if (err instanceof SeatAllocationLockUnavailableError) {
+      console.error(`[settings/${actionName}] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+  if (!lockToken) {
+    return res.status(409).json({ error: 'seat_allocation_in_progress', message: 'Another change to this account\'s users is already in progress. Please try again in a moment.' })
+  }
+
   try {
     // Multi-Tenant Phase 4K: STRICTLY tenant-scoped lookup (with the
     // static-directory fallback for Los Tres Amigos) -- see
     // updateUserRoleLocationsAction()'s identical comment above.
-    const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
+    const target = await getAccountByIdForTenant(tenantId, userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
 
     if (disabled && target.role === 'owner') {
-      const lastOwnerCheck = await assertNotLastActiveOwner(resolveTenantId(account), userId)
+      const lastOwnerCheck = await assertNotLastActiveOwner(tenantId, userId)
       if (!lastOwnerCheck.safe) {
         return res.status(409).json({ error: 'last_owner', message: lastOwnerCheck.message })
       }
     }
 
+    // Only a genuine disabled -> enabled transition can ever consume a
+    // seat; an idempotent "enable" of an already-enabled account (or any
+    // disable, regardless of the target's current state) never checks or
+    // consumes one.
+    if (!disabled && target.disabled) {
+      const entitlements = await resolveTenantEntitlements(tenantId)
+      const maxActiveUsers = entitlements.limits.maxActiveUsers
+      if (maxActiveUsers !== null) {
+        const currentSeats = await countActiveOrInvitedUsers(tenantId)
+        if (currentSeats >= maxActiveUsers) {
+          return res.status(409).json({ error: 'seat_limit_reached', current: currentSeats, limit: maxActiveUsers })
+        }
+      }
+    }
+
     const now = new Date().toISOString()
-    const updated = await upsertUser(resolveTenantId(account), {
+    const updated = await upsertUser(tenantId, {
       createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
       inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
       ...target,
@@ -1105,7 +1206,7 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
       sourceIdentity: target,
     })
 
-    await appendAuditEntry(resolveTenantId(account), {
+    await appendAuditEntry(tenantId, {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: disabled ? 'user.disabled' : 'user.enabled',
       changes: [{ field: 'disabled', oldValue: target.disabled, newValue: disabled }],
@@ -1120,6 +1221,8 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
       return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
     }
     throw err
+  } finally {
+    await releaseSeatAllocationLock(tenantId, lockToken)
   }
 }
 
