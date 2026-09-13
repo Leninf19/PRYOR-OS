@@ -121,6 +121,7 @@ const TESTS = [
   'test_location_seat_limits.js',
   'test_ai_usage_metering.js',
   'test_storage_commercial_quota.js',
+  'test_commercial_feature_gating.js',
   'test_google_reconnect_reconciliation.js',
   'test_credential_cas_concurrency.js',
   'test_tenant_entitlement_change.js',

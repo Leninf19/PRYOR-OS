@@ -1,11 +1,16 @@
 // Phase B.2 -- Commercial Entitlement Foundation: plan/feature/limit tables.
+// Phase B.5 wired the FEATURE flags below into real server-side
+// enforcement (dashboard/api/_lib/featureAuthorization.js's requireFeature(),
+// consumed by executive-brief.js and data.js's PREMIUM_DATA_FEATURE_MAP) --
+// see each flag's own comment for whether/how it is actually enforced
+// today. The LIMITS tables (maxLocations/maxActiveUsers/storageBytes/
+// assetCount/aiAllowanceMonthly) were wired earlier, in Phases B.3/B.4.
 //
-// PLUMBING ONLY (Phase B.2's explicit scope). Nothing in this file is
-// imported by any endpoint yet -- see entitlements.js's own header for the
-// one function (resolveTenantEntitlements) that will eventually be the sole
-// consumer wiring these tables into real enforcement, in a later,
-// separately reviewed phase. No Google/AI/Content/data.js/invitation/
-// billing endpoint reads anything here yet.
+// Some feature flags below remain intentionally UNWIRED -- modeled here for
+// future product/pricing clarity, but with no real backend capability to
+// attach an enforcement check to today (Phase B.5's own audit found no
+// concrete implementation, and inventing one merely because a flag exists
+// was explicitly out of scope). See each flag's inline comment for why.
 //
 // This is a SEPARATE table from dashboard/api/_lib/plans.js (pure pricing/
 // Stripe-linkage display metadata, still deliberately never imported by any
@@ -57,20 +62,71 @@ const CORE_FEATURES = Object.freeze({
   badReviewAlerts: true,
   basicTasks: true,
   basicEmailDigest: true,
+  // WIRED (Phase B.5): dashboard/api/executive-brief.js -- the one live,
+  // filter-reactive Anthropic-backed briefing capability. Core's own basic
+  // dashboard (Today.jsx) already gracefully degrades to the pipeline's
+  // static intelligence/company-summary.json narrative when this endpoint
+  // denies/errors (AIBriefingCard.jsx's pre-existing fallback path) -- a
+  // Core tenant still sees a dashboard summary, just not the live one.
   advancedExecutiveBrief: false,
+  // WIRED (Phase B.5), PARTIALLY: only intelligence/department-performance.json
+  // (data.js's PREMIUM_DATA_FEATURE_MAP) is gated under this flag today.
+  // Several other "intelligence" files (complaint-intelligence,
+  // competitive-intelligence, action-center, predictive-alerts, cx-index)
+  // were audited and found to be either genuinely shared with a live,
+  // reachable Core surface (Alerts.jsx's in-app alert feed; Actions.jsx via
+  // its still-reachable /actions-legacy route) or to have no live consumer
+  // at all -- gating them would either break Core's basic product or gate
+  // nothing real. See data.js's PREMIUM_DATA_FEATURE_MAP comment for the
+  // full per-file accounting.
   advancedIntelligence: false,
+  // UNWIRED (Phase B.5 audit): no dedicated backend endpoint or generated
+  // file for cross-location comparison exists. The one plausible
+  // candidate, analytics/location-stats.json, is load-bearing for Core's
+  // OWN basic dashboard (Today.jsx) and basic trends view (TrendsAnalytics.jsx)
+  // -- gating it would break Core's basic product, not just hide a
+  // comparison UI. True server-side locationComparison enforcement would
+  // require a genuinely new, dedicated backend capability; not built here.
   locationComparison: false,
+  // WIRED (Phase B.5): intelligence/operations-impact.json (data.js) --
+  // single-purpose data file, single consumer page (OperationsImpact.jsx),
+  // no overlap with any Core surface. The cleanest mapping in this phase.
   operationsImpact: false,
+  // WIRED (Phase B.5), PARTIALLY: intelligence/best-quotes.json and
+  // intelligence/seasonal-trends.json (data.js) -- both exclusive to
+  // MarketingIntelligence.jsx. That page ALSO reads complaint-intelligence/
+  // competitive-intelligence/meta.json, which remain available to Core (see
+  // advancedIntelligence's comment) -- so a Core tenant hitting this page
+  // sees a partially-populated view, not a full-page 403. Full-page
+  // enforcement would need either a dedicated marketing-only data file or a
+  // frontend-level page gate (left for a later phase per Part J).
   marketingIntelligence: false,
+  // UNWIRED (Phase B.5 audit): no customer-facing automation capability
+  // exists anywhere in the codebase today -- every scheduled job (GBP
+  // review sync, digest emails, health checks) is an internal PLATFORM
+  // cron, identical for every tenant regardless of plan, and must never be
+  // confused with or gated as a premium feature.
   advancedAutomation: false,
+  // WIRED (Phase B.5), PARTIALLY: reports/weekly-summary.json and
+  // intelligence/executive-scores.json (data.js) -- both exclusive to
+  // ExecutiveReports.jsx among live/reachable pages. That page's CSV export
+  // (exportUtils.js's exportCSV()) is client-side-only with no server
+  // endpoint to gate; report-generation-proper is what's enforced here.
   advancedReporting: false,
-  // managerWorkflow is a FUTURE capability -- bad review -> assign/escalate
-  // to a manager -> internal explanation/follow-up -> resolution/status ->
-  // owner visibility -- with no existing endpoint today. Phase B.2 product
-  // decision: model the flag now, but do NOT gate ordinary Tasks CRUD
-  // behind it (basicTasks above stays available to every plan). Wiring
+  // UNWIRED (Phase B.5 audit, reconfirmed): managerWorkflow is a FUTURE
+  // capability -- bad review -> assign/escalate to a manager -> internal
+  // explanation/follow-up -> resolution/status -> owner visibility -- with
+  // no existing endpoint today. Ordinary Tasks CRUD (basicTasks above)
+  // stays available to every plan; do NOT gate it behind this flag. Wiring
   // managerWorkflow to a real endpoint is later, separately reviewed work.
   managerWorkflow: false,
+  // UNWIRED (Phase B.5 audit): no distinct "priority" alert tier exists --
+  // Alerts.jsx renders one unified feed (predictive + competitor +
+  // operational signals) identically for every plan; the only real
+  // severity concept in this codebase is the AI-assigned `critical` review
+  // classification (badReviewAlerts, Core, unchanged). Inventing a second,
+  // Growth-only alert tier with no actual behavioral difference would be
+  // security theater, not a real gate.
   priorityAlerts: false,
 })
 

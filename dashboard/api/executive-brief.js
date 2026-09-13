@@ -14,6 +14,7 @@ import { requireAuth } from './_lib/auth.js'
 import { enforceRateLimit } from './_lib/rateLimit.js'
 import { resolveTenantId } from './_lib/tenants.js'
 import { resolveTenantEntitlements } from './_lib/entitlements.js'
+import { requireFeature } from './_lib/featureAuthorization.js'
 import { getAiUsage, recordAiUsage, currentUsagePeriod, AiUsageStoreUnavailableError } from './_lib/aiUsageStore.js'
 import { calculateAiUsageUnits, resolveTokenCounts } from './_lib/aiUsageUnits.js'
 
@@ -145,6 +146,23 @@ Write the briefing now:`
   const tenantId = resolveTenantId(account)
   const period = currentUsagePeriod()
   const entitlements = await resolveTenantEntitlements(tenantId)
+
+  // Phase B.5 -- commercial feature gating: a live, AI-generated executive
+  // briefing is a Growth-and-above capability ("advancedExecutiveBrief").
+  // This check runs BEFORE the AI commercial quota check just below and
+  // BEFORE the Anthropic call further down -- a Core request must cost
+  // PRYOR zero Anthropic usage. Reuses the SAME `entitlements` object just
+  // resolved above (never a second resolver call) so the feature decision
+  // and the quota decision are evaluated against one identical snapshot.
+  const featureCheck = requireFeature(entitlements, 'advancedExecutiveBrief')
+  if (!featureCheck.allowed) {
+    if (featureCheck.reason === 'resolver_failure') {
+      console.error(`[executive-brief] entitlement resolution failed for tenant ${JSON.stringify(tenantId)} -- failing closed`)
+      return res.status(503).json({ error: 'service_unavailable' })
+    }
+    return res.status(403).json({ error: 'feature_not_available', feature: 'advancedExecutiveBrief' })
+  }
+
   const monthlyLimit = entitlements.limits.aiAllowanceMonthly.usageUnits
   if (monthlyLimit !== null) {
     let currentUsage

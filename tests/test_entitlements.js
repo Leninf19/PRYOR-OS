@@ -381,6 +381,11 @@ async function testNoEndpointReimplementsPlanBranchingOutsideTheResolver() {
     path.join(apiDir, '_lib', 'entitlements.js'),
     path.join(apiDir, '_lib', 'entitlementResolution.js'),
     path.join(apiDir, '_lib', 'planEntitlements.js'),
+    // Phase B.5: featureAuthorization.js is the canonical, centralized
+    // feature-decision helper every endpoint is REQUIRED to call instead of
+    // branching on plan directly -- it legitimately documents plan-shaped
+    // examples in its own header comments, exactly like entitlementResolution.js.
+    path.join(apiDir, '_lib', 'featureAuthorization.js'),
   ])
   const offenders = []
   for (const file of listJsFilesRecursively(apiDir)) {
