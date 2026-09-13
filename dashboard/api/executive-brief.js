@@ -12,6 +12,13 @@
 
 import { requireAuth } from './_lib/auth.js'
 import { enforceRateLimit } from './_lib/rateLimit.js'
+import { resolveTenantId } from './_lib/tenants.js'
+import { resolveTenantEntitlements } from './_lib/entitlements.js'
+import { getAiUsage, recordAiUsage, currentUsagePeriod, AiUsageStoreUnavailableError } from './_lib/aiUsageStore.js'
+import { calculateAiUsageUnits, resolveTokenCounts } from './_lib/aiUsageUnits.js'
+
+const EXECUTIVE_BRIEF_MODEL = 'claude-sonnet-4-6'
+const EXECUTIVE_BRIEF_MAX_TOKENS = 400
 
 // "Cap AI input before Anthropic" hardening (Phase A4, revenue-abuse
 // containment audit -- ai-unbounded-prompt-input): every client-controlled
@@ -127,6 +134,32 @@ Write the briefing now:`
     return res.status(400).json({ error: 'This request is too large to process.' })
   }
 
+  // Phase B.4 -- commercial AI usage quota. An ADDITIONAL layer on top of
+  // the Phase A per-user/per-tenant rolling rate limits above and the
+  // per-field/whole-prompt input-size caps just above -- never a
+  // replacement for either. Entitlements are resolved FRESH here,
+  // immediately before the quota decision and immediately before the
+  // (billed) Anthropic call below, never a value captured earlier in the
+  // request. See rewriteEngine.js's generateRewrite() for the identical
+  // pattern and its own comment on the null/0 sentinel convention.
+  const tenantId = resolveTenantId(account)
+  const period = currentUsagePeriod()
+  const entitlements = await resolveTenantEntitlements(tenantId)
+  const monthlyLimit = entitlements.limits.aiAllowanceMonthly.usageUnits
+  if (monthlyLimit !== null) {
+    let currentUsage
+    try {
+      currentUsage = await getAiUsage(tenantId, period)
+    } catch (err) {
+      if (!(err instanceof AiUsageStoreUnavailableError)) throw err
+      console.error(`[executive-brief] AI usage store unavailable: ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable' })
+    }
+    if (currentUsage.usageUnits >= monthlyLimit) {
+      return res.status(403).json({ error: 'ai_quota_exhausted', current: currentUsage.usageUnits, limit: monthlyLimit })
+    }
+  }
+
   try {
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {
       method:  'POST',
@@ -136,13 +169,16 @@ Write the briefing now:`
         'content-type':      'application/json',
       },
       body: JSON.stringify({
-        model:      'claude-sonnet-4-6',
-        max_tokens: 400,
+        model:      EXECUTIVE_BRIEF_MODEL,
+        max_tokens: EXECUTIVE_BRIEF_MAX_TOKENS,
         messages:   [{ role: 'user', content: prompt }],
       }),
     })
 
     if (!upstream.ok) {
+      // Phase B.4: no AI usage recorded -- Anthropic did not successfully
+      // generate anything ("provider failure does not record successful
+      // usage").
       const errBody = await upstream.text().catch(() => upstream.statusText)
       logAiUsage({ tenantId: account.tenantId, userId: account.userId, endpoint: 'executive-brief', inputChars: prompt.length })
       return res.status(502).json({ error: `Anthropic API error ${upstream.status}: ${errBody}` })
@@ -150,6 +186,26 @@ Write the briefing now:`
 
     const data     = await upstream.json()
     const briefing = data?.content?.[0]?.text?.trim() ?? ''
+
+    // Phase B.4 final cost-metering correction: the upstream call
+    // succeeded, so Anthropic actually processed and billed this request
+    // regardless of what text (if any) came back or whether its OWN usage
+    // metadata is trustworthy -- a successful, already-billed call must
+    // never be recorded as zero cost. resolveTokenCounts() falls back to a
+    // conservative per-field estimate (never silently 0) whenever
+    // input_tokens/output_tokens is missing, non-numeric, or negative; a
+    // genuinely valid provider-reported 0 is accepted as-is, never replaced.
+    // Record usage unconditionally, before branching on whether the
+    // extracted text was usable.
+    const { inputTokens, outputTokens, inputEstimated, outputEstimated } = resolveTokenCounts({
+      rawUsage: data?.usage, promptChars: prompt.length, maxTokens: EXECUTIVE_BRIEF_MAX_TOKENS,
+    })
+    const usageUnits = calculateAiUsageUnits({ model: EXECUTIVE_BRIEF_MODEL, inputTokens, outputTokens })
+    const estimated = inputEstimated || outputEstimated
+    if (estimated) {
+      console.log(`[ai-usage] endpoint=executive-brief tenantId=${JSON.stringify(tenantId ?? null)} usage metadata was incomplete/malformed -- recorded a conservative fallback estimate (inputEstimated=${inputEstimated} outputEstimated=${outputEstimated})`)
+    }
+    await recordAiUsage(tenantId, period, { inputTokens, outputTokens, usageUnits, estimated })
 
     if (!briefing) {
       logAiUsage({ tenantId: account.tenantId, userId: account.userId, endpoint: 'executive-brief', inputChars: prompt.length, outputChars: 0 })

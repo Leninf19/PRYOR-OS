@@ -53,6 +53,8 @@ import {
   getAllAssets, getAsset, createAsset, deleteAsset, ContentAssetStoreUnavailableError,
   acquireContentUploadLock, renewContentUploadLock, releaseContentUploadLock, UPLOAD_LOCK_RENEW_INTERVAL_MS,
 } from '../_lib/contentAssetStore.js'
+import { resolveTenantEntitlements } from '../_lib/entitlements.js'
+import { clampToSafetyCeiling } from '../_lib/planEntitlements.js'
 
 // "Minimum content cost guardrail" hardening (Phase A6, revenue-abuse
 // containment audit -- content-no-storage-quota): a PLATFORM SAFETY
@@ -547,6 +549,41 @@ async function upload(req, res) {
       // via a stale snapshot -- see the lease acquired just above.
       const existingAssets = Object.values(await getAllAssets(tenantId))
       const existingBytes = existingAssets.reduce((sum, a) => sum + (Number.isFinite(a.sizeBytes) ? a.sizeBytes : 0), 0)
+
+      // Phase B.4 -- commercial storage quota. Resolved FRESH here, inside
+      // the SAME upload lease's critical section, reusing the
+      // existingAssets/existingBytes snapshot ALREADY read above under
+      // that lease -- never a second getAllAssets() call, never a value
+      // resolved before the lease was acquired. This is a SEPARATE,
+      // plan-based decision from the Phase A platform-safety ceiling
+      // immediately below it, deliberately kept as two distinct checks
+      // rather than merged into one:
+      //   - a legacy/unmanaged tenant (commercial layer unenforced --
+      //     limits.storageBytes/assetCount === null) skips THIS check
+      //     entirely but still hits the Phase A ceiling unconditionally
+      //     just below, unchanged;
+      //   - an Enterprise tenant's server-authorized limitsOverride is run
+      //     through clampToSafetyCeiling() before being compared here, so
+      //     this check alone can never grant more headroom than Phase A's
+      //     hard 2GB/2000 ceiling already allows;
+      //   - a resolver failure (fail-closed 0/0) makes this check reject
+      //     every upload for that tenant, including its very first one.
+      // No separate quota counter is kept anywhere -- both this check and
+      // the Phase A one below always read the tenant's live, current asset
+      // list, so a deleted asset immediately frees real capacity for both.
+      const entitlements = await resolveTenantEntitlements(tenantId)
+      const commercialLimits = entitlements.limits
+      if (commercialLimits.storageBytes !== null && commercialLimits.assetCount !== null) {
+        const clamped = clampToSafetyCeiling(commercialLimits)
+        if (existingAssets.length + 1 > clamped.assetCount || existingBytes + buffer.length > clamped.storageBytes) {
+          return res.status(409).json({
+            error: 'storage_limit_reached',
+            currentBytes: existingBytes, limitBytes: clamped.storageBytes,
+            currentAssets: existingAssets.length, assetLimit: clamped.assetCount,
+          })
+        }
+      }
+
       if (existingAssets.length >= MAX_TENANT_ASSET_COUNT) {
         return res.status(413).json({ error: 'storage_limit_exceeded', message: 'This account has reached its content library asset limit. Delete unused assets or contact support.' })
       }
