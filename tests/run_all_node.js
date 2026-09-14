@@ -170,6 +170,9 @@ const TESTS = [
   // extended consent snapshot, hardened Setup-completion validation.
   'test_self_service_commercial.js',
   'test_finalize_registration_endpoint.js',
+  // Preview Infrastructure Isolation -- tenant lifecycle dispatch must
+  // never let a Preview deployment execute against Production secrets.
+  'test_preview_lifecycle_isolation.js',
 ]
 
 const results = {}

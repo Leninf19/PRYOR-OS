@@ -1915,17 +1915,91 @@ async function discoverLocations(req, res) {
 // ---------------------------------------------------------------------------
 // Multi-Tenant Phase 4O -- automatic post-approval provisioning handoff.
 // dispatchTenantLifecycleWorkflow() calls THIS repo's own pinned dispatcher
-// (.github/workflows/tenant-lifecycle-dispatch.yml on main) -- the exact
-// same trusted, pinned-commit execution engine every manual operator
-// dispatch has used throughout this project. Deliberately a SEPARATE repo
-// and token from triggerSync()/triggerImport() above, which target Los
-// Tres Amigos's own legacy repo with GITHUB_SYNC_PAT -- that token has no
-// relationship to this one and is never used here.
+// (.github/workflows/tenant-lifecycle-dispatch.yml) -- the exact same
+// trusted, pinned-application-commit execution engine every manual
+// operator dispatch has used throughout this project. Deliberately a
+// SEPARATE repo and token from triggerSync()/triggerImport() above, which
+// target Los Tres Amigos's own legacy repo with GITHUB_SYNC_PAT -- that
+// token has no relationship to this one and is never used here.
+//
+// Preview Infrastructure Isolation (blocker-fix revision) -- for
+// 'production', the dispatch's own `ref` is 'main', exactly as always:
+// GitHub executes the WORKFLOW FILE'S OWN LOGIC as it exists on main
+// (never a caller-chosen ref), which then checks out the separately
+// PINNED_LIFECYCLE_SHA application commit. For 'preview', `ref` is the one
+// fixed, reviewed APPROVED_PREVIEW_LIFECYCLE_REF constant below -- this is
+// what actually makes the Preview-isolation WORKFLOW LOGIC itself
+// (environment-scoped PREVIEW_* secrets, the isolation checks, etc.)
+// exercisable before it is merged to main, since that logic does not yet
+// exist on main. This is a deliberate, narrow exception to "the dispatch's
+// ref is always main": still never caller-supplied, still a single fixed
+// literal per environment, resolved and validated before any network call
+// (see resolveLifecycleExecutionRef() below).
 // ---------------------------------------------------------------------------
 const TENANT_LIFECYCLE_REPO_OWNER = 'Leninf19'
 const TENANT_LIFECYCLE_REPO_NAME = 'PRYOR-OS'
 const TENANT_LIFECYCLE_WORKFLOW_FILE = 'tenant-lifecycle-dispatch.yml'
 const TENANT_LIFECYCLE_DISPATCH_TIMEOUT_MS = 10_000
+
+// Preview Infrastructure Isolation -- which infrastructure (Production vs.
+// Preview GitHub Environment secrets) a lifecycle dispatch executes
+// against is derived SOLELY from THIS SERVER PROCESS's own Vercel-supplied
+// VERCEL_ENV. Vercel sets this automatically for every deployment (never
+// from any request header/body/query, which a browser could forge) --
+// 'production' for the production deployment, 'preview' for every preview
+// deployment, 'development' for `vercel dev`/local. Fails closed (returns
+// null) for anything other than the two values this codebase explicitly
+// supports: an unset/unknown value must never silently default to either
+// side, and 'development' is deliberately NOT treated as either -- running
+// `vercel dev` locally must never be able to dispatch against either real
+// infrastructure.
+const LIFECYCLE_EXECUTION_ENVIRONMENTS = Object.freeze(['production', 'preview'])
+
+function resolveLifecycleExecutionEnvironment() {
+  const vercelEnv = process.env.VERCEL_ENV
+  return LIFECYCLE_EXECUTION_ENVIRONMENTS.includes(vercelEnv) ? vercelEnv : null
+}
+
+// Preview Infrastructure Isolation (blocker-fix revision) -- WHICH git ref
+// the dispatch targets is just as sensitive as WHICH secrets it uses: the
+// dispatch API's own `ref` selects which branch's copy of THIS WORKFLOW
+// FILE actually executes (a completely different thing from the
+// "Checkout pinned lifecycle implementation" step's own fixed
+// PINNED_LIFECYCLE_SHA, which selects the application code and is
+// unaffected by this). Production must keep using 'main' exactly as
+// before. Preview needs the workflow FILE from a real feature branch
+// (main does not yet contain the Preview-isolation workflow logic being
+// smoke-tested), but that branch must be a single, fixed, reviewed
+// constant -- NEVER caller-supplied, never derived from anything
+// request-related, and never open-ended (this is the same discipline as
+// PINNED_LIFECYCLE_SHA itself: a small, explicit, reviewable diff is the
+// only way to change it).
+//
+// For this smoke-test phase, the one approved Preview lifecycle ref is
+// 'feature/commercial-entitlements'. Bumping this to a different branch
+// later (e.g. once merged to main) is a deliberate, reviewed one-line
+// change here, exactly like bumping PINNED_LIFECYCLE_SHA in the workflow
+// file.
+const APPROVED_PREVIEW_LIFECYCLE_REF = 'feature/commercial-entitlements'
+
+// Defense in depth beyond the fixed constant above: Vercel's own
+// VERCEL_GIT_COMMIT_REF (set by Vercel itself from the actual git ref this
+// running deployment was built from -- never from any request) is
+// cross-checked when present. This guards against dispatching the
+// approved Preview ref from a Preview deployment that is NOT actually
+// running that branch's code (e.g. a preview build of some unrelated
+// branch). Its ABSENCE (local/test execution, where VERCEL_ENV is also
+// absent and already fails closed one level up) is not itself treated as
+// a mismatch -- only a genuine, positive disagreement is.
+function resolveLifecycleExecutionRef(environment) {
+  if (environment === 'production') return 'main'
+  if (environment === 'preview') {
+    const deployedRef = process.env.VERCEL_GIT_COMMIT_REF
+    if (deployedRef && deployedRef !== APPROVED_PREVIEW_LIFECYCLE_REF) return null
+    return APPROVED_PREVIEW_LIFECYCLE_REF
+  }
+  return null
+}
 
 // Calls GitHub's workflow_dispatch REST API with a bounded timeout, and
 // classifies the outcome into exactly the three cases the CAS/reconciliation
@@ -1936,7 +2010,13 @@ const TENANT_LIFECYCLE_DISPATCH_TIMEOUT_MS = 10_000
 //   'rejected' -- GitHub responded with a clean 4xx: the dispatch was
 //                 DEFINITELY not accepted (bad inputs, auth problem,
 //                 workflow/repo not found) -- safe to treat as an
-//                 immediate, definite failure, no waiting required.
+//                 immediate, definite failure, no waiting required. Also
+//                 returned LOCALLY (status: 0, no network call made at
+//                 all) when resolveLifecycleExecutionEnvironment() cannot
+//                 determine a supported execution environment, OR when
+//                 resolveLifecycleExecutionRef() cannot determine an
+//                 approved git ref for that environment -- equally
+//                 definite, since no dispatch was even attempted.
 //   'ambiguous' -- a network-level exception (timeout, connection reset,
 //                 DNS/TLS failure) OR any 5xx from GitHub's own edge --
 //                 GitHub's response, if it even reaches us, gives no
@@ -1945,11 +2025,46 @@ const TENANT_LIFECYCLE_DISPATCH_TIMEOUT_MS = 10_000
 //                 resolved later by reconcileStuckProvisioningDispatch()
 //                 (tenantConfigStore.js), which watches for real progress
 //                 instead of guessing from this HTTP-level signal alone.
-// Never accepts a caller-supplied ref/branch/SHA -- `ref: 'main'` is a
-// fixed literal, exactly like every other property of this call.
+// Never accepts a caller-supplied ref/branch/SHA -- `ref` is always
+// resolveLifecycleExecutionRef()'s own return value (a fixed literal for
+// each environment, never anything request-derived). Never accepts a
+// caller-supplied `environment` either -- see
+// resolveLifecycleExecutionEnvironment() above; this function takes only
+// (operation, tenantId), so there is structurally no parameter an
+// upstream caller (however far the call chain runs back toward a browser
+// request) could use to influence which infrastructure OR which git ref
+// this dispatch targets.
 async function dispatchTenantLifecycleWorkflow(operation, tenantId) {
   const pat = process.env.TENANT_PROVISIONING_DISPATCH_PAT
   if (!pat) return { outcome: 'ambiguous', reason: 'TENANT_PROVISIONING_DISPATCH_PAT is not configured' }
+
+  // Preview Infrastructure Isolation -- resolved and validated BEFORE any
+  // network call is made. An unresolvable environment is a definite,
+  // immediate local refusal (never 'ambiguous' -- there is no uncertainty
+  // here, and never a silent default to 'production', which would be the
+  // exact "Preview executes against Production infrastructure" failure
+  // mode this design exists to prevent).
+  const environment = resolveLifecycleExecutionEnvironment()
+  if (!environment) {
+    return {
+      outcome: 'rejected',
+      status: 0,
+      message: `cannot dispatch: unresolvable lifecycle execution environment (VERCEL_ENV=${JSON.stringify(process.env.VERCEL_ENV ?? null)}) -- refusing rather than guessing which infrastructure secrets this would run against`,
+    }
+  }
+
+  // The dispatch's OWN `ref` selects which branch's copy of the workflow
+  // FILE actually executes -- just as sensitive as `environment` above,
+  // and resolved with the exact same fail-closed discipline, before any
+  // network call.
+  const ref = resolveLifecycleExecutionRef(environment)
+  if (!ref) {
+    return {
+      outcome: 'rejected',
+      status: 0,
+      message: `cannot dispatch: unresolvable/unapproved lifecycle ref for environment ${JSON.stringify(environment)} (VERCEL_GIT_COMMIT_REF=${JSON.stringify(process.env.VERCEL_GIT_COMMIT_REF ?? null)}) -- refusing rather than guessing which workflow definition this would run`,
+    }
+  }
 
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), TENANT_LIFECYCLE_DISPATCH_TIMEOUT_MS)
@@ -1965,7 +2080,7 @@ async function dispatchTenantLifecycleWorkflow(operation, tenantId) {
           'X-GitHub-Api-Version': '2022-11-28',
           'Content-Type':         'application/json',
         },
-        body: JSON.stringify({ ref: 'main', inputs: { operation, tenant_id: tenantId, confirmation: tenantId } }),
+        body: JSON.stringify({ ref, inputs: { operation, tenant_id: tenantId, confirmation: tenantId, environment } }),
       }
     )
     if (r.status === 204) return { outcome: 'accepted' }
