@@ -47,6 +47,12 @@ function fakeBillingRedis() {
   return {
     hget: async (key, field) => hashes[key]?.[field] ?? null,
     hset: async (key, fields) => { hashes[key] = { ...(hashes[key] ?? {}), ...fields } },
+    hsetnx: async (key, field, value) => {
+      hashes[key] = hashes[key] ?? {}
+      if (field in hashes[key]) return false
+      hashes[key][field] = value
+      return true
+    },
     get: async (key) => {
       const e = strings[key]
       if (!e || expired(e)) return null
@@ -236,6 +242,25 @@ async function testNoUnknownFieldsAccepted() {
   let threw = null
   try { await createBillingRecord(TENANT_A, { commercialStatus: 'active' }) } catch (err) { threw = err }
   assert(threw instanceof TypeError, 'commercialStatus is not, and must never be, a billing-record field -- it lives only in tenant_config.commercial')
+}
+
+// Phase B.11 -- pendingPaidPlan (the customer's server-validated intended
+// post-trial plan).
+async function testPendingPaidPlanAcceptsCoreAndGrowth() {
+  install()
+  const created = await createBillingRecord(TENANT_A, { pendingPaidPlan: 'core' })
+  assert(created.pendingPaidPlan === 'core')
+  const updated = await updateBillingRecord(TENANT_A, { pendingPaidPlan: 'growth' }, { expectedVersion: created.version })
+  assert(updated.pendingPaidPlan === 'growth')
+}
+
+async function testPendingPaidPlanRejectsEnterpriseAndArbitraryValues() {
+  install()
+  for (const bad of ['enterprise', 'not_a_plan', 123, true]) {
+    let threw = null
+    try { await createBillingRecord(TENANT_A, { pendingPaidPlan: bad }) } catch (err) { threw = err }
+    assert(threw instanceof TypeError, `pendingPaidPlan must reject ${JSON.stringify(bad)} -- enterprise/arbitrary values must never be self-service-selectable`)
+  }
 }
 
 // ===========================================================================
@@ -535,6 +560,8 @@ const tests = [
   ['updating a missing record throws BillingRecordNotFoundError', testUpdateOnMissingRecordThrowsNotFound],
   ['schema validation rejects every malformed field', testSchemaValidationRejectsMalformedFields],
   ['unknown fields (e.g. commercialStatus) are never accepted', testNoUnknownFieldsAccepted],
+  ['pendingPaidPlan accepts core and growth', testPendingPaidPlanAcceptsCoreAndGrowth],
+  ['pendingPaidPlan rejects enterprise and arbitrary values', testPendingPaidPlanRejectsEnterpriseAndArbitraryValues],
   ['customer index claim is idempotent for the same tenant', testCustomerIndexIdempotentForSameTenant],
   ['customer index collision with a different tenant is rejected', testCustomerIndexCollisionRejected],
   ['subscription index claim is idempotent for the same tenant', testSubscriptionIndexIdempotentForSameTenant],

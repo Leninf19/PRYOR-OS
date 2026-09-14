@@ -1,15 +1,22 @@
-// Phase B.10 -- confirms the Stripe SDK + billing store foundation
-// coexists safely with what already existed: paymentProvider.js's stub
-// stays fail-closed/unconfigured (select-plan must NOT start performing
-// Stripe operations in B.10), the Pricing.jsx stale-price bug is fixed,
-// and nothing in this phase touches LTA or tenant_config directly.
+// Phase B.10/B.11 -- confirms the Stripe billing foundation coexists
+// safely with everything around it: the Pricing.jsx stale-price bug stays
+// fixed, no LTA/tenant_config leakage from any billing module, and (as of
+// B.11) the now-real select-plan/stripe-webhook actions still respect the
+// Stripe-SDK-import boundary (only stripeClient.js imports the raw
+// 'stripe' package -- every other file goes through it).
+//
+// paymentProvider.js (the B.10-era fail-closed stub select-plan used to be
+// wired through) was deleted in B.11 once selectPlan() was rewritten to
+// perform a real Stripe Setup-mode Checkout -- it became fully dead code
+// (nothing else ever imported it). This file's own B.10-era tests for that
+// stub are removed accordingly; see test_select_plan_endpoint.js and
+// test_stripe_webhook.js for the new, real-flow coverage.
 //
 // Run directly: node tests/test_billing_foundation_compat.js
 
-import { readFileSync, readdirSync, statSync } from 'fs'
+import { readFileSync, readdirSync, statSync, existsSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { createCheckoutSession, verifyPayment, PaymentNotConfiguredError } from '../dashboard/api/_lib/paymentProvider.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -29,28 +36,22 @@ async function run(name, fn) {
   }
 }
 
-async function testCreateCheckoutSessionStillFailsClosed() {
-  let threw = null
-  try { await createCheckoutSession({ id: 'core' }, 'someone@example.com') } catch (err) { threw = err }
-  assert(threw instanceof PaymentNotConfiguredError, 'createCheckoutSession() must remain a fail-closed stub -- B.10 must not accidentally make a currently-dead payment button start charging users')
+function testPaymentProviderStubWasIntentionallyRemoved() {
+  const p = path.resolve(__dirname, '..', 'dashboard', 'api', '_lib', 'paymentProvider.js')
+  assert(!existsSync(p), 'paymentProvider.js should have been deleted once selectPlan() no longer references it -- if this fails, either the file was resurrected or something still imports it')
 }
 
-async function testVerifyPaymentStillFailsClosed() {
-  let threw = null
-  try { await verifyPayment('sess_whatever') } catch (err) { threw = err }
-  assert(threw instanceof PaymentNotConfiguredError)
-}
-
-function testSessionActionFileDoesNotYetImportStripeSdk() {
+function testSessionActionFileNeverImportsRawStripeSdk() {
   const source = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'api', 'session', '[action].js'), 'utf-8')
-  assert(!/from ['"]stripe['"]/.test(source), 'session/[action].js must not import the Stripe SDK directly in B.10 -- select-plan stays wired through paymentProvider.js\'s stub until B.11 explicitly rewires it')
-  assert(source.includes("import { createCheckoutSession, PaymentNotConfiguredError } from '../_lib/paymentProvider.js'"), 'select-plan must still be wired through the existing paymentProvider.js seam')
+  assert(!/from ['"]stripe['"]/.test(source), 'session/[action].js must never import the raw Stripe SDK directly -- it must go through stripeClient.js\'s getStripeClient()')
+  assert(source.includes("from '../_lib/stripeClient.js'"), 'selectPlan()/stripeWebhookAction() must be wired through stripeClient.js')
+  assert(source.includes("from '../_lib/billingCustomer.js'"), 'selectPlan() must be wired through billingCustomer.js\'s ensureStripeCustomerForTenant()/createSetupCheckoutSession()')
 }
 
-function testNoApiEndpointImportsTheStripeSdkYet() {
-  // Only stripeClient.js itself may import the 'stripe' package in B.10 --
-  // no endpoint file calls Stripe directly yet (no webhook, no checkout
-  // endpoint exists).
+function testNoApiEndpointImportsTheRawStripeSdkExceptStripeClient() {
+  // Only stripeClient.js itself may import the 'stripe' package -- every
+  // other file (including the new stripe-webhook action inside
+  // session/[action].js) must go through getStripeClient().
   const apiDir = path.resolve(__dirname, '..', 'dashboard', 'api')
   const offenders = []
   function walk(dir) {
@@ -65,18 +66,17 @@ function testNoApiEndpointImportsTheStripeSdkYet() {
     }
   }
   walk(apiDir)
-  assert(offenders.length === 0, `only stripeClient.js may import the Stripe SDK in B.10: ${offenders.join(', ')}`)
+  assert(offenders.length === 0, `only stripeClient.js may import the raw Stripe SDK: ${offenders.join(', ')}`)
 }
 
 function testPricingPageShowsCorrectGrowthPrice() {
   const source = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'src', 'components', 'Pricing.jsx'), 'utf-8')
-  assert(/growth.*\n.*price: '\$249'/.test(source) || source.includes("{ id: 'growth', name: 'Growth', price: '$249'"),
-    'Pricing.jsx must display the canonical Growth price ($249), matching plans.js, not the stale pre-Phase-B $349')
-  assert(!/price: '\$349'/.test(source), 'the stale $349 displayed-price entry must be gone (a comment mentioning the old value for context is fine)')
+  assert(source.includes("price: '$249'"), 'Pricing.jsx must display the canonical Growth price ($249), matching plans.js, not the stale pre-Phase-B $349')
+  assert(!/\$349/.test(source), 'the stale $349 value must be gone entirely, including from comments')
 }
 
 function testBillingModulesNeverReferenceLtaOrBootstrap() {
-  const files = ['billingStore.js', 'stripeClient.js', 'billingStatusProjection.js', 'stripePriceMap.js', 'billingPortalPolicy.js']
+  const files = ['billingStore.js', 'stripeClient.js', 'billingStatusProjection.js', 'stripePriceMap.js', 'billingPortalPolicy.js', 'billingCustomer.js', 'billingTerms.js']
   for (const file of files) {
     const source = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'api', '_lib', file), 'utf-8')
     assert(!/Los Tres Amigos/i.test(source), `${file} must never reference LTA`)
@@ -85,23 +85,22 @@ function testBillingModulesNeverReferenceLtaOrBootstrap() {
 }
 
 function testBillingModulesNeverCreateOrWriteTenantConfig() {
-  const files = ['billingStore.js', 'stripeClient.js', 'billingStatusProjection.js', 'stripePriceMap.js']
+  const files = ['billingStore.js', 'stripeClient.js', 'billingStatusProjection.js', 'stripePriceMap.js', 'billingCustomer.js', 'billingTerms.js']
   for (const file of files) {
     const source = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'api', '_lib', file), 'utf-8')
     const importLines = source.split('\n').filter(line => /^\s*import\b/.test(line))
     assert(!importLines.some(line => line.includes('tenantConfigStore.js')),
-      `${file} must never import tenantConfigStore.js -- projecting into tenant_config.commercial is explicitly out of scope for B.10`)
+      `${file} must never import tenantConfigStore.js -- projecting into tenant_config.commercial remains out of scope through B.11`)
   }
 }
 
 const tests = [
-  ['createCheckoutSession() remains a fail-closed stub', testCreateCheckoutSessionStillFailsClosed],
-  ['verifyPayment() remains a fail-closed stub', testVerifyPaymentStillFailsClosed],
-  ['session/[action].js does not yet import the Stripe SDK', testSessionActionFileDoesNotYetImportStripeSdk],
-  ['no API endpoint other than stripeClient.js imports the Stripe SDK', testNoApiEndpointImportsTheStripeSdkYet],
+  ['paymentProvider.js stub was intentionally removed, not resurrected', testPaymentProviderStubWasIntentionallyRemoved],
+  ['session/[action].js never imports the raw Stripe SDK directly', testSessionActionFileNeverImportsRawStripeSdk],
+  ['no API endpoint other than stripeClient.js imports the raw Stripe SDK', testNoApiEndpointImportsTheRawStripeSdkExceptStripeClient],
   ['Pricing.jsx now shows the correct $249 Growth price', testPricingPageShowsCorrectGrowthPrice],
-  ['new billing modules never reference LTA/bootstrap', testBillingModulesNeverReferenceLtaOrBootstrap],
-  ['new billing modules never write tenant_config', testBillingModulesNeverCreateOrWriteTenantConfig],
+  ['billing modules never reference LTA/bootstrap', testBillingModulesNeverReferenceLtaOrBootstrap],
+  ['billing modules never write tenant_config', testBillingModulesNeverCreateOrWriteTenantConfig],
 ]
 
 async function main() {

@@ -21,28 +21,44 @@
 // moment, with zero new client-triggered surface and zero changes to the
 // Python provisioning/sync pipeline.
 //
-// FINAL TRIAL-INTEGRITY CORRECTION #1 -- commercial === null is NEVER, by
-// itself, sufficient grounds for automatic trial enrollment. B.2
-// deliberately made commercial === null mean "legacy compatibility" while
+// FINAL TRIAL-INTEGRITY CORRECTION #1 (superseded/hardened by the B.11
+// pre-commit correction below) -- commercial === null is NEVER, by itself,
+// sufficient grounds for automatic trial enrollment. B.2 deliberately made
+// commercial === null mean "legacy compatibility" while
 // COMMERCIAL_ENFORCEMENT_CUTOFF is disabled, and for grandfathered
 // pre-cutoff tenants once it is armed -- an EXISTING REDIS_ONLY tenant with
 // no commercial record must never be silently upgraded into a 7-day trial
-// merely because tenantStatus() happens to be read. This module therefore
-// requires a SEPARATE, explicit, server-controlled marker --
-// tenant_config.trialEligibility = { eligible: true, markedAt, source } --
-// distinguishing "this tenant is intentionally entering the self-service
-// free-trial onboarding flow" from "commercial state is merely missing."
-// This marker:
+// merely because tenantStatus() happens to be read.
+//
+// B.11 PRE-COMMIT CORRECTION -- commercial === null is now not merely
+// insufficient but structurally IMPOSSIBLE as the automatic-trial entry
+// condition: real self-service tenant creation
+// (session/[action].js's finalizeRegistration()) never leaves `commercial`
+// null even transiently -- it always writes the explicit,
+// resolver-recognized `trial_pending_activation` status (the same shape
+// B.8 already proved safe for access-code trials) atomically alongside the
+// trialEligibility marker below, via selfServiceCommercial.js. This closes
+// the exact hole a naive `commercial: null` + `trialEligibility: true`
+// self-service tenant would otherwise open: while
+// COMMERCIAL_ENFORCEMENT_CUTOFF stays disabled, `commercial === null`
+// resolves as fully-unrestricted LEGACY_UNMANAGED (entitlementResolution.js),
+// which would have given a brand-new, real, paid-card-backed tenant
+// unrestricted access for the entire window before its first sync. This
+// module therefore requires a SEPARATE, explicit, server-controlled
+// marker -- tenant_config.trialEligibility = { eligible: true, markedAt,
+// source } -- distinguishing "this tenant is intentionally entering the
+// self-service free-trial onboarding flow" from "commercial state is
+// merely missing." This marker:
 //   - defaults to absent/not-eligible for every existing tenant (backward
-//     compatible -- nothing today writes it, so automatic enrollment stays
-//     dormant in production until a later, separately reviewed self-service
-//     tenant-creation path explicitly sets it at creation time);
+//     compatible -- the ONLY production writer is finalizeRegistration(),
+//     which always pairs it with trial_pending_activation in the same
+//     atomic write);
 //   - is never read from a request (see TRIAL_ELIGIBILITY_SOURCES below --
 //     only a small enumerated set of SERVER-SIDE provenance values is ever
 //     legal, mirroring tenantConfigStore.js's own TENANT_CREATION_SOURCES
 //     pattern);
-//   - is checked IN ADDITION TO, never instead of, the existing
-//     commercial === null / status === 'active' preconditions below.
+//   - is checked IN ADDITION TO, never instead of, the explicit
+//     trial_pending_activation / status === 'active' preconditions below.
 //
 // FINAL TRIAL-INTEGRITY CORRECTION #2 -- the 7-day clock is anchored to
 // tenant_config.initialSync.completedAt, NEVER to the trial claim's own
@@ -70,7 +86,11 @@ import { reserveTrialClaim, finalizeTrialClaim, TrialEligibilityStoreUnavailable
 import { commercialIdentityKey } from './commercialIdentity.js'
 import { listUsers } from './userStore.js'
 
-const TRIAL_DURATION_MS = 7 * 24 * 60 * 60 * 1000
+// Phase B.11 pre-commit correction -- exported so selfServiceCommercial.js's
+// consent-snapshot fields (session/[action].js's selectPlan()) can never
+// drift from the SAME number this file's own trial-duration math uses.
+export const SELF_SERVICE_TRIAL_DAYS = 7
+const TRIAL_DURATION_MS = SELF_SERVICE_TRIAL_DAYS * 24 * 60 * 60 * 1000
 
 // Enumerated, server-only provenance values for tenant_config.trialEligibility
 // -- mirrors tenantConfigStore.js's TENANT_CREATION_SOURCES discipline
@@ -129,43 +149,46 @@ export async function maybeStartTrial(tenantId, config) {
   // touched by this module, ever.
   if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return config
 
-  // Only a tenant with NO commercial decision at all yet is eligible for
-  // the automatic GBP-triggered trial. This deliberately excludes:
-  //   - a tenant whose trial has already started/expired/converted, or any
-  //     other real commercial decision (commercial is already a populated
-  //     new-shape object) -- Part F's "once consumed, never again,"
-  //     satisfied purely by this precondition, with no separate
-  //     "already consumed" flag needed.
-  //   - a tenant created via an access code (commercial is already an
-  //     OLD-shape {plan, source:'access_code', ...} object written at
-  //     tenant-creation time) -- see this phase's stop-point report, Part
-  //     J: an access-code-sourced tenant never ALSO independently earns
-  //     the automatic GBP trial. This avoids two contradictory trial
-  //     systems firing for the same tenant.
-  if (config.commercial !== null && config.commercial !== undefined) return config
+  // Phase B.11 pre-commit correction (Part 2/3) -- commercial === null is
+  // NEVER, by itself, sufficient OR even a valid entry condition for the
+  // automatic self-service trial anymore. Self-service tenant creation
+  // (session/[action].js's finalizeRegistration(), via
+  // selfServiceCommercial.js's buildSelfServicePendingActivationCommercial())
+  // now ALWAYS writes the explicit, resolver-recognized
+  // `trial_pending_activation` commercial status atomically alongside the
+  // trialEligibility marker below -- it never leaves `commercial: null`
+  // even transiently. This mirrors maybeStartAccessCodeTrial()'s own
+  // structure exactly: the two pending-activation provenances
+  // (self-service vs. access-code) share the SAME `trial_pending_activation`
+  // commercialStatus value but are mutually exclusive by construction,
+  // disambiguated below by the presence/absence of `accessCodeGrant` --
+  // each transitions out via its own dedicated function only. A tenant
+  // whose trial has already started/expired/converted, or any other real
+  // commercial decision, is excluded by the same status check (once
+  // consumed, this function never revisits it -- "once consumed, never
+  // again" falls out of the precondition itself, no separate flag needed).
+  if (config.commercial?.commercialStatus !== 'trial_pending_activation') return config
 
-  // Phase B.8 -- an access-code trial GRANT (accessCodeGrant, written at
-  // tenant-creation time, still pending its own lazy activation via
-  // maybeStartAccessCodeTrial() below) must independently and durably
-  // exclude the automatic self-service trial, even during the window where
-  // `commercial` is still null (exactly the same null-while-pending shape
-  // an ordinary not-yet-activated self-service tenant has). This is
-  // deliberately a SEPARATE, explicit check -- never relying solely on
-  // "commercial is non-null" (which is not yet true here) or on
-  // trialEligibility happening to also be unset (true today, but this
-  // guard keeps the exclusion durable even if that ever changed).
+  // An access-code trial GRANT (accessCodeGrant, written at tenant-creation
+  // time, pending its own lazy activation via maybeStartAccessCodeTrial()
+  // below) must independently and durably exclude the automatic
+  // self-service trial -- the two pending-activation provenances are
+  // mutually exclusive, and this is deliberately a SEPARATE, explicit
+  // check (never relying solely on "no self-service trialEligibility
+  // marker," which the guard below already checks, for defense in depth).
   if (config.accessCodeGrant != null) return config
 
-  // CORRECTION #1: commercial === null is NECESSARY but never SUFFICIENT.
-  // An explicit, server-controlled trialEligibility marker is REQUIRED --
-  // this is what distinguishes "this tenant is intentionally entering the
-  // free-trial onboarding flow" from "commercial state merely happens to be
-  // missing" (an existing/grandfathered/legacy tenant). No production
-  // writer of this marker exists yet (self-service commercial activation is
-  // not live), so this precondition keeps automatic enrollment fully
-  // dormant for every tenant in the codebase today -- exactly the intended,
-  // reviewed behavior until a later, separately reviewed tenant-creation
-  // path sets it explicitly at creation time.
+  // A pending-activation commercialStatus is NECESSARY but never
+  // SUFFICIENT by itself -- an explicit,
+  // server-controlled trialEligibility marker is REQUIRED too, mirroring
+  // the discipline this precondition has always had (originally checked
+  // against `commercial === null`, now checked against the explicit
+  // pending-activation status instead -- see the correction above). No
+  // production writer of trial_pending_activation + trialEligibility
+  // together exists yet other than finalizeRegistration()'s own
+  // self-service path (which always writes both in the same atomic
+  // tenant-creation write), so this stays a precise, narrow gate rather
+  // than a broad one.
   if (config.trialEligibility?.eligible !== true) return config
 
   // Not yet eligible: GBP OAuth connection + first successful initial sync

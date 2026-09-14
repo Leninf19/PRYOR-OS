@@ -49,6 +49,11 @@
 
 import { Redis } from '@upstash/redis'
 import { randomBytes } from 'crypto'
+// Phase B.11 -- pendingPaidPlan validation reuses the SAME self-service
+// plan registry stripePriceMap.js already exposes (never a locally
+// duplicated list that could drift from it). No cycle: stripePriceMap.js
+// only imports plans.js.
+import { SELF_SERVICE_PLAN_IDS } from './stripePriceMap.js'
 
 const BILLING_KEY = 'billing:v1'
 const CUSTOMER_INDEX_PREFIX = 'billing_customer_index:v1'
@@ -178,6 +183,22 @@ export function isValidProviderSubscriptionStatus(v) {
 // schema/validation only).
 // ===========================================================================
 
+// Phase B.11 pre-commit correction (Part 5) -- {acceptedAt, termsVersion,
+// recurringBillingAccepted} alone is not a sufficient historical snapshot:
+// a later reader needs to know WHAT commercial terms the customer actually
+// agreed to, not just that they clicked a checkbox at some point. Every
+// field below except `recurringBillingAccepted` (the checkbox decision
+// itself) is SERVER-DERIVED at the moment of consent -- never trusted from
+// the browser -- and this whole object is written in the SAME atomic
+// billing-record update as `pendingPaidPlan` (see session/[action].js's
+// selectPlan()), so the two can never drift apart: a plan change always
+// requires a fresh consent snapshot for the NEW plan/price, never a silent
+// carry-over of an old amount.
+const CONSENT_FIELDS = Object.freeze([
+  'acceptedAt', 'termsVersion', 'recurringBillingAccepted',
+  'acceptedPlanId', 'acceptedAmountCents', 'currency', 'billingInterval', 'trialDays',
+])
+
 function isValidConsent(v) {
   if (v === null) return true
   return (
@@ -185,7 +206,36 @@ function isValidConsent(v) {
     typeof v.acceptedAt === 'string' && !Number.isNaN(Date.parse(v.acceptedAt)) &&
     typeof v.termsVersion === 'string' && v.termsVersion.length > 0 &&
     v.recurringBillingAccepted === true &&
-    Object.keys(v).every(k => ['acceptedAt', 'termsVersion', 'recurringBillingAccepted'].includes(k))
+    SELF_SERVICE_PLAN_IDS.includes(v.acceptedPlanId) &&
+    Number.isInteger(v.acceptedAmountCents) && v.acceptedAmountCents > 0 &&
+    v.currency === 'usd' &&
+    v.billingInterval === 'month' &&
+    Number.isInteger(v.trialDays) && v.trialDays > 0 &&
+    Object.keys(v).every(k => CONSENT_FIELDS.includes(k))
+  )
+}
+
+// Phase B.11 pre-commit correction (Part 4) -- durable Stripe-Customer-
+// creation operation state. A deterministic Stripe idempotency key alone
+// is NOT permanent duplicate protection -- Stripe's own idempotency
+// records are pruned after roughly 24 hours, so a process crash between
+// "Stripe confirms Customer creation" and "PRYOR records the Customer id"
+// followed by a retry AFTER that window could create a second, duplicate
+// Customer. This durable, server-generated operation record is what lets
+// a retry WITHIN the safe window recover cleanly (same operationId, same
+// idempotency key, Stripe returns the SAME Customer), and lets a retry
+// AFTER the window fail closed instead of risking a duplicate -- see
+// billingCustomer.js's ensureStripeCustomerForTenant() for the full state
+// machine this field drives.
+function isValidCustomerCreationOperation(v) {
+  if (v === null) return true
+  const allowedKeys = ['operationId', 'startedAt', 'state']
+  return (
+    v !== null && typeof v === 'object' && !Array.isArray(v) &&
+    typeof v.operationId === 'string' && v.operationId.length > 0 &&
+    typeof v.startedAt === 'string' && !Number.isNaN(Date.parse(v.startedAt)) &&
+    ['pending', 'completed', 'ambiguous'].includes(v.state) &&
+    Object.keys(v).every(k => allowedKeys.includes(k))
   )
 }
 
@@ -204,6 +254,16 @@ const MUTABLE_FIELDS = Object.freeze([
   'stripeCustomerId', 'stripeSubscriptionId', 'stripePriceId', 'subscriptionStatus',
   'currentPeriodStart', 'currentPeriodEnd', 'cancelAtPeriodEnd', 'defaultPaymentMethodId',
   'lastStripeObjectCreatedAt', 'lastStripeEventCreatedAt', 'consent',
+  // Phase B.11 -- the customer's server-authoritative intended POST-TRIAL
+  // plan (never the current commercial plan/status -- that stays
+  // exclusively tenant_config.commercial's field, written only once a
+  // real subscription exists, B.12+). Validated against the SAME
+  // self-service registry stripePriceMap.js exposes -- 'enterprise' (or
+  // any other non-self-service value) can never be accepted here.
+  'pendingPaidPlan',
+  // Phase B.11 pre-commit correction (Part 4) -- see
+  // isValidCustomerCreationOperation()'s own header above.
+  'customerCreationOperation',
 ])
 
 function validateBillingFields(fields) {
@@ -240,6 +300,12 @@ function validateBillingFields(fields) {
   if (!isValidConsent(fields.consent)) {
     throw new TypeError(`invalid consent ${JSON.stringify(fields.consent)}`)
   }
+  if (fields.pendingPaidPlan !== null && !SELF_SERVICE_PLAN_IDS.includes(fields.pendingPaidPlan)) {
+    throw new TypeError(`invalid pendingPaidPlan ${JSON.stringify(fields.pendingPaidPlan)} -- must be null or one of ${SELF_SERVICE_PLAN_IDS.join(', ')}`)
+  }
+  if (!isValidCustomerCreationOperation(fields.customerCreationOperation)) {
+    throw new TypeError(`invalid customerCreationOperation ${JSON.stringify(fields.customerCreationOperation)}`)
+  }
 }
 
 function assertOnlyKnownFields(fields, fnName) {
@@ -254,8 +320,8 @@ const DEFAULT_FIELDS = Object.freeze({
   subscriptionStatus: null,
   currentPeriodStart: null, currentPeriodEnd: null, cancelAtPeriodEnd: null,
   defaultPaymentMethodId: null,
-  lastStripeObjectCreatedAt: null, lastStripeEventCreatedAt: null,
-  consent: null,
+  lastStripeObjectCreatedAt: null, lastStripeEventCreatedAt: null, pendingPaidPlan: null,
+  consent: null, customerCreationOperation: null,
 })
 
 // ===========================================================================
@@ -279,6 +345,18 @@ export async function getBillingRecord(tenantId) {
 // callers that want "create if absent, else return existing" must call
 // getBillingRecord() first themselves; this function never silently
 // overwrites.
+// Phase B.11 pre-commit correction -- this is genuinely atomic (HSETNX,
+// "set this hash field only if absent," a single Redis command), NOT a
+// separate get-then-set pair. The earlier get-then-hset shape had a real
+// TOCTOU race: two truly concurrent first-time callers could both observe
+// `existing === null` before either one's write lands, and a plain HSET
+// (an unconditional overwrite) would let the second writer silently
+// clobber the first's record -- discovered and fixed while hardening
+// billingCustomer.js's Customer-creation-operation acquisition (B.11 Part
+// 4), which is the first caller in this codebase to depend on
+// createBillingRecord()'s "only one caller ever wins" guarantee for real
+// safety (not just convenience). HSETNX closes this for every caller,
+// not just that one.
 export async function createBillingRecord(tenantId, fields = {}) {
   assertValidTenantId(tenantId, 'createBillingRecord')
   const client = getClient()
@@ -287,10 +365,6 @@ export async function createBillingRecord(tenantId, fields = {}) {
   const merged = { ...DEFAULT_FIELDS, ...fields }
   validateBillingFields(merged)
 
-  const existing = await getBillingRecord(tenantId)
-  if (existing) {
-    throw new BillingRecordAlreadyExistsError(`createBillingRecord: a billing record already exists for tenant ${JSON.stringify(tenantId)}`)
-  }
   const now = new Date().toISOString()
   const next = {
     version: 1,
@@ -300,10 +374,14 @@ export async function createBillingRecord(tenantId, fields = {}) {
     billingCreatedAt: now,
     billingUpdatedAt: now,
   }
+  let created
   try {
-    await client.hset(BILLING_KEY, { [tenantId]: JSON.stringify(next) })
+    created = await client.hsetnx(BILLING_KEY, tenantId, JSON.stringify(next))
   } catch (err) {
     throw new BillingStoreUnavailableError(`billing store unreachable: ${err.message}`)
+  }
+  if (created !== true && created !== 1) {
+    throw new BillingRecordAlreadyExistsError(`createBillingRecord: a billing record already exists for tenant ${JSON.stringify(tenantId)}`)
   }
   return next
 }

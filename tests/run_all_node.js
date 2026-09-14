@@ -160,6 +160,16 @@ const TESTS = [
   'test_stripe_price_map.js',
   'test_billing_portal_policy.js',
   'test_billing_foundation_compat.js',
+  // Phase B.11 -- Pricing UX + Stripe Setup-mode Checkout
+  'test_billing_customer.js',
+  'test_select_plan_endpoint.js',
+  'test_stripe_webhook.js',
+  'test_pricing_page_ui.js',
+  // Phase B.11 pre-commit correction -- self-service signup handoff,
+  // trial-pending-activation, durable Customer-creation operation state,
+  // extended consent snapshot, hardened Setup-completion validation.
+  'test_self_service_commercial.js',
+  'test_finalize_registration_endpoint.js',
 ]
 
 const results = {}

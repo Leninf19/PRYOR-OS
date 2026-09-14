@@ -12,6 +12,7 @@ import VerifyEmail from './VerifyEmail.jsx'
 import GetStarted from './GetStarted.jsx'
 import Pricing from './Pricing.jsx'
 import AccessCodeEntry from './AccessCodeEntry.jsx'
+import SetupComplete from './SetupComplete.jsx'
 
 // Paths reachable WITHOUT a session, checked before any loading/
 // authenticated/unauthenticated branching below -- an invitee/locked-out
@@ -23,12 +24,14 @@ import AccessCodeEntry from './AccessCodeEntry.jsx'
 // Multi-Tenant Phase 4Q.1 -- register/verify-email/get-started/pricing/
 // access-code are ALL reachable without a real lta_session (they carry
 // their own, separate, narrower lta_pending_signup token instead -- see
-// pendingSignupSession.js). None of these five ever mount Onboarding/App;
+// pendingSignupSession.js). None of these six ever mount Onboarding/App;
 // they are pure pre-tenant pages. /get-started, /pricing (in the plan-
-// selection case), and /access-code all read their own state from the
-// server (get-started-status) rather than from anything this file passes
-// them, so they need no special props here, identical to how
-// ForgotPassword/ResetPassword already work.
+// selection case), /pricing/setup-complete (Phase B.11 -- Stripe's own
+// Setup Checkout success_url redirect target), and /access-code all read
+// their own state from the server (get-started-status /
+// finalize-registration) rather than from anything this file passes them,
+// so they need no special props here, identical to how ForgotPassword/
+// ResetPassword already work.
 const PUBLIC_PATHS = {
   '/accept-invite': AcceptInvite,
   '/forgot-password': ForgotPassword,
@@ -37,6 +40,7 @@ const PUBLIC_PATHS = {
   '/verify-email': VerifyEmail,
   '/get-started': GetStarted,
   '/pricing': Pricing,
+  '/pricing/setup-complete': SetupComplete,
   '/access-code': AccessCodeEntry,
 }
 
@@ -54,7 +58,7 @@ const PUBLIC_PATHS = {
 // own dashboard before it can even reach the "Create your workspace"
 // form, rather than leaving it reachable for no reason once a real
 // session already exists.
-const WORKSPACE_CREATION_PATHS = new Set(['/register', '/verify-email', '/get-started', '/pricing', '/access-code'])
+const WORKSPACE_CREATION_PATHS = new Set(['/register', '/verify-email', '/get-started', '/pricing', '/pricing/setup-complete', '/access-code'])
 
 // The authenticated account (userId/email/role/locationIds/displayName from
 // GET /api/session/whoami), available to any component below AuthGate --

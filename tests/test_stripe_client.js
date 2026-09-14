@@ -71,6 +71,29 @@ function testRealClientNeverConstructedWhenFakeIsInjected() {
   assert(a.instance === 1 && b.instance === 2, 'the injected factory runs on every call -- callers control caching themselves in tests')
 }
 
+// Phase B.11 -- the B.10 prerequisite: before any real Stripe API call,
+// apiVersion must be explicitly pinned, never left to the SDK/account's
+// own moving default. Locks the exact pinned string AND cross-checks it
+// against the currently-installed stripe package's own generated default
+// (node_modules/stripe/cjs/apiVersion.js) -- if a future `npm install
+// stripe@newer` ships a different bundled default, this test fails loudly
+// rather than silently drifting from what the installed SDK's type
+// definitions/runtime actually expect.
+function testStripeApiVersionIsExplicitlyPinned() {
+  const source = readFileSync(path.resolve(__dirname, '..', 'dashboard', 'api', '_lib', 'stripeClient.js'), 'utf-8')
+  const pinnedMatch = source.match(/PINNED_STRIPE_API_VERSION = '([^']+)'/)
+  assert(pinnedMatch, 'stripeClient.js must define an explicit PINNED_STRIPE_API_VERSION constant')
+  const pinned = pinnedMatch[1]
+  assert(source.includes('apiVersion: PINNED_STRIPE_API_VERSION'), 'the Stripe SDK constructor call must pass apiVersion: PINNED_STRIPE_API_VERSION explicitly -- never omit it')
+
+  const installedApiVersionModule = path.resolve(__dirname, '..', 'dashboard', 'node_modules', 'stripe', 'cjs', 'apiVersion.js')
+  const installedSource = readFileSync(installedApiVersionModule, 'utf-8')
+  const installedMatch = installedSource.match(/exports\.ApiVersion = '([^']+)'/)
+  assert(installedMatch, 'could not read the installed stripe package\'s own generated ApiVersion constant')
+  assert(pinned === installedMatch[1],
+    `pinned apiVersion ${JSON.stringify(pinned)} no longer matches the installed stripe package's own default ${JSON.stringify(installedMatch[1])} -- review and update PINNED_STRIPE_API_VERSION deliberately before relying on this SDK version`)
+}
+
 function testModuleImportPerformsNoNetworkActivity() {
   // If importing this module made a real network call, requiring it above
   // (with no STRIPE_SECRET_KEY ever set for most of this file's run) would
@@ -113,6 +136,7 @@ const tests = [
   ['error message never contains a secret-shaped value', testErrorMessageNeverContainsASecretValue],
   ['an injected fake client is used instead of a real one', testInjectedFakeClientIsUsedInstead],
   ['no real Stripe client is constructed when a fake is injected', testRealClientNeverConstructedWhenFakeIsInjected],
+  ['the Stripe API version is explicitly pinned and matches the installed SDK', testStripeApiVersionIsExplicitlyPinned],
   ['importing the module performs no network activity', testModuleImportPerformsNoNetworkActivity],
   ['the client bundle never imports Stripe server modules', testClientBundleNeverImportsStripeServerModules],
 ]

@@ -24,6 +24,7 @@ import {
 } from '../dashboard/api/_lib/trialEligibilityStore.js'
 import { commercialIdentityKey } from '../dashboard/api/_lib/commercialIdentity.js'
 import { maybeStartTrial, selectTrialEligibleLocation } from '../dashboard/api/_lib/trialLifecycle.js'
+import { buildSelfServicePendingActivationCommercial } from '../dashboard/api/_lib/selfServiceCommercial.js'
 import { resolveTenantEntitlementsFromConfig } from '../dashboard/api/_lib/entitlementResolution.js'
 import {
   upsertTenantConfig, getTenantConfig, recordLocationApproval, applyEntitlementChange,
@@ -158,7 +159,18 @@ function freshTenantId() { return `t_trial-${++tenantCounter}` }
 // deliberately-marked-eligible test fixture, matching TRIAL_ELIGIBILITY_SOURCES'
 // 'test_fixture' provenance) since most tests in this file are specifically
 // about what happens ONCE a tenant is genuinely eligible; pass `false` to
-// exercise the "commercial===null alone is not enough" correction.
+// exercise the "trial_pending_activation + trialEligibility together are
+// required, neither alone is enough" correction.
+//
+// Phase B.11 pre-commit correction -- when trialEligible is true, this
+// fixture now ALSO writes the explicit `trial_pending_activation`
+// commercial shape (selfServiceCommercial.js's own canonical builder, the
+// SAME one finalizeRegistration() uses in production) atomically alongside
+// trialEligibility, exactly as real self-service tenant creation now
+// always does. `commercial: null` + trialEligibility together is no
+// longer a state any real or fixture tenant should ever be in --
+// maybeStartTrial() no longer recognizes it as its entry condition (see
+// trialLifecycle.js's own B.11 pre-commit correction).
 async function seedActiveTenant(tenantId, {
   googleLocationId = `accounts/acc-${tenantId}/locations/loc-1`,
   ownerEmail = null,
@@ -179,7 +191,9 @@ async function seedActiveTenant(tenantId, {
     },
   }
   if (trialEligible) {
-    patch.trialEligibility = { eligible: true, markedAt: new Date().toISOString(), source: 'test_fixture' }
+    const { commercial, trialEligibility } = buildSelfServicePendingActivationCommercial()
+    patch.commercial = commercial
+    patch.trialEligibility = trialEligibility
   }
   await upsertTenantConfig(tenantId, patch, {})
   if (ownerEmail) {
@@ -604,7 +618,7 @@ async function testRetryAfterCasFailureDoesNotAlterClock() {
   // maybeStartTrial() via a real intervening write.
   await upsertTenantConfig(tenantId, { displayName: 'Renamed Mid-Flight' }, { expectedVersion: config.configVersion })
   const failedAttempt = await maybeStartTrial(tenantId, config)
-  assert(failedAttempt.commercial === null || failedAttempt.commercial === undefined, 'the CAS conflict must leave commercial untouched')
+  assert(failedAttempt.commercial?.commercialStatus === 'trial_pending_activation', 'the CAS conflict must leave commercial untouched (still pending activation, not yet a real trial)')
   const retryResult = await maybeStartTrial(tenantId, await getTenantConfig(tenantId))
   assert(retryResult.commercial.trial.startedAt === anchor, `the retry must anchor to the SAME original initial-sync timestamp, got ${retryResult.commercial.trial.startedAt}`)
 }
@@ -653,9 +667,24 @@ async function testMarkerSurvivesRecordLocationApproval() {
 
 async function testMarkerSurvivesApplyEntitlementChange() {
   installFakeConfigRedis()
+  installFakeClaimRedis()
   const tenantId = freshTenantId()
   await seedActiveTenant(tenantId, { trialEligible: true })
+  // Both `trial_pending_activation` AND a genuinely active `trial` status
+  // are capped at maxLocations: 1 by product design (pendingActivationLimits()/
+  // TRIAL_LIMITS respectively) -- correctly so, and unrelated to what this
+  // test is actually about. Simulate this SAME tenant having since become a
+  // real paying Growth customer (maxLocations: 5) -- a realistic later
+  // state for a tenant whose trialEligibility marker legitimately lingers
+  // as harmless history -- via a direct write, bypassing trial activation
+  // machinery entirely since this test's only concern is "does
+  // applyEntitlementChange() preserve the marker," never trial mechanics.
+  const pending = await getTenantConfig(tenantId)
+  await upsertTenantConfig(tenantId, {
+    commercial: { ...pending.commercial, commercialStatus: 'active', plan: 'growth', planSource: 'self_service_trial' },
+  }, { expectedVersion: pending.configVersion })
   const beforeConfig = await getTenantConfig(tenantId)
+  assert(beforeConfig.commercial?.commercialStatus === 'active', 'setup: tenant must now be a real paid Growth customer')
   assert(beforeConfig.trialEligibility?.eligible === true, 'setup: marker must be present before the entitlement change')
   // A legitimate post-activation config mutation -- adding a second GBP
   // location via the platform-admin entitlement-change path, unrelated to
@@ -679,7 +708,7 @@ async function testSameGbpSecondTenantDeniedTrial() {
   const resultA = await maybeStartTrial(tenantA, await getTenantConfig(tenantA))
   assert(resultA.commercial?.commercialStatus === 'trial', 'tenant A (first) must get the trial')
   const resultB = await maybeStartTrial(tenantB, await getTenantConfig(tenantB))
-  assert(resultB.commercial === null || resultB.commercial === undefined, 'tenant B (same GBP location, second) must be denied a trial')
+  assert(resultB.commercial?.commercialStatus === 'trial_pending_activation', 'tenant B (same GBP location, second) must be denied a trial (remains pending activation)')
 }
 
 async function testSameGbpDifferentEmailStillDenied() {
@@ -693,7 +722,7 @@ async function testSameGbpDifferentEmailStillDenied() {
   await seedActiveTenant(tenantB, { googleLocationId: gbp, ownerEmail: 'totally-different-person@other-domain.com' })
   await maybeStartTrial(tenantA, await getTenantConfig(tenantA))
   const resultB = await maybeStartTrial(tenantB, await getTenantConfig(tenantB))
-  assert(resultB.commercial === null || resultB.commercial === undefined, 'a completely different email must NOT bypass GBP-location-based denial')
+  assert(resultB.commercial?.commercialStatus === 'trial_pending_activation', 'a completely different email must NOT bypass GBP-location-based denial')
 }
 
 async function testSameGbpPlusAliasEmailStillDenied() {
@@ -707,7 +736,7 @@ async function testSameGbpPlusAliasEmailStillDenied() {
   await seedActiveTenant(tenantB, { googleLocationId: gbp, ownerEmail: 'owner+secondtry@example.com' })
   await maybeStartTrial(tenantA, await getTenantConfig(tenantA))
   const resultB = await maybeStartTrial(tenantB, await getTenantConfig(tenantB))
-  assert(resultB.commercial === null || resultB.commercial === undefined, 'a plus-address alias of the same email must NOT bypass GBP-location-based denial')
+  assert(resultB.commercial?.commercialStatus === 'trial_pending_activation', 'a plus-address alias of the same email must NOT bypass GBP-location-based denial')
 }
 
 async function testDifferentGbpLocationsEachIndependentlyEligible() {
@@ -752,7 +781,7 @@ async function testTenantRetryAfterPartialInfraFailureResumesIdempotently() {
   // captured configVersion is now behind) -- this must fail the CAS,
   // NOT burn the trial claim.
   const failedAttempt = await maybeStartTrial(tenantId, config)
-  assert(failedAttempt.commercial === null || failedAttempt.commercial === undefined, 'a CAS conflict must leave commercial untouched, not silently succeed against stale state')
+  assert(failedAttempt.commercial?.commercialStatus === 'trial_pending_activation', 'a CAS conflict must leave commercial untouched, not silently succeed against stale state')
 
   // The SAME tenant retries with FRESH config -- must resume and succeed,
   // anchored to the ORIGINAL reservation's reservedAt (not a new timestamp).
@@ -768,7 +797,7 @@ async function testEligibilityStoreOutageDuringMaybeStartTrialFailsClosedNoThrow
   await seedActiveTenant(tenantId)
   const config = await getTenantConfig(tenantId)
   const result = await maybeStartTrial(tenantId, config) // must not throw
-  assert(result.commercial === null || result.commercial === undefined, 'an eligibility-store outage must defer trial start, never fail open')
+  assert(result.commercial?.commercialStatus === 'trial_pending_activation', 'an eligibility-store outage must defer trial start, never fail open')
 }
 
 // --- Part 6: expiry / resolver time-authoritativeness ---------------------
@@ -903,6 +932,47 @@ function testTrialLifecycleNeverReadsRequestObjects() {
   assert(!/req\.(body|query|headers)/.test(src), 'trialLifecycle.js must never read from a request object -- tenantId must always come from the caller\'s own authenticated resolution')
 }
 
+// Phase B.11 pre-commit correction (Part 3) -- the two pending-activation
+// provenances (self-service vs. access-code) share the SAME
+// `trial_pending_activation` commercialStatus but must remain mutually
+// exclusive: each transitions out via its own dedicated function only,
+// never the other's.
+async function testSelfServiceAndAccessCodePendingActivationAreMutuallyExclusive() {
+  installFakeConfigRedis()
+  installFakeClaimRedis()
+  const { maybeStartAccessCodeTrial } = await import('../dashboard/api/_lib/trialLifecycle.js')
+
+  // An access-code pending-activation tenant: trial_pending_activation +
+  // accessCodeGrant, NO trialEligibility marker.
+  const tenantId = freshTenantId()
+  await upsertTenantConfig(tenantId, { status: 'onboarding', locationCatalogEnabled: true }, { allowCreate: true, creationSource: 'migration' })
+  await recordLocationApproval(tenantId, [{ googleLocationId: `accounts/acc-${tenantId}/locations/loc-1`, title: 'L', address: '' }])
+  await upsertTenantConfig(tenantId, {
+    status: 'active',
+    initialSync: { status: 'completed', startedAt: new Date().toISOString(), completedAt: new Date().toISOString(), reviewCount: 0, locationCount: 1, lastError: null },
+    commercial: {
+      commercialStatus: 'trial_pending_activation', plan: 'growth', planSource: 'access_code_trial', trial: null,
+      limitsOverride: null, suspension: null, cancellation: null, overLimit: null,
+      accessCodeHash: 'fakehash', discountPercent: null, discountFixedCents: null, paymentRequired: false,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    },
+    accessCodeGrant: { grantType: 'trial', trialDays: 21, plan: 'growth', planSource: 'access_code_trial', discountPercent: null, discountFixedCents: null, accessCodeHash: 'fakehash', grantedAt: new Date().toISOString() },
+  }, {})
+
+  const config = await getTenantConfig(tenantId)
+  // maybeStartTrial() (the SELF-SERVICE activator) must refuse this tenant
+  // entirely -- it has no trialEligibility marker AND has an
+  // accessCodeGrant, both independently disqualifying.
+  const afterSelfServiceAttempt = await maybeStartTrial(tenantId, config)
+  assert(afterSelfServiceAttempt.commercial.commercialStatus === 'trial_pending_activation', 'maybeStartTrial() must never activate an access-code-provenance pending tenant')
+  assert(afterSelfServiceAttempt.commercial.planSource === 'access_code_trial', 'planSource must remain untouched by the self-service activator')
+
+  // maybeStartAccessCodeTrial() (the correct activator for this tenant)
+  // DOES activate it.
+  const activated = await maybeStartAccessCodeTrial(tenantId, config)
+  assert(activated.commercial.commercialStatus === 'trial' && activated.commercial.planSource === 'access_code_trial')
+}
+
 async function testLtaUnaffectedEndToEnd() {
   // No fake config/claim/user Redis at all for LTA's path -- if
   // maybeStartTrial() ever touched Redis for LTA, this would throw.
@@ -979,6 +1049,7 @@ const tests = [
   ['security: request body/query cannot set trial dates or status', testRequestBodyCannotSetTrialDatesOrStatus],
   ['security: claim internals are never exposed by tenantStatus', testClaimInternalsNeverExposedByTenantStatus],
   ['security: trialLifecycle.js never reads a request object directly', testTrialLifecycleNeverReadsRequestObjects],
+  ['self-service and access-code pending-activation are mutually exclusive', testSelfServiceAndAccessCodePendingActivationAreMutuallyExclusive],
   ['security: LTA is completely unaffected end-to-end', testLtaUnaffectedEndToEnd],
 ]
 

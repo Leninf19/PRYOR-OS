@@ -51,8 +51,21 @@ import {
   AccessCodeInvalidError, AccessCodeRestrictedError, AccessCodeStoreUnavailableError,
 } from '../_lib/accessCodeStore.js'
 import { buildAccessCodeCommercialWrite, PaymentRequiredNotSupportedError, InvalidAccessCodeGrantError } from '../_lib/accessCodeCommercial.js'
-import { PLANS, isValidPlanId } from '../_lib/plans.js'
-import { createCheckoutSession, PaymentNotConfiguredError } from '../_lib/paymentProvider.js'
+import { isValidPlanId, PLANS } from '../_lib/plans.js'
+import { isSelfServicePlan } from '../_lib/stripePriceMap.js'
+import { CURRENT_BILLING_TERMS_VERSION } from '../_lib/billingTerms.js'
+import { buildSelfServicePendingActivationCommercial, SELF_SERVICE_TRIAL_DAYS } from '../_lib/selfServiceCommercial.js'
+import {
+  ensureStripeCustomerForTenant, createSetupCheckoutSession,
+  BillingUrlNotConfiguredError, BillingSetupRecoveryRequiredError,
+} from '../_lib/billingCustomer.js'
+import {
+  updateBillingRecord, getBillingRecord, getTenantIdForCustomer,
+  claimStripeEvent, markStripeEventProcessed, markStripeEventFailed,
+  BillingVersionConflictError, BillingStoreUnavailableError,
+  isValidStripeCustomerId, isValidStripePaymentMethodId,
+} from '../_lib/billingStore.js'
+import { getStripeClient, StripeNotConfiguredError } from '../_lib/stripeClient.js'
 
 const SESSION_TTL_SECONDS = 12 * 60 * 60 // 12h fixed session (Phase 1)
 
@@ -818,8 +831,10 @@ async function resetPassword(req, res) {
 
 // ===========================================================================
 // Multi-Tenant Phase 4Q.1 -- self-service registration, email verification,
-// and tenant creation via access code. No Stripe (selectPlan() below is a
-// stub -- see paymentProvider.js). Every write below goes through the SAME
+// and tenant creation via access code. selectPlan() below (Phase B.11)
+// collects a saved payment method via Stripe Setup-mode Checkout -- no
+// Subscription/charge/PRYOR trial starts here. Every write below goes
+// through the SAME
 // trusted, already-reviewed functions the operator bootstrap script and
 // the invite/accept-invite flow already use (upsertTenantConfig,
 // upsertUser, generateUserId, signSession) -- this phase adds the
@@ -1152,7 +1167,7 @@ async function getStartedStatus(req, res) {
 //   4. Delete the pending registration -- from this point on, the ONLY
 //      record of this identity is the real tenant_config/user pair.
 //   5. Release the lock (always, via finally).
-async function createTenantForVerifiedRegistration(email, commercial, accessCodeGrant = null) {
+async function createTenantForVerifiedRegistration(email, commercial, accessCodeGrant = null, trialEligibility = null) {
   const lockAcquired = await acquireTenantCreationLock(email)
   if (!lockAcquired) {
     throw new TenantCreationInProgressError('Your workspace is already being created. Please wait a moment and try again.')
@@ -1191,7 +1206,7 @@ async function createTenantForVerifiedRegistration(email, commercial, accessCode
         companyName: fresh.companyName,
         ownerEmail: fresh.email, ownerUserId: fresh.userId, ownerPasswordHash: fresh.passwordHash,
         ownerDisplayName: fresh.displayName, ownerPasswordSetAt: fresh.createdAt,
-        commercial, accessCodeGrant,
+        commercial, accessCodeGrant, trialEligibility,
       }))
     } catch (err) {
       if (err instanceof IdentityAlreadyExistsError) {
@@ -1386,13 +1401,31 @@ async function redeemAccessCodeAction(req, res) {
   }
 }
 
-// POST /api/session/select-plan  { plan }
-// Phase 4Q.1: ALWAYS the stubbed "not available" response -- see
-// paymentProvider.js. No tenant is ever created by this action today.
-// Phase 4Q.2 (separately reviewed) replaces the inside of the try block
-// with a real Stripe checkout redirect; the surrounding shape (validate
-// plan, resolve pending signup, never create a tenant without confirmed
-// payment) does not change.
+// POST /api/session/select-plan  { plan, recurringBillingAccepted }
+//
+// Phase B.11 -- the first real Stripe payment-method-collection path. This
+// action does NOT create a Subscription, does NOT charge anything, and
+// does NOT start a PRYOR trial -- it only: (1) records the customer's
+// server-validated intended post-trial plan, (2) records their explicit
+// recurring-billing consent with a SERVER timestamp, (3) ensures exactly
+// one Stripe Customer exists for this (still pre-tenant) registrant, and
+// (4) returns a Setup-mode Checkout Session URL for the browser to redirect
+// to. B.12 is what bridges a later, authoritative initialSync.completedAt
+// into an actual Subscription.
+//
+// AUTHORIZATION (Part G): requirePendingSignup() is the entire
+// authorization boundary here, exactly as it already is for
+// redeemAccessCodeAction() -- there is no tenant, no user record, and no
+// role to check yet at this point in the self-service funnel (see
+// createTenantForVerifiedRegistration()'s own header for why tenant
+// creation is deliberately deferred this late). The sole holder of a
+// valid, unexpired lta_pending_signup cookie (issued ONLY by verifyEmail(),
+// so its mere possession already proves email verification -- Part Q) is
+// unconditionally the person who will become this tenant's first Owner the
+// moment a real tenant is ever created; there is structurally no "tenant
+// Admin" or any other role that could reach this action instead. tenantId
+// is ALWAYS `pending.tenantIdReserved` (minted server-side at register()
+// time) -- never accepted from the request body.
 async function selectPlan(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
 
@@ -1401,26 +1434,484 @@ async function selectPlan(req, res) {
 
   const pending = await requirePendingSignup(req, res)
   if (!pending) return
+  // Belt-and-suspenders beyond the cookie check above: a registration that
+  // has already moved past plan-selection (tenant creation in progress,
+  // completed, or blocked) must not be allowed to start a second, stale
+  // billing-setup attempt.
+  if (pending.status !== 'verified_awaiting_plan') {
+    return res.status(409).json({ error: 'invalid_state', message: 'This registration is not ready for plan selection.' })
+  }
 
-  const { plan } = req.body ?? {}
-  if (!isValidPlanId(plan)) {
-    return res.status(400).json({ error: 'invalid_request', message: 'Choose a valid plan.' })
+  const { plan, recurringBillingAccepted } = req.body ?? {}
+  // Enterprise (and any other non-canonical value) is rejected here --
+  // never self-service, per Part C/E/R. isValidPlanId() alone would still
+  // accept 'enterprise'; isSelfServicePlan() is the actual gate.
+  if (!isValidPlanId(plan) || !isSelfServicePlan(plan)) {
+    return res.status(400).json({ error: 'invalid_plan', message: 'Choose Core or Growth. Enterprise is available by contacting sales.' })
+  }
+  // The server NEVER trusts a client-supplied acceptedAt/termsVersion --
+  // CURRENT_BILLING_TERMS_VERSION is stamped unconditionally below,
+  // regardless of anything the request claims. The checkbox itself is
+  // unchecked by default in the UI (Pricing.jsx) -- this boolean must be
+  // explicitly true, never defaulted/assumed.
+  if (recurringBillingAccepted !== true) {
+    return res.status(400).json({ error: 'consent_required', message: 'Please confirm recurring billing to continue.' })
+  }
+
+  const tenantId = pending.tenantIdReserved
+
+  let customerId
+  try {
+    ;({ customerId } = await ensureStripeCustomerForTenant(tenantId, pending.email))
+  } catch (err) {
+    if (err instanceof StripeNotConfiguredError) {
+      console.error(`[session/select-plan] ${err.message}`)
+      return res.status(503).json({ error: 'billing_not_configured', message: 'Plan checkout isn\'t available yet. Use an access code, or contact sales to get started.' })
+    }
+    if (err instanceof BillingSetupRecoveryRequiredError) {
+      console.error(`[session/select-plan] ${err.message}`)
+      return res.status(503).json({ error: 'billing_setup_recovery_required', message: 'We could not confirm your billing setup. Please contact support.' })
+    }
+    throw err
+  }
+
+  // Phase B.11 pre-commit correction (Part 5) -- the consent snapshot now
+  // records WHAT commercial terms were actually accepted, not merely that
+  // a checkbox was checked. Every field below except `recurringBillingAccepted`
+  // itself is SERVER-DERIVED from the already-validated `plan` -- never
+  // trusted from the request body (a client-supplied amount/currency/
+  // interval/trialDays/termsVersion is silently ignored, matching
+  // acceptedAt/termsVersion's existing discipline just above). Written in
+  // the SAME atomic update as `pendingPaidPlan`, so the two can never
+  // drift: selecting a DIFFERENT plan later always re-runs this exact
+  // block again, producing a fresh consent snapshot for the NEW plan/price
+  // -- there is no code path that updates `pendingPaidPlan` without also
+  // rewriting `consent` to match.
+  const consentedAt = new Date().toISOString()
+  const planMetadata = PLANS[plan]
+  const consent = {
+    acceptedAt: consentedAt,
+    termsVersion: CURRENT_BILLING_TERMS_VERSION,
+    recurringBillingAccepted: true,
+    acceptedPlanId: plan,
+    acceptedAmountCents: planMetadata.priceCents,
+    currency: 'usd',
+    billingInterval: planMetadata.billingPeriod,
+    trialDays: SELF_SERVICE_TRIAL_DAYS,
+  }
+  const existing = await getBillingRecord(tenantId)
+  try {
+    await updateBillingRecord(tenantId, { pendingPaidPlan: plan, consent }, { expectedVersion: existing.version })
+  } catch (err) {
+    if (err instanceof BillingVersionConflictError) {
+      // A concurrent select-plan call for this same registrant already
+      // updated the record -- harmless; the Checkout Session below is
+      // still created against the correct, already-bound Customer.
+    } else {
+      throw err
+    }
+  }
+
+  let session
+  try {
+    session = await createSetupCheckoutSession({ tenantId, customerId, plan })
+  } catch (err) {
+    if (err instanceof BillingUrlNotConfiguredError) {
+      console.error(`[session/select-plan] ${err.message}`)
+      return res.status(503).json({ error: 'billing_not_configured', message: 'Plan checkout isn\'t available yet. Please try again shortly.' })
+    }
+    console.error(`[session/select-plan] checkout session creation failed: ${err.message}`)
+    return res.status(502).json({ error: 'checkout_creation_failed', message: 'Could not start checkout. Please try again.' })
+  }
+
+  // Phase B.11 pre-commit correction (Part 7) -- refresh the
+  // pending-registration's own 7-day TTL at the exact moment Checkout is
+  // initiated. updatePendingRegistration() already re-applies the full
+  // RECORD_TTL_SECONDS window on every write (pendingRegistrationStore.js);
+  // this otherwise-no-op patch means the registrant now has a FRESH 7 days
+  // to complete Checkout (which Stripe itself caps at 24h) and return to
+  // finalize -- comfortably covering the entire flow even if the customer
+  // waited until day 6.9 after registration to start it. Best-effort: a
+  // failure here is logged but never blocks the response, since the
+  // customer's Checkout Session was already successfully created above.
+  try {
+    await updatePendingRegistration(pending.email, {})
+  } catch (err) {
+    console.error(`[session/select-plan] failed to refresh pending-registration TTL (non-fatal): ${err.message}`)
+  }
+
+  return res.status(200).json({ checkoutUrl: session.url })
+}
+
+// POST /api/session/finalize-registration
+//
+// Phase B.11 pre-commit correction (Part 1) -- closes the gap the original
+// B.11 pass left open: authoritative Setup completion (the verified Stripe
+// webhook recording defaultPaymentMethodId) never, by itself, materialized
+// a real tenant/Owner/session. This is the ONE place that bridge happens.
+//
+// The browser's mere arrival at /pricing/setup-complete (Stripe's
+// success_url) is NEVER treated as proof of anything -- this action reads
+// billing readiness SERVER-SIDE, from this codebase's own already-verified
+// state (billingRecord.defaultPaymentMethodId, set ONLY by
+// stripeWebhookAction() after full signature + SetupIntent-status
+// validation), never from a `session_id` query param or any other
+// browser-supplied signal. If the webhook hasn't landed yet, this returns
+// billing_not_ready (409) -- SetupComplete.jsx polls this endpoint with a
+// short bounded retry, so a delayed webhook is a brief wait, not a dead
+// end.
+//
+// Required invariants and how each is met:
+//   - fake success URL cannot create a tenant: this action never reads
+//     anything from the browser's URL/query string at all.
+//   - no payment method confirmation => no finalization: the
+//     billingRecord.defaultPaymentMethodId check above is the sole gate.
+//   - webhook delayed => customer can safely wait/retry: billing_not_ready
+//     is a stable, retryable response, never a terminal error.
+//   - browser never returns => no corrupt partial tenant: nothing in this
+//     action runs unless/until it is explicitly called; an unfinalized
+//     registration simply remains pending (see Part 7's TTL discussion).
+//   - duplicate calls => one tenant, one Owner: delegated entirely to
+//     createTenantForVerifiedRegistration()'s existing per-email lock +
+//     createNewTenant()'s idempotent-retry recognition (unchanged,
+//     already proven by the access-code path) -- a concurrent second call
+//     fails closed with creation_in_progress; a call after completion
+//     fails closed with already_completed/not_found.
+//   - same reserved tenantId preserved: createTenantForVerifiedRegistration()
+//     always passes fresh.tenantIdReserved through unchanged.
+//   - foreign pending signup cannot finalize another tenant: tenantId is
+//     ALWAYS pending.tenantIdReserved, resolved exclusively from THIS
+//     caller's own pending-signup cookie -- never accepted from the
+//     request body.
+//   - no client tenantId authority: this action's request body is never
+//     read for anything at all.
+async function finalizeRegistration(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const allowed = await enforceRateLimit(req, res, `finalize-registration:${clientIp(req)}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
+
+  const pending = await requirePendingSignup(req, res)
+  if (!pending) return
+
+  if (pending.status === 'completed') {
+    return res.status(409).json({ error: 'already_completed', message: 'This registration has already been completed. Please sign in.' })
+  }
+  // 'creating_tenant' is allowed through (not rejected here) so a
+  // concurrent/retried call safely reaches createTenantForVerifiedRegistration()'s
+  // own lock, which is the actual, already-reviewed source of truth for
+  // "is another attempt for this exact registration in progress" --
+  // rejecting it here too would just duplicate that check with a less
+  // precise error.
+  if (pending.status !== 'verified_awaiting_plan' && pending.status !== 'creating_tenant') {
+    return res.status(409).json({ error: 'invalid_state', message: 'This registration is not ready to finalize.' })
+  }
+
+  const tenantId = pending.tenantIdReserved
+  let billingRecord
+  try {
+    billingRecord = await getBillingRecord(tenantId)
+  } catch (err) {
+    if (err instanceof BillingStoreUnavailableError) {
+      console.error(`[session/finalize-registration] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+  if (!billingRecord?.defaultPaymentMethodId || !billingRecord?.pendingPaidPlan) {
+    return res.status(409).json({ error: 'billing_not_ready', message: 'Your payment method has not been confirmed yet. Please try again in a moment.' })
+  }
+
+  const { commercial, trialEligibility } = buildSelfServicePendingActivationCommercial()
+
+  try {
+    const { tenantId: createdTenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, commercial, null, trialEligibility)
+    await appendAuditEntry(createdTenantId, {
+      actorId: userRecord.userId, actorEmail: userRecord.email, ip: clientIp(req),
+      action: 'tenant.created_via_self_service_billing', entity: 'tenant', entityId: createdTenantId,
+      result: 'success',
+      message: `Tenant created via self-service signup (post-trial plan: ${billingRecord.pendingPaidPlan}).`,
+    })
+    return issueRealSessionAndRespond(res, userRecord, createdTenantId)
+  } catch (err) {
+    if (err instanceof EmailNowOccupiedError) {
+      return res.status(409).json({ error: 'email_occupied', message: err.message })
+    }
+    if (err instanceof TenantCreationInProgressError) {
+      return res.status(409).json({ error: 'creation_in_progress', message: err.message })
+    }
+    if (err instanceof PendingRegistrationNotFoundError) {
+      return res.status(404).json({ error: 'not_found', message: err.message })
+    }
+    throw err
+  }
+}
+
+// POST /api/session/stripe-webhook
+//
+// Phase B.11 -- the smallest webhook surface strictly required for Setup
+// completion (per Stripe's own documented save-and-reuse flow: handle
+// checkout.session.completed, retrieve the SetupIntent it created, read
+// its payment_method). Added as one more dispatch case on this ALREADY
+// top-level-function-budgeted file rather than a new api/ route file --
+// this project is deliberately kept at/under a 10-function headroom target
+// below Vercel Hobby's 12-function ceiling (test_vercel_function_budget.js),
+// and this file's handler() dispatches purely on req.query.action (never
+// req.body) with zero shared pre-dispatch body access, so adding this case
+// here costs nothing against that budget and introduces no risk to raw-body
+// integrity for this or any other action in this file.
+//
+// RAW BODY, non-negotiable: Stripe signature verification requires the
+// EXACT bytes as sent, never a re-parsed-then-re-stringified copy. Vercel's
+// Node function request.body is a LAZILY-COMPUTED getter (per Vercel's own
+// docs) -- as long as this function (and everything it calls) NEVER reads
+// req.body, the underlying request stream is untouched and safe to consume
+// manually via async iteration, which is exactly what collectRawBody() does,
+// FIRST, before anything else. This is the standard, documented pattern for
+// Stripe webhooks on this exact (request, response) Vercel Node function
+// shape. NOTE: this reasoning has not been verified against a live deployed
+// instance in this engagement (deployment is out of scope) -- a real
+// Stripe-CLI-triggered test-mode webhook against a preview deployment
+// should be run once B.11 is deployed, before B.12 depends on this path.
+//
+// AUTHORITY: this handler's ONLY effect is projecting a saved payment
+// method (defaultPaymentMethodId) onto the ALREADY-existing billing
+// record. It NEVER touches tenant_config.commercial, never starts/extends
+// a PRYOR trial, and never creates a Subscription -- see this file's own
+// assertions in tests/test_stripe_webhook.js.
+async function collectRawBody(req) {
+  const chunks = []
+  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  return Buffer.concat(chunks)
+}
+
+async function stripeWebhookAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  let rawBody
+  try {
+    rawBody = await collectRawBody(req)
+  } catch (err) {
+    console.error(`[session/stripe-webhook] failed to read raw request body: ${err.message}`)
+    return res.status(400).json({ error: 'invalid_request' })
+  }
+
+  const signature = req.headers['stripe-signature']
+  if (!signature || !process.env.STRIPE_WEBHOOK_SECRET) {
+    return res.status(400).json({ error: 'invalid_request' })
+  }
+
+  let stripe
+  try {
+    stripe = getStripeClient()
+  } catch (err) {
+    if (err instanceof StripeNotConfiguredError) {
+      console.error(`[session/stripe-webhook] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable' })
+    }
+    throw err
+  }
+
+  let event
+  try {
+    event = stripe.webhooks.constructEvent(rawBody, signature, process.env.STRIPE_WEBHOOK_SECRET)
+  } catch (err) {
+    console.error(`[session/stripe-webhook] signature verification failed: ${err.message}`)
+    return res.status(400).json({ error: 'invalid_signature' })
+  }
+
+  // Only checkout.session.completed, and only for a setup-mode session, is
+  // handled in B.11 -- every other event type is acknowledged (200) but
+  // otherwise ignored, per this phase's explicit "only implement the
+  // event(s) strictly required" instruction.
+  if (event.type !== 'checkout.session.completed') {
+    return res.status(200).json({ received: true })
+  }
+  const session = event.data.object
+  if (session.mode !== 'setup') {
+    return res.status(200).json({ received: true })
+  }
+
+  const stripeCustomerId = typeof session.customer === 'string' ? session.customer : session.customer?.id ?? null
+  // Phase B.11 pre-commit correction (Part 6) -- structural validation
+  // before this id is trusted for anything (index lookup included).
+  if (!isValidStripeCustomerId(stripeCustomerId)) {
+    console.error(`[session/stripe-webhook] checkout.session.completed carried a malformed customer id -- acknowledging without processing`)
+    return res.status(200).json({ received: true })
+  }
+  // The reverse index is authoritative -- session.metadata.tenantId (set by
+  // THIS codebase at Checkout Session creation) is cross-check information
+  // only, never trusted alone, per B.10/B.11's own metadata discipline.
+  const tenantId = stripeCustomerId ? await getTenantIdForCustomer(stripeCustomerId) : null
+  if (!tenantId) {
+    console.error(`[session/stripe-webhook] checkout.session.completed for an unrecognized Stripe customer -- acknowledging without processing`)
+    return res.status(200).json({ received: true })
+  }
+  if (session.metadata?.tenantId && session.metadata.tenantId !== tenantId) {
+    console.error(`[session/stripe-webhook] metadata/tenantId mismatch on event ${event.id} -- the reverse index is authoritative; metadata is treated as a security anomaly and ignored`)
+  }
+
+  let claim
+  try {
+    claim = await claimStripeEvent({
+      eventId: event.id, eventType: event.type, stripeCreatedAt: event.created,
+      providerObjectId: stripeCustomerId, tenantId,
+    })
+  } catch (err) {
+    // Transient (billing store unreachable, etc.) -- nothing was claimed,
+    // so there is no ledger state to protect. Retryable.
+    console.error(`[session/stripe-webhook] failed to claim event ${event.id}: ${err.message}`)
+    return res.status(503).json({ error: 'service_unavailable' })
+  }
+  if (!claim.claimed) {
+    if (claim.reason === 'already_processed') {
+      // The ONLY case that is genuinely, durably done -- reapplying would
+      // be a no-op at best and a double-application risk at worst.
+      return res.status(200).json({ received: true })
+    }
+    // claim.reason === 'lease_active' -- Phase B.11 final pre-commit
+    // correction (webhook delivery semantics). Another worker currently
+    // holds this event's processing lease. Returning 200 here would be a
+    // FALSE acknowledgement: Worker A (the lease holder) could still crash
+    // before finalizing, in which case Stripe would believe delivery
+    // already succeeded (because Worker B answered 200) and would never
+    // redeliver -- permanently stranding an event whose billing fact was
+    // never actually applied. Returning a retryable non-2xx instead costs
+    // nothing (Stripe redelivers on its own backoff schedule) and
+    // preserves at-least-once delivery: by the time the redelivery lands,
+    // Worker A has either finished (next claim sees 'already_processed' ->
+    // 200) or its 120s lease has expired (next claim reclaims and actually
+    // processes it). The ledger is NOT mutated here -- ownership stays with
+    // whichever worker currently holds the lease.
+    console.error(`[session/stripe-webhook] event ${event.id} is currently owned by another in-flight delivery -- returning retryable response rather than a false acknowledgement`)
+    return res.status(503).json({ error: 'processing_in_progress' })
   }
 
   try {
-    await createCheckoutSession(PLANS[plan], pending.email)
-    // Unreachable today (createCheckoutSession always throws) -- kept so
-    // Phase 4Q.2 only has to change paymentProvider.js's implementation,
-    // not this action's shape.
-    return res.status(200).json({ error: 'not_implemented' })
-  } catch (err) {
-    if (err instanceof PaymentNotConfiguredError) {
-      return res.status(503).json({
-        error: 'checkout_not_available',
-        message: 'Plan checkout isn\'t available yet. Use an access code, or contact sales to get started.',
-      })
+    // Phase B.11 pre-commit correction (Part 6) -- harden Setup completion
+    // validation. Every fact below is verified BEFORE anything is
+    // persisted; Stripe's own documented Setup flow is followed
+    // explicitly, never assumed. A DETERMINISTIC anomaly (one that would
+    // observe the identical result on any redelivery of this same
+    // immutable event) is terminal: marked processed, never failed, and
+    // never results in a payment method being recorded. A fact that could
+    // legitimately still be resolving (see setup_intent_status handling
+    // below) is instead marked failed/retryable, never processed.
+    const setupIntentId = typeof session.setup_intent === 'string' ? session.setup_intent : session.setup_intent?.id ?? null
+    if (!setupIntentId) {
+      console.error(`[session/stripe-webhook] checkout.session.completed for tenant ${tenantId} carried no setup_intent -- acknowledging, not processing`)
+      await markStripeEventProcessed(event.id, claim.processingToken, 'no_setup_intent')
+      return res.status(200).json({ received: true })
     }
-    throw err
+
+    // Retrieval failure here (timeout, Stripe SDK connection error, Stripe
+    // 429/5xx) throws and is caught by this try's own catch below, which
+    // marks the event failed (token-checked, retryable) and returns a
+    // retryable 5xx -- it is NOT a deterministic anomaly about the event
+    // itself, so it must never be marked processed.
+    const setupIntent = await stripe.setupIntents.retrieve(setupIntentId)
+    if (!setupIntent) {
+      console.error(`[session/stripe-webhook] SetupIntent ${setupIntentId} could not be retrieved for tenant ${tenantId} -- acknowledging, not processing`)
+      await markStripeEventProcessed(event.id, claim.processingToken, 'setup_intent_not_found')
+      return res.status(200).json({ received: true })
+    }
+    // Only a genuinely SUCCEEDED SetupIntent proves a payment method was
+    // saved. Phase B.11 final pre-commit correction (Part 8): Stripe's own
+    // documented Checkout Session contract states the session's `status`
+    // can already be `complete` (which is what drives this event) while
+    // "payment processing may still be in progress" -- this is NOT
+    // guaranteed synchronous even for a card-only Setup-mode session, so a
+    // non-succeeded status here is not necessarily a dead end. `canceled`
+    // is the one status that is genuinely terminal (a canceled SetupIntent
+    // cannot later become succeeded) and is treated as a deterministic
+    // rejection. Every other non-succeeded status (processing,
+    // requires_action, requires_payment_method, requires_confirmation) MAY
+    // still resolve to succeeded, but this handler does not subscribe to
+    // setup_intent.succeeded/updated, so it cannot observe that later
+    // transition on its own -- instead it marks the event FAILED
+    // (retryable, token-checked) so Stripe's own webhook retry schedule
+    // redelivers the SAME checkout.session.completed event, at which point
+    // the SetupIntent is re-fetched fresh and may by then have reached its
+    // true terminal state. This never strands a legitimate signup behind a
+    // permanently-processed "not succeeded yet" result.
+    if (setupIntent.status === 'canceled') {
+      console.error(`[session/stripe-webhook] SetupIntent ${setupIntentId} for tenant ${tenantId} is canceled -- terminal, acknowledging without processing`)
+      await markStripeEventProcessed(event.id, claim.processingToken, 'setup_intent_canceled')
+      return res.status(200).json({ received: true })
+    }
+    if (setupIntent.status !== 'succeeded') {
+      console.error(`[session/stripe-webhook] SetupIntent ${setupIntentId} for tenant ${tenantId} has status ${JSON.stringify(setupIntent.status)}, not yet 'succeeded' -- marking failed/retryable, not processed`)
+      await markStripeEventFailed(event.id, claim.processingToken, `setup_intent_status_${setupIntent.status}`)
+      return res.status(503).json({ error: 'setup_not_yet_complete' })
+    }
+    const setupIntentCustomerId = typeof setupIntent.customer === 'string' ? setupIntent.customer : setupIntent.customer?.id ?? null
+    if (setupIntentCustomerId !== stripeCustomerId) {
+      console.error(`[session/stripe-webhook] SetupIntent ${setupIntentId}'s own customer does not match the Checkout Session's customer for tenant ${tenantId} -- treating as a security anomaly, acknowledging without processing`)
+      await markStripeEventProcessed(event.id, claim.processingToken, 'setup_intent_customer_mismatch')
+      return res.status(200).json({ received: true })
+    }
+    const paymentMethodId = typeof setupIntent.payment_method === 'string' ? setupIntent.payment_method : setupIntent.payment_method?.id ?? null
+    if (!isValidStripePaymentMethodId(paymentMethodId) || paymentMethodId === null) {
+      console.error(`[session/stripe-webhook] SetupIntent ${setupIntentId} for tenant ${tenantId} succeeded but carried no valid payment_method -- acknowledging, not processing`)
+      await markStripeEventProcessed(event.id, claim.processingToken, 'setup_intent_missing_payment_method')
+      return res.status(200).json({ received: true })
+    }
+
+    // Phase B.11 final pre-commit correction (Part 6) -- a missing billing
+    // record here is a structural anomaly, not an expected race: the
+    // reverse index that resolved `tenantId` above is only ever claimed
+    // AFTER the billing record already exists (billingCustomer.js's
+    // ensureStripeCustomerForTenant() creates the record, then the
+    // Customer, then claims the index -- see that file's own header).
+    // Silently acknowledging success here would falsely mark this event
+    // processed while the payment method was never actually recorded
+    // anywhere. Throwing routes this into the catch below: marked failed
+    // (retryable) and a 5xx, never a false 200.
+    const billingRecord = await getBillingRecord(tenantId)
+    if (!billingRecord) {
+      throw new Error(`no billing record exists for tenant ${JSON.stringify(tenantId)} despite a resolved customer index -- refusing to acknowledge a payment method that was never recorded`)
+    }
+
+    try {
+      await updateBillingRecord(tenantId, { defaultPaymentMethodId: paymentMethodId }, { expectedVersion: billingRecord.version })
+    } catch (err) {
+      if (err instanceof BillingVersionConflictError) {
+        // Phase B.11 final pre-commit correction (Part 5) -- re-read
+        // instead of blindly retrying/failing. If the exact desired
+        // projection is ALREADY present (e.g. a concurrent redelivery of
+        // this SAME event, or a legitimate concurrent billing write that
+        // happened to also carry this fact), the operation is idempotently
+        // satisfied -- processed/200, not a false failure. If the current
+        // record does NOT already reflect this payment method, some OTHER
+        // concurrent legitimate mutation raced this write; that is a
+        // genuine, retryable conflict, never a false success.
+        if (err.currentRecord?.defaultPaymentMethodId === paymentMethodId) {
+          await markStripeEventProcessed(event.id, claim.processingToken, 'setup_completed_already_applied')
+          return res.status(200).json({ received: true })
+        }
+        throw err
+      }
+      throw err
+    }
+
+    await markStripeEventProcessed(event.id, claim.processingToken, 'setup_completed')
+    return res.status(200).json({ received: true })
+  } catch (err) {
+    // Every path that reaches here (SetupIntent retrieval timeout/network
+    // failure, Stripe 429/5xx, billing-store outage, an unresolved CAS
+    // conflict, the missing-billing-record anomaly above, or any other
+    // unexpected exception) is treated identically: a genuine transient or
+    // unresolved failure to apply the projection, NEVER a false success.
+    // markStripeEventFailed() is token-checked -- if this worker's lease
+    // was itself already superseded (StaleProcessingTokenError), the
+    // best-effort catch below simply lets a newer worker's own outcome
+    // stand; either way Stripe still receives a retryable 5xx here so it
+    // redelivers.
+    try {
+      await markStripeEventFailed(event.id, claim.processingToken, String(err.message ?? 'error').slice(0, 200))
+    } catch { /* best-effort -- the outer 500 below still triggers a Stripe retry regardless */ }
+    console.error(`[session/stripe-webhook] failed to apply setup completion for tenant ${tenantId}: ${err.message}`)
+    return res.status(500).json({ error: 'processing_failed' })
   }
 }
 
@@ -1443,6 +1934,8 @@ export default async function handler(req, res) {
     case 'get-started-status':     return getStartedStatus(req, res)
     case 'redeem-access-code':     return redeemAccessCodeAction(req, res)
     case 'select-plan':            return selectPlan(req, res)
+    case 'finalize-registration':  return finalizeRegistration(req, res)
+    case 'stripe-webhook':         return stripeWebhookAction(req, res)
     default:                 return res.status(404).json({ error: 'not_found' })
   }
 }
