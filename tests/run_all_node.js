@@ -173,6 +173,9 @@ const TESTS = [
   // Preview Infrastructure Isolation -- tenant lifecycle dispatch must
   // never let a Preview deployment execute against Production secrets.
   'test_preview_lifecycle_isolation.js',
+  // B.11.5 -- independent, end-to-end synthetic-tenant onboarding
+  // reliability test (register -> ... -> trial start -> entitlements).
+  'test_b11_5_synthetic_onboarding_reliability.js',
 ]
 
 const results = {}
