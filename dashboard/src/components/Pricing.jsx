@@ -6,9 +6,16 @@ import AuthShell, { ErrorBanner, PrimaryButton } from './auth/AuthShell.jsx'
 // -- this page must never claim success. Every plan click surfaces the
 // SAME honest "checkout isn't available yet" message; no tenant is ever
 // created from this page in 4Q.1.
+// Phase B.10 -- corrected stale display price: Growth is $249/month (see
+// dashboard/api/_lib/plans.js's own Phase B.2 pre-commit correction
+// comment), not the pre-Phase-B $349 this page still showed. This page has
+// no live checkout yet (see the comment above) so nothing was ever
+// mischarged -- this is a display-only fix, so the eventual real Checkout
+// (B.11+) never has to reconcile a price shown here against a different
+// price actually charged.
 const PLAN_DISPLAY = [
   { id: 'core', name: 'Core', price: '$149', period: '/mo' },
-  { id: 'growth', name: 'Growth', price: '$349', period: '/mo' },
+  { id: 'growth', name: 'Growth', price: '$249', period: '/mo' },
   { id: 'enterprise', name: 'Enterprise', price: 'Contact Sales', period: '' },
 ]
 

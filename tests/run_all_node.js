@@ -153,6 +153,13 @@ const TESTS = [
   'test_google_sync_freshness.js',
   // Vercel Serverless Function Count Reduction
   'test_vercel_function_budget.js',
+  // Phase B.10 -- Stripe SDK + Billing Store Foundation
+  'test_stripe_client.js',
+  'test_billing_store.js',
+  'test_billing_status_projection.js',
+  'test_stripe_price_map.js',
+  'test_billing_portal_policy.js',
+  'test_billing_foundation_compat.js',
 ]
 
 const results = {}
