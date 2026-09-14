@@ -139,6 +139,7 @@ const TESTS = [
   'test_access_code_store.js',
   'test_registration.js',
   'test_tenant_creation_from_registration.js',
+  'test_access_code_commercial_modernization.js',
   'test_prevent_shadow_tenant_creation.js',
   'test_tenant_creation_callers.js',
   'test_admin_access_codes_endpoint.js',

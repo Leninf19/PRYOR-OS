@@ -226,12 +226,17 @@ const LOCATION_A = 1
 const TEST_GENERATION = 'gen-1'
 
 function fakeRes() {
-  const res = { statusCode: null, body: null, headers: {} }
+  const res = { statusCode: null, body: null, headers: {}, redirectedTo: null }
   res.status = (code) => { res.statusCode = code; return res }
   res.json = (obj) => { res.body = obj; return res }
   res.send = (str) => { res.body = str; return res }
   res.setHeader = (name, value) => { res.headers[name] = value; return res }
   res.getHeader = (name) => res.headers[name]
+  // auth()'s SUCCESS path (a real OAuth redirect to Google) calls this --
+  // needed so a test proving "not denied" for a class that allows
+  // INTEGRATION_EXPANSION doesn't crash before ever reaching the
+  // commercial check's own res.status()/res.send() denial path.
+  res.redirect = (code, url) => { res.statusCode = code; res.redirectedTo = url; return res }
   return res
 }
 
@@ -591,6 +596,48 @@ function testConnectAndSyncAreStructurallyClassifiedDifferently() {
   assert(!importFn[0].includes('CommercialOperationClass.INTEGRATION_EXPANSION'), 'triggerImport() must never be classified INTEGRATION_EXPANSION (would wrongly deny past_due)')
 }
 
+// ===========================================================================
+// Phase B.8 final pre-commit correction -- 'trial_pending_activation'
+// (an access-code trial grant awaiting its first successful initial sync)
+// must ALLOW exactly the onboarding actions it needs (Google connect,
+// discover-locations) and DENY everything else product-related (publish,
+// content creation), reusing this file's existing fully-provisioned
+// tenant fixture (credential + location catalog already set up by
+// provisionTenant()) -- only the commercial status changes.
+// ===========================================================================
+
+async function testGooglePublishDeniedDuringPendingActivation() {
+  setupFixtures()
+  const token = await provisionTenant()
+  await setCommercialStatus('trial_pending_activation', { planSource: 'access_code_trial', accessCodeHash: 'h', paymentRequired: false })
+  globalThis.fetch = async (url) => { throw new Error(`unexpected Google network call during a pending-activation-denied publish: ${url}`) }
+  const res = await invokeGoogle('publish', { method: 'POST', token, body: { reviewName: 'accounts/1/locations/1/reviews/review-1', replyText: 'Thanks!' } })
+  assert(res.statusCode === 403 && res.body.commercialStatus === 'trial_pending_activation',
+    `Google publish must be denied (zero Google traffic) during pending-trial activation, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+}
+
+async function testDiscoverLocationsAllowedDuringPendingActivation() {
+  setupFixtures()
+  const token = await provisionTenant()
+  await setCommercialStatus('trial_pending_activation', { planSource: 'access_code_trial', accessCodeHash: 'h', paymentRequired: false })
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('oauth2.googleapis.com/token')) return { ok: true, status: 200, json: async () => ({ access_token: 'tok', expires_in: 3600 }) }
+    return { ok: true, status: 200, json: async () => ({ accounts: [] }) }
+  }
+  const res = await invokeGoogle('discover-locations', { method: 'POST', token })
+  assert(res.statusCode !== 403, `discover-locations (required GBP onboarding) must remain allowed during pending-trial activation, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+}
+
+async function testGoogleConnectAllowedDuringPendingActivation() {
+  setupFixtures()
+  const token = await provisionTenant()
+  await setCommercialStatus('trial_pending_activation', { planSource: 'access_code_trial', accessCodeHash: 'h', paymentRequired: false })
+  const req = { method: 'GET', query: { action: 'auth' }, body: {}, headers: { cookie: `${SESSION_COOKIE}=${token}`, host: 'app.example.com' }, socket: { remoteAddress: '127.0.0.1' } }
+  const res = fakeRes()
+  await googleHandler(req, res)
+  assert(res.statusCode !== 403, `Google connect/reconnect (required onboarding) must remain allowed during pending-trial activation, got ${res.statusCode}: ${res.body}`)
+}
+
 async function testDiscoverLocationsAllowedForActive() {
   setupFixtures()
   const token = await provisionTenant()
@@ -839,6 +886,19 @@ async function seedContentQuotaTenant(commercial) {
   const campaignRes = await invokeContent('upsert-campaign', { method: 'POST', token, body: { name: 'Quota Test Campaign', locationIds: '*' } })
   assert(campaignRes.statusCode === 201, `sanity: campaign setup must succeed, got ${campaignRes.statusCode}: ${JSON.stringify(campaignRes.body)}`)
   return { token, campaignId: campaignRes.body.campaign.id }
+}
+
+async function testCreateTextAssetDeniedDuringPendingActivation() {
+  setupFixtures()
+  // Set up the campaign while genuinely active (upsert-campaign is itself
+  // OPERATIONAL_WRITE, denied during pending activation -- setup must
+  // happen before flipping status, exactly like every other "corrupt
+  // status after setup" test in this file).
+  const { token, campaignId } = await seedContentQuotaTenant(newShapeCommercial({ plan: 'growth' }))
+  const existing = await getTenantConfig(TENANT)
+  await upsertTenantConfig(TENANT, { commercial: newShapeCommercial({ commercialStatus: 'trial_pending_activation', plan: 'growth', planSource: 'access_code_trial', accessCodeHash: 'h', paymentRequired: false }) }, { expectedVersion: existing.configVersion })
+  const res = await invokeContent('create-text-asset', { method: 'POST', token, body: { campaignId, captionText: 'Should be denied before activation' } })
+  assert(res.statusCode === 403, `create-text-asset must be denied during pending-trial activation (zero AI/storage/content consumption before activation), got ${res.statusCode}: ${JSON.stringify(res.body)}`)
 }
 
 async function testCreateTextAssetDeniedAtCommercialAssetCountCeiling() {
@@ -1206,6 +1266,9 @@ const tests = [
   ['google connect/reconnect denied for past_due (INTEGRATION_EXPANSION)', testGoogleConnectDeniedForPastDue],
   ['google connect/reconnect denied for suspended', testGoogleConnectDeniedForSuspended],
   ['connect/reconnect and sync/import are structurally classified differently', testConnectAndSyncAreStructurallyClassifiedDifferently],
+  ['Google publish denied during pending-trial activation (zero Google traffic)', testGooglePublishDeniedDuringPendingActivation],
+  ['discover-locations allowed during pending-trial activation (required onboarding)', testDiscoverLocationsAllowedDuringPendingActivation],
+  ['Google connect/reconnect allowed during pending-trial activation (required onboarding)', testGoogleConnectAllowedDuringPendingActivation],
 
   // --- Part 4: location capacity expansion ---
   ['recordLocationApproval denies an addition while past_due', testRecordLocationApprovalDeniesAdditionWhilePastDue],
@@ -1234,6 +1297,7 @@ const tests = [
   ['upsert-campaign allowed while active', testUpsertCampaignAllowedWhileActive],
 
   // --- Part 8b: content non-upload storage-quota bypass (pre-commit correction #4) ---
+  ['create-text-asset denied during pending-trial activation', testCreateTextAssetDeniedDuringPendingActivation],
   ['create-text-asset denied at the commercial asset-count ceiling', testCreateTextAssetDeniedAtCommercialAssetCountCeiling],
   ['create-text-asset allowed under the ceiling', testCreateTextAssetAllowedUnderCeiling],
   ['create-text-asset resolver failure fails closed (0/0), denies the very first caption', testCreateTextAssetResolverFailureFailsClosed],

@@ -88,6 +88,12 @@ const SELF_SERVICE_TENANT_ID_PATTERN = /^t_[a-z0-9-]*-[a-z0-9]{6}$/
  * @param {object} [params.commercial] - plain descriptive commercial/
  *   billing metadata (tenantConfigStore.js's `commercial` field) -- never
  *   consulted by any authorization check.
+ * @param {object} [params.accessCodeGrant] - Phase B.8: a PENDING
+ *   access-code trial grant (accessCodeCommercial.js's
+ *   buildAccessCodeCommercialWrite() Case 2 output) written alongside a
+ *   null `commercial` -- see trialLifecycle.js's maybeStartAccessCodeTrial()
+ *   for the lazy activation that later converts this into real commercial
+ *   state. Always null for every non-access-code caller.
  * @param {string} [params.createdByType] - 'user'|'admin'|'system' (provenance only)
  * @param {string} [params.createdByActorId] - provenance only
  * @returns {Promise<{tenantId: string, userRecord: object}>}
@@ -95,7 +101,7 @@ const SELF_SERVICE_TENANT_ID_PATTERN = /^t_[a-z0-9-]*-[a-z0-9]{6}$/
 export async function createNewTenant({
   mode, tenantIdOverride, reservedTenantId, companyName,
   ownerEmail, ownerUserId, ownerPasswordHash, ownerDisplayName, ownerPasswordSetAt,
-  commercial = null, createdByType = null, createdByActorId = null,
+  commercial = null, accessCodeGrant = null, createdByType = null, createdByActorId = null,
 }) {
   if (!Object.values(TenantCreationMode).includes(mode)) {
     throw new TenantCreationModeRequiredError(`createNewTenant: mode is required and must be one of ${Object.values(TenantCreationMode).join(', ')} -- got ${JSON.stringify(mode)}`)
@@ -175,7 +181,7 @@ export async function createNewTenant({
     // recordLocationApproval()'s own defensive, non-attacker-reachable
     // allowCreate use) permitted to pass allowCreate: true. creationSource
     // is exactly `mode` -- the two enums are deliberately identical sets.
-    await upsertTenantConfig(tenantId, { displayName: companyName ?? tenantId, commercial }, {
+    await upsertTenantConfig(tenantId, { displayName: companyName ?? tenantId, commercial, accessCodeGrant }, {
       allowCreate: true, creationSource: mode, createdByType, createdByActorId,
     })
   }

@@ -50,7 +50,7 @@
 //     "unlimited."
 
 import {
-  isValidPlanId, PLAN_ENTITLEMENTS, TRIAL_ENTITLEMENTS, FEATURE_KEYS, clampToSafetyCeiling,
+  isValidPlanId, PLAN_ENTITLEMENTS, TRIAL_ENTITLEMENTS, TRIAL_LIMITS, FEATURE_KEYS, clampToSafetyCeiling,
 } from './planEntitlements.js'
 
 // Writable commercial statuses -- the only values a real commercial-state
@@ -61,7 +61,16 @@ import {
 // nothing in this codebase can produce it yet (no billing signal exists),
 // and no production admin endpoint is added in this phase solely to
 // simulate it (tests construct it via direct store/fixture setup instead).
-export const COMMERCIAL_STATUSES = Object.freeze(['trial', 'active', 'past_due', 'suspended', 'canceled'])
+//
+// 'trial_pending_activation' (Phase B.8 pre-commit correction) is the ONE
+// exception to "no production writer exists yet": accessCodeCommercial.js's
+// buildAccessCodeCommercialWrite() writes it immediately, at tenant-creation
+// time, for an access-code trial grant -- see this file's own comment on
+// PENDING_ACTIVATION_LIMITS below for why. It is the ONLY status this
+// resolver ever transitions OUT OF via a dedicated activation function
+// (trialLifecycle.js's maybeStartAccessCodeTrial()) rather than staying
+// fixed until an external billing signal changes it.
+export const COMMERCIAL_STATUSES = Object.freeze(['trial', 'active', 'past_due', 'suspended', 'canceled', 'trial_pending_activation'])
 
 // Resolver-OUTPUT-ONLY sentinel statuses -- NEVER legal to write into
 // tenant_config.commercial.commercialStatus; only ever produced by
@@ -132,6 +141,23 @@ function unenforcedLimits() {
     maxLocations: null, maxActiveUsers: null,
     storageBytes: null, assetCount: null,
     aiAllowanceMonthly: Object.freeze({ usageUnits: null }),
+  })
+}
+
+// Phase B.8 pre-commit correction -- 'trial_pending_activation' limits.
+// Numeric onboarding capacity (maxLocations/maxActiveUsers) reuses the SAME
+// TRIAL_LIMITS values a normal trial would eventually get (Part 1's own
+// "Numeric onboarding capacity may use the existing Trial safety limits"
+// instruction) -- enough to connect Google, discover locations, and
+// approve the tenant's first location. Every cost-relevant limit
+// (storageBytes/assetCount/aiAllowanceMonthly) is zeroed: this state must
+// never grant real product usage, only onboarding capability. NEVER
+// unenforced (null) -- this is an ACTIVE restriction, not a bypassed one.
+function pendingActivationLimits() {
+  return Object.freeze({
+    maxLocations: TRIAL_LIMITS.maxLocations, maxActiveUsers: TRIAL_LIMITS.maxActiveUsers,
+    storageBytes: 0, assetCount: 0,
+    aiAllowanceMonthly: Object.freeze({ usageUnits: 0 }),
   })
 }
 
@@ -227,6 +253,14 @@ function resolveNewShapeCommercial(commercial) {
   // which collapses to 'suspended' above) remain fully denied here --
   // unchanged from B.2/B.3/B.4/B.5's existing, already-tested behavior.
   const isPastDue = effectiveStatus === 'past_due'
+  // Phase B.8 pre-commit correction -- see COMMERCIAL_STATUSES's own
+  // comment and pendingActivationLimits()'s header. Deliberately checked
+  // and handled BEFORE the writesAllowed ternary below: this status is
+  // neither "full real access" (isActive/isTrialing/isPastDue) nor
+  // "deny-all" (suspended/canceled/zeroLimits) -- it is its own explicit,
+  // THIRD shape (bounded onboarding capacity, zero cost-relevant capacity),
+  // so it must never fall through either branch of that ternary.
+  const isPendingActivation = effectiveStatus === 'trial_pending_activation'
 
   const base = isTrialing ? TRIAL_ENTITLEMENTS : PLAN_ENTITLEMENTS[commercial.plan]
 
@@ -247,17 +281,23 @@ function resolveNewShapeCommercial(commercial) {
   // 'past_due' grant real features/limits. Only 'suspended'/'canceled' (or
   // a just-computed trial_expired->suspended) collapse to deny-all --
   // WITHOUT changing `plan`/`effectivePlan` (an owner should see "you're on
-  // Growth, suspended," never "you have no plan").
-  const writesAllowed = isActive || isTrialing || isPastDue
-  const limits = writesAllowed ? planLimits : zeroLimits()
-  const features = writesAllowed ? base.features : denyAllFeatures()
-
-  let reason
-  if (trialExpired) reason = 'trial_expired'
-  else if (isActive) reason = 'active_plan'
-  else if (isTrialing) reason = 'trial_active'
-  else if (isPastDue) reason = 'past_due_grace'
-  else reason = effectiveStatus // suspended / canceled
+  // Growth, suspended," never "you have no plan"). 'trial_pending_activation'
+  // (Phase B.8) is its own explicit third case, handled first.
+  let limits, features, reason
+  if (isPendingActivation) {
+    limits = pendingActivationLimits()
+    features = denyAllFeatures()
+    reason = 'trial_pending_activation'
+  } else {
+    const writesAllowed = isActive || isTrialing || isPastDue
+    limits = writesAllowed ? planLimits : zeroLimits()
+    features = writesAllowed ? base.features : denyAllFeatures()
+    if (trialExpired) reason = 'trial_expired'
+    else if (isActive) reason = 'active_plan'
+    else if (isTrialing) reason = 'trial_active'
+    else if (isPastDue) reason = 'past_due_grace'
+    else reason = effectiveStatus // suspended / canceled
+  }
 
   // Phase B.6: `trialStatus` must be TIME-AUTHORITATIVE, not a passthrough
   // of the raw stored value -- a trial past its trialEndsAt is EFFECTIVELY

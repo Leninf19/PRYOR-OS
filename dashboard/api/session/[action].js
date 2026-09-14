@@ -23,7 +23,7 @@ import { getTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvi
 import { resolveTenantEntitlements } from '../_lib/entitlements.js'
 import { resolveTenantEntitlementsFromConfig } from '../_lib/entitlementResolution.js'
 import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
-import { maybeStartTrial } from '../_lib/trialLifecycle.js'
+import { maybeStartTrial, maybeStartAccessCodeTrial } from '../_lib/trialLifecycle.js'
 import {
   createNewTenant, TenantCreationMode, TenantCreationModeRequiredError,
   IdentityAlreadyExistsError, TenantAlreadyExistsError,
@@ -46,7 +46,11 @@ import {
 import {
   signPendingSignupToken, verifyPendingSignupToken, PENDING_SIGNUP_COOKIE, PENDING_SIGNUP_TTL_SECONDS,
 } from '../_lib/pendingSignupSession.js'
-import { redeemAccessCode, AccessCodeInvalidError, AccessCodeRestrictedError, AccessCodeStoreUnavailableError } from '../_lib/accessCodeStore.js'
+import {
+  redeemAccessCode, previewAccessCode, getAccessCodeRedemptionClaim, clearAccessCodeRedemptionClaim,
+  AccessCodeInvalidError, AccessCodeRestrictedError, AccessCodeStoreUnavailableError,
+} from '../_lib/accessCodeStore.js'
+import { buildAccessCodeCommercialWrite, PaymentRequiredNotSupportedError, InvalidAccessCodeGrantError } from '../_lib/accessCodeCommercial.js'
 import { PLANS, isValidPlanId } from '../_lib/plans.js'
 import { createCheckoutSession, PaymentNotConfiguredError } from '../_lib/paymentProvider.js'
 
@@ -316,6 +320,12 @@ async function tenantStatus(req, res) {
   // immediately rather than on the next poll.
   const configBeforeTrialCheck = config
   config = await maybeStartTrial(tenantId, config)
+  // Phase B.8 -- the access-code trial's own lazy activation, mutually
+  // exclusive with maybeStartTrial() above (a tenant has EITHER
+  // trialEligibility OR accessCodeGrant set, never both -- see
+  // trialLifecycle.js's own header). Chained the same way: a no-op unless
+  // this specific tenant has a pending access-code trial grant.
+  config = await maybeStartAccessCodeTrial(tenantId, config)
   const commercialForResponse = config === configBeforeTrialCheck ? commercial : toSafeCommercialView(resolveTenantEntitlementsFromConfig(config))
 
   return res.status(200).json({
@@ -1142,7 +1152,7 @@ async function getStartedStatus(req, res) {
 //   4. Delete the pending registration -- from this point on, the ONLY
 //      record of this identity is the real tenant_config/user pair.
 //   5. Release the lock (always, via finally).
-async function createTenantForVerifiedRegistration(email, commercial) {
+async function createTenantForVerifiedRegistration(email, commercial, accessCodeGrant = null) {
   const lockAcquired = await acquireTenantCreationLock(email)
   if (!lockAcquired) {
     throw new TenantCreationInProgressError('Your workspace is already being created. Please wait a moment and try again.')
@@ -1181,7 +1191,7 @@ async function createTenantForVerifiedRegistration(email, commercial) {
         companyName: fresh.companyName,
         ownerEmail: fresh.email, ownerUserId: fresh.userId, ownerPasswordHash: fresh.passwordHash,
         ownerDisplayName: fresh.displayName, ownerPasswordSetAt: fresh.createdAt,
-        commercial,
+        commercial, accessCodeGrant,
       }))
     } catch (err) {
       if (err instanceof IdentityAlreadyExistsError) {
@@ -1219,6 +1229,34 @@ async function issueRealSessionAndRespond(res, userRecord, tenantId) {
 // sends the raw code string and nothing else. tenantId/userId used for
 // redemption bookkeeping are the SAME server-derived values used for
 // tenant creation, never request input.
+//
+// Phase B.8 corrections:
+//   1. (Part E) previewAccessCode() -- a non-destructive peek -- runs
+//      FIRST. A paymentRequired: true code is rejected here, before the
+//      real, irreversible redeemAccessCode() atomic consume ever runs, so
+//      a code Stripe/billing cannot yet honor is never burned by a
+//      rejected attempt.
+//   2. (Part 2, final pre-commit correction) recovery is now keyed by the
+//      DURABLE accessCodeStore.js redemption-claim ledger (one Redis key
+//      per normalized email, written atomically inside REDEEM_SCRIPT
+//      itself, with its own 30-day TTL) -- NOT the pending-registration
+//      record's own `accessCodeRedemption` field, which this phase's
+//      earlier draft relied on. That field's storage is only as durable as
+//      the pending-registration record's own TTL, which is refreshed by
+//      ordinary registration activity but is NOT a genuine durability
+//      guarantee for an already-atomically-consumed access-code
+//      redemption slot -- if THAT record expired before tenant creation
+//      ever completed, the stored redemption result would be lost even
+//      though the code itself stayed permanently burned. The claim ledger
+//      is checked FIRST, before ever looking at the request body: if this
+//      email has already redeemed a code (whether in this exact request's
+//      earlier attempt, an earlier session, or even after re-registering
+//      the same email from scratch), that frozen result is used and
+//      redeemAccessCode() is never called again -- so a maxRedemptions: 1
+//      code can never be exhausted by a legitimate customer's own retry,
+//      no matter how long the underlying failure takes to recover from. A
+//      DIFFERENT registrant's email is a structurally different ledger
+//      key -- there is nothing to inherit or steal.
 async function redeemAccessCodeAction(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
 
@@ -1231,21 +1269,10 @@ async function redeemAccessCodeAction(req, res) {
   const secondAllowed = await enforceRateLimit(req, res, `redeem-access-code-identity:${pending.userId}`, { requestsPerWindow: 10, windowSeconds: 60 * 10 })
   if (!secondAllowed) return
 
-  const { code } = req.body ?? {}
-  if (typeof code !== 'string' || !code.trim()) {
-    return res.status(400).json({ error: 'invalid_request', message: 'An access code is required.' })
-  }
-
   let redemption
   try {
-    redemption = await redeemAccessCode({
-      rawCode: code.trim(), email: pending.email,
-      tenantId: pending.tenantIdReserved, userId: pending.userId,
-    })
+    redemption = await getAccessCodeRedemptionClaim(pending.email)
   } catch (err) {
-    if (err instanceof AccessCodeInvalidError || err instanceof AccessCodeRestrictedError) {
-      return res.status(400).json({ error: 'invalid_access_code', message: err.message })
-    }
     if (err instanceof AccessCodeStoreUnavailableError) {
       console.error(`[session/redeem-access-code] ${err.message}`)
       return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
@@ -1253,17 +1280,92 @@ async function redeemAccessCodeAction(req, res) {
     throw err
   }
 
+  if (!redemption) {
+    const { code } = req.body ?? {}
+    if (typeof code !== 'string' || !code.trim()) {
+      return res.status(400).json({ error: 'invalid_request', message: 'An access code is required.' })
+    }
+    const rawCode = code.trim()
+
+    let preview
+    try {
+      preview = await previewAccessCode({ rawCode, email: pending.email })
+    } catch (err) {
+      if (err instanceof AccessCodeInvalidError || err instanceof AccessCodeRestrictedError) {
+        return res.status(400).json({ error: 'invalid_access_code', message: err.message })
+      }
+      if (err instanceof AccessCodeStoreUnavailableError) {
+        console.error(`[session/redeem-access-code] ${err.message}`)
+        return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+      }
+      throw err
+    }
+
+    // Phase B.8 (Part E) -- checked on the PREVIEW, before any real
+    // consume. See accessCodeCommercial.js's own header for why rejection,
+    // not a fabricated 'pending_payment' status, is this phase's chosen
+    // smallest-safe behavior. A rejected paymentRequired code never
+    // reaches redeemAccessCode() at all, so redemptionCount is never
+    // touched.
+    if (preview.paymentRequired === true) {
+      return res.status(400).json({ error: 'payment_not_yet_supported', message: 'This access code requires payment, which is not yet supported. Please contact support.' })
+    }
+
+    try {
+      // redeemAccessCode() itself atomically writes the durable claim
+      // (accessCodeStore.js's REDEEM_SCRIPT) in the SAME operation that
+      // increments redemptionCount -- there is no window where one
+      // happens without the other.
+      redemption = await redeemAccessCode({
+        rawCode, email: pending.email,
+        tenantId: pending.tenantIdReserved, userId: pending.userId,
+      })
+    } catch (err) {
+      if (err instanceof AccessCodeInvalidError || err instanceof AccessCodeRestrictedError) {
+        return res.status(400).json({ error: 'invalid_access_code', message: err.message })
+      }
+      if (err instanceof AccessCodeStoreUnavailableError) {
+        console.error(`[session/redeem-access-code] ${err.message}`)
+        return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+      }
+      throw err
+    }
+  }
+
+  let commercial, accessCodeGrant
   try {
-    const { tenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, {
-      plan: redemption.plan,
-      source: 'access_code',
-      accessCodeHash: redemption.codeHash,
-      trialEndsAt: redemption.trialDays ? new Date(Date.now() + redemption.trialDays * 24 * 60 * 60 * 1000).toISOString() : null,
-    })
+    ;({ commercial, accessCodeGrant } = buildAccessCodeCommercialWrite(redemption))
+  } catch (err) {
+    if (err instanceof PaymentRequiredNotSupportedError) {
+      // Defensive only -- previewAccessCode() above already rejects
+      // paymentRequired: true before ever reaching a real redemption, so
+      // this should be unreachable for a fresh redemption. It remains
+      // reachable only for a durable claim recovered from BEFORE this
+      // phase's own correction (an old-shape/pre-fix claim) -- fail closed
+      // with the same stable error, never fabricate access.
+      return res.status(400).json({ error: 'payment_not_yet_supported', message: err.message })
+    }
+    if (err instanceof InvalidAccessCodeGrantError) {
+      console.error(`[session/redeem-access-code] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This access code could not be processed. Please contact support.' })
+    }
+    throw err
+  }
+
+  try {
+    const { tenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, commercial, accessCodeGrant)
+    // Best-effort -- see clearAccessCodeRedemptionClaim()'s own comment for
+    // why a failure here has no security consequence (createNewTenant()'s
+    // identity check already makes a genuine second tenant for this email
+    // impossible regardless).
+    await clearAccessCodeRedemptionClaim(pending.email)
     await appendAuditEntry(tenantId, {
       actorId: userRecord.userId, actorEmail: userRecord.email, ip: clientIp(req),
       action: 'tenant.created_via_access_code', entity: 'tenant', entityId: tenantId,
-      result: 'success', message: `Tenant created via access code (plan: ${redemption.plan}).`,
+      result: 'success',
+      message: accessCodeGrant
+        ? `Tenant created via access-code trial grant (plan: ${accessCodeGrant.plan}, trialDays: ${accessCodeGrant.trialDays}, pending activation).`
+        : `Tenant created via access code (plan: ${commercial.plan}).`,
     })
     return issueRealSessionAndRespond(res, userRecord, tenantId)
   } catch (err) {

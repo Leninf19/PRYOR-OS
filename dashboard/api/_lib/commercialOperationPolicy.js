@@ -143,15 +143,33 @@ export const CommercialOperationClass = Object.freeze({
 // = allowed, `false` = denied. Every entry is a REAL, writable
 // COMMERCIAL_STATUSES value (never a RESOLUTION_FAILURE_STATUSES sentinel --
 // those are handled separately, before this table is even consulted).
+//
+// 'trial_pending_activation' (Phase B.8 pre-commit correction) -- an
+// access-code trial grant awaiting its first successful initial sync (see
+// entitlementResolution.js's own header). Allowed ONLY what onboarding
+// itself genuinely needs to reach that activation event: safe reads,
+// security/account maintenance, resource reduction (all universally always
+// allowed anyway), establishing/exploring the Google integration
+// (INTEGRATION_EXPANSION -- connect, discover-locations), and capacity
+// expansion bounded by pendingActivationLimits()'s own numeric ceiling
+// (CAPACITY_EXPANSION -- approving the tenant's first location; also
+// permits inviting teammates up to maxActiveUsers, a deliberately accepted
+// side effect since it costs nothing and is bounded). Everything that
+// actually costs money or is normal product consumption (OPERATIONAL_WRITE,
+// COST_GENERATING, INTEGRATION_OPERATION -- there is no established
+// integration yet to "operate") is denied -- AI/storage additionally have
+// zero numeric allowance via pendingActivationLimits(), so B.4's existing
+// quota checks deny those independently of this table too (belt and
+// suspenders, never a single point of failure).
 const POLICY = Object.freeze({
-  [CommercialOperationClass.READ_BASIC]:            Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true  }),
-  [CommercialOperationClass.SECURITY_MAINTENANCE]:  Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true  }),
-  [CommercialOperationClass.RESOURCE_REDUCTION]:    Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true  }),
-  [CommercialOperationClass.OPERATIONAL_WRITE]:     Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false }),
-  [CommercialOperationClass.COST_GENERATING]:       Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false }),
-  [CommercialOperationClass.INTEGRATION_OPERATION]: Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false }),
-  [CommercialOperationClass.INTEGRATION_EXPANSION]: Object.freeze({ trial: true, active: true, past_due: false, suspended: false, canceled: false }),
-  [CommercialOperationClass.CAPACITY_EXPANSION]:    Object.freeze({ trial: true, active: true, past_due: false, suspended: false, canceled: false }),
+  [CommercialOperationClass.READ_BASIC]:            Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true,  trial_pending_activation: true  }),
+  [CommercialOperationClass.SECURITY_MAINTENANCE]:  Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true,  trial_pending_activation: true  }),
+  [CommercialOperationClass.RESOURCE_REDUCTION]:    Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true,  trial_pending_activation: true  }),
+  [CommercialOperationClass.OPERATIONAL_WRITE]:     Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false, trial_pending_activation: false }),
+  [CommercialOperationClass.COST_GENERATING]:       Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false, trial_pending_activation: false }),
+  [CommercialOperationClass.INTEGRATION_OPERATION]: Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false, trial_pending_activation: false }),
+  [CommercialOperationClass.INTEGRATION_EXPANSION]: Object.freeze({ trial: true, active: true, past_due: false, suspended: false, canceled: false, trial_pending_activation: true  }),
+  [CommercialOperationClass.CAPACITY_EXPANSION]:    Object.freeze({ trial: true, active: true, past_due: false, suspended: false, canceled: false, trial_pending_activation: true  }),
 })
 
 // Classes safe to ALLOW outright on a genuine resolver failure -- see this

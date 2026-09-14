@@ -123,7 +123,7 @@ async function createAccessCodeAction(req, res) {
 
   const {
     prefix, plan, discountPercent = null, discountFixedCents = null, trialDays = null,
-    paymentRequired = true, expiresAt = null, maxRedemptions = 1,
+    paymentRequired, expiresAt = null, maxRedemptions = 1,
     allowedEmail = null, allowedEmailDomain = null, clientLabel = null,
   } = req.body ?? {}
 
@@ -142,11 +142,20 @@ async function createAccessCodeAction(req, res) {
   if (expiresAt != null && Number.isNaN(new Date(expiresAt).getTime())) {
     return res.status(400).json({ error: 'invalid_request', message: 'Expiration must be a valid date.' })
   }
+  // Phase B.8 pre-commit correction (Part 3) -- paymentRequired must be an
+  // EXPLICIT boolean in every request; no silent default. The admin UI
+  // (dashboard/src/pages/admin/AccessCodes.jsx) already always sends this
+  // field via its own explicit checkbox -- this rejects only a caller that
+  // omits it entirely (a stale client, a direct API/script call), which
+  // now has major, non-obvious commercial meaning (an unredeemable code).
+  if (typeof paymentRequired !== 'boolean') {
+    return res.status(400).json({ error: 'invalid_request', message: 'paymentRequired must be explicitly true or false.' })
+  }
 
   try {
     const { rawCode, record } = await createAccessCode({
       prefix: prefix.toUpperCase(), plan, discountPercent, discountFixedCents, trialDays,
-      paymentRequired: Boolean(paymentRequired), expiresAt, maxRedemptions,
+      paymentRequired, expiresAt, maxRedemptions,
       allowedEmail, allowedEmailDomain, clientLabel, createdBy: account.userId,
     })
 

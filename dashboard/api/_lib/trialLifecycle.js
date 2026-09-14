@@ -144,6 +144,18 @@ export async function maybeStartTrial(tenantId, config) {
   //     systems firing for the same tenant.
   if (config.commercial !== null && config.commercial !== undefined) return config
 
+  // Phase B.8 -- an access-code trial GRANT (accessCodeGrant, written at
+  // tenant-creation time, still pending its own lazy activation via
+  // maybeStartAccessCodeTrial() below) must independently and durably
+  // exclude the automatic self-service trial, even during the window where
+  // `commercial` is still null (exactly the same null-while-pending shape
+  // an ordinary not-yet-activated self-service tenant has). This is
+  // deliberately a SEPARATE, explicit check -- never relying solely on
+  // "commercial is non-null" (which is not yet true here) or on
+  // trialEligibility happening to also be unset (true today, but this
+  // guard keeps the exclusion durable even if that ever changed).
+  if (config.accessCodeGrant != null) return config
+
   // CORRECTION #1: commercial === null is NECESSARY but never SUFFICIENT.
   // An explicit, server-controlled trialEligibility marker is REQUIRED --
   // this is what distinguishes "this tenant is intentionally entering the
@@ -263,4 +275,90 @@ export async function maybeStartTrial(tenantId, config) {
   }
 
   return updatedConfig
+}
+
+// Phase B.8 -- the lazy activation counterpart to maybeStartTrial(), for an
+// EXPLICIT access-code trial grant (accessCodeCommercial.js's
+// buildAccessCodeCommercialWrite() Case 2) instead of the automatic
+// self-service one. Called from the exact same read-time hook
+// (session/[action].js's tenantStatus(), immediately after maybeStartTrial()
+// -- the two are mutually exclusive by construction: a tenant only ever has
+// EITHER trialEligibility ELSE accessCodeGrant set, never both) so this is
+// just as naturally recurring and client-trigger-free as the automatic
+// trial's own activation.
+//
+// DELIBERATELY DOES NOT touch trialEligibilityStore.js's per-GBP-location
+// claim ledger at all -- that system exists to stop the SAME physical
+// location from harvesting multiple free self-service trials across
+// different signups, an anti-abuse concern that does not apply to an
+// explicit, human-authorized sales/admin grant. This is this phase's
+// approved policy (an access-code trial is independent of the automatic
+// free-trial anti-abuse claim, but its provenance stays auditable via
+// accessCodeGrant.accessCodeHash carrying through into the final
+// commercial.accessCodeHash) -- never invented casually; see this file's
+// own accessCodeCommercial.js header for the full reasoning.
+export async function maybeStartAccessCodeTrial(tenantId, config) {
+  if (!config) return config
+
+  // No LTA/BOOTSTRAP read or write, ever -- identical discipline to
+  // maybeStartTrial() above.
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return config
+
+  // Only a tenant sitting in the explicit 'trial_pending_activation'
+  // commercial shape (Phase B.8 pre-commit correction -- see
+  // accessCodeCommercial.js's header for why this is never `commercial ===
+  // null`), with its accompanying grant, is eligible. Any OTHER commercial
+  // state (already a real trial, active, suspended, anything) is never
+  // touched again -- mirrors "once consumed, never again" exactly, and this
+  // status is the ONLY one this function ever transitions out of.
+  if (config.commercial?.commercialStatus !== 'trial_pending_activation') return config
+  if (config.accessCodeGrant?.grantType !== 'trial') return config
+
+  // Same authoritative-anchor requirement as the automatic trial: GBP OAuth
+  // connection + first successful initial sync, represented by
+  // tenant_config.status === 'active', never inferred from anything else.
+  if (config.status !== 'active') return config
+
+  const authoritativeActivationAt = config.initialSync?.completedAt
+  if (typeof authoritativeActivationAt !== 'string' || !authoritativeActivationAt) {
+    console.error(`[trialLifecycle] tenant ${JSON.stringify(tenantId)} is 'active' with a pending access-code trial grant but has no initialSync.completedAt -- refusing to start without an authoritative clock anchor`)
+    return config
+  }
+
+  const grant = config.accessCodeGrant
+  const trialStartedAt = authoritativeActivationAt
+  const trialEndsAt = new Date(Date.parse(trialStartedAt) + grant.trialDays * 24 * 60 * 60 * 1000).toISOString()
+
+  const newCommercial = {
+    commercialStatus: 'trial',
+    plan: grant.plan,
+    planSource: 'access_code_trial',
+    trial: { status: 'active', startedAt: trialStartedAt, endsAt: trialEndsAt, consumedAt: trialStartedAt },
+    limitsOverride: null, suspension: null, cancellation: null, overLimit: null,
+    accessCodeHash: grant.accessCodeHash,
+    discountPercent: grant.discountPercent, discountFixedCents: grant.discountFixedCents,
+    paymentRequired: false,
+    createdAt: trialStartedAt, updatedAt: new Date().toISOString(),
+  }
+
+  try {
+    // CAS-bound to the SAME config this function was handed -- a
+    // concurrent write (another observation racing this same tenant) fails
+    // closed via ConfigVersionConflictError, retried on the next
+    // tenantStatus() poll exactly like maybeStartTrial()'s own CAS write.
+    // trialStartedAt/trialEndsAt are a pure function of immutable inputs
+    // (grant.trialDays, initialSync.completedAt), so a retry recomputes the
+    // identical object -- never a later/extended one.
+    return await upsertTenantConfig(tenantId, { commercial: newCommercial }, { expectedVersion: config.configVersion })
+  } catch (err) {
+    if (err instanceof ConfigVersionConflictError) {
+      console.log(`[trialLifecycle] tenant ${JSON.stringify(tenantId)} access-code trial-start CAS conflict -- will retry on next observation`)
+      return config
+    }
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable during access-code trial-start for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return config
+    }
+    throw err
+  }
 }
