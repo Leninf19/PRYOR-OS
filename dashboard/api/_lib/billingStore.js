@@ -292,6 +292,18 @@ const MUTABLE_FIELDS = Object.freeze([
   // Phase B.12 -- see isValidSubscriptionActivationOperation()'s own header
   // above.
   'subscriptionActivation',
+  // Phase B.13 -- the FIRST-accepted, non-stale past_due event's own
+  // `event.created` (never Date.now()/wall-clock observation time),
+  // converted to ISO. Written exactly once per delinquency episode by the
+  // caller (session/[action].js's handleSubscriptionProjectionEvent(),
+  // computed from THIS SAME pre-transition billing snapshot so it can
+  // never diverge from the subscriptionStatus write it accompanies) --
+  // never reset by a duplicate/replay/later past_due event for the SAME
+  // ongoing episode, and cleared to null the moment a validated active
+  // status returns. This module never computes or interprets "how many
+  // days has this been set" itself -- see trialLifecycle.js's own header
+  // on why PRYOR never runs an independent suspension timer.
+  'pastDueSince',
 ])
 
 function validateBillingFields(fields) {
@@ -337,6 +349,9 @@ function validateBillingFields(fields) {
   if (!isValidSubscriptionActivationOperation(fields.subscriptionActivation)) {
     throw new TypeError(`invalid subscriptionActivation ${JSON.stringify(fields.subscriptionActivation)}`)
   }
+  if (!isValidIsoTimestampOrNull(fields.pastDueSince)) {
+    throw new TypeError(`invalid pastDueSince ${JSON.stringify(fields.pastDueSince)}`)
+  }
 }
 
 function assertOnlyKnownFields(fields, fnName) {
@@ -353,6 +368,7 @@ const DEFAULT_FIELDS = Object.freeze({
   defaultPaymentMethodId: null,
   lastStripeObjectCreatedAt: null, lastStripeEventCreatedAt: null, pendingPaidPlan: null,
   consent: null, customerCreationOperation: null, subscriptionActivation: null,
+  pastDueSince: null,
 })
 
 // ===========================================================================

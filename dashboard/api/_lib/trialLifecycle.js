@@ -86,6 +86,17 @@ import { reserveTrialClaim, finalizeTrialClaim, TrialEligibilityStoreUnavailable
 import { commercialIdentityKey } from './commercialIdentity.js'
 import { listUsers } from './userStore.js'
 import { isSelfServicePlan } from './stripePriceMap.js'
+import { appendAuditEntry } from './auditLog.js'
+
+// Phase B.13 -- the ONE enumerated, reviewable set of automatic
+// billing-failure suspension reasons this codebase will ever write.
+// Mirrors TRIAL_ELIGIBILITY_SOURCES/TENANT_CREATION_SOURCES's own
+// discipline: "how did this happen" stays a small, reviewed set of real
+// answers, never an arbitrary string. Exactly one value exists in B.13 --
+// a future manual/admin/fraud suspension reason would be a SEPARATE,
+// explicitly-reviewed addition, never silently auto-resumable by
+// activatePaidSubscriptionIfValid() below (see that function's own guard).
+export const SUSPENSION_REASONS = Object.freeze(['stripe_unpaid_terminal'])
 
 // Phase B.11 pre-commit correction -- exported so selfServiceCommercial.js's
 // consent-snapshot fields (session/[action].js's selectPlan()) can never
@@ -408,15 +419,21 @@ export async function maybeStartAccessCodeTrial(tenantId, config) {
 // [action].js's handleSubscriptionProjectionEvent()) is responsible for
 // every customer/price/subscription cross-check BEFORE calling this.
 //
-// ONE-DIRECTIONAL, "ONCE CONSUMED, NEVER AGAIN": only ever transitions OUT
-// OF commercialStatus === 'trial'. A tenant already 'active' (e.g. a
-// duplicate/redelivered Stripe event, or a second observation racing this
-// same one) is a pure, harmless no-op -- this is what makes repeated calls
-// (retries, duplicate webhook deliveries) safe without any separate
-// idempotency ledger of its own. Any OTHER existing state (suspended,
-// canceled, past_due, trial_pending_activation) is likewise left
-// completely untouched -- this function is never a general-purpose
-// "set commercialStatus" writer, only this one specific, narrow transition.
+// ONE-DIRECTIONAL, "ONCE CONSUMED, NEVER AGAIN" -- Phase B.13 amendment:
+// this now transitions OUT OF THREE states, never any other:
+//   - 'trial'                                          -> genuine first activation (B.12, unchanged)
+//   - 'past_due'                                       -> delinquency recovery (B.13)
+//   - 'suspended' WITH suspension.reason === 'stripe_unpaid_terminal' -> billing-failure recovery (B.13)
+// A tenant already 'active' (duplicate/redelivered event, a second
+// observation racing this same one) is a pure, harmless no-op. Every OTHER
+// existing state (canceled, trial_pending_activation, or 'suspended' for
+// any OTHER reason -- there is exactly one reason value today, see
+// SUSPENSION_REASONS, but this guard is written to stay correct if a
+// future manual/admin/fraud reason is ever added) is left completely
+// untouched -- this function is never a general-purpose "set
+// commercialStatus" writer, only these specific, narrow transitions, and
+// NEVER auto-resumes a suspension it did not itself create for this exact
+// reason.
 //
 // NEVER creates or restarts a trial (there is no trial-shaped object
 // written here at all -- the tenant's own historical `trial` sub-object is
@@ -425,6 +442,16 @@ export async function maybeStartAccessCodeTrial(tenantId, config) {
 // commercialStatus is 'active'), and NEVER grants Enterprise (Enterprise is
 // excluded from isSelfServicePlan() by construction, mirroring
 // stripePriceMap.js's own SELF_SERVICE_PLAN_IDS gate).
+//
+// PLAN NEVER CHANGES on the past_due/suspended recovery paths -- B.14's
+// job, not this function's. `plan` is required and validated on every
+// call (even for a past_due/suspended resume) as a defense-in-depth
+// cross-check: the caller (session/[action].js's handleSubscriptionProjectionEvent())
+// already resolved it from the tenant's OWN current Stripe price via
+// stripePriceMap.js, so it MUST already equal the tenant's existing
+// commercial.plan on a recovery path -- a mismatch (e.g. Stripe reporting
+// a different price than what PRYOR has on record) is treated as an
+// anomaly and refused, never silently absorbed as an implicit plan change.
 export async function activatePaidSubscriptionIfValid(tenantId, plan) {
   if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return null
 
@@ -440,11 +467,12 @@ export async function activatePaidSubscriptionIfValid(tenantId, plan) {
   }
   if (!config) return null
 
-  // The ONLY state this function ever transitions OUT of. Already-'active'
-  // (duplicate event, race with another observation) and every other
-  // status are both left completely untouched -- see this function's own
-  // header for why that is exactly the desired idempotent/no-op behavior.
-  if (config.commercial?.commercialStatus !== 'trial') return config
+  const existingCommercial = config.commercial
+  const currentStatus = existingCommercial?.commercialStatus
+  const isFromTrial = currentStatus === 'trial'
+  const isFromPastDue = currentStatus === 'past_due'
+  const isFromBillingSuspension = currentStatus === 'suspended' && SUSPENSION_REASONS.includes(existingCommercial?.suspension?.reason) && existingCommercial?.suspension?.reason === 'stripe_unpaid_terminal'
+  if (!isFromTrial && !isFromPastDue && !isFromBillingSuspension) return config
 
   // Defense in depth -- the caller must already have validated `plan`
   // against real server billing state before ever calling this, but this
@@ -455,26 +483,37 @@ export async function activatePaidSubscriptionIfValid(tenantId, plan) {
     return config
   }
 
+  // Recovery paths (past_due/suspended) must never silently change plan --
+  // B.14's future job, not this one. A mismatch here means the incoming
+  // validated Stripe price does not match what this tenant is already on
+  // record for; refuse rather than guess.
+  if ((isFromPastDue || isFromBillingSuspension) && plan !== existingCommercial.plan) {
+    console.error(`[trialLifecycle] refusing recovery activation for tenant ${JSON.stringify(tenantId)} -- incoming plan ${JSON.stringify(plan)} does not match existing commercial.plan ${JSON.stringify(existingCommercial.plan)}`)
+    return config
+  }
+
   const now = new Date().toISOString()
-  const existingCommercial = config.commercial
-  // Fields explicitly changed by this transition: commercialStatus
-  // ('trial' -> 'active'), plan (set to the server-validated Core/Growth
-  // plan), planSource (new provenance value), updatedAt. Every other field
-  // -- including `trial` itself (startedAt/endsAt/consumedAt, kept as a
-  // historical record only), limitsOverride, suspension, cancellation,
-  // overLimit, accessCodeHash, discountPercent, discountFixedCents,
-  // paymentRequired, createdAt -- is carried forward completely unchanged
-  // via this spread, never reset, never reinterpreted.
+  // Fields explicitly changed by this transition: commercialStatus (->
+  // 'active'), plan/planSource (ONLY set on the trial-activation path --
+  // left completely unchanged on a past_due/suspended recovery, per the
+  // guard above), suspension (cleared to null ONLY on the billing-suspension
+  // recovery path), updatedAt. Every other field -- including `trial`
+  // itself (kept as a historical record only), limitsOverride,
+  // cancellation, overLimit, accessCodeHash, discountPercent,
+  // discountFixedCents, paymentRequired, createdAt -- is carried forward
+  // completely unchanged via this spread, never reset, never reinterpreted.
   const newCommercial = {
     ...existingCommercial,
     commercialStatus: 'active',
-    plan,
-    planSource: 'stripe_subscription_active',
+    plan: isFromTrial ? plan : existingCommercial.plan,
+    planSource: isFromTrial ? 'stripe_subscription_active' : existingCommercial.planSource,
+    suspension: isFromBillingSuspension ? null : existingCommercial.suspension,
     updatedAt: now,
   }
 
+  let updated
   try {
-    return await upsertTenantConfig(tenantId, { commercial: newCommercial }, { expectedVersion: config.configVersion })
+    updated = await upsertTenantConfig(tenantId, { commercial: newCommercial }, { expectedVersion: config.configVersion })
   } catch (err) {
     if (err instanceof ConfigVersionConflictError) {
       // Something else already changed this tenant's commercial state
@@ -490,4 +529,254 @@ export async function activatePaidSubscriptionIfValid(tenantId, plan) {
     }
     throw err
   }
+
+  if (isFromBillingSuspension) {
+    try {
+      await appendAuditEntry(tenantId, {
+        actorId: null, actorEmail: null,
+        action: 'tenant.billing_suspension_resumed', entity: 'tenant', entityId: tenantId,
+        result: 'success', message: 'Stripe reported a validated active subscription -- resumed from stripe_unpaid_terminal suspension.',
+      })
+    } catch (err) {
+      console.error(`[trialLifecycle] failed to record audit entry for billing-suspension resume of tenant ${JSON.stringify(tenantId)} (non-fatal): ${err.message}`)
+    }
+  }
+
+  return updated
+}
+
+// Phase B.13 -- the ONE place tenant_config.commercial ever transitions
+// INTO the delinquency-grace state (commercialStatus: 'past_due'). Mirrors
+// activatePaidSubscriptionIfValid()'s exact discipline. Per the locked
+// B.13 policy (entitlementResolution.js's own B.7 `isPastDue` branch,
+// unchanged): past_due retains FULL plan limits/features -- this function
+// never touches limits/features itself, it only flips the status the
+// resolver already knows how to interpret correctly.
+//
+// FROM {'trial', 'active'} ONLY -> 'past_due'. Idempotent no-op if already
+// 'past_due' (a duplicate/redelivered/later past_due event for the SAME
+// ongoing episode) -- the caller (session/[action].js) is responsible for
+// deriving/preserving billing:v1.pastDueSince separately; this function
+// touches ONLY tenant_config.commercial, never billing:v1.
+export async function recordPastDueIfValid(tenantId) {
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return null
+
+  let config
+  try {
+    config = await getTenantConfig(tenantId)
+  } catch (err) {
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable while recording past_due for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return null
+    }
+    throw err
+  }
+  if (!config) return null
+
+  const existingCommercial = config.commercial
+  const currentStatus = existingCommercial?.commercialStatus
+  if (currentStatus !== 'trial' && currentStatus !== 'active') return config
+
+  const now = new Date().toISOString()
+  const newCommercial = { ...existingCommercial, commercialStatus: 'past_due', updatedAt: now }
+
+  try {
+    return await upsertTenantConfig(tenantId, { commercial: newCommercial }, { expectedVersion: config.configVersion })
+  } catch (err) {
+    if (err instanceof ConfigVersionConflictError) {
+      console.log(`[trialLifecycle] tenant ${JSON.stringify(tenantId)} past_due recording CAS conflict -- leaving current state as-is`)
+      return config
+    }
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable while recording past_due for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return config
+    }
+    throw err
+  }
+}
+
+// Phase B.13 -- the ONE automatic billing-failure suspension writer. FROM
+// {'active', 'past_due'} ONLY -> 'suspended'. Deliberately NEVER from
+// 'trial' -- an unpaid signal arriving while PRYOR still considers the
+// tenant trialing is outside this function's scope; PRYOR's own
+// independent trial-expiry computation (entitlementResolution.js's
+// `trialExpired` check) already provides a completely separate safety net
+// for that case. `suspendedAt` is REQUIRED and must be the caller's own
+// Stripe `event.created` (converted to ISO) -- never Date.now() -- so the
+// recorded timestamp reflects when STRIPE decided the subscription was
+// terminal, not whenever this function happened to run.
+export async function suspendForTerminalUnpaidIfValid(tenantId, { suspendedAt }) {
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return null
+  if (typeof suspendedAt !== 'string' || Number.isNaN(Date.parse(suspendedAt))) {
+    throw new TypeError('suspendForTerminalUnpaidIfValid: suspendedAt must be a valid ISO timestamp')
+  }
+
+  let config
+  try {
+    config = await getTenantConfig(tenantId)
+  } catch (err) {
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable while suspending tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return null
+    }
+    throw err
+  }
+  if (!config) return null
+
+  const existingCommercial = config.commercial
+  const currentStatus = existingCommercial?.commercialStatus
+  // Idempotent no-op if already suspended for this SAME reason (duplicate/
+  // redelivered event) -- never overwrites an existing suspendedAt.
+  if (currentStatus === 'suspended') return config
+  if (currentStatus !== 'active' && currentStatus !== 'past_due') return config
+
+  const now = new Date().toISOString()
+  const newCommercial = {
+    ...existingCommercial,
+    commercialStatus: 'suspended',
+    suspension: { reason: 'stripe_unpaid_terminal', suspendedAt },
+    updatedAt: now,
+  }
+
+  let updated
+  try {
+    updated = await upsertTenantConfig(tenantId, { commercial: newCommercial }, { expectedVersion: config.configVersion })
+  } catch (err) {
+    if (err instanceof ConfigVersionConflictError) {
+      console.log(`[trialLifecycle] tenant ${JSON.stringify(tenantId)} suspension CAS conflict -- leaving current state as-is`)
+      return config
+    }
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable while suspending tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return config
+    }
+    throw err
+  }
+
+  try {
+    await appendAuditEntry(tenantId, {
+      actorId: null, actorEmail: null,
+      action: 'tenant.suspended_billing', entity: 'tenant', entityId: tenantId,
+      result: 'success', message: `Stripe reported the subscription as terminally unpaid -- suspended (reason: stripe_unpaid_terminal, suspendedAt: ${suspendedAt}).`,
+    })
+  } catch (err) {
+    console.error(`[trialLifecycle] failed to record audit entry for suspension of tenant ${JSON.stringify(tenantId)} (non-fatal): ${err.message}`)
+  }
+
+  return updated
+}
+
+// Phase B.13 -- cancellation-INTENT sync only. NEVER changes
+// commercialStatus or limits/features -- the tenant keeps full access
+// through the remainder of the current paid period regardless of this
+// field. Idempotent by construction: recomputes the exact same object on
+// a redelivered/duplicate event (requestedAt is preserved, never reset,
+// as long as the existing cancellation is already 'pending_at_period_end')
+// and short-circuits to a no-op write when nothing actually changed.
+export async function syncCancellationIntentIfValid(tenantId, { cancelAtPeriodEnd, effectiveAt, requestedAt }) {
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return null
+
+  let config
+  try {
+    config = await getTenantConfig(tenantId)
+  } catch (err) {
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable while syncing cancellation intent for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return null
+    }
+    throw err
+  }
+  if (!config || !config.commercial) return config
+
+  const existingCommercial = config.commercial
+  const existingCancellation = existingCommercial.cancellation ?? null
+
+  let newCancellation
+  if (cancelAtPeriodEnd) {
+    // Preserve the ORIGINAL requestedAt if a pending cancellation is
+    // already recorded -- a redelivered/duplicate/later true event must
+    // never reset it, mirroring pastDueSince's own stability requirement.
+    const preservedRequestedAt = existingCancellation?.status === 'pending_at_period_end' ? existingCancellation.requestedAt : requestedAt
+    newCancellation = { status: 'pending_at_period_end', requestedAt: preservedRequestedAt, effectiveAt }
+  } else {
+    newCancellation = null
+  }
+
+  if (JSON.stringify(existingCancellation) === JSON.stringify(newCancellation)) return config
+
+  const now = new Date().toISOString()
+  const newCommercial = { ...existingCommercial, cancellation: newCancellation, updatedAt: now }
+
+  try {
+    return await upsertTenantConfig(tenantId, { commercial: newCommercial }, { expectedVersion: config.configVersion })
+  } catch (err) {
+    if (err instanceof ConfigVersionConflictError) {
+      console.log(`[trialLifecycle] tenant ${JSON.stringify(tenantId)} cancellation-intent sync CAS conflict -- leaving current state as-is`)
+      return config
+    }
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable while syncing cancellation intent for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return config
+    }
+    throw err
+  }
+}
+
+// Phase B.13 -- the ONE place a subscription's ACTUAL completed
+// cancellation (Stripe's customer.subscription.deleted, never a mere
+// cancel_at_period_end toggle -- see syncCancellationIntentIfValid() above
+// for that) transitions tenant_config.commercial into the terminal
+// 'canceled' state. Preserves plan, trial history, and every billing
+// identifier -- no destructive deletion of any kind. Idempotent: a
+// tenant already 'canceled' is a pure no-op (duplicate/redelivered
+// deletion event).
+export async function completeCancellationIfValid(tenantId) {
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return null
+
+  let config
+  try {
+    config = await getTenantConfig(tenantId)
+  } catch (err) {
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable while completing cancellation for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return null
+    }
+    throw err
+  }
+  if (!config) return null
+
+  const existingCommercial = config.commercial
+  if (!existingCommercial) return config
+  const currentStatus = existingCommercial.commercialStatus
+  if (currentStatus === 'canceled') return config
+
+  const now = new Date().toISOString()
+  const newCommercial = { ...existingCommercial, commercialStatus: 'canceled', cancellation: null, updatedAt: now }
+
+  let updated
+  try {
+    updated = await upsertTenantConfig(tenantId, { commercial: newCommercial }, { expectedVersion: config.configVersion })
+  } catch (err) {
+    if (err instanceof ConfigVersionConflictError) {
+      console.log(`[trialLifecycle] tenant ${JSON.stringify(tenantId)} cancellation-completion CAS conflict -- leaving current state as-is`)
+      return config
+    }
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable while completing cancellation for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return config
+    }
+    throw err
+  }
+
+  try {
+    await appendAuditEntry(tenantId, {
+      actorId: null, actorEmail: null,
+      action: 'tenant.subscription_canceled', entity: 'tenant', entityId: tenantId,
+      result: 'success', message: 'Stripe confirmed the subscription was deleted -- tenant commercial state transitioned to canceled. No data was deleted.',
+    })
+  } catch (err) {
+    console.error(`[trialLifecycle] failed to record audit entry for cancellation of tenant ${JSON.stringify(tenantId)} (non-fatal): ${err.message}`)
+  }
+
+  return updated
 }

@@ -180,6 +180,8 @@ const TESTS = [
   'test_subscription_activation.js',
   // Phase B.12 (Decision 1) -- primary event-driven billing-activation callback.
   'test_billing_activation_callback.js',
+  // Phase B.13 -- Stripe Billing Customer Portal session creation.
+  'test_billing_portal.js',
 ]
 
 const results = {}

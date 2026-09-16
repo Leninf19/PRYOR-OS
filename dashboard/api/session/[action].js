@@ -23,7 +23,13 @@ import { getTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvi
 import { resolveTenantEntitlements } from '../_lib/entitlements.js'
 import { resolveTenantEntitlementsFromConfig } from '../_lib/entitlementResolution.js'
 import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
-import { maybeStartTrial, maybeStartAccessCodeTrial, activatePaidSubscriptionIfValid } from '../_lib/trialLifecycle.js'
+import {
+  maybeStartTrial, maybeStartAccessCodeTrial, activatePaidSubscriptionIfValid,
+  recordPastDueIfValid, suspendForTerminalUnpaidIfValid, syncCancellationIntentIfValid, completeCancellationIfValid,
+} from '../_lib/trialLifecycle.js'
+import {
+  createBillingPortalSession, BillingPortalNotReadyError, BillingPortalConfigurationInvalidError, BillingPortalUrlNotConfiguredError,
+} from '../_lib/billingPortal.js'
 import {
   createNewTenant, TenantCreationMode, TenantCreationModeRequiredError,
   IdentityAlreadyExistsError, TenantAlreadyExistsError,
@@ -1753,13 +1759,19 @@ async function stripeWebhookAction(req, res) {
     return res.status(400).json({ error: 'invalid_signature' })
   }
 
-  // Phase B.12 -- minimal customer.subscription.updated/deleted projection.
-  // See handleSubscriptionProjectionEvent()'s own header for the exact,
-  // deliberately narrow scope (billingStore.js projection fields only --
-  // never tenant_config.commercial, never a B.13 suspension/cancellation
-  // policy action).
+  // Phase B.12/B.13 -- customer.subscription.updated/deleted projection +
+  // canonical delinquency/suspension/cancellation transitions. See
+  // handleSubscriptionProjectionEvent()'s own header for the exact scope.
   if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
     return handleSubscriptionProjectionEvent(event, res)
+  }
+
+  // Phase B.13 -- invoice.payment_failed: audit/notification only. See
+  // handleInvoicePaymentFailedEvent()'s own header -- this event NEVER
+  // suspends, NEVER resets the past_due grace clock, and NEVER otherwise
+  // changes canonical commercial state on its own (Amendment 1/3).
+  if (event.type === 'invoice.payment_failed') {
+    return handleInvoicePaymentFailedEvent(event, res)
   }
 
   // Only checkout.session.completed, and only for a setup-mode session, is
@@ -2041,6 +2053,34 @@ async function handleSubscriptionProjectionEvent(event, res) {
     projectProviderStatusToCommercialStatus(rawStatus)
 
     const period = resolveSubscriptionPeriod(subscription)
+    // Server-side identity fields, computed ONCE and reused by every
+    // cross-validation branch below -- never Stripe metadata, always the
+    // object's own top-level customer field.
+    const subscriptionCustomerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id ?? null
+    const subscriptionMatchesRecord = record.stripeSubscriptionId === stripeSubscriptionId
+    const customerMatchesRecord = subscriptionCustomerId != null && subscriptionCustomerId === record.stripeCustomerId
+
+    // Phase B.13 (Amendment 2) -- the past_due grace-clock timestamp.
+    // Computed from THIS SAME pre-transition `record` snapshot the
+    // subscriptionStatus write below is bound to (via expectedVersion),
+    // so ordering can never produce subscriptionStatus: 'past_due' with
+    // pastDueSince: null. Set ONLY on the first accepted, non-stale
+    // transition INTO past_due (record.subscriptionStatus was NOT already
+    // 'past_due', or was but somehow lost its timestamp) -- a duplicate,
+    // replayed, or later past_due delivery for the SAME ongoing episode
+    // leaves it completely untouched. Derived from Stripe's OWN
+    // event.created, never Date.now(). Cleared to null the moment a
+    // validated 'active' status is recorded (Amendment 1) -- never
+    // independently aged out by a PRYOR-computed day count.
+    let pastDueSince = record.pastDueSince
+    if (rawStatus === 'past_due') {
+      if (record.subscriptionStatus !== 'past_due' || !record.pastDueSince) {
+        pastDueSince = new Date(event.created * 1000).toISOString()
+      }
+    } else if (rawStatus === 'active') {
+      pastDueSince = null
+    }
+
     const patch = {
       subscriptionStatus: rawStatus,
       currentPeriodStart: period.start,
@@ -2052,6 +2092,7 @@ async function handleSubscriptionProjectionEvent(event, res) {
       // deliveries against; leaving it unset would make that check
       // permanently a no-op for every subscription-status delivery.
       lastStripeEventCreatedAt: event.created,
+      pastDueSince,
     }
     try {
       await updateBillingRecord(tenantId, patch, { expectedVersion: record.version })
@@ -2062,26 +2103,29 @@ async function handleSubscriptionProjectionEvent(event, res) {
       // it); no retry-loop needed here.
     }
 
-    // Phase B.12 (Decision 2) -- the MINIMAL canonical paid-active
-    // transition. Only a genuinely validated Stripe 'active' status on a
-    // customer.subscription.updated event (never .deleted, never any other
-    // status) can ever advance tenant_config.commercial out of 'trial'.
-    // Every one of price/customer/subscription is cross-checked against
-    // this tenant's OWN already-durable billing:v1 record/reverse index --
-    // Stripe object metadata is consulted nowhere in this block. A failed
-    // cross-check still leaves the Stripe-status FACT recorded above (the
-    // billing record's own subscriptionStatus), it just never advances the
+    // Phase B.12/B.13 (Amendment 1) -- the MINIMAL canonical paid-active
+    // transition/RECOVERY. Only a genuinely validated Stripe 'active'
+    // status on a customer.subscription.updated event (never .deleted,
+    // never any other status) can ever advance/restore tenant_config.commercial
+    // to 'active' -- from 'trial' (B.12, genuine first activation), from
+    // 'past_due' (B.13, delinquency recovery), or from 'suspended' with
+    // reason stripe_unpaid_terminal (B.13, billing-failure recovery).
+    // subscription.payment_succeeded is DELIBERATELY not subscribed to for
+    // this -- this webhook's own validated 'active' status is the sole
+    // canonical recovery signal (Amendment 1). Every one of price/customer/
+    // subscription is cross-checked against this tenant's OWN
+    // already-durable billing:v1 record/reverse index -- Stripe object
+    // metadata is consulted nowhere in this block. A failed cross-check
+    // still leaves the Stripe-status FACT recorded above (the billing
+    // record's own subscriptionStatus), it just never advances the
     // canonical PRYOR commercial state.
     if (event.type === 'customer.subscription.updated' && rawStatus === 'active') {
-      const subscriptionCustomerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id ?? null
       const rawPrice = subscription.items?.data?.[0]?.price
       const subscriptionPriceId = typeof rawPrice === 'string' ? rawPrice : rawPrice?.id ?? null
       // Server-side, price -> plan direction of trust ONLY (stripePriceMap.js's
       // own established discipline) -- never subscription.metadata.plan.
       const plan = resolvePlanIdForStripePriceId(subscriptionPriceId)
 
-      const subscriptionMatchesRecord = record.stripeSubscriptionId === stripeSubscriptionId
-      const customerMatchesRecord = subscriptionCustomerId != null && subscriptionCustomerId === record.stripeCustomerId
       if (subscriptionMatchesRecord && customerMatchesRecord && plan != null) {
         await activatePaidSubscriptionIfValid(tenantId, plan)
       } else {
@@ -2093,6 +2137,70 @@ async function handleSubscriptionProjectionEvent(event, res) {
       }
     }
 
+    // Phase B.13 (Amendment 3) -- past_due: full plan access, NO
+    // suspension. Writes commercialStatus: 'past_due' only -- the
+    // resolver's own existing B.7 `isPastDue` branch (entitlementResolution.js)
+    // already grants real limits/features for this status; nothing about
+    // access is decided here.
+    if (rawStatus === 'past_due') {
+      if (subscriptionMatchesRecord && customerMatchesRecord) {
+        await recordPastDueIfValid(tenantId)
+      } else {
+        console.error(
+          `[session/stripe-webhook] customer.subscription.updated for tenant ${tenantId} reported 'past_due' but failed cross-validation ` +
+          `(subscriptionMatchesRecord=${subscriptionMatchesRecord}, customerMatchesRecord=${customerMatchesRecord}) -- fact recorded, no canonical transition applied`
+        )
+      }
+    }
+
+    // Phase B.13 (Amendment 3) -- unpaid is the ONLY automatic
+    // billing-failure suspension trigger in B.13. 'paused' is deliberately
+    // NEVER treated as suspension authority here (Amendment 3) -- it is
+    // recorded as a billing:v1 fact only (via `patch` above) and otherwise
+    // ignored by this canonical layer.
+    if (rawStatus === 'unpaid') {
+      if (subscriptionMatchesRecord && customerMatchesRecord) {
+        await suspendForTerminalUnpaidIfValid(tenantId, { suspendedAt: new Date(event.created * 1000).toISOString() })
+      } else {
+        console.error(
+          `[session/stripe-webhook] customer.subscription.updated for tenant ${tenantId} reported 'unpaid' but failed cross-validation ` +
+          `(subscriptionMatchesRecord=${subscriptionMatchesRecord}, customerMatchesRecord=${customerMatchesRecord}) -- fact recorded, no suspension applied`
+        )
+      }
+    }
+
+    // Phase B.13 -- the actual, completed cancellation path (customer.subscription.deleted,
+    // or a customer.subscription.updated delivery whose own status is
+    // already 'canceled') -- separate from the cancellation-INTENT sync
+    // below. No destructive deletion of any kind; preserves plan/trial
+    // history/billing identifiers.
+    if (rawStatus === 'canceled') {
+      if (subscriptionMatchesRecord && customerMatchesRecord) {
+        await completeCancellationIfValid(tenantId)
+      } else {
+        console.error(
+          `[session/stripe-webhook] ${event.type} for tenant ${tenantId} reported 'canceled' but failed cross-validation ` +
+          `(subscriptionMatchesRecord=${subscriptionMatchesRecord}, customerMatchesRecord=${customerMatchesRecord}) -- fact recorded, no cancellation completion applied`
+        )
+      }
+    }
+
+    // Phase B.13 -- cancellation-INTENT sync (cancel_at_period_end toggle),
+    // independent of `rawStatus`, on every validated, non-stale
+    // customer.subscription.updated delivery whose subscription id matches
+    // this tenant's own record. Deliberately NOT run for .deleted --
+    // completeCancellationIfValid() above already clears `cancellation` to
+    // null once the subscription is genuinely gone. Never alters
+    // commercialStatus/access -- see syncCancellationIntentIfValid()'s own
+    // header.
+    if (event.type === 'customer.subscription.updated' && subscriptionMatchesRecord) {
+      await syncCancellationIntentIfValid(tenantId, {
+        cancelAtPeriodEnd: subscription.cancel_at_period_end === true,
+        effectiveAt: period.end,
+        requestedAt: new Date(event.created * 1000).toISOString(),
+      })
+    }
+
     await markStripeEventProcessed(event.id, claim.processingToken, `projected_${rawStatus}`)
     return res.status(200).json({ received: true })
   } catch (err) {
@@ -2102,6 +2210,135 @@ async function handleSubscriptionProjectionEvent(event, res) {
     console.error(`[session/stripe-webhook] failed to apply subscription projection for tenant ${tenantId} (event ${event.id}): ${err.message}`)
     return res.status(500).json({ error: 'processing_failed' })
   }
+}
+
+// Phase B.13 (Amendment 1/3) -- invoice.payment_failed: a SPECIFIC failed
+// collection attempt during Stripe's own Smart Retries schedule.
+// DELIBERATELY audit/notification-only -- this handler NEVER writes
+// tenant_config.commercial, NEVER touches billing:v1.pastDueSince, and
+// NEVER suspends anything. The subscription's own `past_due`/`unpaid`
+// status, delivered separately via customer.subscription.updated, remains
+// the ONLY signal that ever drives those transitions (see
+// handleSubscriptionProjectionEvent() above). invoice.payment_succeeded is
+// deliberately NOT subscribed to in B.13 -- Amendment 1 designates the
+// subscription's own validated 'active' status as the sole canonical
+// recovery signal, so a separate invoice-success event would have no
+// concrete state-transition purpose here.
+async function handleInvoicePaymentFailedEvent(event, res) {
+  const invoice = event.data.object
+  const invoiceSubscriptionId = typeof invoice?.subscription === 'string' ? invoice.subscription : invoice?.subscription?.id ?? null
+  if (!isValidStripeSubscriptionId(invoiceSubscriptionId) || invoiceSubscriptionId === null) {
+    console.error('[session/stripe-webhook] invoice.payment_failed carried a malformed/absent subscription id -- acknowledging without processing')
+    return res.status(200).json({ received: true })
+  }
+  // The reverse index is authoritative -- never resolved from
+  // invoice.metadata/subscription_details.metadata alone, same discipline
+  // as every other webhook handler in this file.
+  const tenantId = await getTenantIdForSubscription(invoiceSubscriptionId)
+  if (!tenantId) {
+    console.error('[session/stripe-webhook] invoice.payment_failed for an unrecognized Stripe subscription -- acknowledging without processing')
+    return res.status(200).json({ received: true })
+  }
+
+  let claim
+  try {
+    claim = await claimStripeEvent({
+      eventId: event.id, eventType: event.type, stripeCreatedAt: event.created,
+      providerObjectId: invoiceSubscriptionId, tenantId,
+    })
+  } catch (err) {
+    console.error(`[session/stripe-webhook] failed to claim event ${event.id}: ${err.message}`)
+    return res.status(503).json({ error: 'service_unavailable' })
+  }
+  if (!claim.claimed) {
+    if (claim.reason === 'already_processed') {
+      return res.status(200).json({ received: true })
+    }
+    console.error(`[session/stripe-webhook] event ${event.id} is currently owned by another in-flight delivery -- returning retryable response rather than a false acknowledgement`)
+    return res.status(503).json({ error: 'processing_in_progress' })
+  }
+
+  try {
+    const record = await getBillingRecord(tenantId)
+    if (!record) {
+      throw new Error(`no billing record exists for tenant ${JSON.stringify(tenantId)} despite a resolved subscription index -- refusing to acknowledge an invoice event that was never recorded`)
+    }
+    const invoiceCustomerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id ?? null
+    const subscriptionMatchesRecord = record.stripeSubscriptionId === invoiceSubscriptionId
+    const customerMatchesRecord = invoiceCustomerId != null && invoiceCustomerId === record.stripeCustomerId
+    if (!subscriptionMatchesRecord || !customerMatchesRecord) {
+      console.error(
+        `[session/stripe-webhook] invoice.payment_failed for tenant ${tenantId} failed cross-validation ` +
+        `(subscriptionMatchesRecord=${subscriptionMatchesRecord}, customerMatchesRecord=${customerMatchesRecord}) -- acknowledging without recording`
+      )
+      await markStripeEventProcessed(event.id, claim.processingToken, 'wrong_customer_or_subscription')
+      return res.status(200).json({ received: true })
+    }
+
+    // Best-effort audit trail only -- never blocks/fails the response, and
+    // never the only source of truth for anything (see this function's own
+    // header). A failure here has zero effect on billing state.
+    try {
+      await appendAuditEntry(tenantId, {
+        actorId: null, actorEmail: null,
+        action: 'billing.invoice_payment_failed', entity: 'tenant', entityId: tenantId,
+        result: 'failure', message: 'Stripe reported a failed invoice payment attempt (Smart Retries in progress) -- audit/notification only, no PRYOR state change.',
+      })
+    } catch (err) {
+      console.error(`[session/stripe-webhook] failed to record audit entry for invoice.payment_failed of tenant ${tenantId} (non-fatal): ${err.message}`)
+    }
+
+    await markStripeEventProcessed(event.id, claim.processingToken, 'payment_failed_recorded')
+    return res.status(200).json({ received: true })
+  } catch (err) {
+    try {
+      await markStripeEventFailed(event.id, claim.processingToken, String(err.message ?? 'error').slice(0, 200))
+    } catch { /* best-effort -- the outer 500 below still triggers a Stripe retry regardless */ }
+    console.error(`[session/stripe-webhook] failed to process invoice.payment_failed for tenant ${tenantId} (event ${event.id}): ${err.message}`)
+    return res.status(500).json({ error: 'processing_failed' })
+  }
+}
+
+// Phase B.13 -- owner-only Stripe Billing Portal session creation. The
+// browser supplies NOTHING (no body is ever read) -- every value
+// (tenantId, Stripe Customer, Stripe Subscription's existence, the pinned
+// Portal Configuration, return_url) is derived server-side. See
+// billingPortal.js's own header for the full fail-closed contract,
+// including the live re-validation of the Portal Configuration's actual
+// Stripe-side feature flags on every call (never cached/assumed).
+async function billingPortalSessionAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `session:billing-portal:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  const tenantId = resolveTenantId(account)
+
+  let session
+  try {
+    session = await createBillingPortalSession(tenantId)
+  } catch (err) {
+    if (err instanceof BillingPortalNotReadyError) {
+      return res.status(409).json({ error: 'billing_not_ready', message: 'Billing is not set up for this account yet.' })
+    }
+    if (err instanceof BillingPortalConfigurationInvalidError) {
+      console.error(`[session/billing-portal-session] ${err.message}`)
+      return res.status(503).json({ error: 'portal_not_configured', message: 'The billing portal is temporarily unavailable. Please try again shortly.' })
+    }
+    if (err instanceof BillingPortalUrlNotConfiguredError) {
+      console.error(`[session/billing-portal-session] ${err.message}`)
+      return res.status(503).json({ error: 'portal_not_configured', message: 'The billing portal is temporarily unavailable. Please try again shortly.' })
+    }
+    if (err instanceof StripeNotConfiguredError) {
+      console.error(`[session/billing-portal-session] ${err.message}`)
+      return res.status(503).json({ error: 'portal_not_configured', message: 'The billing portal is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+
+  return res.status(200).json({ url: session.url })
 }
 
 // Phase B.12 (Decision 1) -- the PRIMARY, event-driven, server-to-server
@@ -2268,6 +2505,7 @@ export default async function handler(req, res) {
     case 'finalize-registration':  return finalizeRegistration(req, res)
     case 'stripe-webhook':         return stripeWebhookAction(req, res)
     case 'billing-activation-callback': return billingActivationCallback(req, res)
+    case 'billing-portal-session': return billingPortalSessionAction(req, res)
     default:                 return res.status(404).json({ error: 'not_found' })
   }
 }
