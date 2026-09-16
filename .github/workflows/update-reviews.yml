@@ -205,7 +205,7 @@ jobs:
         if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success' && steps.verify-google-artifacts.outcome == 'success'
         id: verify-bundle
         run: |
-          npx vercel build --yes --token=${{ secrets.VERCEL_TOKEN }}
+          npx vercel build --yes --scope lenin-fierros-projects --token=${{ secrets.VERCEL_TOKEN }}
           python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --bundle-config .vercel/output/functions/api/data.func/.vc-config.json
           python verify_private_data_artifacts.py --tenant-id "$TENANT_ID" --target google --bundle-config ".vercel/output/functions/api/google/[action].func/.vc-config.json"
         env:
@@ -234,7 +234,7 @@ jobs:
       # Never combined with --with-cache, which would defeat the point.
       - name: Deploy to Vercel
         if: always() && steps.integrity.outcome == 'success' && steps.verify-artifacts.outcome == 'success' && steps.verify-google-artifacts.outcome == 'success' && steps.verify-bundle.outcome == 'success'
-        run: npx vercel --prod --force --yes --token=${{ secrets.VERCEL_TOKEN }}
+        run: npx vercel --prod --force --yes --scope lenin-fierros-projects --token=${{ secrets.VERCEL_TOKEN }}
         env:
           # PRYOR OS Controlled Production Release Preparation + Reconciliation:
           # these IDs previously pointed at a stale/legacy Vercel project --
