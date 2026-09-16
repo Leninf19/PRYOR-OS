@@ -2061,27 +2061,6 @@ async function handleSubscriptionProjectionEvent(event, res) {
     const subscriptionMatchesRecord = record.stripeSubscriptionId === stripeSubscriptionId
     const customerMatchesRecord = subscriptionCustomerId != null && subscriptionCustomerId === record.stripeCustomerId
 
-    // Phase B.13 (Amendment 2) -- the past_due grace-clock timestamp.
-    // Computed from THIS SAME pre-transition `record` snapshot the
-    // subscriptionStatus write below is bound to (via expectedVersion),
-    // so ordering can never produce subscriptionStatus: 'past_due' with
-    // pastDueSince: null. Set ONLY on the first accepted, non-stale
-    // transition INTO past_due (record.subscriptionStatus was NOT already
-    // 'past_due', or was but somehow lost its timestamp) -- a duplicate,
-    // replayed, or later past_due delivery for the SAME ongoing episode
-    // leaves it completely untouched. Derived from Stripe's OWN
-    // event.created, never Date.now(). Cleared to null the moment a
-    // validated 'active' status is recorded (Amendment 1) -- never
-    // independently aged out by a PRYOR-computed day count.
-    let pastDueSince = record.pastDueSince
-    if (rawStatus === 'past_due') {
-      if (record.subscriptionStatus !== 'past_due' || !record.pastDueSince) {
-        pastDueSince = new Date(event.created * 1000).toISOString()
-      }
-    } else if (rawStatus === 'active') {
-      pastDueSince = null
-    }
-
     const patch = {
       subscriptionStatus: rawStatus,
       currentPeriodStart: period.start,
@@ -2093,7 +2072,40 @@ async function handleSubscriptionProjectionEvent(event, res) {
       // deliveries against; leaving it unset would make that check
       // permanently a no-op for every subscription-status delivery.
       lastStripeEventCreatedAt: event.created,
-      pastDueSince,
+    }
+
+    // Phase B.13 (Amendment 2) -- the past_due grace-clock timestamp.
+    // Computed from THIS SAME pre-transition `record` snapshot the
+    // subscriptionStatus write above is bound to (via expectedVersion), so
+    // ordering can never produce subscriptionStatus: 'past_due' with
+    // pastDueSince: null. Set ONLY on the first accepted, non-stale
+    // transition INTO past_due (record.subscriptionStatus was NOT already
+    // 'past_due', or was but somehow lost its timestamp) -- a duplicate,
+    // replayed, or later past_due delivery for the SAME ongoing episode
+    // leaves it completely untouched. Derived from Stripe's OWN
+    // event.created, never Date.now(). Cleared to null the moment a
+    // validated 'active' status is recorded (Amendment 1) -- never
+    // independently aged out by a PRYOR-computed day count.
+    //
+    // Live-Preview bug fix -- for every OTHER status (including 'trialing',
+    // the exact status a reactivated-during-trial subscription reports),
+    // `pastDueSince` is deliberately OMITTED from the patch entirely rather
+    // than copied forward from `record.pastDueSince`. An older billing
+    // record created before this field existed has no `pastDueSince` key at
+    // all (`getBillingRecord()` never applies DEFAULT_FIELDS to a raw read),
+    // so `record.pastDueSince` is `undefined` -- and an object spread
+    // (`{...existing, ...patch}` in updateBillingRecord()) with an
+    // EXPLICITLY-present `pastDueSince: undefined` in `patch` overrides
+    // DEFAULT_FIELDS' own `null` fallback, landing on a bare `undefined`
+    // that validateBillingFields() correctly rejects. Never including the
+    // key at all sidesteps this: the merge simply preserves whatever
+    // canonical value (present or already-defaulted) already exists.
+    if (rawStatus === 'past_due') {
+      patch.pastDueSince = (record.subscriptionStatus !== 'past_due' || !record.pastDueSince)
+        ? new Date(event.created * 1000).toISOString()
+        : record.pastDueSince
+    } else if (rawStatus === 'active') {
+      patch.pastDueSince = null
     }
     try {
       await updateBillingRecord(tenantId, patch, { expectedVersion: record.version })

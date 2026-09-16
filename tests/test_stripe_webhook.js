@@ -441,6 +441,20 @@ async function seedTenantWithSubscription(tenantId, subscriptionId, { stripeCust
   await claimSubscriptionIndex(subscriptionId, tenantId)
 }
 
+// Live-Preview `pastDueSince` bug fixtures -- createBillingRecord() always
+// applies DEFAULT_FIELDS (pastDueSince: null), so it can never reproduce the
+// actual live failure: an OLDER billing record, created before this field
+// existed, whose stored JSON has NO `pastDueSince` key at all (not even
+// null). This reaches directly into the fake Redis hash (key 'billing:v1',
+// the same literal documented throughout billingStore.js) to delete the key
+// after the fact, exactly simulating that pre-existing-record shape.
+async function stripPastDueSinceKey(redis, tenantId) {
+  const raw = await redis.hget('billing:v1', tenantId)
+  const record = JSON.parse(raw)
+  delete record.pastDueSince
+  await redis.hset('billing:v1', { [tenantId]: JSON.stringify(record) })
+}
+
 async function testSubscriptionUpdatedProjectsActiveStatus() {
   const redis = fakeBillingRedis()
   setBillingClient(() => redis)
@@ -1283,6 +1297,162 @@ async function testTrialCancelWrongSubscriptionRejected() {
 
   const config = await getTenantConfig(tenantId)
   assert(config.commercial.cancellation === null, 'a subscription-id mismatch must reject the trial-cancellation intent write, exactly like every other canonical transition')
+}
+
+// ===========================================================================
+// Live-Preview bug fix -- pastDueSince must never be written as `undefined`.
+// An older billing record (created before this field existed) has no
+// `pastDueSince` key at all; for every status OTHER than 'past_due'/'active'
+// the field must be OMITTED from the patch entirely (never copied forward
+// as `record.pastDueSince`, which would be `undefined` for such a record and
+// fail validateBillingFields()). These tests reproduce that exact
+// missing-key shape via stripPastDueSinceKey().
+// ===========================================================================
+
+async function testTrialingWithNoPastDueSinceKeySucceeds() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_pastduefix-trialing-nokey-1'
+  await seedTenantWithSubscription(tenantId, 'sub_pastduefixnokey1')
+  await stripPastDueSinceKey(redis, tenantId)
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_pastduefixnokey1', subscriptionId: 'sub_pastduefixnokey1', status: 'trialing' })
+  const res = await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+  assert(res.statusCode === 200, `a trialing event against a billing record with no pastDueSince key must succeed, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.pastDueSince === null, 'omitting pastDueSince from the patch must let it resolve to the default null, never an explicit undefined')
+}
+
+async function testTrialingPreservesExistingPastDueSince() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_pastduefix-trialing-preserve-1'
+  await seedTenantWithSubscription(tenantId, 'sub_pastduefixpreserve1')
+  const existingPastDueSince = new Date(Date.now() - 60 * 60 * 1000).toISOString()
+  await updateBillingRecord(tenantId, { pastDueSince: existingPastDueSince }, { expectedVersion: 1 })
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_pastduefixpreserve1', subscriptionId: 'sub_pastduefixpreserve1', status: 'trialing' })
+  const res = await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+  assert(res.statusCode === 200)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.pastDueSince === existingPastDueSince, 'a trialing event must never touch an already-set pastDueSince value')
+}
+
+async function testFirstPastDueFromMissingKeyRecordSetsTimestamp() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_pastduefix-firstpd-nokey-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'active' })
+  await seedTenantWithSubscription(tenantId, 'sub_pastduefixfirstpd1', { stripeCustomerId: 'cus_pastduefixfirstpd1' })
+  await stripPastDueSinceKey(redis, tenantId)
+
+  const eventCreated = Math.floor(Date.now() / 1000)
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_pastduefixfirstpd1', subscriptionId: 'sub_pastduefixfirstpd1', status: 'past_due', customer: 'cus_pastduefixfirstpd1', created: eventCreated })
+  const res = await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+  assert(res.statusCode === 200)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.pastDueSince === new Date(eventCreated * 1000).toISOString(), 'the first past_due event against a missing-key record must set pastDueSince from event.created')
+}
+
+async function testRepeatedPastDueFromMissingKeyRecordStaysStable() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_pastduefix-reppd-nokey-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'active' })
+  await seedTenantWithSubscription(tenantId, 'sub_pastduefixreppd1', { stripeCustomerId: 'cus_pastduefixreppd1' })
+  await stripPastDueSinceKey(redis, tenantId)
+
+  const firstCreated = Math.floor(Date.now() / 1000)
+  const first = buildSubscriptionEventPayload({ eventId: 'evt_pastduefixreppd1', subscriptionId: 'sub_pastduefixreppd1', status: 'past_due', customer: 'cus_pastduefixreppd1', created: firstCreated })
+  await invokeWebhookProperly(first, Stripe.webhooks.generateTestHeaderString({ payload: first, secret: TEST_WEBHOOK_SECRET }))
+
+  const laterCreated = firstCreated + 1000
+  const second = buildSubscriptionEventPayload({ eventId: 'evt_pastduefixreppd2', subscriptionId: 'sub_pastduefixreppd1', status: 'past_due', customer: 'cus_pastduefixreppd1', created: laterCreated })
+  await invokeWebhookProperly(second, Stripe.webhooks.generateTestHeaderString({ payload: second, secret: TEST_WEBHOOK_SECRET }))
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.pastDueSince === new Date(firstCreated * 1000).toISOString(), 'a repeated past_due event must never reset an already-set pastDueSince, even one recovered from a missing-key record')
+}
+
+async function testActiveRecoveryFromMissingKeyRecordSetsNull() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_pastduefix-active-nokey-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'past_due' })
+  await seedTenantWithSubscription(tenantId, 'sub_pastduefixactive1', { stripeCustomerId: 'cus_pastduefixactive1' })
+  await stripPastDueSinceKey(redis, tenantId)
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_pastduefixactive1', subscriptionId: 'sub_pastduefixactive1', status: 'active', customer: 'cus_pastduefixactive1' })
+  const res = await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+  assert(res.statusCode === 200)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.pastDueSince === null, 'a validated active event must explicitly clear pastDueSince to null even starting from a missing-key record')
+}
+
+async function testUnpaidPreservesMissingKeyPastDueSinceWithoutUndefined() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_pastduefix-unpaid-nokey-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'past_due' })
+  await seedTenantWithSubscription(tenantId, 'sub_pastduefixunpaid1', { stripeCustomerId: 'cus_pastduefixunpaid1' })
+  await stripPastDueSinceKey(redis, tenantId)
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_pastduefixunpaid1', subscriptionId: 'sub_pastduefixunpaid1', status: 'unpaid', customer: 'cus_pastduefixunpaid1' })
+  const res = await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+  assert(res.statusCode === 200, `an unpaid event against a missing-key record must succeed, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.pastDueSince === null, 'unpaid must never emit an explicit undefined pastDueSince -- omitting the field must resolve to the default null')
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'suspended', 'the fix must not change unpaid\'s own existing suspension behavior')
+}
+
+async function testPausedPreservesMissingKeyPastDueSinceWithoutUndefined() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_pastduefix-paused-nokey-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'active' })
+  await seedTenantWithSubscription(tenantId, 'sub_pastduefixpaused1', { stripeCustomerId: 'cus_pastduefixpaused1' })
+  await stripPastDueSinceKey(redis, tenantId)
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_pastduefixpaused1', subscriptionId: 'sub_pastduefixpaused1', status: 'paused', customer: 'cus_pastduefixpaused1' })
+  const res = await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+  assert(res.statusCode === 200, `a paused event against a missing-key record must succeed, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.pastDueSince === null, 'paused must never emit an explicit undefined pastDueSince -- omitting the field must resolve to the default null')
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'active', 'paused must never create canonical suspension -- unchanged by this fix (Amendment 3)')
 }
 
 // ===========================================================================
@@ -2378,6 +2548,14 @@ const tests = [
   ['a stale trial-cancel webhook cannot recreate cancellation after a newer reactivation', testStaleTrialCancelWebhookCannotRecreateAfterReactivation],
   ['a customer mismatch rejects the trial-cancellation intent', testTrialCancelWrongCustomerRejected],
   ['a subscription mismatch rejects the trial-cancellation intent', testTrialCancelWrongSubscriptionRejected],
+  // Live-Preview bug fix -- pastDueSince must never be written as undefined.
+  ['a trialing event against a missing-pastDueSince-key record succeeds', testTrialingWithNoPastDueSinceKeySucceeds],
+  ['a trialing event preserves an already-set pastDueSince', testTrialingPreservesExistingPastDueSince],
+  ['the first past_due event from a missing-key record sets the timestamp', testFirstPastDueFromMissingKeyRecordSetsTimestamp],
+  ['a repeated past_due event from a missing-key record stays stable', testRepeatedPastDueFromMissingKeyRecordStaysStable],
+  ['an active recovery from a missing-key record sets pastDueSince to null', testActiveRecoveryFromMissingKeyRecordSetsNull],
+  ['unpaid preserves a missing-key pastDueSince without emitting undefined', testUnpaidPreservesMissingKeyPastDueSinceWithoutUndefined],
+  ['paused preserves a missing-key pastDueSince without emitting undefined', testPausedPreservesMissingKeyPastDueSinceWithoutUndefined],
   // Phase B.13 -- Delinquency: past_due.
   ['the first past_due event sets commercialStatus and pastDueSince from event.created', testFirstPastDueSetsCommercialStatusAndPastDueSince],
   ['a duplicate past_due event does not reset the grace clock', testDuplicatePastDueDoesNotResetClock],
