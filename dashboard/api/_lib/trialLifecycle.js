@@ -666,14 +666,70 @@ export async function suspendForTerminalUnpaidIfValid(tenantId, { suspendedAt })
   return updated
 }
 
+// Trial-cancellation patch (live-Preview-discovered edge case) -- Stripe
+// does NOT represent a cancellation requested DURING an active trial the
+// same way it represents an ordinary post-trial cancellation. The normal
+// case sets `cancel_at_period_end: true` and leaves `cancel_at` alone; a
+// mid-trial cancellation instead leaves `cancel_at_period_end: false` and
+// sets an ABSOLUTE `cancel_at` aligned exactly to the subscription's own
+// `trial_end` (confirmed against a live Stripe sandbox subscription and its
+// own Portal UI copy, "Cancels <trial_end date>"). Treating
+// `cancel_at_period_end === false` as "definitely not scheduled to cancel"
+// is therefore wrong -- this narrow, pure, no-I/O helper recognizes BOTH
+// representations so syncCancellationIntentIfValid() below has a single,
+// uniform "is this subscription currently scheduled to end" signal to act
+// on, regardless of which lifecycle stage (trial vs. paid) the
+// cancellation was requested during.
+//
+// Deliberately narrow -- this is not a general Stripe-scheduling framework,
+// just the two representations Stripe is documented/observed to actually
+// use for "not yet canceled, but scheduled to end". Never trusts
+// `cancellation_details` (informational/human-readable only, never
+// structurally validated by Stripe) -- only raw `status`/`cancel_at`/
+// `trial_end`/`ended_at`, exactly the fields the caller has already
+// cross-validated belong to this tenant's own subscription.
+export function getEffectiveScheduledCancellation(subscription) {
+  if (subscription?.cancel_at_period_end === true) {
+    const item = subscription?.items?.data?.[0]
+    const periodEndEpoch = typeof subscription?.current_period_end === 'number'
+      ? subscription.current_period_end
+      : (typeof item?.current_period_end === 'number' ? item.current_period_end : null)
+    if (typeof periodEndEpoch !== 'number') return null
+    return { scheduled: true, effectiveAtEpoch: periodEndEpoch }
+  }
+
+  // Trial-end cancellation -- every one of these conditions is required;
+  // this is intentionally strict rather than inferring intent from any
+  // single field. `ended_at` must be absent/null -- an already-ended
+  // subscription is never "scheduled" to end, it already has.
+  if (
+    subscription?.status === 'trialing' &&
+    typeof subscription?.cancel_at === 'number' &&
+    typeof subscription?.trial_end === 'number' &&
+    subscription.cancel_at === subscription.trial_end &&
+    subscription?.ended_at == null
+  ) {
+    return { scheduled: true, effectiveAtEpoch: subscription.cancel_at }
+  }
+
+  return null
+}
+
 // Phase B.13 -- cancellation-INTENT sync only. NEVER changes
 // commercialStatus or limits/features -- the tenant keeps full access
-// through the remainder of the current paid period regardless of this
-// field. Idempotent by construction: recomputes the exact same object on
-// a redelivered/duplicate event (requestedAt is preserved, never reset,
-// as long as the existing cancellation is already 'pending_at_period_end')
-// and short-circuits to a no-op write when nothing actually changed.
-export async function syncCancellationIntentIfValid(tenantId, { cancelAtPeriodEnd, effectiveAt, requestedAt }) {
+// through the remainder of the current paid period (or trial, in the
+// trial-cancellation case above) regardless of this field. Idempotent by
+// construction: recomputes the exact same object on a redelivered/
+// duplicate event (requestedAt is preserved, never reset, as long as the
+// existing cancellation is already 'pending_at_period_end') and
+// short-circuits to a no-op write when nothing actually changed.
+//
+// `scheduled`/`effectiveAt` are the caller's already-resolved output of
+// getEffectiveScheduledCancellation() above (converted to ISO) -- this
+// function itself stays representation-agnostic; the canonical
+// `pending_at_period_end` status string is unchanged for either Stripe
+// representation (trial-cancellation patch: deliberately not renamed).
+export async function syncCancellationIntentIfValid(tenantId, { scheduled, effectiveAt, requestedAt }) {
   if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return null
 
   let config
@@ -692,7 +748,7 @@ export async function syncCancellationIntentIfValid(tenantId, { cancelAtPeriodEn
   const existingCancellation = existingCommercial.cancellation ?? null
 
   let newCancellation
-  if (cancelAtPeriodEnd) {
+  if (scheduled) {
     // Preserve the ORIGINAL requestedAt if a pending cancellation is
     // already recorded -- a redelivered/duplicate/later true event must
     // never reset it, mirroring pastDueSince's own stability requirement.

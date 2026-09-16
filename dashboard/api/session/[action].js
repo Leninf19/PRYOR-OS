@@ -26,6 +26,7 @@ import { requireCommercialOperation, commercialDenialResponse, CommercialOperati
 import {
   maybeStartTrial, maybeStartAccessCodeTrial, activatePaidSubscriptionIfValid,
   recordPastDueIfValid, suspendForTerminalUnpaidIfValid, syncCancellationIntentIfValid, completeCancellationIfValid,
+  getEffectiveScheduledCancellation,
 } from '../_lib/trialLifecycle.js'
 import {
   createBillingPortalSession, BillingPortalNotReadyError, BillingPortalConfigurationInvalidError, BillingPortalUrlNotConfiguredError,
@@ -2185,18 +2186,33 @@ async function handleSubscriptionProjectionEvent(event, res) {
       }
     }
 
-    // Phase B.13 -- cancellation-INTENT sync (cancel_at_period_end toggle),
-    // independent of `rawStatus`, on every validated, non-stale
-    // customer.subscription.updated delivery whose subscription id matches
-    // this tenant's own record. Deliberately NOT run for .deleted --
-    // completeCancellationIfValid() above already clears `cancellation` to
-    // null once the subscription is genuinely gone. Never alters
-    // commercialStatus/access -- see syncCancellationIntentIfValid()'s own
-    // header.
-    if (event.type === 'customer.subscription.updated' && subscriptionMatchesRecord) {
+    // Phase B.13 -- cancellation-INTENT sync, independent of `rawStatus`, on
+    // every validated, non-stale customer.subscription.updated delivery
+    // whose subscription id AND customer both match this tenant's own
+    // record (the same subscriptionMatchesRecord/customerMatchesRecord pair
+    // every other canonical-transition branch above requires -- a
+    // cancellation intent is exactly as sensitive as those and must never
+    // be written off an event that fails cross-validation). Deliberately
+    // NOT run for .deleted -- completeCancellationIfValid() above already
+    // clears `cancellation` to null once the subscription is genuinely
+    // gone. Never alters commercialStatus/access -- see
+    // syncCancellationIntentIfValid()'s own header.
+    //
+    // Trial-cancellation patch: getEffectiveScheduledCancellation()
+    // recognizes BOTH Stripe representations of "scheduled to end" (the
+    // ordinary cancel_at_period_end=true toggle, and the absolute
+    // trial-aligned cancel_at Stripe uses instead for a mid-trial
+    // cancellation) -- see that helper's own header for the live-Preview
+    // evidence that motivated this. `effective` is null for neither-applies
+    // (including the reactivation case: cancel_at_period_end=false AND no
+    // valid future trial-end cancel_at remains), which
+    // syncCancellationIntentIfValid() already treats as "clear
+    // cancellation" -- no separate reactivation branch is needed.
+    if (event.type === 'customer.subscription.updated' && subscriptionMatchesRecord && customerMatchesRecord) {
+      const effective = getEffectiveScheduledCancellation(subscription)
       await syncCancellationIntentIfValid(tenantId, {
-        cancelAtPeriodEnd: subscription.cancel_at_period_end === true,
-        effectiveAt: period.end,
+        scheduled: effective != null,
+        effectiveAt: effective ? new Date(effective.effectiveAtEpoch * 1000).toISOString() : null,
         requestedAt: new Date(event.created * 1000).toISOString(),
       })
     }

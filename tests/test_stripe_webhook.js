@@ -412,6 +412,10 @@ async function testNonSetupModeSessionIsIgnored() {
 function buildSubscriptionEventPayload({
   eventId = 'evt_sub1', type = 'customer.subscription.updated', subscriptionId, status = 'active',
   cancelAtPeriodEnd = false, created, customer, priceId, metadataTenantId, currentPeriodEnd,
+  // Trial-cancellation patch fixtures -- undefined (never a default number)
+  // so tests that don't care about these fields never accidentally exercise
+  // the trial-cancellation branch.
+  cancelAt, trialEnd, endedAt,
 }) {
   const nowSeconds = Math.floor(Date.now() / 1000)
   const object = {
@@ -421,6 +425,9 @@ function buildSubscriptionEventPayload({
   if (customer !== undefined) object.customer = customer
   if (priceId !== undefined) object.items = { data: [{ price: { id: priceId } }] }
   if (metadataTenantId !== undefined) object.metadata = { tenantId: metadataTenantId }
+  if (cancelAt !== undefined) object.cancel_at = cancelAt
+  if (trialEnd !== undefined) object.trial_end = trialEnd
+  if (endedAt !== undefined) object.ended_at = endedAt
   const payload = { id: eventId, type, created: created ?? nowSeconds, data: { object } }
   return JSON.stringify(payload)
 }
@@ -973,6 +980,309 @@ async function testCanceledPreservesPlanAndData() {
   assert(config.commercial.trial != null, 'trial history must be preserved')
   const record = await getBillingRecord(tenantId)
   assert(record.stripeCustomerId === 'cus_preserve1' && record.stripeSubscriptionId === 'sub_preserve1', 'billing identifiers/auditability must be preserved -- no destructive deletion')
+}
+
+// ===========================================================================
+// Trial-cancellation patch (live-Preview-discovered edge case) -- Stripe
+// represents a cancellation requested DURING an active trial via an
+// absolute `cancel_at` aligned to `trial_end`, never via
+// `cancel_at_period_end: true`. These tests exercise
+// getEffectiveScheduledCancellation()'s trial-end branch through the full
+// webhook handler, alongside the reactivation/staleness/cross-validation
+// guarantees the objective requires.
+// ===========================================================================
+
+async function testTrialCancelAtEqualsTrialEndWritesCancellation() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-basic-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'trial' })
+  await seedTenantWithSubscription(tenantId, 'sub_trialcancel1', { stripeCustomerId: 'cus_trialcancel1' })
+
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  const trialEnd = nowSeconds + 5 * 24 * 60 * 60
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancel1', subscriptionId: 'sub_trialcancel1', status: 'trialing',
+    customer: 'cus_trialcancel1', cancelAtPeriodEnd: false, cancelAt: trialEnd, trialEnd,
+  })
+  const res = await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+  assert(res.statusCode === 200)
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation?.status === 'pending_at_period_end', 'a mid-trial cancel_at aligned to trial_end must produce the same canonical cancellation intent shape')
+  assert(config.commercial.commercialStatus === 'trial', 'the trial-cancellation intent must never itself change commercialStatus')
+}
+
+async function testTrialCancelRequestedAtFromFirstEvent() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-reqat-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'trial' })
+  await seedTenantWithSubscription(tenantId, 'sub_trialcancelreqat1', { stripeCustomerId: 'cus_trialcancelreqat1' })
+
+  const firstCreated = Math.floor(Date.now() / 1000)
+  const trialEnd = firstCreated + 5 * 24 * 60 * 60
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelreqat1', subscriptionId: 'sub_trialcancelreqat1', status: 'trialing',
+    customer: 'cus_trialcancelreqat1', cancelAtPeriodEnd: false, cancelAt: trialEnd, trialEnd, created: firstCreated,
+  })
+  await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation.requestedAt === new Date(firstCreated * 1000).toISOString(), 'requestedAt must be derived from the first accepted event.created, never Date.now()')
+}
+
+async function testTrialCancelEffectiveAtFromCancelAt() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-effat-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'trial' })
+  await seedTenantWithSubscription(tenantId, 'sub_trialcanceleffat1', { stripeCustomerId: 'cus_trialcanceleffat1' })
+
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  const trialEnd = nowSeconds + 6 * 24 * 60 * 60
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcanceleffat1', subscriptionId: 'sub_trialcanceleffat1', status: 'trialing',
+    customer: 'cus_trialcanceleffat1', cancelAtPeriodEnd: false, cancelAt: trialEnd, trialEnd,
+  })
+  await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation.effectiveAt === new Date(trialEnd * 1000).toISOString(), 'effectiveAt must be derived from the validated cancel_at, never current_period_end, for a trial-end cancellation')
+}
+
+async function testRepeatedTrialCancelDoesNotResetRequestedAt() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-repeated-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'trial' })
+  await seedTenantWithSubscription(tenantId, 'sub_trialcancelrepeated1', { stripeCustomerId: 'cus_trialcancelrepeated1' })
+
+  const firstCreated = Math.floor(Date.now() / 1000)
+  const trialEnd = firstCreated + 5 * 24 * 60 * 60
+  const first = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelrepeated1', subscriptionId: 'sub_trialcancelrepeated1', status: 'trialing',
+    customer: 'cus_trialcancelrepeated1', cancelAtPeriodEnd: false, cancelAt: trialEnd, trialEnd, created: firstCreated,
+  })
+  await invokeWebhookProperly(first, Stripe.webhooks.generateTestHeaderString({ payload: first, secret: TEST_WEBHOOK_SECRET }))
+
+  // A LATER, different event, still the same trial-end cancellation (Stripe
+  // redelivering/re-confirming the same intent).
+  const laterCreated = firstCreated + 1000
+  const second = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelrepeated2', subscriptionId: 'sub_trialcancelrepeated1', status: 'trialing',
+    customer: 'cus_trialcancelrepeated1', cancelAtPeriodEnd: false, cancelAt: trialEnd, trialEnd, created: laterCreated,
+  })
+  await invokeWebhookProperly(second, Stripe.webhooks.generateTestHeaderString({ payload: second, secret: TEST_WEBHOOK_SECRET }))
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation.requestedAt === new Date(firstCreated * 1000).toISOString(), 'a repeated trial-cancel event must never reset requestedAt to a later timestamp')
+}
+
+async function testTrialCancelAtNotEqualTrialEndDoesNotQualify() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-mismatch-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'trial' })
+  await seedTenantWithSubscription(tenantId, 'sub_trialcancelmismatch1', { stripeCustomerId: 'cus_trialcancelmismatch1' })
+
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  const trialEnd = nowSeconds + 5 * 24 * 60 * 60
+  const arbitraryCancelAt = trialEnd - 1000 // scheduled to end before trial_end -- not the trial-end representation
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelmismatch1', subscriptionId: 'sub_trialcancelmismatch1', status: 'trialing',
+    customer: 'cus_trialcancelmismatch1', cancelAtPeriodEnd: false, cancelAt: arbitraryCancelAt, trialEnd,
+  })
+  await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation === null, 'an arbitrary cancel_at that does not equal trial_end must never qualify as a trial-end cancellation')
+}
+
+async function testTrialCancelMissingTrialEndDoesNotQualify() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-notrialend-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'trial' })
+  await seedTenantWithSubscription(tenantId, 'sub_trialcancelnotrialend1', { stripeCustomerId: 'cus_trialcancelnotrialend1' })
+
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelnotrialend1', subscriptionId: 'sub_trialcancelnotrialend1', status: 'trialing',
+    customer: 'cus_trialcancelnotrialend1', cancelAtPeriodEnd: false, cancelAt: nowSeconds + 5 * 24 * 60 * 60,
+    // trial_end deliberately omitted
+  })
+  await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation === null, 'a missing trial_end must never qualify as a trial-end cancellation, regardless of cancel_at')
+}
+
+async function testTrialCancelEndedAtPresentDoesNotQualify() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-ended-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'trial' })
+  await seedTenantWithSubscription(tenantId, 'sub_trialcancelended1', { stripeCustomerId: 'cus_trialcancelended1' })
+
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  const trialEnd = nowSeconds + 5 * 24 * 60 * 60
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelended1', subscriptionId: 'sub_trialcancelended1', status: 'trialing',
+    customer: 'cus_trialcancelended1', cancelAtPeriodEnd: false, cancelAt: trialEnd, trialEnd, endedAt: nowSeconds,
+  })
+  await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation === null, 'a present ended_at must never qualify as a scheduled trial-end cancellation -- the subscription has already ended')
+}
+
+async function testTrialCancelReactivationClearsCancellationAndPreservesTrial() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-reactivate-1'
+  await seedCommercialTenantConfig(tenantId, {
+    commercialStatus: 'trial',
+    cancellation: { status: 'pending_at_period_end', requestedAt: new Date().toISOString(), effectiveAt: new Date().toISOString() },
+  })
+  await seedTenantWithSubscription(tenantId, 'sub_trialcancelreactivate1', { stripeCustomerId: 'cus_trialcancelreactivate1' })
+
+  // Stripe's own "Don't cancel subscription" reversal: cancel_at_period_end
+  // stays false (as it always was during a trial) and cancel_at is removed
+  // entirely -- no valid future trial-end cancel_at remains.
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelreactivate1', subscriptionId: 'sub_trialcancelreactivate1', status: 'trialing',
+    customer: 'cus_trialcancelreactivate1', cancelAtPeriodEnd: false,
+  })
+  await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation === null, 'removing cancel_at must clear the pending trial-end cancellation intent')
+  assert(config.commercial.commercialStatus === 'trial', 'reactivation must never itself change commercialStatus -- the trial remains active')
+}
+
+async function testStaleTrialCancelWebhookCannotRecreateAfterReactivation() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-stale-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'trial' })
+  await seedTenantWithSubscription(tenantId, 'sub_trialcancelstale1', { stripeCustomerId: 'cus_trialcancelstale1' })
+
+  const firstCreated = Math.floor(Date.now() / 1000)
+  const trialEnd = firstCreated + 5 * 24 * 60 * 60
+
+  // 1) The original trial-cancellation event.
+  const first = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelstale1', subscriptionId: 'sub_trialcancelstale1', status: 'trialing',
+    customer: 'cus_trialcancelstale1', cancelAtPeriodEnd: false, cancelAt: trialEnd, trialEnd, created: firstCreated,
+  })
+  await invokeWebhookProperly(first, Stripe.webhooks.generateTestHeaderString({ payload: first, secret: TEST_WEBHOOK_SECRET }))
+  let config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation?.status === 'pending_at_period_end', 'sanity check -- the original event must have written the cancellation intent')
+
+  // 2) A NEWER reactivation event (cancel_at removed).
+  const laterCreated = firstCreated + 1000
+  const second = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelstale2', subscriptionId: 'sub_trialcancelstale1', status: 'trialing',
+    customer: 'cus_trialcancelstale1', cancelAtPeriodEnd: false, created: laterCreated,
+  })
+  await invokeWebhookProperly(second, Stripe.webhooks.generateTestHeaderString({ payload: second, secret: TEST_WEBHOOK_SECRET }))
+  config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation === null, 'sanity check -- the newer reactivation event must have cleared the cancellation intent')
+
+  // 3) A STALE redelivery of the ORIGINAL cancellation event (older created
+  // than what is already durably recorded) must never resurrect it.
+  const staleCreated = firstCreated + 500
+  const third = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelstale3', subscriptionId: 'sub_trialcancelstale1', status: 'trialing',
+    customer: 'cus_trialcancelstale1', cancelAtPeriodEnd: false, cancelAt: trialEnd, trialEnd, created: staleCreated,
+  })
+  await invokeWebhookProperly(third, Stripe.webhooks.generateTestHeaderString({ payload: third, secret: TEST_WEBHOOK_SECRET }))
+  config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation === null, 'a stale webhook must never recreate a cancellation intent after a newer reactivation event')
+}
+
+async function testTrialCancelWrongCustomerRejected() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-wrongcust-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'trial' })
+  await seedTenantWithSubscription(tenantId, 'sub_trialcancelwrongcust1', { stripeCustomerId: 'cus_trialcancelrealcust1' })
+
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  const trialEnd = nowSeconds + 5 * 24 * 60 * 60
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelwrongcust1', subscriptionId: 'sub_trialcancelwrongcust1', status: 'trialing',
+    customer: 'cus_trialcancelattackercust1', cancelAtPeriodEnd: false, cancelAt: trialEnd, trialEnd,
+  })
+  await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation === null, 'a customer mismatch must reject the trial-cancellation intent write, exactly like every other canonical transition')
+}
+
+async function testTrialCancelWrongSubscriptionRejected() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_trialcancel-wrongsub-1'
+  await seedCommercialTenantConfig(tenantId, { commercialStatus: 'trial' })
+  await createBillingRecord(tenantId, { stripeSubscriptionId: 'sub_trialcancelrealsub1', stripeCustomerId: 'cus_trialcancelwrongsub1', subscriptionStatus: 'trialing' })
+  await claimSubscriptionIndex('sub_trialcanceleventsub1', tenantId)
+
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  const trialEnd = nowSeconds + 5 * 24 * 60 * 60
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_trialcancelwrongsub1', subscriptionId: 'sub_trialcanceleventsub1', status: 'trialing',
+    customer: 'cus_trialcancelwrongsub1', cancelAtPeriodEnd: false, cancelAt: trialEnd, trialEnd,
+  })
+  await invokeWebhookProperly(payload, Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET }))
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.cancellation === null, 'a subscription-id mismatch must reject the trial-cancellation intent write, exactly like every other canonical transition')
 }
 
 // ===========================================================================
@@ -2056,6 +2366,18 @@ const tests = [
   ['reactivation clears the cancellation intent', testReactivationClearsCancellation],
   ['an actual deleted event transitions to canceled', testActualDeletedEventTransitionsToCanceled],
   ['canceled preserves plan and data -- no destructive deletion', testCanceledPreservesPlanAndData],
+  // Trial-cancellation patch (live-Preview-discovered edge case).
+  ['a trial cancel_at equal to trial_end writes the cancellation intent', testTrialCancelAtEqualsTrialEndWritesCancellation],
+  ['trial-cancellation requestedAt is anchored to the first accepted event', testTrialCancelRequestedAtFromFirstEvent],
+  ['trial-cancellation effectiveAt is derived from cancel_at', testTrialCancelEffectiveAtFromCancelAt],
+  ['a repeated trial-cancel event does not reset requestedAt', testRepeatedTrialCancelDoesNotResetRequestedAt],
+  ['a trial cancel_at not equal to trial_end does not qualify', testTrialCancelAtNotEqualTrialEndDoesNotQualify],
+  ['a trialing subscription with no trial_end does not qualify', testTrialCancelMissingTrialEndDoesNotQualify],
+  ['a trialing subscription with ended_at present does not qualify', testTrialCancelEndedAtPresentDoesNotQualify],
+  ['reactivation clears a trial-cancellation intent and preserves the trial', testTrialCancelReactivationClearsCancellationAndPreservesTrial],
+  ['a stale trial-cancel webhook cannot recreate cancellation after a newer reactivation', testStaleTrialCancelWebhookCannotRecreateAfterReactivation],
+  ['a customer mismatch rejects the trial-cancellation intent', testTrialCancelWrongCustomerRejected],
+  ['a subscription mismatch rejects the trial-cancellation intent', testTrialCancelWrongSubscriptionRejected],
   // Phase B.13 -- Delinquency: past_due.
   ['the first past_due event sets commercialStatus and pastDueSince from event.created', testFirstPastDueSetsCommercialStatusAndPastDueSince],
   ['a duplicate past_due event does not reset the grace clock', testDuplicatePastDueDoesNotResetClock],
