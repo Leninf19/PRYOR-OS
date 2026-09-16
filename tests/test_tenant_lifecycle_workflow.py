@@ -259,6 +259,34 @@ def test_job_summary_step_runs_always_but_does_not_gate_earlier_steps():
     assert "tenant_status_report.py" in summary_steps[0]["run"], "the job summary step must call tenant_status_report.py"
 
 
+def test_activate_billing_step_requires_main_ref_but_does_not_gate_initial_sync():
+    """Safety-audit invariant: this file has no Preview/Production split at
+    all -- its 'Activate billing' step always targets the REAL Production
+    billing callback URL/secret, regardless of which branch it was
+    dispatched from. Since this file's OTHER steps (provision_tenant.py/
+    initial_sync.py) can only ever succeed when dispatched from whatever
+    branch currently hosts the multi-tenant implementation (never main),
+    the github.ref=='refs/heads/main' guard must apply ONLY to 'Activate
+    billing' -- 'Run Initial Sync' itself must remain completely
+    unaffected."""
+    _text, data = _load()
+    steps = data["jobs"]["operate"]["steps"]
+    activate_step = next((s for s in steps if s.get("name") == "Activate billing"), None)
+    assert activate_step is not None, "expected an 'Activate billing' step"
+    assert activate_step.get("id") == "activate_billing"
+    assert activate_step["if"] == "inputs.operation == 'initial_sync' && steps.run_initial_sync.outcome == 'success' && github.ref == 'refs/heads/main'", (
+        f"unexpected gating: {activate_step['if']!r}"
+    )
+
+    sync_step = next((s for s in steps if s.get("name") == "Run Initial Sync"), None)
+    assert sync_step is not None, "expected a 'Run Initial Sync' step"
+    assert sync_step.get("id") == "run_initial_sync"
+    assert sync_step["if"] == "inputs.operation == 'initial_sync'", (
+        f"'Run Initial Sync' must remain completely unaffected by the new ref guard, got if: {sync_step['if']!r}"
+    )
+    assert "github.ref" not in sync_step["if"]
+
+
 def main() -> int:
     run("workflow file exists and parses as valid YAML", test_workflow_file_exists_and_parses)
     run("dispatch inputs are exactly operation/tenant_id/confirmation, correctly typed", test_dispatch_inputs_are_exactly_as_required)
@@ -272,6 +300,7 @@ def main() -> int:
     run("diagnose_google_status step's env/secret mapping is exact, no BLOB_READ_WRITE_TOKEN", test_diagnose_google_status_step_env_mapping_is_exact)
     run("no step uses continue-on-error", test_no_continue_on_error_anywhere)
     run("the job summary step runs always() without gating earlier steps' outcome", test_job_summary_step_runs_always_but_does_not_gate_earlier_steps)
+    run("Activate billing requires github.ref == refs/heads/main; Run Initial Sync is unaffected", test_activate_billing_step_requires_main_ref_but_does_not_gate_initial_sync)
 
     print()
     if all(results):

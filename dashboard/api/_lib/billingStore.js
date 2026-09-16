@@ -239,6 +239,31 @@ function isValidCustomerCreationOperation(v) {
   )
 }
 
+// Phase B.12 -- durable Stripe-Subscription-creation operation state.
+// Identical shape and reasoning to isValidCustomerCreationOperation() above
+// (see that function's header for the full "why a durable record, not just
+// a Stripe idempotency key" rationale -- unchanged here), plus ONE
+// additional terminal state this operation alone can reach:
+// 'expired_before_activation' -- see subscriptionActivation.js's own header
+// for the EXPIRED-TRIAL RULE this represents (PRYOR's canonical trial ended
+// before a first Stripe subscription was ever created; this is a
+// deterministic precondition failure, never a Stripe-result ambiguity, so
+// it is deliberately a DIFFERENT terminal state than 'ambiguous' -- a
+// human/support reader must be able to tell "we didn't even try because the
+// trial had already ended" apart from "we tried and Stripe's outcome is
+// unknown").
+function isValidSubscriptionActivationOperation(v) {
+  if (v === null) return true
+  const allowedKeys = ['operationId', 'startedAt', 'state']
+  return (
+    v !== null && typeof v === 'object' && !Array.isArray(v) &&
+    typeof v.operationId === 'string' && v.operationId.length > 0 &&
+    typeof v.startedAt === 'string' && !Number.isNaN(Date.parse(v.startedAt)) &&
+    ['pending', 'completed', 'ambiguous', 'expired_before_activation'].includes(v.state) &&
+    Object.keys(v).every(k => allowedKeys.includes(k))
+  )
+}
+
 // ===========================================================================
 // Part Q -- the exact, exhaustive allowlist of fields a caller may ever set
 // via createBillingRecord()/updateBillingRecord(). This is the structural
@@ -264,6 +289,9 @@ const MUTABLE_FIELDS = Object.freeze([
   // Phase B.11 pre-commit correction (Part 4) -- see
   // isValidCustomerCreationOperation()'s own header above.
   'customerCreationOperation',
+  // Phase B.12 -- see isValidSubscriptionActivationOperation()'s own header
+  // above.
+  'subscriptionActivation',
 ])
 
 function validateBillingFields(fields) {
@@ -306,6 +334,9 @@ function validateBillingFields(fields) {
   if (!isValidCustomerCreationOperation(fields.customerCreationOperation)) {
     throw new TypeError(`invalid customerCreationOperation ${JSON.stringify(fields.customerCreationOperation)}`)
   }
+  if (!isValidSubscriptionActivationOperation(fields.subscriptionActivation)) {
+    throw new TypeError(`invalid subscriptionActivation ${JSON.stringify(fields.subscriptionActivation)}`)
+  }
 }
 
 function assertOnlyKnownFields(fields, fnName) {
@@ -321,7 +352,7 @@ const DEFAULT_FIELDS = Object.freeze({
   currentPeriodStart: null, currentPeriodEnd: null, cancelAtPeriodEnd: null,
   defaultPaymentMethodId: null,
   lastStripeObjectCreatedAt: null, lastStripeEventCreatedAt: null, pendingPaidPlan: null,
-  consent: null, customerCreationOperation: null,
+  consent: null, customerCreationOperation: null, subscriptionActivation: null,
 })
 
 // ===========================================================================

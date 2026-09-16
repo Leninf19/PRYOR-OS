@@ -85,6 +85,7 @@ import { locationCatalogModeFor, LocationCatalogMigrationMode } from './tenants.
 import { reserveTrialClaim, finalizeTrialClaim, TrialEligibilityStoreUnavailableError } from './trialEligibilityStore.js'
 import { commercialIdentityKey } from './commercialIdentity.js'
 import { listUsers } from './userStore.js'
+import { isSelfServicePlan } from './stripePriceMap.js'
 
 // Phase B.11 pre-commit correction -- exported so selfServiceCommercial.js's
 // consent-snapshot fields (session/[action].js's selectPlan()) can never
@@ -380,6 +381,111 @@ export async function maybeStartAccessCodeTrial(tenantId, config) {
     }
     if (err instanceof TenantConfigStoreUnavailableError) {
       console.error(`[trialLifecycle] tenant config store unavailable during access-code trial-start for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return config
+    }
+    throw err
+  }
+}
+
+// Phase B.12 -- the ONE place tenant_config.commercial ever transitions from
+// the completed-trial state into the existing, already-resolver-recognized
+// canonical PAID-ACTIVE state (commercialStatus: 'active') -- mirrors
+// maybeStartTrial()/maybeStartAccessCodeTrial()'s exact discipline (a
+// server-controlled, idempotent, CAS-protected write against an
+// ALREADY-LOADED config, never re-read independently here) and reuses
+// COMMERCIAL_STATUSES's existing 'active' value and PLAN_ENTITLEMENTS'
+// existing Core/Growth/Enterprise resolution -- there is deliberately NO
+// separate/parallel "paid" schema anywhere in this codebase.
+//
+// AUTHORITY AND CALLER CONTRACT: this function trusts its OWN two
+// arguments completely -- `plan` MUST already be a value the caller
+// independently derived from SERVER billing state (stripePriceMap.js's
+// resolvePlanIdForStripePriceId() against the tenant's OWN billing:v1
+// record, itself resolved via the Stripe subscription reverse index --
+// never from Stripe object metadata alone). This function does not
+// re-validate the caller's provenance for that value beyond the one
+// structural guard below (isSelfServicePlan) -- the caller (session/
+// [action].js's handleSubscriptionProjectionEvent()) is responsible for
+// every customer/price/subscription cross-check BEFORE calling this.
+//
+// ONE-DIRECTIONAL, "ONCE CONSUMED, NEVER AGAIN": only ever transitions OUT
+// OF commercialStatus === 'trial'. A tenant already 'active' (e.g. a
+// duplicate/redelivered Stripe event, or a second observation racing this
+// same one) is a pure, harmless no-op -- this is what makes repeated calls
+// (retries, duplicate webhook deliveries) safe without any separate
+// idempotency ledger of its own. Any OTHER existing state (suspended,
+// canceled, past_due, trial_pending_activation) is likewise left
+// completely untouched -- this function is never a general-purpose
+// "set commercialStatus" writer, only this one specific, narrow transition.
+//
+// NEVER creates or restarts a trial (there is no trial-shaped object
+// written here at all -- the tenant's own historical `trial` sub-object is
+// preserved via the spread below, purely as a record of when the trial
+// that led here started/ended, never reinterpreted as a live trial once
+// commercialStatus is 'active'), and NEVER grants Enterprise (Enterprise is
+// excluded from isSelfServicePlan() by construction, mirroring
+// stripePriceMap.js's own SELF_SERVICE_PLAN_IDS gate).
+export async function activatePaidSubscriptionIfValid(tenantId, plan) {
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return null
+
+  let config
+  try {
+    config = await getTenantConfig(tenantId)
+  } catch (err) {
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable during paid-active activation for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return null
+    }
+    throw err
+  }
+  if (!config) return null
+
+  // The ONLY state this function ever transitions OUT of. Already-'active'
+  // (duplicate event, race with another observation) and every other
+  // status are both left completely untouched -- see this function's own
+  // header for why that is exactly the desired idempotent/no-op behavior.
+  if (config.commercial?.commercialStatus !== 'trial') return config
+
+  // Defense in depth -- the caller must already have validated `plan`
+  // against real server billing state before ever calling this, but this
+  // function never trusts that alone: Enterprise (or any other
+  // non-self-service value) can never be applied here either way.
+  if (!isSelfServicePlan(plan)) {
+    console.error(`[trialLifecycle] refusing paid-active activation for tenant ${JSON.stringify(tenantId)} -- plan ${JSON.stringify(plan)} is not a self-service plan`)
+    return config
+  }
+
+  const now = new Date().toISOString()
+  const existingCommercial = config.commercial
+  // Fields explicitly changed by this transition: commercialStatus
+  // ('trial' -> 'active'), plan (set to the server-validated Core/Growth
+  // plan), planSource (new provenance value), updatedAt. Every other field
+  // -- including `trial` itself (startedAt/endsAt/consumedAt, kept as a
+  // historical record only), limitsOverride, suspension, cancellation,
+  // overLimit, accessCodeHash, discountPercent, discountFixedCents,
+  // paymentRequired, createdAt -- is carried forward completely unchanged
+  // via this spread, never reset, never reinterpreted.
+  const newCommercial = {
+    ...existingCommercial,
+    commercialStatus: 'active',
+    plan,
+    planSource: 'stripe_subscription_active',
+    updatedAt: now,
+  }
+
+  try {
+    return await upsertTenantConfig(tenantId, { commercial: newCommercial }, { expectedVersion: config.configVersion })
+  } catch (err) {
+    if (err instanceof ConfigVersionConflictError) {
+      // Something else already changed this tenant's commercial state
+      // underneath this attempt (another concurrent webhook delivery, a
+      // support action, etc.) -- never retried blindly here; the next
+      // delivery/observation re-evaluates fresh state on its own.
+      console.log(`[trialLifecycle] tenant ${JSON.stringify(tenantId)} paid-active activation CAS conflict -- leaving current state as-is`)
+      return config
+    }
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable while activating paid-active state for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
       return config
     }
     throw err

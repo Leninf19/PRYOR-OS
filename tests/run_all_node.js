@@ -176,6 +176,10 @@ const TESTS = [
   // B.11.5 -- independent, end-to-end synthetic-tenant onboarding
   // reliability test (register -> ... -> trial start -> entitlements).
   'test_b11_5_synthetic_onboarding_reliability.js',
+  // Phase B.12 -- Stripe Subscription Activation (ensureSubscriptionActivation()).
+  'test_subscription_activation.js',
+  // Phase B.12 (Decision 1) -- primary event-driven billing-activation callback.
+  'test_billing_activation_callback.js',
 ]
 
 const results = {}

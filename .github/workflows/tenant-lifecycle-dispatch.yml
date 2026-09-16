@@ -403,6 +403,7 @@ jobs:
         run: python provision_tenant.py --tenant-id "$TENANT_ID"
 
       - name: Run Initial Sync (production)
+        id: run_initial_sync_production
         if: inputs.operation == 'initial_sync' && inputs.environment == 'production'
         env:
           TENANT_ID: ${{ inputs.tenant_id }}
@@ -415,6 +416,7 @@ jobs:
         run: python initial_sync.py --tenant-id "$TENANT_ID"
 
       - name: Run Initial Sync (preview)
+        id: run_initial_sync_preview
         if: inputs.operation == 'initial_sync' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success'
         env:
           TENANT_ID: ${{ inputs.tenant_id }}
@@ -425,6 +427,117 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.PREVIEW_GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.PREVIEW_GOOGLE_CLIENT_SECRET }}
         run: python initial_sync.py --tenant-id "$TENANT_ID"
+
+      # Phase B.12 (Decision 1) -- the PRIMARY, event-driven Subscription-
+      # activation trigger: fires ONLY after Initial Sync has genuinely
+      # persisted tenant_config.initialSync.completedAt (gated on the
+      # PRODUCTION Initial Sync step's own 'success' outcome -- never the
+      # bare success() default, same discipline as "Chain to Initial Sync"
+      # above). Calls the Node/Vercel application's own internal callback
+      # (dashboard/api/session/[action].js's billingActivationCallback()),
+      # which itself calls the SAME canonical maybeStartTrial()/
+      # ensureSubscriptionActivation() functions tenantStatus()'s own
+      # fallback polling already uses -- this step is a delivery mechanism
+      # only, never a second implementation of that logic.
+      #
+      # AUTHENTICATION: a dedicated, single-purpose secret
+      # (BILLING_ACTIVATION_CALLBACK_SECRET) -- deliberately NEVER
+      # CREDENTIAL_ENCRYPTION_KEY, GOOGLE_CLIENT_SECRET, VERCEL_TOKEN, a
+      # GitHub PAT, or any Stripe secret. Preview/Production isolation
+      # mirrors every other secret-bearing action in this file exactly:
+      # two fully separate steps, each referencing exactly ONE secret name,
+      # no &&/|| cross-environment fallback expression anywhere.
+      #
+      # APP_BASE_URL is NOT a secret -- knowledge of the URL alone grants
+      # nothing without the callback secret above (same reasoning as every
+      # public API endpoint this codebase already has). It is a fixed,
+      # reviewed literal, never derived from any input, mirroring
+      # APPROVED_PREVIEW_LIFECYCLE_REF's own discipline on the Node side.
+      #
+      # RETRY: a bounded (5-attempt, 5s-interval) retry loop against
+      # transient failures (deploy blip, cold start, brief outage). If the
+      # callback never succeeds, this step fails (`exit 1`) -- GitHub
+      # Actions' own default behavior then marks the job 'failure', making
+      # this failure visible rather than silently declaring billing
+      # activation complete. A workflow RERUN safely re-invokes the exact
+      # same idempotent callback -- it can never restart the trial or
+      # create a duplicate subscription (see the callback's own
+      # implementation and its dedicated test suite).
+      # SAFETY AUDIT ADDITION -- github.ref == 'refs/heads/main' is REQUIRED
+      # here, on top of inputs.environment == 'production': `ref` (which
+      # branch's copy of THIS WORKFLOW FILE actually executes) and
+      # `environment` (a caller-chosen input) are two fully independent
+      # dispatch parameters -- nothing else in this file ties them
+      # together, so a dispatch with ref=<any non-main branch> +
+      # environment=production would otherwise still reach this step with
+      # the REAL Production secret/URL. Node's own dispatchTenantLifecycleWorkflow()
+      # already always sends ref='main' for environment=='production' (see
+      # google/[action].js's resolveLifecycleExecutionRef()), but that is a
+      # CALLER-side convention, not something this workflow itself
+      # enforced until now. This guard makes the invariant structural
+      # instead of merely conventional. Deliberately step-scoped, not
+      # job-level -- provisioning/initial_sync steps are unchanged.
+      - name: Activate billing (production)
+        id: activate_billing_production
+        if: inputs.operation == 'initial_sync' && inputs.environment == 'production' && steps.run_initial_sync_production.outcome == 'success' && github.ref == 'refs/heads/main'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          BILLING_ACTIVATION_CALLBACK_SECRET: ${{ secrets.BILLING_ACTIVATION_CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          APP_BASE_URL="https://app.futuremark.studio"
+          ATTEMPTS=5
+          DELAY_SECONDS=5
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            HTTP_STATUS=$(curl -sS -o /tmp/billing_activation_response.json -w '%{http_code}' \
+              --max-time 15 \
+              -X POST "$APP_BASE_URL/api/session?action=billing-activation-callback" \
+              -H "Authorization: Bearer $BILLING_ACTIVATION_CALLBACK_SECRET" \
+              -H "Content-Type: application/json" \
+              -d "{\"tenantId\":\"$TENANT_ID\"}") || HTTP_STATUS="000"
+            if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
+              echo "billing activation callback succeeded on attempt $attempt (HTTP $HTTP_STATUS) for tenant $TENANT_ID"
+              cat /tmp/billing_activation_response.json || true
+              exit 0
+            fi
+            echo "billing activation callback attempt $attempt/$ATTEMPTS failed (HTTP $HTTP_STATUS) for tenant $TENANT_ID"
+            if [[ "$attempt" -lt "$ATTEMPTS" ]]; then
+              sleep "$DELAY_SECONDS"
+            fi
+          done
+          echo "::error::billing activation callback did not succeed after $ATTEMPTS attempts for tenant $TENANT_ID -- failing this workflow visibly rather than silently declaring complete billing activation"
+          exit 1
+
+      - name: Activate billing (preview)
+        id: activate_billing_preview
+        if: inputs.operation == 'initial_sync' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success' && steps.run_initial_sync_preview.outcome == 'success'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          BILLING_ACTIVATION_CALLBACK_SECRET: ${{ secrets.PREVIEW_BILLING_ACTIVATION_CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          APP_BASE_URL="https://pryor-os-git-feature-commercial-e-6c39d9-lenin-fierros-projects.vercel.app"
+          ATTEMPTS=5
+          DELAY_SECONDS=5
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            HTTP_STATUS=$(curl -sS -o /tmp/billing_activation_response.json -w '%{http_code}' \
+              --max-time 15 \
+              -X POST "$APP_BASE_URL/api/session?action=billing-activation-callback" \
+              -H "Authorization: Bearer $BILLING_ACTIVATION_CALLBACK_SECRET" \
+              -H "Content-Type: application/json" \
+              -d "{\"tenantId\":\"$TENANT_ID\"}") || HTTP_STATUS="000"
+            if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
+              echo "billing activation callback succeeded on attempt $attempt (HTTP $HTTP_STATUS) for tenant $TENANT_ID"
+              cat /tmp/billing_activation_response.json || true
+              exit 0
+            fi
+            echo "billing activation callback attempt $attempt/$ATTEMPTS failed (HTTP $HTTP_STATUS) for tenant $TENANT_ID"
+            if [[ "$attempt" -lt "$ATTEMPTS" ]]; then
+              sleep "$DELAY_SECONDS"
+            fi
+          done
+          echo "::error::billing activation callback did not succeed after $ATTEMPTS attempts for tenant $TENANT_ID -- failing this workflow visibly rather than silently declaring complete billing activation"
+          exit 1
 
       - name: Apply entitlement change (production)
         if: inputs.operation == 'apply_entitlement_change' && inputs.environment == 'production'

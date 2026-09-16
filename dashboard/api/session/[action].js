@@ -17,13 +17,13 @@ import { signSession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError, UserCreationMode, lookupTenantIdForUserId } from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
-import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID } from '../_lib/tenants.js'
+import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID, isValidTenantId } from '../_lib/tenants.js'
 import { generateTenantId } from '../_lib/tenantIdGenerator.js'
 import { getTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvisioningDispatch } from '../_lib/tenantConfigStore.js'
 import { resolveTenantEntitlements } from '../_lib/entitlements.js'
 import { resolveTenantEntitlementsFromConfig } from '../_lib/entitlementResolution.js'
 import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
-import { maybeStartTrial, maybeStartAccessCodeTrial } from '../_lib/trialLifecycle.js'
+import { maybeStartTrial, maybeStartAccessCodeTrial, activatePaidSubscriptionIfValid } from '../_lib/trialLifecycle.js'
 import {
   createNewTenant, TenantCreationMode, TenantCreationModeRequiredError,
   IdentityAlreadyExistsError, TenantAlreadyExistsError,
@@ -52,7 +52,7 @@ import {
 } from '../_lib/accessCodeStore.js'
 import { buildAccessCodeCommercialWrite, PaymentRequiredNotSupportedError, InvalidAccessCodeGrantError } from '../_lib/accessCodeCommercial.js'
 import { isValidPlanId, PLANS } from '../_lib/plans.js'
-import { isSelfServicePlan } from '../_lib/stripePriceMap.js'
+import { isSelfServicePlan, resolvePlanIdForStripePriceId } from '../_lib/stripePriceMap.js'
 import { CURRENT_BILLING_TERMS_VERSION } from '../_lib/billingTerms.js'
 import { buildSelfServicePendingActivationCommercial, SELF_SERVICE_TRIAL_DAYS } from '../_lib/selfServiceCommercial.js'
 import {
@@ -60,12 +60,19 @@ import {
   BillingUrlNotConfiguredError, BillingSetupRecoveryRequiredError,
 } from '../_lib/billingCustomer.js'
 import {
-  updateBillingRecord, getBillingRecord, getTenantIdForCustomer,
+  updateBillingRecord, getBillingRecord, getTenantIdForCustomer, getTenantIdForSubscription,
   claimStripeEvent, markStripeEventProcessed, markStripeEventFailed,
   BillingVersionConflictError, BillingStoreUnavailableError,
-  isValidStripeCustomerId, isValidStripePaymentMethodId,
+  isValidStripeCustomerId, isValidStripePaymentMethodId, isValidStripeSubscriptionId,
+  isValidProviderSubscriptionStatus, isStaleBillingEvent,
 } from '../_lib/billingStore.js'
 import { getStripeClient, StripeNotConfiguredError } from '../_lib/stripeClient.js'
+import { projectProviderStatusToCommercialStatus } from '../_lib/billingStatusProjection.js'
+import { timingSafeEqual } from 'crypto'
+import {
+  ensureSubscriptionActivation, resolveSubscriptionPeriod,
+  SubscriptionActivationRecoveryRequiredError, TrialExpiredBeforeActivationError,
+} from '../_lib/subscriptionActivation.js'
 
 const SESSION_TTL_SECONDS = 12 * 60 * 60 // 12h fixed session (Phase 1)
 
@@ -340,6 +347,32 @@ async function tenantStatus(req, res) {
   // this specific tenant has a pending access-code trial grant.
   config = await maybeStartAccessCodeTrial(tenantId, config)
   const commercialForResponse = config === configBeforeTrialCheck ? commercial : toSafeCommercialView(resolveTenantEntitlementsFromConfig(config))
+
+  // Phase B.12 -- RECONCILIATION/FALLBACK ONLY. The primary, reliable
+  // server-side Subscription-activation trigger is a separate, not-yet-
+  // implemented concern (see this repo's B.12 report: no existing
+  // server-side hook fires when initial_sync.py's GitHub Actions job
+  // succeeds -- that script writes tenant_config directly and has no
+  // callback of any kind into this Node deployment, so today this
+  // tenantStatus() read-time call is the ONLY path that can ever reach
+  // ensureSubscriptionActivation() at all). This call is deliberately
+  // best-effort and NEVER allowed to affect this endpoint's own response:
+  // ensureSubscriptionActivation() is itself fully idempotent (a tenant
+  // that already has a Subscription, or isn't yet eligible, is a fast,
+  // cheap no-op -- see that module's own header), so calling it on every
+  // poll can never create a second Subscription no matter how many times
+  // this fires concurrently or how a future primary trigger overlaps with
+  // it. Recognized, expected billing-state exceptions are logged and
+  // swallowed here, never surfaced as a failed tenant-status read.
+  try {
+    await ensureSubscriptionActivation(tenantId, config)
+  } catch (err) {
+    if (err instanceof SubscriptionActivationRecoveryRequiredError || err instanceof TrialExpiredBeforeActivationError) {
+      console.error(`[tenantStatus] subscription activation for tenant ${JSON.stringify(tenantId)} requires manual recovery: ${err.message}`)
+    } else {
+      console.error(`[tenantStatus] subscription activation reconciliation failed for tenant ${JSON.stringify(tenantId)} (non-fatal): ${err.message}`)
+    }
+  }
 
   return res.status(200).json({
     tenantId,
@@ -1720,6 +1753,15 @@ async function stripeWebhookAction(req, res) {
     return res.status(400).json({ error: 'invalid_signature' })
   }
 
+  // Phase B.12 -- minimal customer.subscription.updated/deleted projection.
+  // See handleSubscriptionProjectionEvent()'s own header for the exact,
+  // deliberately narrow scope (billingStore.js projection fields only --
+  // never tenant_config.commercial, never a B.13 suspension/cancellation
+  // policy action).
+  if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+    return handleSubscriptionProjectionEvent(event, res)
+  }
+
   // Only checkout.session.completed, and only for a setup-mode session, is
   // handled in B.11 -- every other event type is acknowledged (200) but
   // otherwise ignored, per this phase's explicit "only implement the
@@ -1915,6 +1957,295 @@ async function stripeWebhookAction(req, res) {
   }
 }
 
+// Phase B.12 -- minimal customer.subscription.updated/deleted projection.
+//
+// SCOPE, DELIBERATELY NARROW (per this phase's explicit amendment): this
+// ONLY updates billingStore.js's own Stripe-status projection fields
+// (subscriptionStatus, currentPeriodStart/End, cancelAtPeriodEnd) via
+// billingStatusProjection.js's already-hardened, non-creative mapping. It:
+//   - NEVER writes tenant_config.commercial, so it structurally CANNOT
+//     start, restart, or extend a PRYOR trial -- a 'trialing' subscription
+//     status is recorded nowhere by this handler at all (there is nothing
+//     for it to write: billingStatusProjection.js maps 'trialing' to
+//     shouldWrite: false specifically so a careless caller can't misuse it,
+//     and this handler never even branches on that value).
+//   - NEVER performs any B.13 delinquency/cancellation POLICY action --
+//     no Smart Retries handling, no past_due/unpaid suspension, no
+//     Customer Portal, no cancellation UX. A projected
+//     'past_due'/'suspended'/'canceled' commercialStatus mapping is
+//     recorded ONLY as a fact on the billing record's own
+//     `subscriptionStatus` field for a future B.13 to act on -- this
+//     handler never enforces anything from it.
+async function handleSubscriptionProjectionEvent(event, res) {
+  const subscription = event.data.object
+  const stripeSubscriptionId = typeof subscription?.id === 'string' ? subscription.id : null
+  if (!isValidStripeSubscriptionId(stripeSubscriptionId) || stripeSubscriptionId === null) {
+    console.error(`[session/stripe-webhook] ${event.type} carried a malformed subscription id -- acknowledging without processing`)
+    return res.status(200).json({ received: true })
+  }
+  // The reverse index is authoritative -- never resolved from
+  // subscription.metadata.tenantId alone, same discipline as the setup-
+  // completion handler above.
+  const tenantId = await getTenantIdForSubscription(stripeSubscriptionId)
+  if (!tenantId) {
+    console.error(`[session/stripe-webhook] ${event.type} for an unrecognized Stripe subscription -- acknowledging without processing`)
+    return res.status(200).json({ received: true })
+  }
+
+  let claim
+  try {
+    claim = await claimStripeEvent({
+      eventId: event.id, eventType: event.type, stripeCreatedAt: event.created,
+      providerObjectId: stripeSubscriptionId, tenantId,
+    })
+  } catch (err) {
+    console.error(`[session/stripe-webhook] failed to claim event ${event.id}: ${err.message}`)
+    return res.status(503).json({ error: 'service_unavailable' })
+  }
+  if (!claim.claimed) {
+    if (claim.reason === 'already_processed') {
+      return res.status(200).json({ received: true })
+    }
+    console.error(`[session/stripe-webhook] event ${event.id} is currently owned by another in-flight delivery -- returning retryable response rather than a false acknowledgement`)
+    return res.status(503).json({ error: 'processing_in_progress' })
+  }
+
+  try {
+    const record = await getBillingRecord(tenantId)
+    if (!record) {
+      throw new Error(`no billing record exists for tenant ${JSON.stringify(tenantId)} despite a resolved subscription index -- refusing to acknowledge a projection that was never recorded`)
+    }
+
+    // customer.subscription.deleted always means the subscription is gone,
+    // regardless of whatever status the object itself still reports --
+    // this is Stripe's own documented contract for this event.
+    const rawStatus = event.type === 'customer.subscription.deleted' ? 'canceled' : subscription.status
+    if (!isValidProviderSubscriptionStatus(rawStatus)) {
+      console.error(`[session/stripe-webhook] ${event.type} for tenant ${tenantId} carried an unrecognized status ${JSON.stringify(rawStatus)} -- acknowledging without projecting`)
+      await markStripeEventProcessed(event.id, claim.processingToken, 'unrecognized_status')
+      return res.status(200).json({ received: true })
+    }
+
+    // Staleness guard (B.10's own isStaleBillingEvent()) -- never apply an
+    // older/mismatched snapshot over a newer one already recorded.
+    if (isStaleBillingEvent({ candidateStripeCreatedAt: event.created, candidateSubscriptionId: stripeSubscriptionId }, record)) {
+      await markStripeEventProcessed(event.id, claim.processingToken, 'stale_event_ignored')
+      return res.status(200).json({ received: true })
+    }
+
+    // Consulted only as a defensive confirmation that the mapping module
+    // itself still treats 'trialing' as non-authoritative -- `shouldWrite`
+    // never gates anything written below; this handler writes the SAME
+    // fixed set of billing-record-only projection fields regardless of its
+    // value, and never touches tenant_config.commercial under any status.
+    projectProviderStatusToCommercialStatus(rawStatus)
+
+    const period = resolveSubscriptionPeriod(subscription)
+    const patch = {
+      subscriptionStatus: rawStatus,
+      currentPeriodStart: period.start,
+      currentPeriodEnd: period.end,
+      cancelAtPeriodEnd: subscription.cancel_at_period_end ?? false,
+      // Phase B.12 (Decision 2 audit correction) -- lastStripeEventCreatedAt
+      // must actually be WRITTEN for isStaleBillingEvent()'s own guard
+      // (called above) to ever have a non-null baseline to compare future
+      // deliveries against; leaving it unset would make that check
+      // permanently a no-op for every subscription-status delivery.
+      lastStripeEventCreatedAt: event.created,
+    }
+    try {
+      await updateBillingRecord(tenantId, patch, { expectedVersion: record.version })
+    } catch (err) {
+      if (!(err instanceof BillingVersionConflictError)) throw err
+      // A concurrent write already landed -- this projection is
+      // best-effort/idempotent by nature (the next delivery/poll converges
+      // it); no retry-loop needed here.
+    }
+
+    // Phase B.12 (Decision 2) -- the MINIMAL canonical paid-active
+    // transition. Only a genuinely validated Stripe 'active' status on a
+    // customer.subscription.updated event (never .deleted, never any other
+    // status) can ever advance tenant_config.commercial out of 'trial'.
+    // Every one of price/customer/subscription is cross-checked against
+    // this tenant's OWN already-durable billing:v1 record/reverse index --
+    // Stripe object metadata is consulted nowhere in this block. A failed
+    // cross-check still leaves the Stripe-status FACT recorded above (the
+    // billing record's own subscriptionStatus), it just never advances the
+    // canonical PRYOR commercial state.
+    if (event.type === 'customer.subscription.updated' && rawStatus === 'active') {
+      const subscriptionCustomerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id ?? null
+      const rawPrice = subscription.items?.data?.[0]?.price
+      const subscriptionPriceId = typeof rawPrice === 'string' ? rawPrice : rawPrice?.id ?? null
+      // Server-side, price -> plan direction of trust ONLY (stripePriceMap.js's
+      // own established discipline) -- never subscription.metadata.plan.
+      const plan = resolvePlanIdForStripePriceId(subscriptionPriceId)
+
+      const subscriptionMatchesRecord = record.stripeSubscriptionId === stripeSubscriptionId
+      const customerMatchesRecord = subscriptionCustomerId != null && subscriptionCustomerId === record.stripeCustomerId
+      if (subscriptionMatchesRecord && customerMatchesRecord && plan != null) {
+        await activatePaidSubscriptionIfValid(tenantId, plan)
+      } else {
+        console.error(
+          `[session/stripe-webhook] customer.subscription.updated for tenant ${tenantId} reported 'active' but failed cross-validation ` +
+          `(subscriptionMatchesRecord=${subscriptionMatchesRecord}, customerMatchesRecord=${customerMatchesRecord}, plan=${JSON.stringify(plan)}) ` +
+          `-- the Stripe-status fact was still recorded, but the canonical paid-active commercial transition was NOT applied`
+        )
+      }
+    }
+
+    await markStripeEventProcessed(event.id, claim.processingToken, `projected_${rawStatus}`)
+    return res.status(200).json({ received: true })
+  } catch (err) {
+    try {
+      await markStripeEventFailed(event.id, claim.processingToken, String(err.message ?? 'error').slice(0, 200))
+    } catch { /* best-effort -- the outer 500 below still triggers a Stripe retry regardless */ }
+    console.error(`[session/stripe-webhook] failed to apply subscription projection for tenant ${tenantId} (event ${event.id}): ${err.message}`)
+    return res.status(500).json({ error: 'processing_failed' })
+  }
+}
+
+// Phase B.12 (Decision 1) -- the PRIMARY, event-driven, server-to-server
+// Subscription-activation trigger. Called ONLY by the GitHub Actions
+// tenant-lifecycle workflows (tenant-lifecycle.yml /
+// tenant-lifecycle-dispatch.yml), immediately after their own
+// `initial_sync.py` step has already succeeded and durably persisted
+// tenant_config.initialSync.completedAt -- never by a browser, never
+// requiring one to be open. tenantStatus()'s own call to
+// ensureSubscriptionActivation() (see that function's own call site below)
+// remains the reconciliation/fallback path only.
+//
+// AUTHENTICATION: a single, environment-scoped shared secret, compared
+// with a constant-time comparison (never `===`/string comparison, which
+// leaks timing information proportional to the first mismatched byte).
+// Preview/Production isolation mirrors google/[action].js's own
+// resolveLifecycleExecutionEnvironment() discipline EXACTLY: which secret
+// name is even consulted is derived SOLELY from this server process's own
+// Vercel-supplied VERCEL_ENV (never any request header/body/query, which a
+// caller could forge) -- 'production' consults ONLY
+// BILLING_ACTIVATION_CALLBACK_SECRET, 'preview' consults ONLY
+// PREVIEW_BILLING_ACTIVATION_CALLBACK_SECRET, and anything else
+// (development/unset) fails closed with no secret at all, exactly like
+// resolveLifecycleExecutionEnvironment()'s own null-for-unsupported
+// discipline. There is NO `||`/`&&`-based fallback expression anywhere in
+// this resolution -- each branch references exactly one secret name,
+// structurally identical to tenant-lifecycle-dispatch.yml's own revision-12
+// "no cross-environment fallback" fix on the OUTBOUND side.
+function resolveBillingActivationCallbackSecret() {
+  const vercelEnv = process.env.VERCEL_ENV
+  if (vercelEnv === 'production') return process.env.BILLING_ACTIVATION_CALLBACK_SECRET || null
+  if (vercelEnv === 'preview') return process.env.PREVIEW_BILLING_ACTIVATION_CALLBACK_SECRET || null
+  return null
+}
+
+function extractBearerToken(req) {
+  const header = req.headers?.authorization
+  if (typeof header !== 'string') return null
+  const match = /^Bearer (.+)$/.exec(header)
+  return match ? match[1] : null
+}
+
+// Constant-time comparison (Node's own crypto.timingSafeEqual) -- never a
+// plain `===`/string comparison for a secret. timingSafeEqual() itself
+// throws if the two buffers differ in length, so an unequal-length pair is
+// handled explicitly first (still without a length-dependent early return
+// based on the SECRET's own length -- only the caller-supplied value's
+// length is ever observable here, which reveals nothing about the real
+// secret).
+function constantTimeEquals(a, b) {
+  const bufA = Buffer.from(a, 'utf8')
+  const bufB = Buffer.from(b, 'utf8')
+  if (bufA.length !== bufB.length) return false
+  return timingSafeEqual(bufA, bufB)
+}
+
+async function billingActivationCallback(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const expectedSecret = resolveBillingActivationCallbackSecret()
+  const providedSecret = extractBearerToken(req)
+  // A single, generic 401 in every failure case (not configured, missing
+  // header, wrong value) -- never distinguishes which, and never echoes
+  // anything about the secret itself in the response body or logs.
+  if (!expectedSecret || !providedSecret || !constantTimeEquals(providedSecret, expectedSecret)) {
+    return res.status(401).json({ error: 'unauthorized' })
+  }
+
+  // Deliberately reads ONLY tenantId from the body. Every other
+  // financially meaningful identifier (plan, price, customer id, payment
+  // method id, trial dates, subscription id) is never destructured, never
+  // read, and therefore has ZERO effect no matter what a caller sends --
+  // every one of those is derived exclusively from this tenant's own
+  // already-durable server-side tenant_config/billing:v1 state, deep
+  // inside maybeStartTrial()/maybeStartAccessCodeTrial()/
+  // ensureSubscriptionActivation() below.
+  const { tenantId } = req.body ?? {}
+  if (typeof tenantId !== 'string' || !isValidTenantId(tenantId) || tenantId === DEFAULT_TENANT_ID) {
+    return res.status(400).json({ error: 'invalid_request' })
+  }
+
+  let config
+  try {
+    config = await getTenantConfig(tenantId)
+  } catch (err) {
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      return res.status(503).json({ error: 'service_unavailable' })
+    }
+    throw err
+  }
+  if (!config || typeof config.initialSync?.completedAt !== 'string' || !config.initialSync.completedAt) {
+    // Not an error -- a legitimate, expected state if this callback ever
+    // fires before the initial-sync write is durably visible (should not
+    // happen given the workflow's own step ordering, but never assumed).
+    // 200, so the workflow's bounded retry loop does not spin forever on a
+    // condition retrying THIS call can never fix by itself.
+    return res.status(200).json({ received: true, trial: { status: null }, subscription: { outcome: 'not_ready', reason: 'no_initial_sync' } })
+  }
+
+  // Canonical PRYOR trial activation -- the exact same, already-reviewed,
+  // idempotent, CAS-protected functions tenantStatus() itself calls. Never
+  // restarts/extends an existing trial's timestamps (see trialLifecycle.js's
+  // own header) -- a no-op for any tenant whose trial already started, or
+  // who isn't eligible at all.
+  config = await maybeStartTrial(tenantId, config)
+  config = await maybeStartAccessCodeTrial(tenantId, config)
+
+  let subscriptionResult
+  try {
+    subscriptionResult = await ensureSubscriptionActivation(tenantId, config)
+  } catch (err) {
+    if (err instanceof SubscriptionActivationRecoveryRequiredError) {
+      return res.status(200).json({
+        received: true,
+        trial: { status: config.commercial?.commercialStatus ?? null },
+        subscription: { outcome: 'recovery_required', type: 'ambiguous' },
+      })
+    }
+    if (err instanceof TrialExpiredBeforeActivationError) {
+      return res.status(200).json({
+        received: true,
+        trial: { status: config.commercial?.commercialStatus ?? null },
+        subscription: { outcome: 'recovery_required', type: 'trial_expired_before_activation' },
+      })
+    }
+    // A genuine transient failure (Stripe outage, billing-store outage,
+    // etc.) -- retryable. The GitHub Actions callback step's own bounded
+    // retry loop is what "surfaces a recovery-required state clearly" AND
+    // "fails visibly rather than silently declaring complete billing
+    // activation" for this case.
+    console.error(`[session/billing-activation-callback] subscription activation failed for tenant ${tenantId}: ${err.message}`)
+    return res.status(503).json({ error: 'service_unavailable' })
+  }
+
+  // 'already_active' is returned identically to a fresh 'created' --
+  // idempotent by construction (requirement: "return success if
+  // subscription is already activated").
+  return res.status(200).json({
+    received: true,
+    trial: { status: config.commercial?.commercialStatus ?? null },
+    subscription: { outcome: subscriptionResult.outcome, reason: subscriptionResult.reason ?? null },
+  })
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
     case 'login':            return login(req, res)
@@ -1936,6 +2267,7 @@ export default async function handler(req, res) {
     case 'select-plan':            return selectPlan(req, res)
     case 'finalize-registration':  return finalizeRegistration(req, res)
     case 'stripe-webhook':         return stripeWebhookAction(req, res)
+    case 'billing-activation-callback': return billingActivationCallback(req, res)
     default:                 return res.status(404).json({ error: 'not_found' })
   }
 }

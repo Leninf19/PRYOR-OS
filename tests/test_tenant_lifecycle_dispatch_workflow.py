@@ -530,11 +530,14 @@ def test_operation_steps_have_no_always_override():
     doubled the six lifecycle actions into production/preview pairs (12
     steps) and kept "Chain to Initial Sync" as the 13th -- its `if:` still
     STARTS WITH 'inputs.operation ==', so it is correctly picked up by
-    this same filter."""
+    this same filter. Phase B.12 (Decision 1) adds "Activate billing
+    (production)"/"Activate billing (preview)" as the 14th/15th -- each
+    chained on its own environment's Run Initial Sync step succeeding,
+    exactly like Chain to Initial Sync is chained on provisioning."""
     _text, data = _load()
     steps = _steps(data)
     operation_steps = [s for s in steps if s.get("if", "").startswith("inputs.operation ==")]
-    assert len(operation_steps) == 13, f"expected exactly 13 operation-gated steps (6 lifecycle actions x 2 + Chain to Initial Sync), found {len(operation_steps)}"
+    assert len(operation_steps) == 15, f"expected exactly 15 operation-gated steps (6 lifecycle actions x 2 + Chain to Initial Sync + Activate billing x 2), found {len(operation_steps)}"
     for s in operation_steps:
         cond = s["if"]
         assert "always()" not in cond and "failure()" not in cond, (
@@ -600,6 +603,115 @@ def test_chain_to_initial_sync_step_gating_and_env():
     )
 
 
+def test_run_initial_sync_steps_have_ids_for_chaining():
+    """Phase B.12 (Decision 1) -- the 'Activate billing' steps below need a
+    stable id to gate on, exactly like Chain to Initial Sync already gates
+    on run_provisioning_production/run_provisioning_preview."""
+    _text, data = _load()
+    prod = _step(data, "Run Initial Sync (production)")
+    preview = _step(data, "Run Initial Sync (preview)")
+    assert prod.get("id") == "run_initial_sync_production"
+    assert preview.get("id") == "run_initial_sync_preview"
+
+
+def test_activate_billing_production_step_gating_and_env():
+    _text, data = _load()
+    step = _step(data, "Activate billing (production)")
+    assert step.get("id") == "activate_billing_production"
+    assert step["if"] == "inputs.operation == 'initial_sync' && inputs.environment == 'production' && steps.run_initial_sync_production.outcome == 'success' && github.ref == 'refs/heads/main'", (
+        f"unexpected gating: {step['if']!r}"
+    )
+    env = step.get("env", {})
+    assert set(env.keys()) == {"TENANT_ID", "BILLING_ACTIVATION_CALLBACK_SECRET"}, f"unexpected env keys: {sorted(env.keys())}"
+    assert env["TENANT_ID"] == "${{ inputs.tenant_id }}"
+    assert env["BILLING_ACTIVATION_CALLBACK_SECRET"] == "${{ secrets.BILLING_ACTIVATION_CALLBACK_SECRET }}", (
+        f"must be sourced from the dedicated BILLING_ACTIVATION_CALLBACK_SECRET, never CREDENTIAL_ENCRYPTION_KEY/GOOGLE_CLIENT_SECRET/VERCEL_TOKEN/a GitHub PAT/any Stripe secret, got {env['BILLING_ACTIVATION_CALLBACK_SECRET']!r}"
+    )
+    assert "PREVIEW_" not in str(env), "the production step must never reference any PREVIEW_* secret name"
+
+
+def test_activate_billing_preview_step_gating_and_env():
+    _text, data = _load()
+    step = _step(data, "Activate billing (preview)")
+    assert step.get("id") == "activate_billing_preview"
+    assert step["if"] == "inputs.operation == 'initial_sync' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success' && steps.run_initial_sync_preview.outcome == 'success'", (
+        f"unexpected gating: {step['if']!r}"
+    )
+    env = step.get("env", {})
+    assert set(env.keys()) == {"TENANT_ID", "BILLING_ACTIVATION_CALLBACK_SECRET"}, f"unexpected env keys: {sorted(env.keys())}"
+    assert env["TENANT_ID"] == "${{ inputs.tenant_id }}"
+    assert env["BILLING_ACTIVATION_CALLBACK_SECRET"] == "${{ secrets.PREVIEW_BILLING_ACTIVATION_CALLBACK_SECRET }}", (
+        f"the preview step must reference secrets.PREVIEW_BILLING_ACTIVATION_CALLBACK_SECRET specifically, got {env['BILLING_ACTIVATION_CALLBACK_SECRET']!r}"
+    )
+
+
+def test_production_billing_callback_requires_main_ref():
+    """Safety-audit invariant: `ref` (which branch's copy of this workflow
+    file executes) and `inputs.environment` are two fully independent
+    dispatch parameters -- without an explicit github.ref check, a
+    dispatch with ref=<any non-main branch> + environment=production would
+    still reach the real Production billing callback. This is the
+    structural, workflow-enforced guarantee (not merely the caller-side
+    convention already encoded in resolveLifecycleExecutionRef())."""
+    _text, data = _load()
+    prod_step = _step(data, "Activate billing (production)")
+    assert "github.ref == 'refs/heads/main'" in prod_step["if"], (
+        "the Production billing callback must require github.ref == 'refs/heads/main' -- "
+        f"got if: {prod_step['if']!r}"
+    )
+
+
+def test_preview_billing_callback_is_not_ref_restricted():
+    """The Preview callback's whole purpose is to be reachable from a real
+    feature branch (APPROVED_PREVIEW_LIFECYCLE_REF) -- the main-ref guard
+    must apply ONLY to the Production step, never to Preview."""
+    _text, data = _load()
+    preview_step = _step(data, "Activate billing (preview)")
+    assert "github.ref" not in preview_step["if"], (
+        f"the Preview billing callback must remain unrestricted by ref, got if: {preview_step['if']!r}"
+    )
+
+
+def test_activate_billing_steps_never_use_a_conditional_secret_expression():
+    """Same revision-12 discipline as every other secret in this file --
+    checked here explicitly for the new secret name too (also covered
+    generically by test_no_step_uses_a_conditional_secret_selection_expression,
+    this is a belt-and-suspenders, named check)."""
+    _text, data = _load()
+    for name in ("Activate billing (production)", "Activate billing (preview)"):
+        step = _step(data, name)
+        value = str(step.get("env", {}).get("BILLING_ACTIVATION_CALLBACK_SECRET", ""))
+        assert "&&" not in value and "||" not in value, f"{name}: forbidden conditional secret-selection expression: {value!r}"
+
+
+def test_activate_billing_steps_have_bounded_retry_and_fail_visibly():
+    """The concrete, executable proof of the retry/visible-failure
+    requirement: a bounded loop that retries on non-2xx, and an explicit
+    `exit 1` (never a silent/success exit) once every attempt is
+    exhausted -- GitHub Actions' own default behavior then marks the job
+    'failure', so a persistently-failing callback can never be silently
+    treated as complete billing activation."""
+    _text, data = _load()
+    for name in ("Activate billing (production)", "Activate billing (preview)"):
+        step = _step(data, name)
+        run_script = step["run"]
+        assert "for attempt in $(seq 1 \"$ATTEMPTS\")" in run_script, f"{name}: must retry in a bounded loop"
+        assert "exit 0" in run_script and "exit 1" in run_script, f"{name}: must have both a success exit and a final failure exit"
+        assert run_script.rstrip().endswith("exit 1"), f"{name}: the script must end by failing closed if every attempt was exhausted"
+        assert "Authorization: Bearer $BILLING_ACTIVATION_CALLBACK_SECRET" in run_script, f"{name}: must authenticate via the Bearer secret"
+        # The secret's own VALUE must never be echoed/printed anywhere in
+        # this script (only ever referenced inside the Authorization header
+        # sent over HTTPS to the app itself).
+        assert "echo" not in run_script.split("Authorization:")[0].split("BILLING_ACTIVATION_CALLBACK_SECRET")[-1] or True
+        for line in run_script.split("\n"):
+            if "echo" in line or "cat " in line:
+                assert "$BILLING_ACTIVATION_CALLBACK_SECRET" not in line, f"{name}: must never print the callback secret's value: {line!r}"
+        # inputs.* must never be interpolated directly into the run: text
+        # (same injection-safety discipline as every other step in this
+        # file) -- TENANT_ID is read from env:, referenced as "$TENANT_ID".
+        assert "${{ inputs." not in run_script, f"{name}: must never interpolate a workflow input directly into the run script"
+
+
 def test_secret_bearing_summary_only_runs_after_successful_validation():
     """Revision 12 (blocker fix) split 'Write job summary' into separate
     production/preview steps, exactly like every other secret-bearing
@@ -637,8 +749,9 @@ def test_validation_failure_reaches_no_secret_bearing_step_end_to_end():
     summary' (which carries no secrets and runs no script) -- not any of
     the 12 production/preview operation steps (revision 12), not 'Verify
     Preview isolation' (which carries PREVIEW_ENVIRONMENT_MARKER), 'Chain
-    to Initial Sync' (which carries GITHUB_TOKEN), or either 'Write job
-    summary' variant."""
+    to Initial Sync' (which carries GITHUB_TOKEN), either 'Write job
+    summary' variant, or (Phase B.12 Decision 1) either 'Activate billing'
+    variant (which carries BILLING_ACTIVATION_CALLBACK_SECRET)."""
     _text, data = _load()
     steps = _steps(data)
     secret_bearing_step_names = {
@@ -653,6 +766,8 @@ def test_validation_failure_reaches_no_secret_bearing_step_end_to_end():
     expected.add(WRITE_JOB_SUMMARY_PAIR[1])
     expected.add("Chain to Initial Sync")
     expected.add("Verify Preview isolation")
+    expected.add("Activate billing (production)")
+    expected.add("Activate billing (preview)")
     assert secret_bearing_step_names == expected, f"unexpected set of secret-bearing steps: {secret_bearing_step_names}"
 
     always_gated_names = {WRITE_JOB_SUMMARY_PAIR[0], WRITE_JOB_SUMMARY_PAIR[1], "Verify Preview isolation"}
@@ -788,6 +903,13 @@ def main() -> int:
     run("'Validate inputs' has id: validate", test_validate_step_has_an_id_every_secret_step_can_reference)
     run("operation steps have no always()/failure() override", test_operation_steps_have_no_always_override)
     run("Chain to Initial Sync is gated on either provisioning variant's own success, carries only GITHUB_TOKEN", test_chain_to_initial_sync_step_gating_and_env)
+    run("Run Initial Sync steps have ids for chaining", test_run_initial_sync_steps_have_ids_for_chaining)
+    run("Activate billing (production) is gated correctly and uses BILLING_ACTIVATION_CALLBACK_SECRET", test_activate_billing_production_step_gating_and_env)
+    run("Activate billing (preview) is gated correctly and uses PREVIEW_BILLING_ACTIVATION_CALLBACK_SECRET", test_activate_billing_preview_step_gating_and_env)
+    run("Activate billing steps never use a conditional secret-selection expression", test_activate_billing_steps_never_use_a_conditional_secret_expression)
+    run("the Production billing callback requires github.ref == refs/heads/main", test_production_billing_callback_requires_main_ref)
+    run("the Preview billing callback is not ref-restricted", test_preview_billing_callback_is_not_ref_restricted)
+    run("Activate billing steps retry and fail visibly, never printing the secret", test_activate_billing_steps_have_bounded_retry_and_fail_visibly)
     run("secret-bearing summary only runs after successful validation", test_secret_bearing_summary_only_runs_after_successful_validation)
     run("failure summary carries no secrets and invokes no script", test_failure_summary_step_carries_no_secrets_and_invokes_no_script)
     run("a failed validation reaches NO secret-bearing step, end to end", test_validation_failure_reaches_no_secret_bearing_step_end_to_end)

@@ -14,10 +14,14 @@ import Stripe from 'stripe'
 import handler from '../dashboard/api/session/[action].js'
 import {
   _setRedisClientForTests as setBillingClient, _resetRedisClientForTests as resetBillingClient,
-  createBillingRecord, getBillingRecord, claimCustomerIndex, getStripeEventRecord,
+  createBillingRecord, getBillingRecord, updateBillingRecord, claimCustomerIndex, claimSubscriptionIndex, getStripeEventRecord,
 } from '../dashboard/api/_lib/billingStore.js'
 import { _setStripeClientForTests, _resetStripeClientForTests } from '../dashboard/api/_lib/stripeClient.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
+import {
+  upsertTenantConfig, getTenantConfig, recordLocationApproval,
+  _setRedisClientForTests as setConfigClient, _resetRedisClientForTests as resetConfigClient,
+} from '../dashboard/api/_lib/tenantConfigStore.js'
 
 const TEST_WEBHOOK_SECRET = 'whsec_test_only_never_a_real_secret_0123456789'
 
@@ -35,9 +39,67 @@ async function run(name, fn) {
     console.log(`FAIL: ${name} -- ${e.message}`)
     results.push(false)
   } finally {
-    resetBillingClient(); _resetStripeClientForTests(); _resetLimiterFactoryForTests()
+    resetBillingClient(); _resetStripeClientForTests(); _resetLimiterFactoryForTests(); resetConfigClient()
     delete process.env.STRIPE_WEBHOOK_SECRET
+    delete process.env.STRIPE_CORE_PRICE_ID
+    delete process.env.STRIPE_GROWTH_PRICE_ID
   }
+}
+
+// Same pitfall already fixed once in this engagement
+// (test_billing_activation_callback.js): the factory passed to
+// _setRedisClientForTests() is invoked FRESH on every store operation, so
+// it must close over a single, already-created store instance -- never
+// `() => fakeKeyedHashRedis()`, which would hand back a brand-new empty
+// store on every call and never persist anything.
+function fakeKeyedHashRedis() {
+  const store = {}
+  return {
+    hget: async (key, field) => store[key]?.[field] ?? null,
+    hgetall: async (key) => ({ ...(store[key] ?? {}) }),
+    hset: async (key, fields) => { store[key] = { ...(store[key] ?? {}), ...fields } },
+    hdel: async (key, field) => { if (store[key]) delete store[key][field] },
+    eval: async (_script, keys, args) => {
+      const key = keys[0]
+      const [field, expectedVersionStr, nextJson] = args
+      const raw = store[key]?.[field] ?? null
+      let currentVersion = '0'
+      if (raw) {
+        try { const decoded = JSON.parse(raw); if (decoded && decoded.configVersion !== undefined) currentVersion = String(decoded.configVersion) } catch { /* version 0 */ }
+      }
+      if (currentVersion !== expectedVersionStr) return raw ?? false
+      store[key] = { ...(store[key] ?? {}), [field]: nextJson }
+      return true
+    },
+  }
+}
+
+function installConfigStore() {
+  const configRedis = fakeKeyedHashRedis()
+  setConfigClient(() => configRedis)
+  return configRedis
+}
+
+// Seeds a tenant_config already sitting in a real, canonical 'trial' state
+// (mirrors test_trial_lifecycle.js's own seedActiveTenant(), simplified to
+// exactly what the paid-active transition tests need: a genuine
+// commercial.trial object, never hand-constructed from scratch).
+async function seedTrialingTenantConfig(tenantId, { trialStartedAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString() } = {}) {
+  await upsertTenantConfig(tenantId, { status: 'onboarding', locationCatalogEnabled: true }, { allowCreate: true, creationSource: 'migration' })
+  await recordLocationApproval(tenantId, [{ googleLocationId: `accounts/acc-${tenantId}/locations/loc-1`, title: 'Primary Location', address: '' }])
+  const trialEndsAt = new Date(Date.parse(trialStartedAt) + 7 * 24 * 60 * 60 * 1000).toISOString()
+  await upsertTenantConfig(tenantId, {
+    status: 'active',
+    commercial: {
+      commercialStatus: 'trial', plan: 'growth', planSource: 'trial_auto_gbp',
+      trial: { status: 'active', startedAt: trialStartedAt, endsAt: trialEndsAt, consumedAt: trialStartedAt },
+      limitsOverride: null, suspension: null, cancellation: null, overLimit: null,
+      accessCodeHash: null, discountPercent: null, discountFixedCents: null, paymentRequired: null,
+      createdAt: trialStartedAt, updatedAt: trialStartedAt,
+    },
+    trialEligibility: { eligible: true, markedAt: trialStartedAt, source: 'test_fixture' },
+  }, {})
+  return getTenantConfig(tenantId)
 }
 
 function fakeBillingRedis() {
@@ -313,6 +375,508 @@ async function testNonSetupModeSessionIsIgnored() {
   const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
   const res = await invokeWebhookProperly(payload, signature)
   assert(res.statusCode === 200, 'a non-setup-mode session must be acknowledged but ignored, not processed by this B.11 handler')
+}
+
+// ===========================================================================
+// Phase B.12 -- customer.subscription.updated/deleted minimal projection.
+// ===========================================================================
+
+function buildSubscriptionEventPayload({
+  eventId = 'evt_sub1', type = 'customer.subscription.updated', subscriptionId, status = 'active',
+  cancelAtPeriodEnd = false, created, customer, priceId, metadataTenantId,
+}) {
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  const object = {
+    id: subscriptionId, status, cancel_at_period_end: cancelAtPeriodEnd,
+    current_period_start: nowSeconds, current_period_end: nowSeconds + 30 * 24 * 60 * 60,
+  }
+  if (customer !== undefined) object.customer = customer
+  if (priceId !== undefined) object.items = { data: [{ price: { id: priceId } }] }
+  if (metadataTenantId !== undefined) object.metadata = { tenantId: metadataTenantId }
+  const payload = { id: eventId, type, created: created ?? nowSeconds, data: { object } }
+  return JSON.stringify(payload)
+}
+
+async function seedTenantWithSubscription(tenantId, subscriptionId, { stripeCustomerId, pendingPaidPlan } = {}) {
+  await createBillingRecord(tenantId, {
+    stripeSubscriptionId: subscriptionId, subscriptionStatus: 'trialing',
+    ...(stripeCustomerId !== undefined ? { stripeCustomerId } : {}),
+    ...(pendingPaidPlan !== undefined ? { pendingPaidPlan } : {}),
+  })
+  await claimSubscriptionIndex(subscriptionId, tenantId)
+}
+
+async function testSubscriptionUpdatedProjectsActiveStatus() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_sub-tenant-1'
+  await seedTenantWithSubscription(tenantId, 'sub_test1')
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_subactive1', subscriptionId: 'sub_test1', status: 'active' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200, `expected 200, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.subscriptionStatus === 'active', 'the projected status must land on the billing record')
+}
+
+async function testSubscriptionDeletedAlwaysProjectsCanceled() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_sub-tenant-2'
+  await seedTenantWithSubscription(tenantId, 'sub_test2')
+
+  // Stripe's own contract: the object's own `status` field on a
+  // customer.subscription.deleted event may not itself read 'canceled' --
+  // the EVENT TYPE is what is authoritative for this transition.
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_subdeleted1', type: 'customer.subscription.deleted', subscriptionId: 'sub_test2', status: 'active' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.subscriptionStatus === 'canceled', 'a customer.subscription.deleted event must always project canceled, regardless of the object\'s own reported status')
+}
+
+async function testTrialingSubscriptionEventNeverTouchesTenantConfig() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_sub-tenant-3'
+  await seedTenantWithSubscription(tenantId, 'sub_test3')
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_subtrialing1', subscriptionId: 'sub_test3', status: 'trialing' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const record = await getBillingRecord(tenantId)
+  // billingStore.js's own record has NO commercialStatus/trial field at
+  // all (that lives exclusively in tenant_config.commercial, a completely
+  // separate store this handler never imports or touches) -- a 'trialing'
+  // projection can therefore structurally never start or restart a PRYOR
+  // trial. This asserts the ONLY field this handler could have written
+  // reflects the raw Stripe status, and nothing resembling a PRYOR trial
+  // shape was ever introduced onto the billing record.
+  assert(record.subscriptionStatus === 'trialing')
+  assert(!('commercialStatus' in record) && !('trial' in record), 'a Stripe trialing projection must never introduce any PRYOR trial-shaped field')
+}
+
+async function testPastDueUnpaidCanceledProjectionIntroducesNoEnforcementFields() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  for (const status of ['past_due', 'unpaid', 'canceled']) {
+    const tenantId = `t_sub-tenant-status-${status.replace(/_/g, '-')}`
+    const subscriptionId = `sub_test${status.replace(/_/g, '')}`
+    await seedTenantWithSubscription(tenantId, subscriptionId)
+    const payload = buildSubscriptionEventPayload({ eventId: `evt_${status.replace(/_/g, '')}1`, subscriptionId, status })
+    const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+    const res = await invokeWebhookProperly(payload, signature)
+    assert(res.statusCode === 200)
+    const record = await getBillingRecord(tenantId)
+    assert(record.subscriptionStatus === status, `${status} must be recorded as a plain fact on the billing record`)
+    // B.13 scope (suspension/cancellation POLICY, Customer Portal,
+    // cancel-at-period-end UX) is never implemented here -- there is no
+    // suspension/enforcement field on this record type at all to check for
+    // absence beyond the projection fields billingStore.js itself defines;
+    // this test's real assertion is structural (see the source-scan test
+    // below) that the handler never imports tenantConfigStore.js.
+    assert(record.stripeSubscriptionId === subscriptionId)
+  }
+}
+
+async function testDuplicateSubscriptionWebhookDeliveryIsIdempotent() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_sub-tenant-dup1'
+  await seedTenantWithSubscription(tenantId, 'sub_dup1')
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_subdup1', subscriptionId: 'sub_dup1', status: 'active' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+
+  const first = await invokeWebhookProperly(payload, signature)
+  const recordAfterFirst = await getBillingRecord(tenantId)
+  // Mutate the record's version out from under a hypothetical re-apply by
+  // recording a DIFFERENT status directly, then redeliver the SAME event --
+  // if redelivery were not idempotent, it would blindly overwrite this.
+  await updateBillingRecord(tenantId, { subscriptionStatus: 'past_due' }, { expectedVersion: recordAfterFirst.version })
+
+  const second = await invokeWebhookProperly(payload, signature)
+  assert(first.statusCode === 200 && second.statusCode === 200)
+  const finalRecord = await getBillingRecord(tenantId)
+  assert(finalRecord.subscriptionStatus === 'past_due', 'a duplicate delivery of an already-processed event must never reprocess/overwrite a later legitimate change')
+}
+
+async function testUnrecognizedSubscriptionIsAcknowledgedNotProcessed() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+  // No claimSubscriptionIndex() was ever called for this subscription id.
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_subunknown1', subscriptionId: 'sub_neverbound1', status: 'active' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200, 'an unrecognized subscription must be acknowledged (200) so Stripe does not retry forever')
+}
+
+// ===========================================================================
+// Phase B.12 (Decision 2) -- the minimal canonical paid-active transition.
+// Every test below seeds a REAL tenant_config via tenantConfigStore.js
+// (never a hand-built object), exactly mirroring test_trial_lifecycle.js's
+// own discipline.
+// ===========================================================================
+
+async function testTrialingWebhookDoesNotMutatePryorTrial() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-trialing-1'
+  const configBefore = await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_trialing1', { stripeCustomerId: 'cus_trialing1' })
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_trialingpaid1', subscriptionId: 'sub_trialing1', status: 'trialing', customer: 'cus_trialing1' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const configAfter = await getTenantConfig(tenantId)
+  assert(configAfter.commercial.commercialStatus === 'trial', 'trialing must never advance commercialStatus')
+  assert(configAfter.commercial.trial.startedAt === configBefore.commercial.trial.startedAt, 'trialing must never touch trial.startedAt')
+  assert(configAfter.commercial.trial.endsAt === configBefore.commercial.trial.endsAt, 'trialing must never touch trial.endsAt')
+  assert(configAfter.configVersion === configBefore.configVersion, 'a trialing event must never write tenant_config at all')
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.subscriptionStatus === 'trialing', 'the raw Stripe status is still projected onto the billing record')
+}
+
+async function testValidActiveWebhookTransitionsToPaidActiveExactlyOnce() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthtest1'
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-active-1'
+  await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_active1', { stripeCustomerId: 'cus_active1' })
+
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_active1', subscriptionId: 'sub_active1', status: 'active',
+    customer: 'cus_active1', priceId: 'price_growthtest1',
+  })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200, `expected 200, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'active', `expected active, got ${config.commercial.commercialStatus}`)
+  assert(config.commercial.plan === 'growth')
+  assert(config.commercial.planSource === 'stripe_subscription_active')
+  assert(config.commercial.trial != null && config.commercial.trial.status === 'active', 'the historical trial record must be preserved, never wiped')
+
+  // A second, later 'active' delivery for the same (already-active) tenant
+  // must be a pure no-op -- this transition only ever fires OUT of 'trial'.
+  const payload2 = buildSubscriptionEventPayload({
+    eventId: 'evt_active2', subscriptionId: 'sub_active1', status: 'active',
+    customer: 'cus_active1', priceId: 'price_growthtest1', created: Math.floor(Date.now() / 1000) + 10,
+  })
+  const signature2 = Stripe.webhooks.generateTestHeaderString({ payload: payload2, secret: TEST_WEBHOOK_SECRET })
+  const res2 = await invokeWebhookProperly(payload2, signature2)
+  assert(res2.statusCode === 200)
+  const configAfterSecond = await getTenantConfig(tenantId)
+  assert(configAfterSecond.configVersion === config.configVersion, 'a second active event must never re-apply the transition -- exactly once')
+}
+
+async function testDuplicateActiveEventIsIdempotent() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthtestdup'
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-active-dup1'
+  await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_activedup1', { stripeCustomerId: 'cus_activedup1' })
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_activedup1', subscriptionId: 'sub_activedup1', status: 'active', customer: 'cus_activedup1', priceId: 'price_growthtestdup' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+
+  const first = await invokeWebhookProperly(payload, signature)
+  const configAfterFirst = await getTenantConfig(tenantId)
+  const second = await invokeWebhookProperly(payload, signature) // exact same event id -- redelivery
+  const configAfterSecond = await getTenantConfig(tenantId)
+
+  assert(first.statusCode === 200 && second.statusCode === 200)
+  assert(configAfterFirst.commercial.commercialStatus === 'active')
+  assert(configAfterSecond.configVersion === configAfterFirst.configVersion, 'a duplicate delivery of the SAME event id must never reapply the transition')
+}
+
+async function testStaleActiveEventIsIgnoredAppropriately() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthteststale'
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-active-stale1'
+  await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_stale1', { stripeCustomerId: 'cus_stale1' })
+
+  const now = Math.floor(Date.now() / 1000)
+  const newerPayload = buildSubscriptionEventPayload({ eventId: 'evt_stalenew1', subscriptionId: 'sub_stale1', status: 'active', customer: 'cus_stale1', priceId: 'price_growthteststale', created: now + 1000 })
+  const newerSignature = Stripe.webhooks.generateTestHeaderString({ payload: newerPayload, secret: TEST_WEBHOOK_SECRET })
+  const newerRes = await invokeWebhookProperly(newerPayload, newerSignature)
+  assert(newerRes.statusCode === 200)
+  const configAfterActive = await getTenantConfig(tenantId)
+  assert(configAfterActive.commercial.commercialStatus === 'active')
+
+  // An OLDER event (a different eventId, so it isn't just deduplicated by
+  // the event ledger) delivered AFTER the newer one -- must be ignored by
+  // isStaleBillingEvent()'s own guard, never overwriting the already-applied
+  // newer status.
+  const olderPayload = buildSubscriptionEventPayload({ eventId: 'evt_staleold1', subscriptionId: 'sub_stale1', status: 'past_due', customer: 'cus_stale1', priceId: 'price_growthteststale', created: now })
+  const olderSignature = Stripe.webhooks.generateTestHeaderString({ payload: olderPayload, secret: TEST_WEBHOOK_SECRET })
+  const olderRes = await invokeWebhookProperly(olderPayload, olderSignature)
+  assert(olderRes.statusCode === 200)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.subscriptionStatus === 'active', 'a stale (older) event must never overwrite an already-applied newer status')
+  const configAfterStale = await getTenantConfig(tenantId)
+  assert(configAfterStale.commercial.commercialStatus === 'active', 'the canonical commercial state must remain unaffected by an ignored stale event')
+}
+
+async function testWrongSubscriptionReverseIndexRejectsActiveTransition() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthtestwrongsub'
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-active-wrongsub1'
+  await seedTrialingTenantConfig(tenantId)
+  // The billing record's OWN recorded subscription is 'sub_real1', but the
+  // reverse index below (deliberately, to simulate a data inconsistency)
+  // maps a DIFFERENT subscription id to this same tenant.
+  await createBillingRecord(tenantId, { stripeSubscriptionId: 'sub_real1', stripeCustomerId: 'cus_wrongsub1', subscriptionStatus: 'trialing' })
+  await claimSubscriptionIndex('sub_event1', tenantId)
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_wrongsub1', subscriptionId: 'sub_event1', status: 'active', customer: 'cus_wrongsub1', priceId: 'price_growthtestwrongsub' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'trial', 'a subscription-id mismatch against the tenant\'s own billing record must reject the paid-active transition')
+}
+
+async function testWrongCustomerRejectsActiveTransition() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthtestwrongcust'
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-active-wrongcust1'
+  await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_wrongcust1', { stripeCustomerId: 'cus_real1' })
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_wrongcust1', subscriptionId: 'sub_wrongcust1', status: 'active', customer: 'cus_attacker1', priceId: 'price_growthtestwrongcust' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'trial', 'a customer mismatch against the tenant\'s own billing record must reject the paid-active transition')
+}
+
+async function testWrongPriceMappingRejectsActiveTransition() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthtestwrongprice'
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-active-wrongprice1'
+  await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_wrongprice1', { stripeCustomerId: 'cus_wrongprice1' })
+
+  // An unmapped price -- neither the configured Core nor Growth price id.
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_wrongprice1', subscriptionId: 'sub_wrongprice1', status: 'active', customer: 'cus_wrongprice1', priceId: 'price_totallyunmapped999' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'trial', 'an unmapped/unrecognized price must reject the paid-active transition')
+}
+
+async function testPaidActiveTransitionCannotGrantEnterprise() {
+  // There is no STRIPE_ENTERPRISE_PRICE_ID concept anywhere in this
+  // codebase (stripePriceMap.js's SELF_SERVICE_PLAN_IDS structurally
+  // excludes Enterprise) -- any price that does not match the configured
+  // Core/Growth price ids (including one that might represent an
+  // Enterprise deal in Stripe's own dashboard) can never resolve to a
+  // plan here, and therefore can never grant paid-active status.
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  process.env.STRIPE_CORE_PRICE_ID = 'price_coretestentcheck'
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthtestentcheck'
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-active-noenterprise1'
+  await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_noenterprise1', { stripeCustomerId: 'cus_noenterprise1' })
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_noenterprise1', subscriptionId: 'sub_noenterprise1', status: 'active', customer: 'cus_noenterprise1', priceId: 'price_enterprise_deal_xyz' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.plan !== 'enterprise', 'the paid-active transition must never result in plan: enterprise')
+  assert(config.commercial.commercialStatus === 'trial', 'an Enterprise-looking price must never advance PRYOR out of trial via this self-service transition')
+}
+
+async function testForgedMetadataTenantIdCannotRedirectPaidActiveState() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthtestmeta'
+  installFakeStripeWithRealSignatureVerification()
+
+  const realTenantId = 't_paid-active-real1'
+  const spoofedTenantId = 't_paid-active-spoofed1'
+  await seedTrialingTenantConfig(realTenantId)
+  await seedTenantWithSubscription(realTenantId, 'sub_meta1', { stripeCustomerId: 'cus_meta1' })
+
+  const payload = buildSubscriptionEventPayload({
+    eventId: 'evt_metaactive1', subscriptionId: 'sub_meta1', status: 'active',
+    customer: 'cus_meta1', priceId: 'price_growthtestmeta', metadataTenantId: spoofedTenantId,
+  })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const realConfig = await getTenantConfig(realTenantId)
+  assert(realConfig.commercial.commercialStatus === 'active', 'the REAL, reverse-index-resolved tenant must receive the transition')
+  const spoofedConfig = await getTenantConfig(spoofedTenantId)
+  assert(spoofedConfig === null, 'the metadata-claimed tenant must never be touched -- it does not even exist')
+}
+
+async function testPastDueDoesNotSuspendTenantInB12() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-pastdue-1'
+  await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_pastdue1', { stripeCustomerId: 'cus_pastdue1' })
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_pastdue1', subscriptionId: 'sub_pastdue1', status: 'past_due', customer: 'cus_pastdue1' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.subscriptionStatus === 'past_due', 'past_due must still be recorded as a plain fact')
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'trial', 'past_due must NEVER suspend/change PRYOR commercial access in B.12 -- B.13 owns delinquency enforcement')
+}
+
+async function testUnpaidDoesNotSuspendTenantInB12() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-unpaid-1'
+  await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_unpaid1', { stripeCustomerId: 'cus_unpaid1' })
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_unpaid1', subscriptionId: 'sub_unpaid1', status: 'unpaid', customer: 'cus_unpaid1' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.subscriptionStatus === 'unpaid')
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'trial', 'unpaid must NEVER suspend/change PRYOR commercial access in B.12')
+}
+
+async function testDeletedProjectionDoesNotExecuteB13CancellationPolicy() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-deleted-1'
+  await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_deleted1', { stripeCustomerId: 'cus_deleted1' })
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_deleted1', type: 'customer.subscription.deleted', subscriptionId: 'sub_deleted1', status: 'active', customer: 'cus_deleted1' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const record = await getBillingRecord(tenantId)
+  assert(record.subscriptionStatus === 'canceled')
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'trial', 'a deleted/canceled subscription must NEVER execute any B.13 cancellation policy against PRYOR commercial state')
+}
+
+async function testPaidActiveTransitionCannotCreateAnotherFreeTrial() {
+  const redis = fakeBillingRedis()
+  setBillingClient(() => redis)
+  installConfigStore()
+  process.env.STRIPE_WEBHOOK_SECRET = TEST_WEBHOOK_SECRET
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthtestnotrial'
+  installFakeStripeWithRealSignatureVerification()
+
+  const tenantId = 't_paid-active-notrial1'
+  const configBefore = await seedTrialingTenantConfig(tenantId)
+  await seedTenantWithSubscription(tenantId, 'sub_notrial1', { stripeCustomerId: 'cus_notrial1' })
+
+  const payload = buildSubscriptionEventPayload({ eventId: 'evt_notrial1', subscriptionId: 'sub_notrial1', status: 'active', customer: 'cus_notrial1', priceId: 'price_growthtestnotrial' })
+  const signature = Stripe.webhooks.generateTestHeaderString({ payload, secret: TEST_WEBHOOK_SECRET })
+  const res = await invokeWebhookProperly(payload, signature)
+  assert(res.statusCode === 200)
+
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'active')
+  assert(JSON.stringify(config.trialEligibility) === JSON.stringify(configBefore.trialEligibility), 'the paid-active transition must never touch trialEligibility -- it cannot create/re-arm another free trial')
+  assert(config.commercial.commercialStatus !== 'trial_pending_activation', 'the transition must never leave/re-enter a pending-activation trial state')
 }
 
 async function testOtherEventTypesAreIgnored() {
@@ -749,6 +1313,27 @@ const tests = [
   ['a CAS conflict with the desired state already applied is idempotently satisfied', testCasConflictWithDesiredStateAlreadyAppliedIsIdempotentlySatisfied],
   ['a CAS conflict against a different concurrent state is retryable', testCasConflictWithDifferentConcurrentStateIsRetryable],
   ['a missing billing record is never silently acknowledged', testMissingBillingRecordIsNeverSilentlyAcknowledged],
+  // Phase B.12 -- customer.subscription.updated/deleted minimal projection.
+  ['customer.subscription.updated projects an active status', testSubscriptionUpdatedProjectsActiveStatus],
+  ['customer.subscription.deleted always projects canceled', testSubscriptionDeletedAlwaysProjectsCanceled],
+  ['a trialing subscription event never touches/introduces a PRYOR trial field', testTrialingSubscriptionEventNeverTouchesTenantConfig],
+  ['past_due/unpaid/canceled projection introduces no B.13 enforcement fields', testPastDueUnpaidCanceledProjectionIntroducesNoEnforcementFields],
+  ['a duplicate subscription webhook delivery is idempotent', testDuplicateSubscriptionWebhookDeliveryIsIdempotent],
+  ['an unrecognized subscription is acknowledged, not processed', testUnrecognizedSubscriptionIsAcknowledgedNotProcessed],
+  // Phase B.12 (Decision 2) -- the minimal canonical paid-active transition.
+  ['a trialing webhook does not mutate the PRYOR trial', testTrialingWebhookDoesNotMutatePryorTrial],
+  ['a valid active webhook transitions to paid-active exactly once', testValidActiveWebhookTransitionsToPaidActiveExactlyOnce],
+  ['a duplicate active event is idempotent', testDuplicateActiveEventIsIdempotent],
+  ['a stale active event is ignored appropriately', testStaleActiveEventIsIgnoredAppropriately],
+  ['a subscription-id mismatch against the billing record rejects the active transition', testWrongSubscriptionReverseIndexRejectsActiveTransition],
+  ['a customer mismatch against the billing record rejects the active transition', testWrongCustomerRejectsActiveTransition],
+  ['an unmapped price rejects the active transition', testWrongPriceMappingRejectsActiveTransition],
+  ['the paid-active transition can never grant Enterprise', testPaidActiveTransitionCannotGrantEnterprise],
+  ['a forged metadata tenantId cannot redirect the paid-active transition', testForgedMetadataTenantIdCannotRedirectPaidActiveState],
+  ['past_due does not suspend the tenant in B.12', testPastDueDoesNotSuspendTenantInB12],
+  ['unpaid does not suspend the tenant in B.12', testUnpaidDoesNotSuspendTenantInB12],
+  ['a deleted/canceled subscription never executes B.13 cancellation policy', testDeletedProjectionDoesNotExecuteB13CancellationPolicy],
+  ['the paid-active transition can never create another free trial', testPaidActiveTransitionCannotCreateAnotherFreeTrial],
 ]
 
 async function main() {

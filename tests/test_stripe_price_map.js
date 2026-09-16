@@ -1,5 +1,7 @@
-// Phase B.10 -- regression tests for dashboard/api/_lib/stripePriceMap.js.
-// Pure lookup logic over plans.js -- no I/O, no Stripe API.
+// Phase B.10/B.12 -- regression tests for dashboard/api/_lib/stripePriceMap.js.
+// Pure lookup logic -- no I/O, no Stripe API. Phase B.12: price identity now
+// comes from STRIPE_CORE_PRICE_ID/STRIPE_GROWTH_PRICE_ID env vars, not
+// plans.js's static (still-null) stripePriceId field.
 //
 // Run directly: node tests/test_stripe_price_map.js
 
@@ -21,6 +23,9 @@ function run(name, fn) {
   } catch (e) {
     console.log(`FAIL: ${name} -- ${e.message}`)
     results.push(false)
+  } finally {
+    delete process.env.STRIPE_CORE_PRICE_ID
+    delete process.env.STRIPE_GROWTH_PRICE_ID
   }
 }
 
@@ -64,6 +69,52 @@ function testNullNeverMatchesAnUnconfiguredPriceSlot() {
   assert(resolvePlanIdForStripePriceId(null) === null, 'null must never match an unconfigured (also null) price slot')
 }
 
+// ===========================================================================
+// Phase B.12 -- STRIPE_CORE_PRICE_ID/STRIPE_GROWTH_PRICE_ID env-var mapping.
+// ===========================================================================
+
+function testCoreResolvesOnlyFromItsOwnEnvVar() {
+  process.env.STRIPE_CORE_PRICE_ID = 'price_coreabc123'
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthxyz789'
+  assert(resolveApprovedStripePriceId('core') === 'price_coreabc123')
+  assert(resolveApprovedStripePriceId('core') !== 'price_growthxyz789', 'Core must never resolve to the Growth price')
+}
+
+function testGrowthResolvesOnlyFromItsOwnEnvVar() {
+  process.env.STRIPE_CORE_PRICE_ID = 'price_coreabc123'
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthxyz789'
+  assert(resolveApprovedStripePriceId('growth') === 'price_growthxyz789')
+  assert(resolveApprovedStripePriceId('growth') !== 'price_coreabc123', 'Growth must never resolve to the Core price')
+}
+
+function testEnterpriseNeverReadsAnyPriceEnvVar() {
+  process.env.STRIPE_CORE_PRICE_ID = 'price_coreabc123'
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthxyz789'
+  assert(resolveApprovedStripePriceId('enterprise') === null, 'Enterprise must never resolve to a self-service price, no matter what is configured')
+}
+
+function testMalformedEnvValueFailsClosed() {
+  // Does not even look like a real Stripe price id (e.g. a copy/paste
+  // mistake of a Customer or Secret Key id) -- must fail closed, never be
+  // passed through to Stripe as-is.
+  process.env.STRIPE_CORE_PRICE_ID = 'cus_notAPriceId'
+  assert(resolveApprovedStripePriceId('core') === null, 'a malformed env value must fail closed (null), never be trusted as a real price id')
+}
+
+function testMissingEnvVarFailsClosedIndependently() {
+  process.env.STRIPE_CORE_PRICE_ID = 'price_coreabc123'
+  // STRIPE_GROWTH_PRICE_ID deliberately left unset.
+  assert(resolveApprovedStripePriceId('growth') === null, 'a missing Growth price env var must fail closed independently of Core being configured')
+  assert(resolveApprovedStripePriceId('core') === 'price_coreabc123', 'Core must still resolve correctly even while Growth is unconfigured')
+}
+
+function testReverseLookupTracksTheLiveEnvMapping() {
+  process.env.STRIPE_CORE_PRICE_ID = 'price_coreabc123'
+  process.env.STRIPE_GROWTH_PRICE_ID = 'price_growthxyz789'
+  assert(resolvePlanIdForStripePriceId('price_coreabc123') === 'core')
+  assert(resolvePlanIdForStripePriceId('price_growthxyz789') === 'growth')
+}
+
 const tests = [
   ['Core and Growth are self-service-eligible', testCoreAndGrowthAreSelfService],
   ['Enterprise is excluded from self-service', testEnterpriseExcludedFromSelfService],
@@ -71,6 +122,12 @@ const tests = [
   ['an unknown/arbitrary plan id never resolves to a price', testUnknownOrArbitraryPlanIdNeverResolves],
   ['an arbitrary price id never resolves to a plan', testReversePriceLookupNeverInventsAPlan],
   ['null never matches an unconfigured price slot', testNullNeverMatchesAnUnconfiguredPriceSlot],
+  ['Core resolves only from STRIPE_CORE_PRICE_ID', testCoreResolvesOnlyFromItsOwnEnvVar],
+  ['Growth resolves only from STRIPE_GROWTH_PRICE_ID', testGrowthResolvesOnlyFromItsOwnEnvVar],
+  ['Enterprise never reads any price env var', testEnterpriseNeverReadsAnyPriceEnvVar],
+  ['a malformed env value fails closed', testMalformedEnvValueFailsClosed],
+  ['a missing env var fails closed independently per plan', testMissingEnvVarFailsClosedIndependently],
+  ['the reverse lookup tracks the live env mapping', testReverseLookupTracksTheLiveEnvMapping],
 ]
 
 for (const [name, fn] of tests) run(name, fn)
