@@ -182,6 +182,8 @@ const TESTS = [
   'test_billing_activation_callback.js',
   // Phase B.13 -- Stripe Billing Customer Portal session creation.
   'test_billing_portal.js',
+  // Phase B.13 -- owner-only, read-only canonical billing status endpoint.
+  'test_billing_status.js',
 ]
 
 const results = {}

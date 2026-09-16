@@ -2369,6 +2369,104 @@ async function billingPortalSessionAction(req, res) {
   return res.status(200).json({ url: session.url })
 }
 
+// GET /api/session/billing-status -- Owner-only, READ-ONLY safe projection of
+// canonical commercial cancellation/suspension state, plus a minimal Stripe
+// billing-record status fact set. The ONE application-level way to see
+// tenant_config.commercial.cancellation/.suspension without direct Redis
+// access -- tenantStatus()'s own toSafeCommercialView() deliberately never
+// surfaces them (see that function's own header) since they don't affect
+// access/limits; this is a narrow, additive read, not a change to that
+// endpoint's existing contract.
+//
+// AUTHORIZATION: identical to billing-portal-session -- requireAuth(req,
+// res, ['owner']), the exact same billing-authorization boundary already
+// reviewed for that endpoint. Not a new access class, not broadened to
+// 'admin' or any other role.
+//
+// READ-ONLY: never writes tenant_config or billing:v1, never calls Stripe,
+// never triggers maybeStartTrial()/maybeStartAccessCodeTrial()/
+// ensureSubscriptionActivation() or any other lazy reconciliation --
+// unlike tenantStatus(), this is a pure read of whatever is already
+// durably stored, with no side effects of any kind.
+//
+// SANITIZATION: the response is an explicit, hand-built allowlist -- never
+// stripeCustomerId, stripeSubscriptionId, defaultPaymentMethodId, or any
+// other credential/identifier, never a raw tenant_config or billing-record
+// spread, never internal audit data, never an environment value. Missing
+// cancellation/suspension serialize as null, never omitted or invented.
+async function billingStatusAction(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `session:billing-status:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
+  if (!allowed) return
+
+  const tenantId = resolveTenantId(account)
+
+  // Reuses the exact same resolver tenantStatus() already calls
+  // unconditionally -- it never throws (fails closed internally) and
+  // already handles the DEFAULT_TENANT_ID/never-onboarded cases safely, so
+  // this endpoint never needs its own separate bootstrap special-case.
+  const commercial = toSafeCommercialView(await resolveTenantEntitlements(tenantId))
+
+  // tenant_config.commercial.cancellation/.suspension live only on a real
+  // tenant's own config record -- the bootstrap tenant (Los Tres Amigos)
+  // has no tenant_config at all (see tenantStatus()'s own DEFAULT_TENANT_ID
+  // branch), so both fields are structurally null for it, never fetched.
+  let config = null
+  if (tenantId !== DEFAULT_TENANT_ID) {
+    try {
+      config = await getTenantConfig(tenantId)
+    } catch (err) {
+      if (err instanceof TenantConfigStoreUnavailableError) {
+        return res.status(503).json({ error: 'service_unavailable', message: 'Could not read billing status. Please try again shortly.' })
+      }
+      throw err
+    }
+  }
+
+  const rawCancellation = config?.commercial?.cancellation ?? null
+  const cancellation = rawCancellation
+    ? {
+        status: rawCancellation.status,
+        requestedAt: rawCancellation.requestedAt ?? null,
+        effectiveAt: rawCancellation.effectiveAt ?? null,
+      }
+    : null
+
+  const rawSuspension = config?.commercial?.suspension ?? null
+  const suspension = rawSuspension
+    ? {
+        reason: rawSuspension.reason,
+        suspendedAt: rawSuspension.suspendedAt ?? null,
+      }
+    : null
+
+  let record = null
+  try {
+    record = await getBillingRecord(tenantId)
+  } catch (err) {
+    if (err instanceof BillingStoreUnavailableError) {
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not read billing status. Please try again shortly.' })
+    }
+    throw err
+  }
+
+  return res.status(200).json({
+    plan: commercial.plan,
+    commercialStatus: commercial.commercialStatus,
+    trialStatus: commercial.trialStatus,
+    trialStartedAt: commercial.trialStartedAt,
+    trialEndsAt: commercial.trialEndsAt,
+    cancellation,
+    suspension,
+    stripeStatus: record?.subscriptionStatus ?? null,
+    pastDueSince: record?.pastDueSince ?? null,
+    subscriptionPresent: Boolean(record?.stripeSubscriptionId),
+  })
+}
+
 // Phase B.12 (Decision 1) -- the PRIMARY, event-driven, server-to-server
 // Subscription-activation trigger. Called ONLY by the GitHub Actions
 // tenant-lifecycle workflows (tenant-lifecycle.yml /
@@ -2534,6 +2632,7 @@ export default async function handler(req, res) {
     case 'stripe-webhook':         return stripeWebhookAction(req, res)
     case 'billing-activation-callback': return billingActivationCallback(req, res)
     case 'billing-portal-session': return billingPortalSessionAction(req, res)
+    case 'billing-status':         return billingStatusAction(req, res)
     default:                 return res.status(404).json({ error: 'not_found' })
   }
 }
