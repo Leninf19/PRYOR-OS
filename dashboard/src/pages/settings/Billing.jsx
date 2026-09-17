@@ -54,6 +54,29 @@ function fmtDate(iso) {
   return d.toLocaleDateString(undefined, { dateStyle: 'medium' })
 }
 
+// Deterministic, non-locale-dependent price formatting (never
+// toLocaleString(), which can vary by environment/currency settings and
+// would make this text unstable to assert on) -- whole-dollar plan prices
+// (the only kind PLANS currently defines) render without decimals; a
+// malformed/non-finite value safely omits the price rather than crashing
+// or rendering "NaN/month".
+function fmtMonthlyPrice(priceCents) {
+  if (typeof priceCents !== 'number' || !Number.isFinite(priceCents) || priceCents < 0) return null
+  const dollars = priceCents / 100
+  const amount = Number.isInteger(dollars) ? String(dollars) : dollars.toFixed(2)
+  return `$${amount}/month`
+}
+
+// "Plan after trial" line text -- built ONLY from the server-provided
+// planAfterTrial.name/priceCents (never a hardcoded plan/price pair, never
+// derived from status.plan). A missing/malformed price degrades to just
+// the plan name rather than omitting the whole line or crashing.
+function formatPlanAfterTrial(planAfterTrial) {
+  if (typeof planAfterTrial?.name !== 'string' || !planAfterTrial.name) return null
+  const price = fmtMonthlyPrice(planAfterTrial.priceCents)
+  return price ? `${planAfterTrial.name} — ${price}` : planAfterTrial.name
+}
+
 // Maps the portal-session endpoint's own error codes to owner-facing copy --
 // never the raw server error/message, per this phase's explicit
 // "don't expose raw error details" requirement.
@@ -64,19 +87,44 @@ function friendlyPortalError(code) {
 }
 
 function BillingStatusCard({ status }) {
+  const isTrial = status.commercialStatus === 'trial'
   const trialEndsAt = status.trialStatus === 'active' ? fmtDate(status.trialEndsAt) : null
   const cancellationEffectiveAt = status.cancellation != null ? fmtDate(status.cancellation.effectiveAt) : null
   const isStripeUnpaidTerminal = status.commercialStatus === 'suspended' && status.suspension?.reason === 'stripe_unpaid_terminal'
+
+  // During a trial, `status.plan` is the EFFECTIVE feature-entitlement tier
+  // (always Growth, per entitlementResolution.js -- unaffected by this UI
+  // change), never what the tenant selected/will be billed for -- labeling
+  // it "Current Plan" during trial is exactly the smoke-test-discovered
+  // confusion this corrects. Once trialing ends, `status.plan` already
+  // equals the real billed plan (unchanged), so the paid-state label and
+  // meaning are untouched.
+  const planRowLabel = isTrial ? 'Trial Access' : 'Current Plan'
+
+  // "Plan after trial" is deliberately suppressed once a cancellation is
+  // scheduled (even if the server still reports a planAfterTrial value) --
+  // the subscription is ending, so presenting a future paid plan would
+  // wrongly imply billing continues past the trial.
+  const planAfterTrialText = isTrial && status.cancellation == null
+    ? formatPlanAfterTrial(status.planAfterTrial)
+    : null
 
   return (
     <Card className="p-6 space-y-4">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <p className="text-[10px] font-medium" style={{ color: 'var(--color-text-3)' }}>Current Plan</p>
+          <p className="text-[10px] font-medium" style={{ color: 'var(--color-text-3)' }}>{planRowLabel}</p>
           <p className="text-sm font-bold mt-0.5" style={{ color: 'var(--color-text-1)' }}>{humanizePlan(status.plan)}</p>
         </div>
         <Badge variant={statusBadgeVariant(status.commercialStatus)}>{humanizeStatus(status.commercialStatus)}</Badge>
       </div>
+
+      {planAfterTrialText && (
+        <div>
+          <p className="text-[10px] font-medium" style={{ color: 'var(--color-text-3)' }}>Plan after trial</p>
+          <p className="text-sm font-bold mt-0.5" style={{ color: 'var(--color-text-1)' }}>{planAfterTrialText}</p>
+        </div>
+      )}
 
       {trialEndsAt && (
         <p className="text-xs" style={{ color: 'var(--color-text-2)' }}>Trial ends {trialEndsAt}</p>

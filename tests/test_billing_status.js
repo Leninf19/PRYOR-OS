@@ -96,6 +96,7 @@ function install() {
   setUserRedis(() => userRedis)
   setConfigClient(() => configRedis)
   _setLimiterFactoryForTests(() => ({ limit: async () => ({ success: true, remaining: 99 }) }))
+  return { billingRedis }
 }
 
 let tenantCounter = 0
@@ -253,6 +254,92 @@ async function testNoRawIdentifiersOrSecretsLeak() {
 }
 
 // ===========================================================================
+// Preview-smoke-test UX correction -- planAfterTrial. `plan` above stays
+// the EFFECTIVE entitlement tier (unchanged); planAfterTrial is a separate,
+// additive projection of billing:v1.pendingPaidPlan through the existing
+// PLANS metadata table.
+// ===========================================================================
+
+async function testPlanAfterTrialNullWithNoPendingPaidPlan() {
+  install()
+  const tenantId = freshTenantId()
+  const token = await seedOwnerSession(tenantId)
+  await seedCommercialConfig(tenantId, { commercialStatus: 'trial', plan: 'growth' })
+  await createBillingRecord(tenantId, { stripeCustomerId: 'cus_noplan1', subscriptionStatus: 'trialing' })
+  const res = await invokeBillingStatus({ token })
+  assert(res.statusCode === 200)
+  assert('planAfterTrial' in res.body, 'billing-status must always include the planAfterTrial key')
+  assert(res.body.planAfterTrial === null, 'planAfterTrial must be null when no pendingPaidPlan is set')
+}
+
+async function testPlanAfterTrialMapsCorePlanMetadataExactly() {
+  install()
+  const tenantId = freshTenantId()
+  const token = await seedOwnerSession(tenantId)
+  await seedCommercialConfig(tenantId, { commercialStatus: 'trial', plan: 'growth' })
+  await createBillingRecord(tenantId, { stripeCustomerId: 'cus_core1', pendingPaidPlan: 'core', subscriptionStatus: 'trialing' })
+  const res = await invokeBillingStatus({ token })
+  assert(res.statusCode === 200)
+  assert(res.body.plan === 'growth', 'the existing plan field must still report the effective (trial) tier, unchanged by this correction')
+  assert(res.body.planAfterTrial !== null)
+  assert(res.body.planAfterTrial.id === 'core')
+  assert(res.body.planAfterTrial.name === 'Core')
+  assert(res.body.planAfterTrial.priceCents === 14900)
+}
+
+async function testPlanAfterTrialMapsGrowthPlanMetadataExactly() {
+  install()
+  const tenantId = freshTenantId()
+  const token = await seedOwnerSession(tenantId)
+  await seedCommercialConfig(tenantId, { commercialStatus: 'trial', plan: 'growth' })
+  await createBillingRecord(tenantId, { stripeCustomerId: 'cus_growth1', pendingPaidPlan: 'growth', subscriptionStatus: 'trialing' })
+  const res = await invokeBillingStatus({ token })
+  assert(res.statusCode === 200)
+  assert(res.body.planAfterTrial.id === 'growth')
+  assert(res.body.planAfterTrial.name === 'Growth')
+  assert(res.body.planAfterTrial.priceCents === 24900)
+}
+
+async function testPlanAfterTrialFailsClosedOnInvalidStoredValue() {
+  const { billingRedis } = install()
+  const tenantId = freshTenantId()
+  const token = await seedOwnerSession(tenantId)
+  await seedCommercialConfig(tenantId, { commercialStatus: 'trial', plan: 'growth' })
+  await createBillingRecord(tenantId, { stripeCustomerId: 'cus_badplan1', subscriptionStatus: 'trialing' })
+  // Directly corrupt the stored record to a value that could never be
+  // written through the normal validated select-plan path (Enterprise is
+  // excluded from SELF_SERVICE_PLAN_IDS) -- proves the read-side
+  // projection fails closed to null rather than throwing or inventing a
+  // fallback plan.
+  const raw = await billingRedis.hget('billing:v1', tenantId)
+  const record = JSON.parse(raw)
+  record.pendingPaidPlan = 'enterprise'
+  await billingRedis.hset('billing:v1', { [tenantId]: JSON.stringify(record) })
+  const res = await invokeBillingStatus({ token })
+  assert(res.statusCode === 200, `must never throw/500 on an invalid stored value, got ${res.statusCode}`)
+  assert(res.body.planAfterTrial === null, 'an invalid/non-self-service stored value must fail closed to null')
+}
+
+async function testPlanAfterTrialNeverExposesRawIdentifiersOrExtraFields() {
+  install()
+  const tenantId = freshTenantId()
+  const token = await seedOwnerSession(tenantId)
+  await seedCommercialConfig(tenantId, { commercialStatus: 'trial', plan: 'growth' })
+  await createBillingRecord(tenantId, {
+    stripeCustomerId: 'cus_planidcheck1', stripeSubscriptionId: 'sub_planidcheck1',
+    pendingPaidPlan: 'core', subscriptionStatus: 'trialing',
+  })
+  const res = await invokeBillingStatus({ token })
+  assert(res.statusCode === 200)
+  const serialized = JSON.stringify(res.body)
+  assert(!serialized.includes('cus_planidcheck1'), 'the Stripe customer id must never leak via planAfterTrial')
+  assert(!serialized.includes('sub_planidcheck1'), 'the Stripe subscription id must never leak via planAfterTrial')
+  assert(!serialized.includes('stripePriceId'), 'planAfterTrial must never include a raw Stripe price id')
+  assert(Object.keys(res.body.planAfterTrial).sort().join(',') === 'id,name,priceCents',
+    'planAfterTrial must be exactly {id, name, priceCents}, never a wider/raw PLANS spread')
+}
+
+// ===========================================================================
 // 7 -- store unavailable fails safely (never a raw record, never a 200).
 // ===========================================================================
 
@@ -296,6 +383,11 @@ const tests = [
   ['no cancellation returns null', testCancellationNullReturnsNull],
   ['a suspension returns the exact safe shape', testSuspensionSafeShapeReturned],
   ['no raw billing identifiers/secrets leak', testNoRawIdentifiersOrSecretsLeak],
+  ['planAfterTrial is null with no pendingPaidPlan', testPlanAfterTrialNullWithNoPendingPaidPlan],
+  ['planAfterTrial maps Core to exact canonical PLANS metadata', testPlanAfterTrialMapsCorePlanMetadataExactly],
+  ['planAfterTrial maps Growth to exact canonical PLANS metadata', testPlanAfterTrialMapsGrowthPlanMetadataExactly],
+  ['planAfterTrial fails closed to null on an invalid stored value', testPlanAfterTrialFailsClosedOnInvalidStoredValue],
+  ['planAfterTrial never exposes raw identifiers or extra fields', testPlanAfterTrialNeverExposesRawIdentifiersOrExtraFields],
   ['a billing-store outage fails safely', testStoreUnavailableFailsSafely],
   ['the endpoint performs no mutation', testEndpointPerformsNoMutation],
 ]

@@ -2453,6 +2453,26 @@ async function billingStatusAction(req, res) {
     throw err
   }
 
+  // Preview-smoke-test UX correction -- `plan` above is deliberately the
+  // EFFECTIVE entitlement tier (always 'growth' during any trial, per
+  // entitlementResolution.js's own isTrialing branch -- unchanged by this
+  // field). It is NOT the plan the tenant selected/will be billed for.
+  // That selection already lives on billing:v1 as `pendingPaidPlan`
+  // (session/[action].js's own select-plan action, B.11) -- this is a
+  // pure, additive read of the SAME `record` already fetched above, never
+  // a second store call, and never the internal field name itself: the
+  // client only ever sees a small, explicit {id, name, priceCents} shape
+  // built from the existing, reviewed PLANS metadata table, never a raw
+  // Stripe price id, never anything else off the billing record. Falls
+  // closed to null on anything not a real self-service plan id (missing,
+  // malformed, or -- structurally impossible today, but checked anyway --
+  // Enterprise) rather than throwing or guessing a fallback.
+  let planAfterTrial = null
+  if (isSelfServicePlan(record?.pendingPaidPlan)) {
+    const meta = PLANS[record.pendingPaidPlan]
+    planAfterTrial = { id: meta.id, name: meta.name, priceCents: meta.priceCents }
+  }
+
   return res.status(200).json({
     plan: commercial.plan,
     commercialStatus: commercial.commercialStatus,
@@ -2464,6 +2484,7 @@ async function billingStatusAction(req, res) {
     stripeStatus: record?.subscriptionStatus ?? null,
     pastDueSince: record?.pastDueSince ?? null,
     subscriptionPresent: Boolean(record?.stripeSubscriptionId),
+    planAfterTrial,
   })
 }
 

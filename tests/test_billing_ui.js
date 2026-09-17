@@ -112,6 +112,51 @@ function testSuspensionCopyIsReasonSpecific() {
     'the two suspension messages must be mutually exclusive (ternary on the specific reason), never both renderable at once')
 }
 
+// Preview-smoke-test UX correction -- Trial Access / Plan after trial.
+// items 1/2/9 -- trial uses "Trial Access", never "Current Plan" for the
+// plan row; the non-trial state keeps "Current Plan" unchanged.
+function testTrialUsesTrialAccessLabelNeverCurrentPlan() {
+  const content = read('pages/settings/Billing.jsx')
+  assert(/const planRowLabel = isTrial \? 'Trial Access' : 'Current Plan'/.test(content),
+    'the plan-row label must be a single ternary keyed on isTrial -- "Trial Access" during trial, "Current Plan" otherwise, never both/neither')
+  assert(/const isTrial = status\.commercialStatus === 'trial'/.test(content),
+    'isTrial must be derived directly from commercialStatus, never guessed')
+}
+
+// items 3/4/5/8 -- Plan after trial renders only during trial (with no
+// cancellation), reads name/priceCents from the server-provided
+// planAfterTrial object only, and never invents a plan when it is null.
+function testPlanAfterTrialRendersFromServerFieldsOnly() {
+  const content = read('pages/settings/Billing.jsx')
+  assert(/const planAfterTrialText = isTrial && status\.cancellation == null\s*\n\s*\? formatPlanAfterTrial\(status\.planAfterTrial\)\s*\n\s*: null/.test(content),
+    'planAfterTrialText must be gated on isTrial && cancellation == null, and derived only from status.planAfterTrial')
+  assert(/Plan after trial/.test(content))
+  assert(/typeof planAfterTrial\?\.name !== 'string' \|\| !planAfterTrial\.name\) return null/.test(content),
+    'a null/malformed planAfterTrial must return null, never invent a plan name')
+  assert(/const price = fmtMonthlyPrice\(planAfterTrial\.priceCents\)/.test(content),
+    'the future price must be read from planAfterTrial.priceCents, never a hardcoded value')
+  assert(/\$\{planAfterTrial\.name\} — \$\{price\}/.test(content), 'the future plan name must be read from planAfterTrial.name')
+}
+
+// item 6 -- no hardcoded dollar amounts anywhere in the page; every price
+// must flow through fmtMonthlyPrice(planAfterTrial.priceCents).
+function testNoHardcodedPlanPrices() {
+  const content = read('pages/settings/Billing.jsx')
+  assert(!/\$149|\$249|14900|24900/.test(content),
+    'Billing.jsx must never hardcode a plan price -- it must always come from the server-provided planAfterTrial.priceCents')
+}
+
+// item 7 -- a scheduled cancellation suppresses "Plan after trial" even if
+// the server still reports a planAfterTrial value (already partially
+// covered by the ternary in testPlanAfterTrialRendersFromServerFieldsOnly,
+// asserted explicitly here for traceability against the required item).
+function testCancellationSuppressesPlanAfterTrial() {
+  const content = read('pages/settings/Billing.jsx')
+  assert(/isTrial && status\.cancellation == null/.test(content),
+    'planAfterTrialText must never be computed when a cancellation is scheduled, regardless of what planAfterTrial contains')
+}
+
+// ===========================================================================
 // 10 -- Cancellation Scheduled + effective date.
 function testCancellationScheduledBlock() {
   const content = read('pages/settings/Billing.jsx')
@@ -214,6 +259,10 @@ const tests = [
   ['trial end date is rendered from the server field only, never computed locally', testTrialEndDateFromServerOnly],
   ['past_due renders the exact required copy', testExactPastDueCopy],
   ['suspension copy is reason-specific and mutually exclusive', testSuspensionCopyIsReasonSpecific],
+  ['trial uses "Trial Access", never "Current Plan", for the plan row', testTrialUsesTrialAccessLabelNeverCurrentPlan],
+  ['Plan after trial renders from server-provided fields only, never invented', testPlanAfterTrialRendersFromServerFieldsOnly],
+  ['no hardcoded plan prices appear anywhere in Billing.jsx', testNoHardcodedPlanPrices],
+  ['a scheduled cancellation suppresses Plan after trial', testCancellationSuppressesPlanAfterTrial],
   ['Cancellation Scheduled block renders the effective date with no local cancel/reactivate controls', testCancellationScheduledBlock],
   ['billingService.js calls the correct endpoints with no client-supplied identifiers', testServiceHitsCorrectEndpointsWithNoIdentifiers],
   ['a successful portal-session response redirects using the returned URL', testSuccessRedirectsUsingReturnedUrl],
