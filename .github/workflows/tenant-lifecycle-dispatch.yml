@@ -91,6 +91,41 @@ name: Tenant Lifecycle Dispatch (pinned)
 # dispatch to run against the STILL-PINNED prior commit and fail with the
 # exact same UNIQUE-constraint error the fix was meant to resolve --
 # corrected here.)
+#
+# revision 10 (Preview Infrastructure Isolation): adds a required
+# `environment` input (production|preview, no default -- every caller,
+# including a human clicking "Run workflow", must choose explicitly). The
+# job now declares `environment: ${{ inputs.environment }}`, which is
+# GitHub's own mechanism for scoping environment-level secrets: a
+# same-NAMED secret defined in the "preview" GitHub Environment overrides
+# the repository-level (Production) one ONLY for a run whose job targets
+# that environment. This alone is NOT sufficient, though -- if the
+# "preview" GitHub Environment is ever referenced before its own
+# Preview-only secrets are actually configured, `secrets.*` SILENTLY falls
+# back to the repository-level (Production) value for any name not yet
+# defined at the environment level, which is exactly the "Preview
+# executes against Production infrastructure" failure this revision exists
+# to prevent. To close that gap structurally, a new "Verify Preview
+# isolation" step (preview-only) requires `secrets.PREVIEW_ENVIRONMENT_MARKER`
+# to be non-empty -- a marker secret that must be configured ONLY inside
+# the "preview" GitHub Environment, with NO repository-level counterpart
+# ever created, so it has no fallback value to silently succeed with. Every
+# secret-bearing step that touches Redis/credential/Blob/Google secrets
+# (the six existing operation steps, plus "Write job summary") now requires
+# `inputs.environment == 'production' || steps.verify_preview_isolation.outcome
+# == 'success'` -- for 'production' this is unconditionally true (identical
+# behavior to before this revision); for 'preview' it additionally requires
+# the marker check to have passed. "Chain to Initial Sync" carries no
+# lifecycle secret itself, so it is not gated on the marker check, but now
+# passes `inputs.environment` through unchanged so the chained initial_sync
+# run re-derives and re-verifies the SAME environment independently. The
+# concurrency group now includes `inputs.environment` so a Preview run and a
+# Production run for the SAME tenant_id can never collide/serialize against
+# each other. PINNED_LIFECYCLE_SHA is UNCHANGED -- the pinned Python scripts
+# only ever read environment variables by NAME; which values (Production vs.
+# Preview) those names resolve to is decided entirely by GitHub's own
+# environment-secret resolution before Python ever runs, so no change was
+# needed on feature/multi-tenant-pryor for this revision.
 #   - "Write job summary" is the one step that previously broke this
 #     invariant, because if: always() explicitly overrides the
 #     success()-required default. It is now split into two mutually
@@ -99,6 +134,94 @@ name: Tenant Lifecycle Dispatch (pinned)
 #     tenant_status_report.py), and one gated on
 #     `steps.validate.outcome == 'failure'` that writes a static,
 #     secret-free, tenant-code-free message instead.
+#
+# revision 11 (Preview Infrastructure Isolation -- two blockers closed):
+#
+#   Blocker 1 (secret fallback was not actually fail-closed): revision
+#   10's `environment: ${{ inputs.environment }}` job-level scoping is
+#   REAL, but it cannot by itself guarantee isolation -- if the "preview"
+#   GitHub Environment is referenced while missing an environment-scoped
+#   secret with the SAME NAME as a repository-level (Production) one,
+#   `secrets.*` SILENTLY resolves to the Production value. The
+#   PREVIEW_ENVIRONMENT_MARKER presence check from revision 10 proved the
+#   Environment was selected, but proved nothing about the six actual
+#   lifecycle secrets. Fixed by making Preview reference SIX ENTIRELY
+#   DIFFERENT SECRET NAMES with no repository-level counterpart at all --
+#   PREVIEW_UPSTASH_REDIS_REST_URL, PREVIEW_UPSTASH_REDIS_REST_TOKEN,
+#   PREVIEW_CREDENTIAL_ENCRYPTION_KEY, PREVIEW_BLOB_READ_WRITE_TOKEN,
+#   PREVIEW_GOOGLE_CLIENT_ID, PREVIEW_GOOGLE_CLIENT_SECRET -- selected via
+#   `${{ inputs.environment == 'production' && secrets.X || secrets.PREVIEW_X }}`
+#   in each operation step's own env: block. Production's secret NAMES are
+#   completely unchanged. This is now the PRIMARY isolation guarantee --
+#   there is no code path where a 'preview' dispatch can even SYNTACTICALLY
+#   reference a Production secret name, regardless of Environment-scoping
+#   configuration. "Verify Preview isolation" is extended to check ALL
+#   SEVEN Preview-only secrets (the six above plus PREVIEW_ENVIRONMENT_MARKER,
+#   which remains as defense in depth, no longer the primary guarantee) are
+#   non-empty before any operation step runs -- fails closed, naming
+#   exactly which ones are missing.
+#
+#   Blocker 2 (Preview dispatch still executed ref=main): the dispatch
+#   API's OWN top-level `ref` parameter selects which branch's copy of
+#   THIS WORKFLOW FILE actually runs -- completely separate from
+#   PINNED_LIFECYCLE_SHA (which selects the application code checked out
+#   by the "Checkout pinned lifecycle implementation" step below, and is
+#   unaffected by this). dashboard/api/google/[action].js previously
+#   hardcoded `ref: 'main'` for every dispatch, so a Preview deployment
+#   would run main's workflow LOGIC (which does not contain this
+#   Preview-isolation logic at all) -- making this feature unsmoke-testable
+#   before merge. Fixed via dispatchTenantLifecycleWorkflow()'s new
+#   resolveLifecycleExecutionRef(): 'production' -> the literal 'main'
+#   (unchanged); 'preview' -> the one fixed, reviewed
+#   APPROVED_PREVIEW_LIFECYCLE_REF constant ('feature/commercial-entitlements'
+#   for this smoke-test phase), cross-checked against Vercel's own
+#   VERCEL_GIT_COMMIT_REF when present; anything else -> null, refused
+#   before any network call. Never caller/request-supplied. "Chain to
+#   Initial Sync" no longer hardcodes `ref='main'` either -- it now reuses
+#   `github.ref_name`, GitHub's own trusted record of which ref THIS run
+#   was actually dispatched against (set by the dispatch API call itself,
+#   never an input), so the chained initial_sync run always targets the
+#   SAME workflow-file ref its own provisioning run used.
+#
+# revision 12 (Preview Infrastructure Isolation -- cross-environment
+# fallback via && / || removed): revision 11's per-secret ternary --
+# `${{ inputs.environment == 'production' && secrets.X || secrets.PREVIEW_X }}`
+# -- is NOT a strict ternary. GitHub Actions' `&&`/`||` return one of their
+# OPERANDS (JS-style truthy semantics), not a coerced boolean, and an
+# empty-string secret is falsy. So if `environment == 'production'` but
+# the actual `secrets.X` happens to be empty/unconfigured, `inputs.environment
+# == 'production' && secrets.X` itself evaluates to that EMPTY (falsy)
+# value, and the `||` then falls through to `secrets.PREVIEW_X` -- a
+# genuine PRODUCTION RUN silently pulling a PREVIEW secret. This is exactly
+# backwards from revision 11's own intent and violates the isolation
+# guarantee in the opposite direction.
+#
+# Fixed by removing every such expression and replacing each with TWO
+# FULLY SEPARATE STEPS per lifecycle action -- one gated strictly on
+# `inputs.environment == 'production'` whose env: block references ONLY
+# Production secret names (bare `secrets.X`, no expression involving
+# `environment` at all), and one gated strictly on `inputs.environment ==
+# 'preview' && steps.verify_preview_isolation.outcome == 'success'` whose
+# env: block references ONLY `secrets.PREVIEW_X` names. Neither step's env:
+# block can EVER mention the other namespace's secret name, in any
+# expression, under any condition -- there is no shared expression left to
+# have a fallthrough bug in. This applies to every secret-bearing lifecycle
+# action: provisioning, initial sync, entitlement change, Google
+# diagnostic, Redis identity probe, credential/schema audit, and the job
+# summary. "Run provisioning" is split into id: run_provisioning_production
+# and id: run_provisioning_preview; "Chain to Initial Sync" now fires when
+# EITHER succeeded (`steps.run_provisioning_production.outcome == 'success'
+# || steps.run_provisioning_preview.outcome == 'success'`) -- still never
+# the bare success() default, still requires a genuine provisioning
+# success, exactly one of which can ever apply per run since the two
+# variants' `if:` conditions are mutually exclusive on `inputs.environment`.
+# A missing/empty Production secret now fails however
+# provision_tenant.py/initial_sync.py/etc. themselves handle an empty
+# credential (exactly the SAME pre-existing behavior as before Preview
+# Infrastructure Isolation existed at all) -- it can no longer silently
+# borrow a Preview value to keep running. A missing Preview secret
+# continues to fail closed earlier, at "Verify Preview isolation", before
+# either preview-tagged step can even attempt to run.
 
 on:
   workflow_dispatch:
@@ -122,10 +245,17 @@ on:
         description: "Type the EXACT tenant id again to confirm"
         required: true
         type: string
+      environment:
+        description: "Which infrastructure this dispatch targets -- no default, must be chosen explicitly every time"
+        required: true
+        type: choice
+        options:
+          - production
+          - preview
       # Deliberately NO ref/branch/sha input of any kind.
 
 concurrency:
-  group: tenant-lifecycle-${{ inputs.tenant_id }}
+  group: tenant-lifecycle-${{ inputs.environment }}-${{ inputs.tenant_id }}
   cancel-in-progress: false
 
 permissions:
@@ -139,6 +269,15 @@ jobs:
   operate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Preview Infrastructure Isolation (revision 10, narrowed by revision
+    # 11) -- scopes GitHub Environment-level secrets/protection rules.
+    # Since revision 11, this is NOT the primary isolation guarantee (the
+    # distinct PREVIEW_* secret NAMES referenced in each step below are) --
+    # this line remains for PREVIEW_ENVIRONMENT_MARKER's own scoping and
+    # any future Environment protection rules (required reviewers, etc.).
+    # Referencing a name with no configured Environment is safe and
+    # behaves exactly as if this line were absent.
+    environment: ${{ inputs.environment }}
     steps:
       - name: Checkout pinned lifecycle implementation
         uses: actions/checkout@v6
@@ -157,12 +296,25 @@ jobs:
           TENANT_ID: ${{ inputs.tenant_id }}
           CONFIRMATION: ${{ inputs.confirmation }}
           OPERATION: ${{ inputs.operation }}
+          ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
           case "$OPERATION" in
             diagnose_google_status|provision|initial_sync|apply_entitlement_change|redis_identity_probe|credential_key_audit) ;;
             *)
               echo "::error::operation '$OPERATION' is not an allowed operation"
+              exit 1
+              ;;
+          esac
+          # Preview Infrastructure Isolation -- same discipline as OPERATION
+          # above: an explicit shell-level allowlist, never reliant solely
+          # on the workflow_dispatch `type: choice` schema (which only
+          # constrains the GitHub UI, not necessarily every possible API
+          # caller).
+          case "$ENVIRONMENT" in
+            production|preview) ;;
+            *)
+              echo "::error::environment '$ENVIRONMENT' is not an allowed lifecycle execution environment"
               exit 1
               ;;
           esac
@@ -178,7 +330,7 @@ jobs:
             echo "::error::confirmation must exactly match tenant_id -- refusing to proceed"
             exit 1
           fi
-          echo "Validated tenant_id=$TENANT_ID operation=$OPERATION"
+          echo "Validated tenant_id=$TENANT_ID operation=$OPERATION environment=$ENVIRONMENT"
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -188,9 +340,49 @@ jobs:
       - name: Install Python dependencies
         run: pip install cryptography
 
-      - name: Run provisioning
-        id: run_provisioning
-        if: inputs.operation == 'provision'
+      # Preview Infrastructure Isolation (revision 11) -- fail-closed
+      # verification that EVERY Preview-only secret this run will need is
+      # actually configured, before any operation step runs. Since
+      # revision 11, every operation step below sources Preview secrets
+      # from these SAME PREVIEW_*-prefixed names (never the Production
+      # names) -- so an empty value here means the step would otherwise
+      # run with a blank credential, not a silent Production fallback (that
+      # specific failure mode is now closed structurally by the distinct
+      # names themselves; this step's job is to fail loudly and early
+      # instead of letting each operation script hit its own confusing
+      # runtime error against an empty string). PREVIEW_ENVIRONMENT_MARKER
+      # has no repository-level counterpart either and remains as
+      # additional defense in depth, not the primary guarantee. Every later
+      # secret-bearing step requires this step's own success whenever
+      # environment == 'preview' (see each step's own `if:` below).
+      - name: Verify Preview isolation
+        id: verify_preview_isolation
+        if: steps.validate.outcome == 'success' && inputs.environment == 'preview'
+        env:
+          PREVIEW_ENVIRONMENT_MARKER: ${{ secrets.PREVIEW_ENVIRONMENT_MARKER }}
+          PREVIEW_UPSTASH_REDIS_REST_URL: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_URL }}
+          PREVIEW_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_TOKEN }}
+          PREVIEW_CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.PREVIEW_CREDENTIAL_ENCRYPTION_KEY }}
+          PREVIEW_BLOB_READ_WRITE_TOKEN: ${{ secrets.PREVIEW_BLOB_READ_WRITE_TOKEN }}
+          PREVIEW_GOOGLE_CLIENT_ID: ${{ secrets.PREVIEW_GOOGLE_CLIENT_ID }}
+          PREVIEW_GOOGLE_CLIENT_SECRET: ${{ secrets.PREVIEW_GOOGLE_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in PREVIEW_ENVIRONMENT_MARKER PREVIEW_UPSTASH_REDIS_REST_URL PREVIEW_UPSTASH_REDIS_REST_TOKEN PREVIEW_CREDENTIAL_ENCRYPTION_KEY PREVIEW_BLOB_READ_WRITE_TOKEN PREVIEW_GOOGLE_CLIENT_ID PREVIEW_GOOGLE_CLIENT_SECRET; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Preview lifecycle secrets not configured: ${missing[*]} -- refusing to proceed. Configure each of these inside Settings > Environments > preview before dispatching with environment=preview. None of these has (or should ever have) a repository-level counterpart."
+            exit 1
+          fi
+          echo "Preview environment isolation verified -- all required PREVIEW_* secrets are configured."
+
+      - name: Run provisioning (production)
+        id: run_provisioning_production
+        if: inputs.operation == 'provision' && inputs.environment == 'production'
         env:
           TENANT_ID: ${{ inputs.tenant_id }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
@@ -199,8 +391,20 @@ jobs:
           BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
         run: python provision_tenant.py --tenant-id "$TENANT_ID"
 
-      - name: Run Initial Sync
-        if: inputs.operation == 'initial_sync'
+      - name: Run provisioning (preview)
+        id: run_provisioning_preview
+        if: inputs.operation == 'provision' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.PREVIEW_CREDENTIAL_ENCRYPTION_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.PREVIEW_BLOB_READ_WRITE_TOKEN }}
+        run: python provision_tenant.py --tenant-id "$TENANT_ID"
+
+      - name: Run Initial Sync (production)
+        id: run_initial_sync_production
+        if: inputs.operation == 'initial_sync' && inputs.environment == 'production'
         env:
           TENANT_ID: ${{ inputs.tenant_id }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
@@ -211,8 +415,132 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: python initial_sync.py --tenant-id "$TENANT_ID"
 
-      - name: Apply entitlement change
-        if: inputs.operation == 'apply_entitlement_change'
+      - name: Run Initial Sync (preview)
+        id: run_initial_sync_preview
+        if: inputs.operation == 'initial_sync' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.PREVIEW_CREDENTIAL_ENCRYPTION_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.PREVIEW_BLOB_READ_WRITE_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.PREVIEW_GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.PREVIEW_GOOGLE_CLIENT_SECRET }}
+        run: python initial_sync.py --tenant-id "$TENANT_ID"
+
+      # Phase B.12 (Decision 1) -- the PRIMARY, event-driven Subscription-
+      # activation trigger: fires ONLY after Initial Sync has genuinely
+      # persisted tenant_config.initialSync.completedAt (gated on the
+      # PRODUCTION Initial Sync step's own 'success' outcome -- never the
+      # bare success() default, same discipline as "Chain to Initial Sync"
+      # above). Calls the Node/Vercel application's own internal callback
+      # (dashboard/api/session/[action].js's billingActivationCallback()),
+      # which itself calls the SAME canonical maybeStartTrial()/
+      # ensureSubscriptionActivation() functions tenantStatus()'s own
+      # fallback polling already uses -- this step is a delivery mechanism
+      # only, never a second implementation of that logic.
+      #
+      # AUTHENTICATION: a dedicated, single-purpose secret
+      # (BILLING_ACTIVATION_CALLBACK_SECRET) -- deliberately NEVER
+      # CREDENTIAL_ENCRYPTION_KEY, GOOGLE_CLIENT_SECRET, VERCEL_TOKEN, a
+      # GitHub PAT, or any Stripe secret. Preview/Production isolation
+      # mirrors every other secret-bearing action in this file exactly:
+      # two fully separate steps, each referencing exactly ONE secret name,
+      # no &&/|| cross-environment fallback expression anywhere.
+      #
+      # APP_BASE_URL is NOT a secret -- knowledge of the URL alone grants
+      # nothing without the callback secret above (same reasoning as every
+      # public API endpoint this codebase already has). It is a fixed,
+      # reviewed literal, never derived from any input, mirroring
+      # APPROVED_PREVIEW_LIFECYCLE_REF's own discipline on the Node side.
+      #
+      # RETRY: a bounded (5-attempt, 5s-interval) retry loop against
+      # transient failures (deploy blip, cold start, brief outage). If the
+      # callback never succeeds, this step fails (`exit 1`) -- GitHub
+      # Actions' own default behavior then marks the job 'failure', making
+      # this failure visible rather than silently declaring billing
+      # activation complete. A workflow RERUN safely re-invokes the exact
+      # same idempotent callback -- it can never restart the trial or
+      # create a duplicate subscription (see the callback's own
+      # implementation and its dedicated test suite).
+      # SAFETY AUDIT ADDITION -- github.ref == 'refs/heads/main' is REQUIRED
+      # here, on top of inputs.environment == 'production': `ref` (which
+      # branch's copy of THIS WORKFLOW FILE actually executes) and
+      # `environment` (a caller-chosen input) are two fully independent
+      # dispatch parameters -- nothing else in this file ties them
+      # together, so a dispatch with ref=<any non-main branch> +
+      # environment=production would otherwise still reach this step with
+      # the REAL Production secret/URL. Node's own dispatchTenantLifecycleWorkflow()
+      # already always sends ref='main' for environment=='production' (see
+      # google/[action].js's resolveLifecycleExecutionRef()), but that is a
+      # CALLER-side convention, not something this workflow itself
+      # enforced until now. This guard makes the invariant structural
+      # instead of merely conventional. Deliberately step-scoped, not
+      # job-level -- provisioning/initial_sync steps are unchanged.
+      - name: Activate billing (production)
+        id: activate_billing_production
+        if: inputs.operation == 'initial_sync' && inputs.environment == 'production' && steps.run_initial_sync_production.outcome == 'success' && github.ref == 'refs/heads/main'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          BILLING_ACTIVATION_CALLBACK_SECRET: ${{ secrets.BILLING_ACTIVATION_CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          APP_BASE_URL="https://app.futuremark.studio"
+          ATTEMPTS=5
+          DELAY_SECONDS=5
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            HTTP_STATUS=$(curl -sS -o /tmp/billing_activation_response.json -w '%{http_code}' \
+              --max-time 15 \
+              -X POST "$APP_BASE_URL/api/session?action=billing-activation-callback" \
+              -H "Authorization: Bearer $BILLING_ACTIVATION_CALLBACK_SECRET" \
+              -H "Content-Type: application/json" \
+              -d "{\"tenantId\":\"$TENANT_ID\"}") || HTTP_STATUS="000"
+            if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
+              echo "billing activation callback succeeded on attempt $attempt (HTTP $HTTP_STATUS) for tenant $TENANT_ID"
+              cat /tmp/billing_activation_response.json || true
+              exit 0
+            fi
+            echo "billing activation callback attempt $attempt/$ATTEMPTS failed (HTTP $HTTP_STATUS) for tenant $TENANT_ID"
+            if [[ "$attempt" -lt "$ATTEMPTS" ]]; then
+              sleep "$DELAY_SECONDS"
+            fi
+          done
+          echo "::error::billing activation callback did not succeed after $ATTEMPTS attempts for tenant $TENANT_ID -- failing this workflow visibly rather than silently declaring complete billing activation"
+          exit 1
+
+      - name: Activate billing (preview)
+        id: activate_billing_preview
+        if: inputs.operation == 'initial_sync' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success' && steps.run_initial_sync_preview.outcome == 'success'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          BILLING_ACTIVATION_CALLBACK_SECRET: ${{ secrets.PREVIEW_BILLING_ACTIVATION_CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          APP_BASE_URL="https://pryor-os-git-feature-commercial-e-6c39d9-lenin-fierros-projects.vercel.app"
+          ATTEMPTS=5
+          DELAY_SECONDS=5
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            HTTP_STATUS=$(curl -sS -o /tmp/billing_activation_response.json -w '%{http_code}' \
+              --max-time 15 \
+              -X POST "$APP_BASE_URL/api/session?action=billing-activation-callback" \
+              -H "Authorization: Bearer $BILLING_ACTIVATION_CALLBACK_SECRET" \
+              -H "Content-Type: application/json" \
+              -d "{\"tenantId\":\"$TENANT_ID\"}") || HTTP_STATUS="000"
+            if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
+              echo "billing activation callback succeeded on attempt $attempt (HTTP $HTTP_STATUS) for tenant $TENANT_ID"
+              cat /tmp/billing_activation_response.json || true
+              exit 0
+            fi
+            echo "billing activation callback attempt $attempt/$ATTEMPTS failed (HTTP $HTTP_STATUS) for tenant $TENANT_ID"
+            if [[ "$attempt" -lt "$ATTEMPTS" ]]; then
+              sleep "$DELAY_SECONDS"
+            fi
+          done
+          echo "::error::billing activation callback did not succeed after $ATTEMPTS attempts for tenant $TENANT_ID -- failing this workflow visibly rather than silently declaring complete billing activation"
+          exit 1
+
+      - name: Apply entitlement change (production)
+        if: inputs.operation == 'apply_entitlement_change' && inputs.environment == 'production'
         env:
           TENANT_ID: ${{ inputs.tenant_id }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
@@ -223,8 +551,20 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: python apply_entitlement_change.py --tenant-id "$TENANT_ID"
 
-      - name: Diagnose Google status
-        if: inputs.operation == 'diagnose_google_status'
+      - name: Apply entitlement change (preview)
+        if: inputs.operation == 'apply_entitlement_change' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.PREVIEW_CREDENTIAL_ENCRYPTION_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.PREVIEW_BLOB_READ_WRITE_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.PREVIEW_GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.PREVIEW_GOOGLE_CLIENT_SECRET }}
+        run: python apply_entitlement_change.py --tenant-id "$TENANT_ID"
+
+      - name: Diagnose Google status (production)
+        if: inputs.operation == 'diagnose_google_status' && inputs.environment == 'production'
         env:
           TENANT_ID: ${{ inputs.tenant_id }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
@@ -234,6 +574,17 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: python diagnose_google_status.py --tenant-id "$TENANT_ID"
 
+      - name: Diagnose Google status (preview)
+        if: inputs.operation == 'diagnose_google_status' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.PREVIEW_CREDENTIAL_ENCRYPTION_KEY }}
+          GOOGLE_CLIENT_ID: ${{ secrets.PREVIEW_GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.PREVIEW_GOOGLE_CLIENT_SECRET }}
+        run: python diagnose_google_status.py --tenant-id "$TENANT_ID"
+
       # Deliberately receives ONLY the two Redis secrets -- not
       # CREDENTIAL_ENCRYPTION_KEY, not Google, not Blob -- since this
       # operation never touches a credential record, Google, or Blob at
@@ -241,11 +592,18 @@ jobs:
       # tenant-unrelated record) -- tenant_id/confirmation are still
       # required by the schema and validated above as always, but this
       # script's own behavior does not depend on their value.
-      - name: Redis identity probe
-        if: inputs.operation == 'redis_identity_probe'
+      - name: Redis identity probe (production)
+        if: inputs.operation == 'redis_identity_probe' && inputs.environment == 'production'
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python redis_identity_probe.py
+
+      - name: Redis identity probe (preview)
+        if: inputs.operation == 'redis_identity_probe' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success'
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_TOKEN }}
         run: python redis_identity_probe.py
 
       # Strictly read-only: a single Redis GET on the computed credential
@@ -253,12 +611,20 @@ jobs:
       # (credentialVersion/timestamps/health) -- never decrypts, so it
       # never needs CREDENTIAL_ENCRYPTION_KEY, Google secrets, or Blob
       # secrets at all.
-      - name: Credential key/schema audit
-        if: inputs.operation == 'credential_key_audit'
+      - name: Credential key/schema audit (production)
+        if: inputs.operation == 'credential_key_audit' && inputs.environment == 'production'
         env:
           TENANT_ID: ${{ inputs.tenant_id }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python redis_credential_key_audit.py --tenant-id "$TENANT_ID"
+
+      - name: Credential key/schema audit (preview)
+        if: inputs.operation == 'credential_key_audit' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_TOKEN }}
         run: python redis_credential_key_audit.py --tenant-id "$TENANT_ID"
 
       # Multi-Tenant Phase 4O -- GitHub-internal chaining, provisioning ->
@@ -271,41 +637,64 @@ jobs:
       # chained run to start or finish (the dispatch POST returns
       # immediately, before the chained run even begins).
       #
-      # Gated on steps.run_provisioning.outcome == 'success' -- NOT the
-      # bare success() default -- so it fires only when
-      # provision_tenant.py's own process genuinely exited zero. Confirmed
-      # by reading provision_tenant.py's main() directly: every failure
-      # path (a caught ProvisioningError, including the safe
-      # StaleProvisioningAttemptError "someone else is handling this"
-      # case, or any uncaught exception) returns/causes a non-zero exit,
-      # which GitHub Actions always reports as this step's outcome:
-      # 'failure' -- so a genuine provisioning failure structurally cannot
-      # reach this step.
+      # Gated on EITHER production/preview provisioning step's own
+      # outcome == 'success' -- NOT the bare success() default -- so it
+      # fires only when provision_tenant.py's own process genuinely
+      # exited zero. Exactly one of the two can ever be 'success' for a
+      # given run (their `if:` conditions are mutually exclusive on
+      # inputs.environment), so this is never ambiguous about which
+      # attempt actually ran. Confirmed by reading provision_tenant.py's
+      # main() directly: every failure path (a caught ProvisioningError,
+      # including the safe StaleProvisioningAttemptError "someone else is
+      # handling this" case, or any uncaught exception) returns/causes a
+      # non-zero exit, which GitHub Actions always reports as that step's
+      # outcome: 'failure' -- so a genuine provisioning failure
+      # structurally cannot reach this step.
       #
       # No new secret -- uses the same GITHUB_TOKEN every workflow run
       # already receives automatically. tenant_id/confirmation are the
-      # SAME server-derived values already validated for THIS run; no new
-      # input surface, no caller-supplied ref/branch/SHA.
+      # SAME server-derived values already validated for THIS run. This
+      # step itself carries no lifecycle secret (Redis/credential/Blob/
+      # Google), so it is not gated on steps.verify_preview_isolation --
+      # its jobs are (1) to preserve THIS run's own already-validated
+      # `inputs.environment` onto the chained dispatch so the chained
+      # initial_sync run re-derives and re-verifies the SAME environment
+      # independently, from scratch, via its own "Validate inputs"/
+      # "Verify Preview isolation" steps -- never inherited implicitly --
+      # and (2), since revision 11 (blocker fix), to preserve THIS run's
+      # own git ref too: `github.ref_name` is GitHub's own trusted record
+      # of which ref THIS run was actually dispatched against (set by the
+      # dispatch API call that started this very run, never a workflow
+      # input, never caller-supplied) -- so the chained run always targets
+      # the SAME workflow-file ref its own provisioning run used, whether
+      # that is 'main' (production) or the approved Preview ref.
       - name: Chain to Initial Sync
-        if: inputs.operation == 'provision' && steps.run_provisioning.outcome == 'success'
+        if: inputs.operation == 'provision' && (steps.run_provisioning_production.outcome == 'success' || steps.run_provisioning_preview.outcome == 'success')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TENANT_ID: ${{ inputs.tenant_id }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          WORKFLOW_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           gh api --method POST \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             /repos/${{ github.repository }}/actions/workflows/tenant-lifecycle-dispatch.yml/dispatches \
-            -f ref='main' \
+            -f ref="$WORKFLOW_REF" \
             -f "inputs[operation]=initial_sync" \
             -f "inputs[tenant_id]=$TENANT_ID" \
-            -f "inputs[confirmation]=$TENANT_ID"
+            -f "inputs[confirmation]=$TENANT_ID" \
+            -f "inputs[environment]=$ENVIRONMENT"
 
-      # Only reachable when Validate inputs actually succeeded -- the one
-      # place production secrets and tenant_status_report.py are used.
-      - name: Write job summary
-        if: always() && steps.validate.outcome == 'success'
+      # Only reachable when Validate inputs actually succeeded, AND (for
+      # 'preview') Verify Preview isolation also succeeded -- the one place
+      # lifecycle secrets and tenant_status_report.py are used. Revision 12
+      # (blocker fix): fully separate production/preview steps, exactly
+      # like every other secret-bearing step -- no shared expression ever
+      # mentions both secret namespaces.
+      - name: Write job summary (production)
+        if: always() && steps.validate.outcome == 'success' && inputs.environment == 'production'
         env:
           TENANT_ID: ${{ inputs.tenant_id }}
           OPERATION: ${{ inputs.operation }}
@@ -314,9 +703,28 @@ jobs:
           CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
         run: python tenant_status_report.py --tenant-id "$TENANT_ID" --operation "$OPERATION" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Write job summary (preview)
+        if: always() && steps.validate.outcome == 'success' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'success'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          OPERATION: ${{ inputs.operation }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.PREVIEW_UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.PREVIEW_CREDENTIAL_ENCRYPTION_KEY }}
+        run: python tenant_status_report.py --tenant-id "$TENANT_ID" --operation "$OPERATION" >> "$GITHUB_STEP_SUMMARY"
+
       # The failure-path counterpart -- no secrets, no checked-out tenant
       # code invoked, just a static message so a rejected dispatch still
       # leaves a human-readable summary.
       - name: Write validation-failure summary
         if: always() && steps.validate.outcome == 'failure'
         run: echo "Dispatch rejected at input validation -- no tenant-aware script or production secret was ever invoked. See the 'Validate inputs' step's log for the exact reason." >> "$GITHUB_STEP_SUMMARY"
+
+      # Preview Infrastructure Isolation (revision 10) -- the third
+      # distinguishable terminal outcome: inputs validated fine, but this
+      # run targeted 'preview' and PREVIEW_ENVIRONMENT_MARKER was not
+      # configured. No secrets, no tenant-aware script invoked -- same
+      # discipline as the validation-failure summary above.
+      - name: Write Preview isolation failure summary
+        if: always() && steps.validate.outcome == 'success' && inputs.environment == 'preview' && steps.verify_preview_isolation.outcome == 'failure'
+        run: echo "Dispatch rejected at Preview isolation verification -- PREVIEW_ENVIRONMENT_MARKER is not configured for the 'preview' GitHub Environment, so no Preview-only lifecycle secret was ever invoked (this refusal exists specifically to prevent a Preview run from silently falling back to repository-level Production secrets). See the 'Verify Preview isolation' step's log for details." >> "$GITHUB_STEP_SUMMARY"

@@ -40,6 +40,21 @@
 // fail-closed cache value (see its own header comment).
 
 import { Redis } from '@upstash/redis'
+// Phase B.3: PURE, no-I/O resolution -- deliberately imported from
+// entitlementResolution.js, never from entitlements.js (which imports THIS
+// file, for its own async wrapper's getTenantConfig() call -- importing it
+// back here would be a circular dependency). Called on the SAME `existing`
+// tenant_config object recordLocationApproval()/applyEntitlementChange()
+// already loaded, so the location-limit decision and the CAS write's
+// expectedVersion are bound to one identical snapshot -- see that file's
+// header for the exact plan-change TOCTOU race this avoids.
+import { resolveTenantEntitlementsFromConfig } from './entitlementResolution.js'
+// Phase B.7 -- commercial-status policy (orthogonal to the numeric
+// maxLocations check above: a past_due/suspended/canceled tenant is denied
+// ANY location addition regardless of whether it would still be under its
+// numeric plan limit). Not circular: commercialOperationPolicy.js only
+// imports from entitlementResolution.js, never from this file.
+import { requireCommercialOperation, CommercialOperationClass } from './commercialOperationPolicy.js'
 
 const TENANT_CONFIG_KEY = 'tenant_config:v1'
 const TENANT_ID_PATTERN = /^t_[a-z0-9-]+$/
@@ -609,6 +624,42 @@ export class LocationApprovalNotEligibleError extends Error {
   }
 }
 
+// Phase B.3 -- location-limit enforcement (Part A). Thrown by
+// recordLocationApproval()/applyEntitlementChange() when a requested change
+// would leave a tenant with more approved locations than its resolved
+// commercial entitlement allows. `current`/`limit`/`requested` are safe,
+// non-sensitive integers -- no provider/credential information -- meant to
+// be surfaced directly in a 409 response (google/[action].js's
+// approveLocations(), admin/[action].js's tenantEntitlementsApplyAction()).
+export class MaxLocationsExceededError extends Error {
+  constructor(message, { current, limit, requested }) {
+    super(message)
+    this.current = current
+    this.limit = limit
+    this.requested = requested
+  }
+}
+
+// Phase B.7 -- thrown by recordLocationApproval()/applyEntitlementChange()
+// when a requested change would ADD at least one location while the
+// tenant's current commercialStatus forbids CAPACITY_EXPANSION (past_due,
+// suspended, canceled) or while its entitlements cannot be resolved at all
+// (resolver failure -- fails closed, same as a real denial, since an
+// unverifiable commercial state must never be treated as safe to grow on).
+// Never thrown for a pure removal/reduction, per Phase B.7 Part E: a
+// financially restricted tenant must still be able to shrink itself back
+// toward compliance. `commercialStatus`/`reason` are the resolver's own
+// already-vetted safe enums -- never raw internal state -- meant to be
+// surfaced directly via commercialDenialResponse() at the call site.
+export class CommercialCapacityRestrictedError extends Error {
+  constructor(message, { commercialStatus, reason, resolverFailure = false } = {}) {
+    super(message)
+    this.commercialStatus = commercialStatus ?? null
+    this.reason = reason ?? null
+    this.resolverFailure = resolverFailure
+  }
+}
+
 export async function recordLocationApproval(tenantId, selectedLocations) {
   if (!Array.isArray(selectedLocations) || selectedLocations.length === 0) {
     throw new TypeError('recordLocationApproval: selectedLocations must be a non-empty array')
@@ -681,6 +732,57 @@ export async function recordLocationApproval(tenantId, selectedLocations) {
       address: loc.address ?? '',
     }
   })
+
+  // Phase B.3 -- location-limit enforcement (Part A). Resolved from THIS
+  // SAME `existing` snapshot (never a fresh read, never the public
+  // resolveTenantEntitlements(tenantId) -- see entitlementResolution.js's
+  // header for why) so the limit decision and the CAS write below share
+  // one identical configVersion generation: if a concurrent plan change (or
+  // anything else) touches this tenant's config between this check and the
+  // write, the CAS atomically rejects the write regardless of what this
+  // check concluded -- it is never possible for a decision made against
+  // stale entitlements to actually commit. `maxLocations === null` means
+  // "unenforced for this tenant" (BOOTSTRAP/legacy/grandfathered) -- NEVER
+  // converted into a large integer; `0` (a fail-closed/misconfigured
+  // resolution) correctly rejects any non-empty selection outright. This
+  // function REPLACES the tenant's whole approved set (see the header
+  // comment above), so the check is simply "does the requested final
+  // selection fit," not an incremental add/subtract.
+  const entitlementsForLimitCheck = resolveTenantEntitlementsFromConfig(existing)
+
+  // Phase B.7 (Part E) -- commercial-status gate, checked BEFORE the
+  // numeric maxLocations check below and ONLY when this selection is a net
+  // INCREASE over the tenant's current approved count (this function
+  // replaces the whole set, so a same-size or smaller re-selection is a
+  // reduction/no-op and must never be blocked merely because expansion is
+  // currently forbidden). Deliberately ordered first: a genuine resolver
+  // failure resolves to a fail-closed, zero-limit bundle, and running the
+  // numeric check first would surface it as an ordinary
+  // 'location_limit_reached' business response -- exactly the "pretend the
+  // customer needs an upgrade" mistake Part A's error-semantics section
+  // warns against for an infrastructure failure. Checking commercial
+  // status first means a resolver failure is always reported as what it
+  // actually is (service_unavailable), never conflated with a real numeric
+  // limit. Resolved from the SAME `entitlementsForLimitCheck` bundle the
+  // numeric check below also uses -- never a second read.
+  const previousApprovedCount = Array.isArray(existing.approvedLocations) ? existing.approvedLocations.length : 0
+  if (approvedLocations.length > previousApprovedCount) {
+    const capacityCheck = requireCommercialOperation(entitlementsForLimitCheck, CommercialOperationClass.CAPACITY_EXPANSION)
+    if (!capacityCheck.allowed) {
+      throw new CommercialCapacityRestrictedError(
+        `recordLocationApproval: tenant ${tenantId} cannot add locations while ${capacityCheck.denialKind === 'resolver_failure' ? 'entitlements are unresolvable' : `commercialStatus is ${capacityCheck.commercialStatus}`}`,
+        { commercialStatus: capacityCheck.commercialStatus, reason: capacityCheck.reason, resolverFailure: capacityCheck.denialKind === 'resolver_failure' }
+      )
+    }
+  }
+
+  const maxLocations = entitlementsForLimitCheck.limits.maxLocations
+  if (maxLocations !== null && approvedLocations.length > maxLocations) {
+    throw new MaxLocationsExceededError(
+      `recordLocationApproval: tenant ${tenantId} selected ${approvedLocations.length} location(s), exceeding its plan limit of ${maxLocations}`,
+      { current: Array.isArray(existing.approvedLocations) ? existing.approvedLocations.length : 0, limit: maxLocations, requested: approvedLocations.length }
+    )
+  }
 
   // "Fix location approval concurrency" hardening (Phase A3): the
   // eligibility check above (existing.status) and this write are now bound
@@ -1133,6 +1235,45 @@ export async function applyEntitlementChange(tenantId, { addGoogleLocations = []
   })
 
   const nextApprovedLocations = [...survivingApproved, ...additions]
+
+  // Phase B.3 -- location-limit enforcement (Part A). Only checked when
+  // this call is actually ADDING at least one location -- a pure removal,
+  // or a call that only removes, must never fail merely because the
+  // tenant happens to already be over its (possibly since-downgraded)
+  // limit; only an addition that would leave the tenant over limit is
+  // rejected. Resolved from THIS SAME `existing` snapshot the CAS write's
+  // `expectedVersion` is bound to -- see entitlementResolution.js's header
+  // and recordLocationApproval()'s matching comment above for why. A
+  // tenant already over limit before this call (survivingApproved.length
+  // already > maxLocations) correctly still fails here the moment it tries
+  // to add anything at all, since nextApprovedLocations.length can only be
+  // larger.
+  if (additions.length > 0) {
+    const entitlementsForLimitCheck = resolveTenantEntitlementsFromConfig(existing)
+    const maxLocations = entitlementsForLimitCheck.limits.maxLocations
+    if (maxLocations !== null && nextApprovedLocations.length > maxLocations) {
+      throw new MaxLocationsExceededError(
+        `applyEntitlementChange: tenant ${tenantId} would have ${nextApprovedLocations.length} location(s) after this change, exceeding its plan limit of ${maxLocations}`,
+        { current: survivingApproved.length, limit: maxLocations, requested: additions.length }
+      )
+    }
+    // Phase B.7 (Part O) -- deliberately NO CommercialOperationClass gate
+    // here. Unlike recordLocationApproval() (the genuine customer self-
+    // service path, called only from google/[action].js's approveLocations()
+    // behind a tenant-owner session), applyEntitlementChange() is called
+    // EXCLUSIVELY from admin/[action].js's tenant-entitlements-apply
+    // action, which requires requireSuperAdmin() (LTA's own platform
+    // Owner, never a tenant's own Owner -- see admin/[action].js's own
+    // isSuperAdmin() check). This is a trusted internal administrative
+    // control for platform operators to directly repair/adjust a tenant's
+    // entitlements (including restoring/granting locations for a tenant
+    // whose billing state is being manually resolved before a real
+    // plan-change endpoint exists) -- applying customer commercial
+    // restrictions here would be exactly the mistake Part O warns against.
+    // The numeric maxLocations check above still applies unconditionally
+    // (it is a plan-shape ceiling, not a commercial-status decision).
+  }
+
   const now = new Date().toISOString()
 
   const next = await upsertTenantConfig(tenantId, {

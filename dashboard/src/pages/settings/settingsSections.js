@@ -34,6 +34,20 @@ export const settingsSections = [
     requiredRoles: null,
   },
   {
+    id: 'billing',
+    path: 'billing',
+    label: 'Billing',
+    icon: '💳',
+    component: lazy(() => import('./Billing.jsx')),
+    // Phase B.13.1 -- owner-only, matching GET /api/session/billing-status
+    // and POST /api/session/billing-portal-session's own requireAuth(req,
+    // res, ['owner']) guard exactly. This is nav-visibility only (see this
+    // file's own header) -- Billing.jsx itself re-checks account?.role ===
+    // 'owner' before rendering anything billing-mutation-capable, and the
+    // real, only authoritative boundary is those two endpoints themselves.
+    requiredRoles: ['owner'],
+  },
+  {
     id: 'google',
     path: 'google',
     label: 'Google Business Profile',

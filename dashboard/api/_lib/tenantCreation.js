@@ -88,6 +88,22 @@ const SELF_SERVICE_TENANT_ID_PATTERN = /^t_[a-z0-9-]*-[a-z0-9]{6}$/
  * @param {object} [params.commercial] - plain descriptive commercial/
  *   billing metadata (tenantConfigStore.js's `commercial` field) -- never
  *   consulted by any authorization check.
+ * @param {object} [params.accessCodeGrant] - Phase B.8: a PENDING
+ *   access-code trial grant (accessCodeCommercial.js's
+ *   buildAccessCodeCommercialWrite() Case 2 output) written alongside the
+ *   explicit `trial_pending_activation` `commercial` shape -- see
+ *   trialLifecycle.js's maybeStartAccessCodeTrial() for the lazy
+ *   activation that later converts this into real commercial state.
+ *   Always null for every non-access-code caller.
+ * @param {object} [params.trialEligibility] - Phase B.11: the explicit,
+ *   server-controlled self-service automatic-trial marker
+ *   (selfServiceCommercial.js's buildSelfServicePendingActivationCommercial()
+ *   output, `{eligible: true, markedAt, source}`) -- written atomically
+ *   alongside `commercial` in the SAME tenant_config write, never as a
+ *   later separate patch (which would reopen the commercial===null legacy
+ *   window this pairing exists to close). Always null for the
+ *   access-code/admin/migration paths -- mutually exclusive with
+ *   `accessCodeGrant` by convention (never both non-null on the same call).
  * @param {string} [params.createdByType] - 'user'|'admin'|'system' (provenance only)
  * @param {string} [params.createdByActorId] - provenance only
  * @returns {Promise<{tenantId: string, userRecord: object}>}
@@ -95,7 +111,8 @@ const SELF_SERVICE_TENANT_ID_PATTERN = /^t_[a-z0-9-]*-[a-z0-9]{6}$/
 export async function createNewTenant({
   mode, tenantIdOverride, reservedTenantId, companyName,
   ownerEmail, ownerUserId, ownerPasswordHash, ownerDisplayName, ownerPasswordSetAt,
-  commercial = null, createdByType = null, createdByActorId = null,
+  commercial = null, accessCodeGrant = null, trialEligibility = null,
+  createdByType = null, createdByActorId = null,
 }) {
   if (!Object.values(TenantCreationMode).includes(mode)) {
     throw new TenantCreationModeRequiredError(`createNewTenant: mode is required and must be one of ${Object.values(TenantCreationMode).join(', ')} -- got ${JSON.stringify(mode)}`)
@@ -175,7 +192,7 @@ export async function createNewTenant({
     // recordLocationApproval()'s own defensive, non-attacker-reachable
     // allowCreate use) permitted to pass allowCreate: true. creationSource
     // is exactly `mode` -- the two enums are deliberately identical sets.
-    await upsertTenantConfig(tenantId, { displayName: companyName ?? tenantId, commercial }, {
+    await upsertTenantConfig(tenantId, { displayName: companyName ?? tenantId, commercial, accessCodeGrant, trialEligibility }, {
       allowCreate: true, creationSource: mode, createdByType, createdByActorId,
     })
   }

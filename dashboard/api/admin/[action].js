@@ -66,6 +66,7 @@ import { isValidTenantId } from '../_lib/tenants.js'
 import {
   getTenantConfig, listTenantConfigs, applyEntitlementChange,
   EntitlementChangeNotEligibleError, UnknownLocationRemovalError, LocationAlreadyApprovedError, ConfigVersionConflictError,
+  MaxLocationsExceededError,
   TenantConfigStoreUnavailableError,
 } from '../_lib/tenantConfigStore.js'
 import { getStoredCredential, CredentialStoreUnavailableError } from '../_lib/credentialStore.js'
@@ -122,7 +123,7 @@ async function createAccessCodeAction(req, res) {
 
   const {
     prefix, plan, discountPercent = null, discountFixedCents = null, trialDays = null,
-    paymentRequired = true, expiresAt = null, maxRedemptions = 1,
+    paymentRequired, expiresAt = null, maxRedemptions = 1,
     allowedEmail = null, allowedEmailDomain = null, clientLabel = null,
   } = req.body ?? {}
 
@@ -141,11 +142,20 @@ async function createAccessCodeAction(req, res) {
   if (expiresAt != null && Number.isNaN(new Date(expiresAt).getTime())) {
     return res.status(400).json({ error: 'invalid_request', message: 'Expiration must be a valid date.' })
   }
+  // Phase B.8 pre-commit correction (Part 3) -- paymentRequired must be an
+  // EXPLICIT boolean in every request; no silent default. The admin UI
+  // (dashboard/src/pages/admin/AccessCodes.jsx) already always sends this
+  // field via its own explicit checkbox -- this rejects only a caller that
+  // omits it entirely (a stale client, a direct API/script call), which
+  // now has major, non-obvious commercial meaning (an unredeemable code).
+  if (typeof paymentRequired !== 'boolean') {
+    return res.status(400).json({ error: 'invalid_request', message: 'paymentRequired must be explicitly true or false.' })
+  }
 
   try {
     const { rawCode, record } = await createAccessCode({
       prefix: prefix.toUpperCase(), plan, discountPercent, discountFixedCents, trialDays,
-      paymentRequired: Boolean(paymentRequired), expiresAt, maxRedemptions,
+      paymentRequired, expiresAt, maxRedemptions,
       allowedEmail, allowedEmailDomain, clientLabel, createdBy: account.userId,
     })
 
@@ -474,6 +484,11 @@ async function tenantEntitlementsApplyAction(req, res) {
     if (err instanceof ConfigVersionConflictError) {
       await auditEntitlementFailure(tenantId, account, req, 'entitlement.change_rejected_stale_version', `Rejected: expected configVersion ${expectedConfigVersion}, tenant config has moved on.`, { expectedConfigVersion })
       return res.status(409).json({ error: 'stale_config_version', message: 'This tenant\'s configuration has changed since it was last read. Reload and try again.' })
+    }
+    if (err instanceof MaxLocationsExceededError) {
+      // Phase B.3 -- location-limit enforcement (Part A).
+      await auditEntitlementFailure(tenantId, account, req, 'entitlement.change_rejected_limit_reached', err.message, { current: err.current, limit: err.limit, requested: err.requested })
+      return res.status(409).json({ error: 'location_limit_reached', current: err.current, limit: err.limit, requested: err.requested })
     }
     if (err instanceof TenantConfigStoreUnavailableError) {
       return res.status(503).json({ error: 'service_unavailable', message: 'The tenant configuration store is temporarily unavailable.' })

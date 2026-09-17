@@ -137,7 +137,7 @@ jobs:
       # prior deployment, chained back across many deploys. Never combined
       # with --with-cache, which would defeat the point.
       - name: Deploy to Vercel
-        run: npx vercel --prod --force --yes --token=${{ secrets.VERCEL_TOKEN }}
+        run: npx vercel --prod --force --yes --scope lenin-fierros-projects --token=${{ secrets.VERCEL_TOKEN }}
         env:
           # PRYOR OS Controlled Production Release Preparation + Reconciliation:
           # these IDs previously pointed at a stale/legacy Vercel project --

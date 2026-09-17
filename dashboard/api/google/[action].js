@@ -48,9 +48,12 @@ import { createDiscoverySession, getDiscoverySession } from '../_lib/locationDis
 import {
   recordLocationApproval, LocationApprovalNotEligibleError, getTenantConfig, LOCATION_APPROVAL_ELIGIBLE_STATUSES,
   markTenantProvisioningDispatched, markTenantProvisioningDispatchFailed, ConfigVersionConflictError,
+  MaxLocationsExceededError, CommercialCapacityRestrictedError,
 } from '../_lib/tenantConfigStore.js'
 import { reconcileApprovedLocationsAgainstDiscovery, UnreconciledApprovedLocationError } from '../_lib/tenantLocationReconciliation.js'
 import { discoverGoogleLocationIdsForReconciliation } from '../_lib/googleLocationDiscovery.js'
+import { resolveTenantEntitlements } from '../_lib/entitlements.js'
+import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -150,6 +153,33 @@ async function auth(req, res) {
   // This is the tenant the callback will later be required to prove it's
   // still acting for.
   const tenantId = resolveTenantId(account)
+
+  // Phase B.7 (pre-commit correction) -- connect/reconnect creates a NEW
+  // external operational capability (a fresh, usable Google credential) and
+  // is classified INTEGRATION_EXPANSION, like discover-locations (denies
+  // past_due too): there is no legitimate reason to establish a new
+  // connection while capacity/integration changes are frozen, and B.7
+  // builds no reactivation/billing endpoint that would need this to stay
+  // open for a suspended tenant. Disconnect (below, in disconnect())
+  // remains unconditionally allowed -- only NEW connection is restricted
+  // here. Deliberately NOT the (narrower, past_due-allowed)
+  // INTEGRATION_OPERATION class -- that class is reserved for ordinary use
+  // of an ALREADY-established integration (sync/import), never for
+  // establishing/replacing the integration itself.
+  const authEntitlements = await resolveTenantEntitlements(tenantId)
+  const authOpCheck = requireCommercialOperation(authEntitlements, CommercialOperationClass.INTEGRATION_EXPANSION)
+  if (!authOpCheck.allowed) {
+    const denialMessage = authOpCheck.denialKind === 'resolver_failure'
+      ? 'Service is temporarily unavailable. Please try again shortly.'
+      : 'Connecting Google Business Profile is not available while your account is restricted. Contact support to resolve your billing status.'
+    return res.status(authOpCheck.denialKind === 'resolver_failure' ? 503 : 403).send(`
+      <html><body style="font-family:system-ui;max-width:520px;margin:60px auto;padding:0 20px">
+        <h2>Connection unavailable</h2>
+        <p>${denialMessage}</p>
+        <a href="/settings">← Back to Settings</a>
+      </body></html>
+    `)
+  }
 
   // CSRF protection, hardened: a random nonce plus the initiating tenant
   // and user identity are signed together (google/_lib/oauthState.js) into
@@ -944,6 +974,23 @@ async function triggerSync(req, res) {
     })
   }
 
+  // Phase B.7 (pre-commit correction) -- defensive commercial-status gate.
+  // Currently a no-op in practice: the DEFAULT_TENANT_ID-only check above
+  // means only Los Tres Amigos (always LEGACY_UNMANAGED_PLAN, always
+  // allowed) can ever reach this line today. Added anyway so this endpoint
+  // fails safely the moment a real per-tenant sync pipeline replaces the
+  // hardcoded one. Classified INTEGRATION_OPERATION, NOT INTEGRATION_EXPANSION
+  // or COST_GENERATING -- this syncs an ALREADY-CONNECTED tenant's existing
+  // integration (no new capability, no new capacity), so approved product
+  // policy is "normal existing sync may continue" during past_due; only
+  // suspended/canceled deny it.
+  const syncEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const syncOpCheck = requireCommercialOperation(syncEntitlements, CommercialOperationClass.INTEGRATION_OPERATION)
+  if (!syncOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(syncOpCheck)
+    return res.status(status).json(body)
+  }
+
   const allowed = await enforceRateLimit(req, res, `trigger-sync:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
   if (!allowed) return
 
@@ -1010,6 +1057,20 @@ async function triggerImport(req, res) {
       error:   'forbidden',
       message: 'This action is not available for your organization yet.',
     })
+  }
+
+  // Phase B.7 (pre-commit correction) -- defensive commercial-status gate
+  // (same reasoning as triggerSync() above: currently inert since only LTA,
+  // always legacy/allowed, can reach this line, but correct once a real
+  // per-tenant import pipeline exists). Classified INTEGRATION_OPERATION --
+  // an import against an already-established integration is explicitly
+  // listed as an INTEGRATION_OPERATION example in the approved policy,
+  // allowed during past_due.
+  const importEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const importOpCheck = requireCommercialOperation(importEntitlements, CommercialOperationClass.INTEGRATION_OPERATION)
+  if (!importOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(importOpCheck)
+    return res.status(status).json(body)
   }
 
   const allowed = await enforceRateLimit(req, res, `trigger-import:${account.userId}`, { requestsPerWindow: 5, windowSeconds: 60 })
@@ -1236,6 +1297,20 @@ async function publish(req, res) {
 
   const allowed = await enforceRateLimit(req, res, `publish:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
   if (!allowed) return
+
+  // Phase B.7 -- commercial status enforcement. Resolved FRESH here,
+  // immediately after Phase A's rate limit and before ANYTHING that could
+  // cause Google traffic (the env-var check just below is config-only, but
+  // the credential lookup, OAuth token refresh/exchange, and the actual
+  // publish PUT all come after this) -- a suspended/canceled tenant's
+  // denied publish attempt costs Google ZERO requests. past_due/trial/
+  // active/legacy are unaffected (OPERATIONAL_WRITE allows all of those).
+  const publishEntitlements = await resolveTenantEntitlements(tenantId)
+  const publishOpCheck = requireCommercialOperation(publishEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (!publishOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(publishOpCheck)
+    return res.status(status).json(body)
+  }
 
   if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
     return res.status(503).json({
@@ -1722,6 +1797,21 @@ async function discoverLocations(req, res) {
   const allowed = await enforceRateLimit(req, res, `discover-locations:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
   if (!allowed) return
 
+  // Phase B.7 (pre-commit correction) -- this action spends real Google API
+  // quota (accounts.list + locations.list) purely to LOOK for more
+  // capacity, with no path to act on the result while capacity expansion is
+  // itself frozen. Classified INTEGRATION_EXPANSION (denies past_due too,
+  // not just suspended/canceled) -- there is no legitimate reason to browse
+  // for locations to add during a billing-grace period where adding one is
+  // already forbidden by CAPACITY_EXPANSION. Must run before ANY Google
+  // network call, same discipline as publish() above.
+  const discoverEntitlements = await resolveTenantEntitlements(tenantId)
+  const discoverOpCheck = requireCommercialOperation(discoverEntitlements, CommercialOperationClass.INTEGRATION_EXPANSION)
+  if (!discoverOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(discoverOpCheck)
+    return res.status(status).json(body)
+  }
+
   let credential
   try {
     credential = await getStoredCredential(tenantId)
@@ -1825,17 +1915,91 @@ async function discoverLocations(req, res) {
 // ---------------------------------------------------------------------------
 // Multi-Tenant Phase 4O -- automatic post-approval provisioning handoff.
 // dispatchTenantLifecycleWorkflow() calls THIS repo's own pinned dispatcher
-// (.github/workflows/tenant-lifecycle-dispatch.yml on main) -- the exact
-// same trusted, pinned-commit execution engine every manual operator
-// dispatch has used throughout this project. Deliberately a SEPARATE repo
-// and token from triggerSync()/triggerImport() above, which target Los
-// Tres Amigos's own legacy repo with GITHUB_SYNC_PAT -- that token has no
-// relationship to this one and is never used here.
+// (.github/workflows/tenant-lifecycle-dispatch.yml) -- the exact same
+// trusted, pinned-application-commit execution engine every manual
+// operator dispatch has used throughout this project. Deliberately a
+// SEPARATE repo and token from triggerSync()/triggerImport() above, which
+// target Los Tres Amigos's own legacy repo with GITHUB_SYNC_PAT -- that
+// token has no relationship to this one and is never used here.
+//
+// Preview Infrastructure Isolation (blocker-fix revision) -- for
+// 'production', the dispatch's own `ref` is 'main', exactly as always:
+// GitHub executes the WORKFLOW FILE'S OWN LOGIC as it exists on main
+// (never a caller-chosen ref), which then checks out the separately
+// PINNED_LIFECYCLE_SHA application commit. For 'preview', `ref` is the one
+// fixed, reviewed APPROVED_PREVIEW_LIFECYCLE_REF constant below -- this is
+// what actually makes the Preview-isolation WORKFLOW LOGIC itself
+// (environment-scoped PREVIEW_* secrets, the isolation checks, etc.)
+// exercisable before it is merged to main, since that logic does not yet
+// exist on main. This is a deliberate, narrow exception to "the dispatch's
+// ref is always main": still never caller-supplied, still a single fixed
+// literal per environment, resolved and validated before any network call
+// (see resolveLifecycleExecutionRef() below).
 // ---------------------------------------------------------------------------
 const TENANT_LIFECYCLE_REPO_OWNER = 'Leninf19'
 const TENANT_LIFECYCLE_REPO_NAME = 'PRYOR-OS'
 const TENANT_LIFECYCLE_WORKFLOW_FILE = 'tenant-lifecycle-dispatch.yml'
 const TENANT_LIFECYCLE_DISPATCH_TIMEOUT_MS = 10_000
+
+// Preview Infrastructure Isolation -- which infrastructure (Production vs.
+// Preview GitHub Environment secrets) a lifecycle dispatch executes
+// against is derived SOLELY from THIS SERVER PROCESS's own Vercel-supplied
+// VERCEL_ENV. Vercel sets this automatically for every deployment (never
+// from any request header/body/query, which a browser could forge) --
+// 'production' for the production deployment, 'preview' for every preview
+// deployment, 'development' for `vercel dev`/local. Fails closed (returns
+// null) for anything other than the two values this codebase explicitly
+// supports: an unset/unknown value must never silently default to either
+// side, and 'development' is deliberately NOT treated as either -- running
+// `vercel dev` locally must never be able to dispatch against either real
+// infrastructure.
+const LIFECYCLE_EXECUTION_ENVIRONMENTS = Object.freeze(['production', 'preview'])
+
+function resolveLifecycleExecutionEnvironment() {
+  const vercelEnv = process.env.VERCEL_ENV
+  return LIFECYCLE_EXECUTION_ENVIRONMENTS.includes(vercelEnv) ? vercelEnv : null
+}
+
+// Preview Infrastructure Isolation (blocker-fix revision) -- WHICH git ref
+// the dispatch targets is just as sensitive as WHICH secrets it uses: the
+// dispatch API's own `ref` selects which branch's copy of THIS WORKFLOW
+// FILE actually executes (a completely different thing from the
+// "Checkout pinned lifecycle implementation" step's own fixed
+// PINNED_LIFECYCLE_SHA, which selects the application code and is
+// unaffected by this). Production must keep using 'main' exactly as
+// before. Preview needs the workflow FILE from a real feature branch
+// (main does not yet contain the Preview-isolation workflow logic being
+// smoke-tested), but that branch must be a single, fixed, reviewed
+// constant -- NEVER caller-supplied, never derived from anything
+// request-related, and never open-ended (this is the same discipline as
+// PINNED_LIFECYCLE_SHA itself: a small, explicit, reviewable diff is the
+// only way to change it).
+//
+// For this smoke-test phase, the one approved Preview lifecycle ref is
+// 'feature/commercial-entitlements'. Bumping this to a different branch
+// later (e.g. once merged to main) is a deliberate, reviewed one-line
+// change here, exactly like bumping PINNED_LIFECYCLE_SHA in the workflow
+// file.
+const APPROVED_PREVIEW_LIFECYCLE_REF = 'feature/commercial-entitlements'
+
+// Defense in depth beyond the fixed constant above: Vercel's own
+// VERCEL_GIT_COMMIT_REF (set by Vercel itself from the actual git ref this
+// running deployment was built from -- never from any request) is
+// cross-checked when present. This guards against dispatching the
+// approved Preview ref from a Preview deployment that is NOT actually
+// running that branch's code (e.g. a preview build of some unrelated
+// branch). Its ABSENCE (local/test execution, where VERCEL_ENV is also
+// absent and already fails closed one level up) is not itself treated as
+// a mismatch -- only a genuine, positive disagreement is.
+function resolveLifecycleExecutionRef(environment) {
+  if (environment === 'production') return 'main'
+  if (environment === 'preview') {
+    const deployedRef = process.env.VERCEL_GIT_COMMIT_REF
+    if (deployedRef && deployedRef !== APPROVED_PREVIEW_LIFECYCLE_REF) return null
+    return APPROVED_PREVIEW_LIFECYCLE_REF
+  }
+  return null
+}
 
 // Calls GitHub's workflow_dispatch REST API with a bounded timeout, and
 // classifies the outcome into exactly the three cases the CAS/reconciliation
@@ -1846,7 +2010,13 @@ const TENANT_LIFECYCLE_DISPATCH_TIMEOUT_MS = 10_000
 //   'rejected' -- GitHub responded with a clean 4xx: the dispatch was
 //                 DEFINITELY not accepted (bad inputs, auth problem,
 //                 workflow/repo not found) -- safe to treat as an
-//                 immediate, definite failure, no waiting required.
+//                 immediate, definite failure, no waiting required. Also
+//                 returned LOCALLY (status: 0, no network call made at
+//                 all) when resolveLifecycleExecutionEnvironment() cannot
+//                 determine a supported execution environment, OR when
+//                 resolveLifecycleExecutionRef() cannot determine an
+//                 approved git ref for that environment -- equally
+//                 definite, since no dispatch was even attempted.
 //   'ambiguous' -- a network-level exception (timeout, connection reset,
 //                 DNS/TLS failure) OR any 5xx from GitHub's own edge --
 //                 GitHub's response, if it even reaches us, gives no
@@ -1855,11 +2025,46 @@ const TENANT_LIFECYCLE_DISPATCH_TIMEOUT_MS = 10_000
 //                 resolved later by reconcileStuckProvisioningDispatch()
 //                 (tenantConfigStore.js), which watches for real progress
 //                 instead of guessing from this HTTP-level signal alone.
-// Never accepts a caller-supplied ref/branch/SHA -- `ref: 'main'` is a
-// fixed literal, exactly like every other property of this call.
+// Never accepts a caller-supplied ref/branch/SHA -- `ref` is always
+// resolveLifecycleExecutionRef()'s own return value (a fixed literal for
+// each environment, never anything request-derived). Never accepts a
+// caller-supplied `environment` either -- see
+// resolveLifecycleExecutionEnvironment() above; this function takes only
+// (operation, tenantId), so there is structurally no parameter an
+// upstream caller (however far the call chain runs back toward a browser
+// request) could use to influence which infrastructure OR which git ref
+// this dispatch targets.
 async function dispatchTenantLifecycleWorkflow(operation, tenantId) {
   const pat = process.env.TENANT_PROVISIONING_DISPATCH_PAT
   if (!pat) return { outcome: 'ambiguous', reason: 'TENANT_PROVISIONING_DISPATCH_PAT is not configured' }
+
+  // Preview Infrastructure Isolation -- resolved and validated BEFORE any
+  // network call is made. An unresolvable environment is a definite,
+  // immediate local refusal (never 'ambiguous' -- there is no uncertainty
+  // here, and never a silent default to 'production', which would be the
+  // exact "Preview executes against Production infrastructure" failure
+  // mode this design exists to prevent).
+  const environment = resolveLifecycleExecutionEnvironment()
+  if (!environment) {
+    return {
+      outcome: 'rejected',
+      status: 0,
+      message: `cannot dispatch: unresolvable lifecycle execution environment (VERCEL_ENV=${JSON.stringify(process.env.VERCEL_ENV ?? null)}) -- refusing rather than guessing which infrastructure secrets this would run against`,
+    }
+  }
+
+  // The dispatch's OWN `ref` selects which branch's copy of the workflow
+  // FILE actually executes -- just as sensitive as `environment` above,
+  // and resolved with the exact same fail-closed discipline, before any
+  // network call.
+  const ref = resolveLifecycleExecutionRef(environment)
+  if (!ref) {
+    return {
+      outcome: 'rejected',
+      status: 0,
+      message: `cannot dispatch: unresolvable/unapproved lifecycle ref for environment ${JSON.stringify(environment)} (VERCEL_GIT_COMMIT_REF=${JSON.stringify(process.env.VERCEL_GIT_COMMIT_REF ?? null)}) -- refusing rather than guessing which workflow definition this would run`,
+    }
+  }
 
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), TENANT_LIFECYCLE_DISPATCH_TIMEOUT_MS)
@@ -1875,7 +2080,7 @@ async function dispatchTenantLifecycleWorkflow(operation, tenantId) {
           'X-GitHub-Api-Version': '2022-11-28',
           'Content-Type':         'application/json',
         },
-        body: JSON.stringify({ ref: 'main', inputs: { operation, tenant_id: tenantId, confirmation: tenantId } }),
+        body: JSON.stringify({ ref, inputs: { operation, tenant_id: tenantId, confirmation: tenantId, environment } }),
       }
     )
     if (r.status === 204) return { outcome: 'accepted' }
@@ -2060,6 +2265,36 @@ async function approveLocations(req, res) {
         error: 'concurrent_update',
         message: 'Your selection could not be saved because this tenant\'s configuration changed at the same time. Please refresh and try again.',
       })
+    }
+    if (err instanceof MaxLocationsExceededError) {
+      // Phase B.3 -- location-limit enforcement (Part A). current/limit/
+      // requested are plain integers only -- no provider/credential
+      // information. Audited with the same denied-entitlement-action
+      // convention as the two cases above.
+      await appendAuditEntry(tenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'tenant_location_catalog', entityId: tenantId, action: 'location_catalog.approval_denied_limit_reached', changes: null, result: 'denied',
+        message: `Self-service location approval was denied: requested ${err.requested} location(s) exceeds the plan limit of ${err.limit} (currently ${err.current}).`,
+      })
+      return res.status(409).json({ error: 'location_limit_reached', current: err.current, limit: err.limit, requested: err.requested })
+    }
+    if (err instanceof CommercialCapacityRestrictedError) {
+      // Phase B.7 (Part E) -- a real commercial-status denial or a
+      // resolver failure, never conflated with the numeric limit case
+      // above. Audited the same way as the other denied-entitlement-action
+      // branches; response shape matches the module's own
+      // commercialDenialResponse() contract (safe enums only).
+      await appendAuditEntry(tenantId, {
+        actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+        entity: 'tenant_location_catalog', entityId: tenantId, action: 'location_catalog.approval_denied_commercial_status', changes: null, result: 'denied',
+        message: err.resolverFailure
+          ? 'Self-service location approval was denied: commercial entitlements could not be resolved.'
+          : `Self-service location approval was denied: commercialStatus is ${err.commercialStatus}.`,
+      })
+      if (err.resolverFailure) {
+        return res.status(503).json({ error: 'service_unavailable' })
+      }
+      return res.status(403).json({ error: 'commercial_access_restricted', commercialStatus: err.commercialStatus, reason: err.reason })
     }
     return res.status(503).json({ error: 'service_unavailable', message: 'Could not activate the location catalog. Please try again shortly.' })
   }

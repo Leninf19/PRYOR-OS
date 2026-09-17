@@ -53,6 +53,9 @@ import {
   getAllAssets, getAsset, createAsset, deleteAsset, ContentAssetStoreUnavailableError,
   acquireContentUploadLock, renewContentUploadLock, releaseContentUploadLock, UPLOAD_LOCK_RENEW_INTERVAL_MS,
 } from '../_lib/contentAssetStore.js'
+import { resolveTenantEntitlements } from '../_lib/entitlements.js'
+import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
+import { clampToSafetyCeiling } from '../_lib/planEntitlements.js'
 
 // "Minimum content cost guardrail" hardening (Phase A6, revenue-abuse
 // containment audit -- content-no-storage-quota): a PLATFORM SAFETY
@@ -217,6 +220,30 @@ async function upsertCampaign(req, res) {
 
   const allowed = await enforceRateLimit(req, res, `content:upsert-campaign:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
+
+  // Phase B.7 (Part L) -- OPERATIONAL_WRITE, applied to both the create
+  // and edit paths below; denied for suspended/canceled, allowed for
+  // past_due.
+  //
+  // Phase B.7 pre-commit correction (Part 4) -- campaigns are deliberately
+  // NOT part of asset/storage accounting: campaignStore.js writes to its
+  // own separate Redis hash (content_campaigns:v1/v2), never Vercel Blob,
+  // and a campaign record never appears in contentAssetStore.js's
+  // getAllAssets() -- the set upload()'s and create-text-asset()'s
+  // commercial storage/asset-count quota checks both read. A campaign
+  // holds only bounded-length metadata (name <=200 chars, description
+  // <=5000 chars, already enforced below), never a Blob object or an
+  // asset-count-consuming record, so no storage-quota check applies here.
+  // See test_commercial_operation_policy.js's structural test asserting
+  // every customer-reachable asset-CREATING path (upload, create-text-
+  // asset) is quota-checked, while upsert-campaign is confirmed to create
+  // no such record at all.
+  const campaignEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const campaignOpCheck = requireCommercialOperation(campaignEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (!campaignOpCheck.allowed) {
+    const { status: denyStatus, body } = commercialDenialResponse(campaignOpCheck)
+    return res.status(denyStatus).json(body)
+  }
 
   const { id, name, description, startDate, endDate, locationIds, tags, status } = req.body ?? {}
 
@@ -426,6 +453,16 @@ async function createTextAsset(req, res) {
   const allowed = await enforceRateLimit(req, res, `content:create-text-asset:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
 
+  // Phase B.7 (Part L) -- OPERATIONAL_WRITE: denied for suspended/canceled,
+  // allowed for past_due. This is IN ADDITION TO, never instead of, the
+  // storage/asset-count quota check below.
+  const textAssetEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const textAssetOpCheck = requireCommercialOperation(textAssetEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (!textAssetOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(textAssetOpCheck)
+    return res.status(status).json(body)
+  }
+
   const { campaignId, captionText, filename } = req.body ?? {}
   if (typeof campaignId !== 'string' || !campaignId) return res.status(400).json({ error: 'invalid_request', message: 'campaignId is required.' })
   if (typeof captionText !== 'string' || !captionText.trim() || captionText.length > 5000) {
@@ -436,16 +473,63 @@ async function createTextAsset(req, res) {
     const campaign = await getCampaign(resolveTenantId(account), campaignId)
     if (!campaign || !accountCoversLocations(account, campaign.locationIds)) return res.status(404).json({ error: 'not_found' })
 
-    const record = await createAsset(resolveTenantId(account), {
-      campaignId, type: 'caption', filename: filename || 'caption.txt',
-      mimeType: 'text/plain', sizeBytes: captionText.length, blobPathname: null, captionText: captionText.trim(),
-    }, account)
-    await appendAuditEntry(resolveTenantId(account), {
-      ...actorFields(account, req), entity: 'content_asset', entityId: record.id,
-      action: 'asset.uploaded', result: 'success', message: `Added caption to campaign "${campaign.name}".`,
-    })
-    const { blobPathname, ...safe } = record
-    return res.status(201).json({ asset: safe })
+    const tenantId = resolveTenantId(account)
+    const sizeBytes = Buffer.byteLength(captionText, 'utf8')
+
+    // Phase B.7 pre-commit correction (Part 4) -- a caption IS a counted
+    // content_assets:v1 record (getAllAssets() makes no type distinction),
+    // so create-text-asset previously bypassed BOTH the commercial storage
+    // quota AND Phase A's hard safety ceiling entirely -- an active,
+    // fully-paid-up tenant already at its asset-count ceiling could still
+    // create unlimited additional captions, and this path was never
+    // checked at all regardless of plan. Fixed by routing through the
+    // EXACT SAME per-tenant upload lease + fresh-metadata quota mechanism
+    // upload() uses below -- same lock key, same live getAllAssets() read,
+    // same commercial-limits clamp, same Phase A ceiling, no second
+    // drifting counter. No heartbeat/lease-renewal is needed here (unlike
+    // upload()): this critical section is a single fast metadata write
+    // with no external Blob call, comfortably inside the lock's 15s TTL.
+    const lockToken = await acquireContentUploadLock(tenantId)
+    if (!lockToken) {
+      return res.status(409).json({ error: 'upload_in_progress', message: 'Another upload is already in progress for this account. Please try again in a moment.' })
+    }
+    try {
+      const existingAssets = Object.values(await getAllAssets(tenantId))
+      const existingBytes = existingAssets.reduce((sum, a) => sum + (Number.isFinite(a.sizeBytes) ? a.sizeBytes : 0), 0)
+
+      const entitlements = await resolveTenantEntitlements(tenantId)
+      const commercialLimits = entitlements.limits
+      if (commercialLimits.storageBytes !== null && commercialLimits.assetCount !== null) {
+        const clamped = clampToSafetyCeiling(commercialLimits)
+        if (existingAssets.length + 1 > clamped.assetCount || existingBytes + sizeBytes > clamped.storageBytes) {
+          return res.status(409).json({
+            error: 'storage_limit_reached',
+            currentBytes: existingBytes, limitBytes: clamped.storageBytes,
+            currentAssets: existingAssets.length, assetLimit: clamped.assetCount,
+          })
+        }
+      }
+
+      if (existingAssets.length >= MAX_TENANT_ASSET_COUNT) {
+        return res.status(413).json({ error: 'storage_limit_exceeded', message: 'This account has reached its content library asset limit. Delete unused assets or contact support.' })
+      }
+      if (existingBytes + sizeBytes > MAX_TENANT_STORAGE_BYTES) {
+        return res.status(413).json({ error: 'storage_limit_exceeded', message: 'This account has reached its content library storage limit. Delete unused assets or contact support.' })
+      }
+
+      const record = await createAsset(tenantId, {
+        campaignId, type: 'caption', filename: filename || 'caption.txt',
+        mimeType: 'text/plain', sizeBytes, blobPathname: null, captionText: captionText.trim(),
+      }, account)
+      await appendAuditEntry(tenantId, {
+        ...actorFields(account, req), entity: 'content_asset', entityId: record.id,
+        action: 'asset.uploaded', result: 'success', message: `Added caption to campaign "${campaign.name}".`,
+      })
+      const { blobPathname, ...safe } = record
+      return res.status(201).json({ asset: safe })
+    } finally {
+      await releaseContentUploadLock(tenantId, lockToken)
+    }
   } catch (err) {
     if (err instanceof ContentAssetStoreUnavailableError || err instanceof CampaignStoreUnavailableError) {
       console.error(`[content/create-text-asset] ${err.message}`)
@@ -547,6 +631,41 @@ async function upload(req, res) {
       // via a stale snapshot -- see the lease acquired just above.
       const existingAssets = Object.values(await getAllAssets(tenantId))
       const existingBytes = existingAssets.reduce((sum, a) => sum + (Number.isFinite(a.sizeBytes) ? a.sizeBytes : 0), 0)
+
+      // Phase B.4 -- commercial storage quota. Resolved FRESH here, inside
+      // the SAME upload lease's critical section, reusing the
+      // existingAssets/existingBytes snapshot ALREADY read above under
+      // that lease -- never a second getAllAssets() call, never a value
+      // resolved before the lease was acquired. This is a SEPARATE,
+      // plan-based decision from the Phase A platform-safety ceiling
+      // immediately below it, deliberately kept as two distinct checks
+      // rather than merged into one:
+      //   - a legacy/unmanaged tenant (commercial layer unenforced --
+      //     limits.storageBytes/assetCount === null) skips THIS check
+      //     entirely but still hits the Phase A ceiling unconditionally
+      //     just below, unchanged;
+      //   - an Enterprise tenant's server-authorized limitsOverride is run
+      //     through clampToSafetyCeiling() before being compared here, so
+      //     this check alone can never grant more headroom than Phase A's
+      //     hard 2GB/2000 ceiling already allows;
+      //   - a resolver failure (fail-closed 0/0) makes this check reject
+      //     every upload for that tenant, including its very first one.
+      // No separate quota counter is kept anywhere -- both this check and
+      // the Phase A one below always read the tenant's live, current asset
+      // list, so a deleted asset immediately frees real capacity for both.
+      const entitlements = await resolveTenantEntitlements(tenantId)
+      const commercialLimits = entitlements.limits
+      if (commercialLimits.storageBytes !== null && commercialLimits.assetCount !== null) {
+        const clamped = clampToSafetyCeiling(commercialLimits)
+        if (existingAssets.length + 1 > clamped.assetCount || existingBytes + buffer.length > clamped.storageBytes) {
+          return res.status(409).json({
+            error: 'storage_limit_reached',
+            currentBytes: existingBytes, limitBytes: clamped.storageBytes,
+            currentAssets: existingAssets.length, assetLimit: clamped.assetCount,
+          })
+        }
+      }
+
       if (existingAssets.length >= MAX_TENANT_ASSET_COUNT) {
         return res.status(413).json({ error: 'storage_limit_exceeded', message: 'This account has reached its content library asset limit. Delete unused assets or contact support.' })
       }

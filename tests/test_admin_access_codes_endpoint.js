@@ -180,7 +180,7 @@ async function testLtaOwnerCreateListRevokeFlow() {
   wireTenantConfigRedis(); wireAccessCodeRedis(); wireAuditRedis()
   const token = await ltaOwnerToken()
 
-  const createRes = await invoke('create-access-code', { token, body: { prefix: 'LTA-ENT', plan: 'enterprise', maxRedemptions: 3 } })
+  const createRes = await invoke('create-access-code', { token, body: { prefix: 'LTA-ENT', plan: 'enterprise', maxRedemptions: 3, paymentRequired: false } })
   assert(createRes.statusCode === 200, `expected 200, got ${createRes.statusCode}: ${JSON.stringify(createRes.body)}`)
   const { rawCode, code } = createRes.body
   assert(rawCode.startsWith('LTA-ENT-') && rawCode.length === 'LTA-ENT-'.length + 10, 'the create response must carry the raw code exactly once')
@@ -232,7 +232,7 @@ async function testAuditEntriesNeverCarryTheRawCode() {
   await setDirectory()
   wireTenantConfigRedis(); wireAccessCodeRedis(); wireAuditRedis()
   const token = await ltaOwnerToken()
-  const createRes = await invoke('create-access-code', { token, body: { prefix: 'LTA-SEC', plan: 'core' } })
+  const createRes = await invoke('create-access-code', { token, body: { prefix: 'LTA-SEC', plan: 'core', paymentRequired: false } })
   const { rawCode, code } = createRes.body
   await invoke('revoke-access-code', { token, body: { codeHash: code.codeHash } })
 

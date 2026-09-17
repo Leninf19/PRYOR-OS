@@ -44,12 +44,19 @@ import { readPrivateDataFile } from '../_lib/reviewDataPaths.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
 import { getAccountByEmail, getAccountByIdForTenant, listAccounts } from '../_lib/accountStore.js'
-import { getUserById, upsertUser, updateUser, deriveUserStatus, UserCreationMode, UserStoreUnavailableError } from '../_lib/userStore.js'
+import {
+  getUserById, upsertUser, updateUser, deriveUserStatus, countActiveOrInvitedUsers, UserCreationMode, UserStoreUnavailableError,
+} from '../_lib/userStore.js'
+import { resolveTenantEntitlements } from '../_lib/entitlements.js'
+import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
+import {
+  acquireSeatAllocationLock, releaseSeatAllocationLock, SeatAllocationLockUnavailableError,
+} from '../_lib/seatAllocationLock.js'
 import { createInviteToken, revokeInviteToken, createResetToken, TokenStoreUnavailableError } from '../_lib/tokenStore.js'
 import { buildInviteEmail, buildInviteEmailSubject, buildResetEmail, buildResetEmailSubject } from '../_lib/accountEmailTemplate.js'
 import {
   generateUserId, isValidDisplayName, validateRoleAndLocations, canAssignRole,
-  buildInviteUrl, buildResetUrl, assertNotLastActiveOwner,
+  buildInviteUrl, buildResetUrl, assertNotLastActiveOwner, classifyAuthorityChange,
 } from '../_lib/userManagement.js'
 
 function actorFields(account, req) {
@@ -203,6 +210,15 @@ async function upsertContactAction(req, res) {
   const allowed = await enforceRateLimit(req, res, `settings:contacts-upsert:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
 
+  // Phase B.7 (Part L) -- OPERATIONAL_WRITE: an ordinary operational
+  // mutation, no capacity/external-cost implication.
+  const contactsUpsertEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const contactsUpsertOpCheck = requireCommercialOperation(contactsUpsertEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+  if (!contactsUpsertOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(contactsUpsertOpCheck)
+    return res.status(status).json(body)
+  }
+
   const { patch, logAction } = req.body ?? {}
   if (logAction !== undefined && typeof logAction !== 'string') {
     return res.status(400).json({ error: 'invalid_request', message: 'logAction must be a string when provided.' })
@@ -312,6 +328,18 @@ async function toggleContactActiveAction(req, res) {
 
   const allowed = await enforceRateLimit(req, res, `settings:contacts-toggle-active:${account.userId}`, { requestsPerWindow: 30, windowSeconds: 60 })
   if (!allowed) return
+
+  // Phase B.7 (Part L) -- only the ENABLING direction is gated
+  // (OPERATIONAL_WRITE); disabling only ever shrinks operational surface
+  // (RESOURCE_REDUCTION) and must remain unconditionally allowed.
+  if (req.body.active === true) {
+    const toggleEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+    const toggleOpCheck = requireCommercialOperation(toggleEntitlements, CommercialOperationClass.OPERATIONAL_WRITE)
+    if (!toggleOpCheck.allowed) {
+      const { status, body } = commercialDenialResponse(toggleOpCheck)
+      return res.status(status).json(body)
+    }
+  }
 
   try {
     const existing = await getContact(resolveTenantId(account), locationId)
@@ -538,6 +566,16 @@ async function sendTestEmailAction(req, res) {
   const allowed = await enforceRateLimit(req, res, `settings:contacts-send-test-email:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
   if (!allowed) return
 
+  // Phase B.7 (Part N) -- a real customer-triggered email send is
+  // COST_GENERATING; denied for suspended/canceled, allowed for past_due
+  // (ordinary operational notifications continue during billing grace).
+  const testEmailEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const testEmailOpCheck = requireCommercialOperation(testEmailEntitlements, CommercialOperationClass.COST_GENERATING)
+  if (!testEmailOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(testEmailOpCheck)
+    return res.status(status).json(body)
+  }
+
   let contact
   try {
     contact = await getContact(resolveTenantId(account), locationId)
@@ -650,13 +688,78 @@ async function inviteUserAction(req, res) {
   const userId = generateUserId()
   const now = new Date().toISOString()
   const trimmedName = name.trim()
+  const tenantId = resolveTenantId(account)
 
+  // Phase B.3 -- Seat limit enforcement (Part B): an invitation consumes a
+  // seat the moment it is ISSUED (deriveUserStatus() resolves a
+  // passwordHash:null/passwordSetAt:null record to 'invited', which counts
+  // identically to 'active' -- see countActiveOrInvitedUsers()). The lock
+  // below serializes this whole "count current seats -> decide -> create"
+  // sequence per tenant, and entitlements are re-resolved FRESH (never a
+  // value captured before the lock) immediately before deciding, so two
+  // concurrent invite-user calls (or an invite racing an enable-user call)
+  // can never both pass based on the same stale count.
+  let lockToken
   try {
-    const { rawToken, tokenHash, expiresAt } = await createInviteToken({
-      userId, email: email.toLowerCase(), role, locationIds, invitedBy: account.userId,
-    })
+    lockToken = await acquireSeatAllocationLock(tenantId)
+  } catch (err) {
+    if (err instanceof SeatAllocationLockUnavailableError) {
+      console.error(`[settings/invite-user] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+  if (!lockToken) {
+    return res.status(409).json({ error: 'seat_allocation_in_progress', message: 'Another change to this account\'s users is already in progress. Please try again in a moment.' })
+  }
 
-    await upsertUser(resolveTenantId(account), {
+  // Phase B.3 pre-commit correction: the lock's critical section is
+  // limited to the MINIMUM authoritative work -- the seat check and the
+  // two writes that actually reserve the seat (createInviteToken() +
+  // upsertUser()). Email delivery, audit logging, and the response are all
+  // deliberately OUTSIDE this try/finally, running only AFTER the lock has
+  // already been released -- an invitation email is never sent (an
+  // external SMTP/provider network call) while this per-tenant lock is
+  // held. The seat allocation itself, once committed here, is never rolled
+  // back merely because the best-effort email below fails to send (see
+  // that section's own try/catch, unchanged from before this correction) --
+  // this is an existing, deliberate invariant, not a new one.
+  let rawToken, tokenHash, expiresAt
+  try {
+    // maxActiveUsers === null means enforcement is deliberately unenforced
+    // for this tenant (bootstrap/legacy/grandfathered) -- NEVER converted
+    // into a large integer. Any other value, including 0 (a fail-closed/
+    // misconfigured resolution), is enforced literally: 0 correctly
+    // rejects every invitation outright, never interpreted as unlimited.
+    const entitlements = await resolveTenantEntitlements(tenantId)
+
+    // Phase B.7 (Part F) -- commercial-status gate, structurally SEPARATE
+    // from the numeric maxActiveUsers check below so a denial here reports
+    // 'commercial_access_restricted', never overloaded onto
+    // 'seat_limit_reached'. A new invitation is CAPACITY_EXPANSION (it
+    // reserves a seat the moment it's issued, per the comment above) --
+    // denied for past_due/suspended/canceled even if the tenant is
+    // numerically still under its plan's seat limit. Resolved from the
+    // SAME `entitlements` object the numeric check below also uses.
+    const capacityCheck = requireCommercialOperation(entitlements, CommercialOperationClass.CAPACITY_EXPANSION)
+    if (!capacityCheck.allowed) {
+      const { status, body } = commercialDenialResponse(capacityCheck)
+      return res.status(status).json(body)
+    }
+
+    const maxActiveUsers = entitlements.limits.maxActiveUsers
+    if (maxActiveUsers !== null) {
+      const currentSeats = await countActiveOrInvitedUsers(tenantId)
+      if (currentSeats >= maxActiveUsers) {
+        return res.status(409).json({ error: 'seat_limit_reached', current: currentSeats, limit: maxActiveUsers })
+      }
+    }
+
+    ;({ rawToken, tokenHash, expiresAt } = await createInviteToken({
+      userId, email: email.toLowerCase(), role, locationIds, invitedBy: account.userId,
+    }))
+
+    await upsertUser(tenantId, {
       // Multi-Tenant Phase 4K: `tenantId` is now stamped EXPLICITLY on the
       // record itself, not just implied by which physical hash it's
       // written to. resolveTenantId() (tenants.js) resolves an account's
@@ -667,7 +770,7 @@ async function inviteUserAction(req, res) {
       // hash) but then be silently treated as an LTA account by
       // resolveTenantId(), since it has no way to tell tenants apart
       // without an explicit field to read.
-      userId, email, passwordHash: null, role, locationIds, tenantId: resolveTenantId(account),
+      userId, email, passwordHash: null, role, locationIds, tenantId,
       sessionVersion: 1, disabled: false, displayName: trimmedName,
       createdAt: now, updatedAt: now, lastLoginAt: null,
       invitedAt: now, invitedBy: account.userId, lastInviteSentAt: now,
@@ -682,38 +785,42 @@ async function inviteUserAction(req, res) {
       // additionally re-confirms the tenant itself genuinely exists.
       creationMode: UserCreationMode.EXISTING_TENANT_INVITE,
     })
-
-    const inviteUrl = buildInviteUrl(req, rawToken)
-    let emailWarning = null
-    try {
-      const locationNames = await resolveLocationNames(resolveTenantId(account), locationIds)
-      const subject = buildInviteEmailSubject()
-      const { html, text } = buildInviteEmail({ name: trimmedName, role, locationIds, locationNames, inviteUrl, expiresAt })
-      await sendReviewEmail({ to: email, cc: [], replyTo: undefined, subject, html, text })
-    } catch (err) {
-      emailWarning = err instanceof EmailSenderUnavailableError
-        ? 'Email is not configured -- share the invitation link manually.'
-        : 'The invitation email could not be sent -- share the invitation link manually.'
-      console.error(`[settings/invite-user] invite email failed: ${sanitizeErrorMessage(err.message)}`)
-    }
-
-    await appendAuditEntry(resolveTenantId(account), {
-      ...actorFields(account, req),
-      entity: 'user', entityId: userId,
-      action: 'invitation.created',
-      changes: [{ field: 'role', oldValue: null, newValue: role }, { field: 'locationIds', oldValue: null, newValue: locationIds }],
-      result: 'success',
-      message: `Invited ${email} as ${role}.`,
-    })
-
-    return res.status(200).json({ userId, email, role, locationIds, inviteUrl, expiresAt, emailWarning })
   } catch (err) {
     if (err instanceof UserStoreUnavailableError || err instanceof TokenStoreUnavailableError) {
       console.error(`[settings/invite-user] ${err.message}`)
       return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
     }
     throw err
+  } finally {
+    await releaseSeatAllocationLock(tenantId, lockToken)
   }
+
+  // The seat allocation lock is already released by this point -- nothing
+  // below is part of the authoritative seat-allocation critical section.
+  const inviteUrl = buildInviteUrl(req, rawToken)
+  let emailWarning = null
+  try {
+    const locationNames = await resolveLocationNames(tenantId, locationIds)
+    const subject = buildInviteEmailSubject()
+    const { html, text } = buildInviteEmail({ name: trimmedName, role, locationIds, locationNames, inviteUrl, expiresAt })
+    await sendReviewEmail({ to: email, cc: [], replyTo: undefined, subject, html, text })
+  } catch (err) {
+    emailWarning = err instanceof EmailSenderUnavailableError
+      ? 'Email is not configured -- share the invitation link manually.'
+      : 'The invitation email could not be sent -- share the invitation link manually.'
+    console.error(`[settings/invite-user] invite email failed: ${sanitizeErrorMessage(err.message)}`)
+  }
+
+  await appendAuditEntry(tenantId, {
+    ...actorFields(account, req),
+    entity: 'user', entityId: userId,
+    action: 'invitation.created',
+    changes: [{ field: 'role', oldValue: null, newValue: role }, { field: 'locationIds', oldValue: null, newValue: locationIds }],
+    result: 'success',
+    message: `Invited ${email} as ${role}.`,
+  })
+
+  return res.status(200).json({ userId, email, role, locationIds, inviteUrl, expiresAt, emailWarning })
 }
 
 // POST /api/settings/resend-invite  { userId }
@@ -731,6 +838,17 @@ async function resendInviteAction(req, res) {
 
   const allowed = await enforceRateLimit(req, res, `settings:resend-invite:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
   if (!allowed) return
+
+  // Phase B.7 (Part F/N) -- resending does not consume a NEW seat (the
+  // invitation was already counted at issue time), so this is
+  // COST_GENERATING (the real email send), not CAPACITY_EXPANSION: denied
+  // for suspended/canceled, allowed for past_due.
+  const resendEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+  const resendOpCheck = requireCommercialOperation(resendEntitlements, CommercialOperationClass.COST_GENERATING)
+  if (!resendOpCheck.allowed) {
+    const { status, body } = commercialDenialResponse(resendOpCheck)
+    return res.status(status).json(body)
+  }
 
   const { userId } = req.body ?? {}
   if (typeof userId !== 'string' || !userId) {
@@ -1004,6 +1122,32 @@ async function updateUserRoleLocationsAction(req, res) {
     const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
 
+    // Phase B.7 pre-commit correction (Part 3) -- this single endpoint can
+    // either EXPAND an existing user's authority (a promotion, or granting
+    // additional locations) or REDUCE it (a demotion, or narrowing
+    // locations), and the two must be gated differently: an expansion is
+    // CAPACITY_EXPANSION-shaped (denied past_due/suspended/canceled), a
+    // reduction is RESOURCE_REDUCTION-shaped (always allowed, even on a
+    // resolver failure -- revoking authority must never become impossible
+    // during an outage). Decided from the ACTUAL before/after state via
+    // classifyAuthorityChange(), never from the endpoint's name -- see that
+    // function's own header for the exact role-rank/location-set rules.
+    const direction = classifyAuthorityChange(
+      { role: target.role, locationIds: target.locationIds },
+      { role, locationIds }
+    )
+    if (direction !== 'unchanged') {
+      const directionEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+      const directionOpCheck = requireCommercialOperation(
+        directionEntitlements,
+        direction === 'expansion' ? CommercialOperationClass.CAPACITY_EXPANSION : CommercialOperationClass.RESOURCE_REDUCTION
+      )
+      if (!directionOpCheck.allowed) {
+        const { status, body } = commercialDenialResponse(directionOpCheck)
+        return res.status(status).json(body)
+      }
+    }
+
     if (target.role === 'owner' && role !== 'owner') {
       const lastOwnerCheck = await assertNotLastActiveOwner(resolveTenantId(account), userId)
       if (!lastOwnerCheck.safe) {
@@ -1076,22 +1220,78 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
     return res.status(400).json({ error: 'invalid_request', message: 'userId is required.' })
   }
 
+  const tenantId = resolveTenantId(account)
+  // Phase B.3 -- Seat limit enforcement (Part B): re-enabling a disabled
+  // user adds a seat back. Locked for the SAME reason as invite-user (see
+  // that function's comment) -- but ONLY when this is genuinely an
+  // enable-a-currently-disabled-user transition; a disable (disabled:true)
+  // never consumes a seat (it can only reduce the count, always allowed,
+  // matching "an over-limit tenant can still disable/remove seats"), and
+  // an idempotent enable of an already-enabled user must not consume a
+  // seat twice -- both of those are decided AFTER loading `target` below,
+  // so the lock is still acquired unconditionally up front (its own
+  // acquisition is cheap and uniform), but the seat COUNT CHECK only runs
+  // for the genuine disabled->enabled transition.
+  let lockToken
+  try {
+    lockToken = await acquireSeatAllocationLock(tenantId)
+  } catch (err) {
+    if (err instanceof SeatAllocationLockUnavailableError) {
+      console.error(`[settings/${actionName}] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+  if (!lockToken) {
+    return res.status(409).json({ error: 'seat_allocation_in_progress', message: 'Another change to this account\'s users is already in progress. Please try again in a moment.' })
+  }
+
   try {
     // Multi-Tenant Phase 4K: STRICTLY tenant-scoped lookup (with the
     // static-directory fallback for Los Tres Amigos) -- see
     // updateUserRoleLocationsAction()'s identical comment above.
-    const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
+    const target = await getAccountByIdForTenant(tenantId, userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
 
     if (disabled && target.role === 'owner') {
-      const lastOwnerCheck = await assertNotLastActiveOwner(resolveTenantId(account), userId)
+      const lastOwnerCheck = await assertNotLastActiveOwner(tenantId, userId)
       if (!lastOwnerCheck.safe) {
         return res.status(409).json({ error: 'last_owner', message: lastOwnerCheck.message })
       }
     }
 
+    // Only a genuine disabled -> enabled transition can ever consume a
+    // seat; an idempotent "enable" of an already-enabled account (or any
+    // disable, regardless of the target's current state) never checks or
+    // consumes one.
+    if (!disabled && target.disabled) {
+      const entitlements = await resolveTenantEntitlements(tenantId)
+
+      // Phase B.7 (Part F) -- commercial-status gate, structurally SEPARATE
+      // from the numeric maxActiveUsers check below (distinct
+      // 'commercial_access_restricted' error, never overloaded onto
+      // 'seat_limit_reached'). Only reached for a genuine disabled->enabled
+      // transition, which adds a seat back -- CAPACITY_EXPANSION denies it
+      // for past_due/suspended/canceled even if numerically under the plan
+      // limit. `disable-user` itself is never gated (RESOURCE_REDUCTION,
+      // always allowed).
+      const capacityCheck = requireCommercialOperation(entitlements, CommercialOperationClass.CAPACITY_EXPANSION)
+      if (!capacityCheck.allowed) {
+        const { status, body } = commercialDenialResponse(capacityCheck)
+        return res.status(status).json(body)
+      }
+
+      const maxActiveUsers = entitlements.limits.maxActiveUsers
+      if (maxActiveUsers !== null) {
+        const currentSeats = await countActiveOrInvitedUsers(tenantId)
+        if (currentSeats >= maxActiveUsers) {
+          return res.status(409).json({ error: 'seat_limit_reached', current: currentSeats, limit: maxActiveUsers })
+        }
+      }
+    }
+
     const now = new Date().toISOString()
-    const updated = await upsertUser(resolveTenantId(account), {
+    const updated = await upsertUser(tenantId, {
       createdAt: now, invitedAt: null, invitedBy: null, lastInviteSentAt: null,
       inviteTokenHash: null, inviteExpiresAt: null, inviteRevokedAt: null, lastLoginAt: null,
       ...target,
@@ -1105,7 +1305,7 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
       sourceIdentity: target,
     })
 
-    await appendAuditEntry(resolveTenantId(account), {
+    await appendAuditEntry(tenantId, {
       ...actorFields(account, req), entity: 'user', entityId: userId,
       action: disabled ? 'user.disabled' : 'user.enabled',
       changes: [{ field: 'disabled', oldValue: target.disabled, newValue: disabled }],
@@ -1120,6 +1320,8 @@ async function setUserDisabledAction(req, res, { disabled, actionName }) {
       return res.status(503).json({ error: 'service_unavailable', message: 'User management is temporarily unavailable. Please try again shortly.' })
     }
     throw err
+  } finally {
+    await releaseSeatAllocationLock(tenantId, lockToken)
   }
 }
 
@@ -1160,6 +1362,27 @@ async function updateUserCanCreateTasksAction(req, res) {
     // updateUserRoleLocationsAction()'s identical comment above.
     const target = await getAccountByIdForTenant(resolveTenantId(account), userId)
     if (!target) return res.status(404).json({ error: 'not_found' })
+
+    // Phase B.7 pre-commit correction (Part 3) -- granting the capability
+    // is an ACCESS EXPANSION (CAPACITY_EXPANSION-shaped: denied past_due/
+    // suspended/canceled); revoking it is a REDUCTION (always allowed,
+    // even on a resolver failure). Decided from the actual before/after
+    // boolean, never assumed from the endpoint name.
+    const direction = classifyAuthorityChange(
+      { canCreateTasks: Boolean(target.canCreateTasks) },
+      { canCreateTasks }
+    )
+    if (direction !== 'unchanged') {
+      const directionEntitlements = await resolveTenantEntitlements(resolveTenantId(account))
+      const directionOpCheck = requireCommercialOperation(
+        directionEntitlements,
+        direction === 'expansion' ? CommercialOperationClass.CAPACITY_EXPANSION : CommercialOperationClass.RESOURCE_REDUCTION
+      )
+      if (!directionOpCheck.allowed) {
+        const { status, body } = commercialDenialResponse(directionOpCheck)
+        return res.status(status).json(body)
+      }
+    }
 
     const now = new Date().toISOString()
     const updated = await upsertUser(resolveTenantId(account), {

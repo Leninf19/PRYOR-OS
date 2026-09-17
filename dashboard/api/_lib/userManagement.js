@@ -87,6 +87,83 @@ export async function assertNotLastActiveOwner(tenantId, targetUserId) {
   return { safe: true, message: null }
 }
 
+// Phase B.7 pre-commit correction (Part 3) -- classifies a proposed
+// role/location/capability change as an ACCESS EXPANSION, a REDUCTION, or
+// UNCHANGED, based on the ACTUAL before/after state -- never on the
+// endpoint name alone. A single settings action (update-user-role-locations,
+// update-user-can-create-tasks) can be used to either expand or reduce an
+// existing user's authority; commercialOperationPolicy.js's CAPACITY_EXPANSION
+// class must only be consulted when this function says 'expansion' --
+// RESOURCE_REDUCTION (always allowed, even suspended/canceled/resolver-down)
+// otherwise.
+//
+// Role authority rank: owner and admin are the top tier (admin holds every
+// grant owner does except SETTINGS_ADMIN -- see permissions.js -- so for
+// THIS purpose, "can this role manage other users/locations at the tenant's
+// full scope" -- they rank together). marketing and location_manager are a
+// middle tier: both may be scoped to specific locations or company-wide,
+// and neither can manage users/entitlements the other cannot; a lateral
+// move between them changes WHICH operational permissions are granted
+// within the same scope, never the tenant-wide authority ceiling, so it is
+// treated as neutral here (a deliberate, documented judgment call -- the
+// concrete examples given for this phase are only owner<->manager).
+// read_only is the bottom tier. Promotion (rank increases) is an expansion;
+// demotion (rank decreases) is a reduction; a lateral move within the same
+// rank is neutral.
+const ROLE_AUTHORITY_RANK = Object.freeze({ owner: 3, admin: 3, marketing: 2, location_manager: 2, read_only: 1 })
+
+function locationSetExpands(oldLocationIds, newLocationIds) {
+  if (oldLocationIds === newLocationIds) return false
+  if (newLocationIds === '*') return oldLocationIds !== '*' // '*' is the broadest possible scope
+  if (oldLocationIds === '*') return false // narrowing FROM '*' is never an expansion
+  // Both are explicit arrays: expands iff the new set contains any location
+  // the old set did not already grant -- a partial swap (some added, some
+  // removed) still counts as an expansion, since at least one previously
+  // unauthorized location becomes newly authorized.
+  const oldSet = new Set(oldLocationIds)
+  return newLocationIds.some(id => !oldSet.has(id))
+}
+
+function locationSetReduces(oldLocationIds, newLocationIds) {
+  if (oldLocationIds === newLocationIds) return false
+  if (oldLocationIds === '*') return newLocationIds !== '*'
+  if (newLocationIds === '*') return false
+  const newSet = new Set(newLocationIds)
+  return oldLocationIds.some(id => !newSet.has(id))
+}
+
+// `before`/`after`: { role?, locationIds?, canCreateTasks? } -- only the
+// fields actually present in BOTH are compared; a field omitted from
+// `after` means "not part of this mutation," never "cleared."
+export function classifyAuthorityChange(before, after) {
+  let expands = false
+  let reduces = false
+
+  if (after.role !== undefined && before.role !== undefined && after.role !== before.role) {
+    const oldRank = ROLE_AUTHORITY_RANK[before.role] ?? 0
+    const newRank = ROLE_AUTHORITY_RANK[after.role] ?? 0
+    if (newRank > oldRank) expands = true
+    else if (newRank < oldRank) reduces = true
+  }
+
+  if (after.locationIds !== undefined && before.locationIds !== undefined) {
+    if (locationSetExpands(before.locationIds, after.locationIds)) expands = true
+    if (locationSetReduces(before.locationIds, after.locationIds)) reduces = true
+  }
+
+  if (after.canCreateTasks !== undefined && before.canCreateTasks !== undefined && after.canCreateTasks !== before.canCreateTasks) {
+    if (after.canCreateTasks === true) expands = true
+    else reduces = true
+  }
+
+  // A mutation with ANY expansion component is classified as an expansion
+  // outright, even if it also reduces something else in the same call --
+  // never let a bundled reduction mask an authority increase.
+  if (expands) return 'expansion'
+  if (reduces) return 'reduction'
+  return 'unchanged'
+}
+
 function buildOrigin(req) {
   const proto = req.headers['x-forwarded-proto'] || 'https'
   const host = req.headers['x-forwarded-host'] || req.headers.host

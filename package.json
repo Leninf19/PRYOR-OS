@@ -2,8 +2,9 @@
   "name": "lta-review-dashboard-tests",
   "private": true,
   "type": "module",
-  "description": "Root-level devDependencies for tests/ -- the actual app dependencies live in dashboard/package.json. This exists only so Node test files under tests/ (which sits outside dashboard/'s node_modules resolution path) can import bcryptjs directly to build fixture account hashes.",
+  "description": "Root-level devDependencies for tests/ -- the actual app dependencies live in dashboard/package.json. This exists only so Node test files under tests/ (which sits outside dashboard/'s node_modules resolution path) can import bcryptjs directly to build fixture account hashes, and (Phase B.11) can import stripe directly to exercise its real, static webhooks.constructEvent()/generateTestHeaderString() signature helpers in tests -- pinned to the exact same version installed in dashboard/package.json.",
   "devDependencies": {
-    "bcryptjs": "^3.0.3"
+    "bcryptjs": "^3.0.3",
+    "stripe": "22.6.2"
   }
 }

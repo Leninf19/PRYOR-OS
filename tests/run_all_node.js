@@ -116,6 +116,14 @@ const TESTS = [
   'test_provisioned_tenant_api_reads.js',
   'test_tenant_ops_endpoint.js',
   'test_tenant_entitlement_boundary.js',
+  'test_entitlements.js',
+  'test_plans.js',
+  'test_location_seat_limits.js',
+  'test_ai_usage_metering.js',
+  'test_storage_commercial_quota.js',
+  'test_commercial_feature_gating.js',
+  'test_trial_lifecycle.js',
+  'test_commercial_operation_policy.js',
   'test_google_reconnect_reconciliation.js',
   'test_credential_cas_concurrency.js',
   'test_tenant_entitlement_change.js',
@@ -131,6 +139,7 @@ const TESTS = [
   'test_access_code_store.js',
   'test_registration.js',
   'test_tenant_creation_from_registration.js',
+  'test_access_code_commercial_modernization.js',
   'test_prevent_shadow_tenant_creation.js',
   'test_tenant_creation_callers.js',
   'test_admin_access_codes_endpoint.js',
@@ -144,6 +153,39 @@ const TESTS = [
   'test_google_sync_freshness.js',
   // Vercel Serverless Function Count Reduction
   'test_vercel_function_budget.js',
+  // Phase B.10 -- Stripe SDK + Billing Store Foundation
+  'test_stripe_client.js',
+  'test_billing_store.js',
+  'test_billing_status_projection.js',
+  'test_stripe_price_map.js',
+  'test_billing_portal_policy.js',
+  'test_billing_foundation_compat.js',
+  // Phase B.11 -- Pricing UX + Stripe Setup-mode Checkout
+  'test_billing_customer.js',
+  'test_select_plan_endpoint.js',
+  'test_stripe_webhook.js',
+  'test_pricing_page_ui.js',
+  // Phase B.11 pre-commit correction -- self-service signup handoff,
+  // trial-pending-activation, durable Customer-creation operation state,
+  // extended consent snapshot, hardened Setup-completion validation.
+  'test_self_service_commercial.js',
+  'test_finalize_registration_endpoint.js',
+  // Preview Infrastructure Isolation -- tenant lifecycle dispatch must
+  // never let a Preview deployment execute against Production secrets.
+  'test_preview_lifecycle_isolation.js',
+  // B.11.5 -- independent, end-to-end synthetic-tenant onboarding
+  // reliability test (register -> ... -> trial start -> entitlements).
+  'test_b11_5_synthetic_onboarding_reliability.js',
+  // Phase B.12 -- Stripe Subscription Activation (ensureSubscriptionActivation()).
+  'test_subscription_activation.js',
+  // Phase B.12 (Decision 1) -- primary event-driven billing-activation callback.
+  'test_billing_activation_callback.js',
+  // Phase B.13 -- Stripe Billing Customer Portal session creation.
+  'test_billing_portal.js',
+  // Phase B.13 -- owner-only, read-only canonical billing status endpoint.
+  'test_billing_status.js',
+  // Phase B.13.1 -- Owner Billing / Manage Subscription UI.
+  'test_billing_ui.js',
 ]
 
 const results = {}

@@ -15,6 +15,13 @@ process.env.CREDENTIAL_ENCRYPTION_KEY = 'test-encryption-key-not-a-real-secret'
 process.env.GOOGLE_CLIENT_ID = 'fake-client-id'
 process.env.GOOGLE_CLIENT_SECRET = 'fake-client-secret'
 process.env.TENANT_PROVISIONING_DISPATCH_PAT = 'fake-dispatch-pat-not-a-real-secret'
+// Preview Infrastructure Isolation -- dispatchTenantLifecycleWorkflow() now
+// fails closed unless VERCEL_ENV is 'production' or 'preview' (see
+// test_preview_lifecycle_isolation.js for that logic's own dedicated
+// coverage). This file's entire pre-existing test suite exercises the
+// automatic-provisioning path as it behaves in REAL Vercel Production, so
+// it is pinned here exactly as Vercel itself would set it there.
+process.env.VERCEL_ENV = 'production'
 
 import bcrypt from 'bcryptjs'
 import googleHandler from '../dashboard/api/google/[action].js'
@@ -29,6 +36,7 @@ import {
   LocationApprovalNotEligibleError, _setRedisClientForTests as setConfigRedis, _resetRedisClientForTests as resetConfigRedis,
 } from '../dashboard/api/_lib/tenantConfigStore.js'
 import { _setRedisClientForTests as setDiscoveryRedis, _resetRedisClientForTests as resetDiscoveryRedis } from '../dashboard/api/_lib/locationDiscoveryStore.js'
+import { _setLimiterFactoryForTests, _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -36,6 +44,14 @@ function assert(cond, msg) {
 
 const results = []
 async function run(name, fn) {
+  // Preview Infrastructure Isolation pinned this file's VERCEL_ENV to
+  // 'production' at the top -- rateLimit.js's own, entirely unrelated,
+  // pre-existing "never fail open in production" hardening then requires
+  // a real Upstash config OR this test-only limiter seam; a permissive
+  // fake keeps every existing test in this file exercising ITS OWN
+  // subject matter (dispatch-outcome classification, CAS, reconciliation)
+  // without becoming an incidental rate-limiting test too.
+  _setLimiterFactoryForTests(() => ({ limit: async () => ({ success: true, remaining: 999, reset: Date.now() + 60000 }) }))
   try {
     await fn()
     console.log(`PASS: ${name}`)
@@ -48,6 +64,7 @@ async function run(name, fn) {
     resetCredentialRedis()
     resetConfigRedis()
     resetDiscoveryRedis()
+    _resetLimiterFactoryForTests()
     delete globalThis.fetch
     delete process.env.ACCOUNT_DIRECTORY_JSON
   }
@@ -217,14 +234,27 @@ const TENANT_A = 't_phase4o-a'
 
 async function testAcceptedDispatchLeavesTenantInProvisioningNoError() {
   wireSharedStores()
+  let capturedBody = null
   const { approveRes } = await approveFreshLocation(TENANT_A, 'accounts/1', 'locations/1',
-    mockFetchRouter({ 'accounts/1': [{ name: 'locations/1', title: 'Location' }] }, { githubDispatch: async () => ({ status: 204 }) }))
+    mockFetchRouter({ 'accounts/1': [{ name: 'locations/1', title: 'Location' }] }, {
+      githubDispatch: async () => ({ status: 204 }),
+      onGithubDispatch: (_url, opts) => { capturedBody = JSON.parse(opts.body) },
+    }))
   assert(approveRes.statusCode === 200, `sanity: approval must succeed, got ${approveRes.statusCode}`)
   assert(approveRes.body.status === 'provisioning', `expected 'provisioning' after an accepted dispatch, got ${approveRes.body.status}`)
 
   const config = await getTenantConfig(TENANT_A)
   assert(config.status === 'provisioning', `expected 'provisioning', got ${config.status}`)
   assert(config.provisioning?.lastError == null, 'an accepted dispatch must never leave a lastError behind')
+
+  // Preview Infrastructure Isolation -- exact proof that Production
+  // behavior is unchanged: the dispatch body carries the server-derived
+  // environment (from VERCEL_ENV='production', set at this file's own
+  // top), the literal ref 'main', and nothing else new.
+  assert(capturedBody.ref === 'main', `expected ref 'main', got ${JSON.stringify(capturedBody.ref)}`)
+  assert(capturedBody.inputs.environment === 'production', `expected inputs.environment 'production', got ${JSON.stringify(capturedBody.inputs.environment)}`)
+  assert(capturedBody.inputs.operation === 'provision' && capturedBody.inputs.tenant_id === TENANT_A && capturedBody.inputs.confirmation === TENANT_A,
+    `unexpected dispatch inputs: ${JSON.stringify(capturedBody.inputs)}`)
 }
 
 async function testRejected4xxDispatchMarksProvisioningDispatchFailedImmediately() {

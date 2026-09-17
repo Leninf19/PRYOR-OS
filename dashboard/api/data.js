@@ -43,6 +43,8 @@
 import { requireAuth, requireLocationAccess, isWildcardGrant } from './_lib/auth.js'
 import { resolveTenantId } from './_lib/tenants.js'
 import { readPrivateDataFile, UnknownTenantError } from './_lib/reviewDataPaths.js'
+import { resolveTenantEntitlements } from './_lib/entitlements.js'
+import { requireFeature } from './_lib/featureAuthorization.js'
 
 // Every static file export_chunks.py writes (see its main()/export_* calls).
 const EXACT_ALLOWLIST = new Set([
@@ -86,6 +88,43 @@ function isAllowed(relPath) {
   if (EXACT_ALLOWLIST.has(relPath)) return true
   return DYNAMIC_ALLOWLIST.some(re => re.test(relPath))
 }
+
+// Phase B.5 -- explicit premium-data-file -> feature mapping. The single
+// source of truth for which of EXACT_ALLOWLIST's files require a commercial
+// feature beyond plain authentication/location authorization. Deliberately
+// a SEPARATE small table rather than folding `requiredFeature` metadata
+// into EXACT_ALLOWLIST itself: that Set is a plain string allowlist
+// consulted only via `.has()` in isAllowed()/DATA_FILE tests, and every
+// entry here is the EXCEPTION, not the rule -- converting the whole set to
+// {relPath, requiredFeature} objects would touch every existing call site
+// for no gain, since the overwhelming majority of entries have no feature
+// requirement at all.
+//
+// EVERY file below was verified (Phase B.5 audit) to be used ONLY by a
+// page/widget that is genuinely, exclusively part of the named premium
+// feature's product surface -- see that audit for the full per-file
+// consumer trace. Deliberately NOT included here (left fully available to
+// Core, confirmed to be genuinely shared/basic-product data during that
+// same audit): meta.json, action-items.json, analytics/kpis.json,
+// analytics/monthly-trend.json, analytics/location-stats.json,
+// analytics/rankings-30d.json, intelligence/company-summary.json (Today's
+// basic-dashboard AI-brief fallback), intelligence/complaint-intelligence.json,
+// intelligence/competitive-intelligence.json, intelligence/action-center.json,
+// intelligence/predictive-alerts.json (all four load-bearing for the live,
+// reachable Alerts/basic-tasks surfaces -- see the audit's explicit
+// ambiguity note), intelligence/response-drafts.json (Reviews/reply
+// surface), intelligence/cx-index.json (no live/reachable consumer at all
+// today), every per-location DYNAMIC_ALLOWLIST file, and every
+// operational/status file (validation.json, scraper-status.json,
+// gbp-sync.json, provider-health.json, insights/all.json).
+const PREMIUM_DATA_FEATURE_MAP = Object.freeze({
+  'intelligence/operations-impact.json': 'operationsImpact',
+  'intelligence/department-performance.json': 'advancedIntelligence',
+  'intelligence/best-quotes.json': 'marketingIntelligence',
+  'intelligence/seasonal-trends.json': 'marketingIntelligence',
+  'reports/weekly-summary.json': 'advancedReporting',
+  'intelligence/executive-scores.json': 'advancedReporting',
+})
 
 // --- Multi-Location Authentication & User Access System, Commit 4 --------
 // Per-file location authorization for a scoped (locationIds !== '*')
@@ -240,6 +279,27 @@ export default async function handler(req, res) {
       }
     }
     // category === 'meta' falls through -- read + filtered after parsing.
+  }
+
+  // Phase B.5 -- commercial feature gating. Runs AFTER (never instead of,
+  // and never in place of) the location/tenant authorization immediately
+  // above -- commercial authorization is a strictly ADDITIONAL, later
+  // check, never a replacement for it. Deliberately UNCONDITIONAL on
+  // isWildcardGrant(account): a wildcard-role (e.g. Owner) account on a
+  // Core plan must be denied a Growth-only file exactly as much as a
+  // location-scoped account would be -- the block above only governs
+  // location/tenant scope, never plan.
+  const requiredFeature = PREMIUM_DATA_FEATURE_MAP[relPath]
+  if (requiredFeature) {
+    const entitlements = await resolveTenantEntitlements(tenantId)
+    const featureCheck = requireFeature(entitlements, requiredFeature)
+    if (!featureCheck.allowed) {
+      if (featureCheck.reason === 'resolver_failure') {
+        console.error(`[api/data] entitlement resolution failed for tenant ${JSON.stringify(tenantId)} -- failing closed for ${relPath}`)
+        return res.status(503).json({ error: 'service_unavailable' })
+      }
+      return res.status(403).json({ error: 'feature_not_available', feature: requiredFeature })
+    }
   }
 
   let raw

@@ -119,9 +119,13 @@ function fakeRedis() {
     // check-and-increment body still runs as one synchronous unit inside a
     // single event-loop turn, exactly like a real Redis EVAL executes a
     // script atomically relative to every other command.
+    // Phase B.8 pre-commit correction: also emulates REDEEM_SCRIPT's
+    // durable redemption-claim write (KEYS[2]/ARGV[5]/ARGV[6]) atomically
+    // alongside the redemptionCount increment.
     eval: (_script, keys, args) => tick(() => {
       const key = keys[0]
-      const [codeHash, tenantId, userId, nowIso] = args
+      const claimKey = keys[1]
+      const [codeHash, tenantId, userId, nowIso, claimPayload, claimTtlSecondsStr] = args
       const entry = data[key]
       const raw = entry?.kind === 'hash' ? entry.value[codeHash] : null
       if (!raw) return false
@@ -134,6 +138,9 @@ function fakeRedis() {
       code.redemptions = code.redemptions || []
       code.redemptions.push({ tenantId, userId, redeemedAt: nowIso })
       entry.value[codeHash] = JSON.stringify(code)
+      if (claimKey && claimPayload !== undefined) {
+        data[claimKey] = { kind: 'string', value: claimPayload, expiresAtMs: Date.now() + Number(claimTtlSecondsStr) * 1000 }
+      }
       return JSON.stringify(code)
     }),
     _raw: data,
@@ -212,8 +219,14 @@ async function registerAndVerify(overrides = {}) {
   return { body, cookie, pending }
 }
 
+// Phase B.8 -- paymentRequired: false by default here: these tests exercise
+// the registration/tenant-creation TRANSACTION, not payment semantics
+// (covered separately in test_access_code_commercial_modernization.js), so
+// every code minted here must be immediately redeemable exactly like it
+// was before this phase (createAccessCode()'s own default, paymentRequired:
+// true, would now be correctly rejected by redeemAccessCodeAction()).
 async function makeAccessCode(overrides = {}) {
-  const { rawCode } = await createAccessCode({ prefix: 'LTA-TST', plan: 'core', createdBy: 'usr_admin', ...overrides })
+  const { rawCode } = await createAccessCode({ prefix: 'LTA-TST', plan: 'core', paymentRequired: false, createdBy: 'usr_admin', ...overrides })
   return rawCode
 }
 
@@ -237,7 +250,13 @@ async function testFullHappyPathCreatesTenantMatchingBootstrapShape() {
 
   const tenantConfig = await getTenantConfig(pending.tenantIdReserved)
   assert(tenantConfig && tenantConfig.displayName === body.companyName)
-  assert(tenantConfig.commercial.plan === 'core' && tenantConfig.commercial.source === 'access_code')
+  // Phase B.8 -- the NEW canonical commercial shape (never the old
+  // { plan, source, accessCodeHash, trialEndsAt } 4-field shape this
+  // phase replaced): a non-trial core access code produces real,
+  // resolver-enforced active state immediately.
+  assert(tenantConfig.commercial.commercialStatus === 'active' && tenantConfig.commercial.plan === 'core' && tenantConfig.commercial.planSource === 'access_code',
+    `expected canonical active/core/access_code commercial state, got ${JSON.stringify(tenantConfig.commercial)}`)
+  assert(tenantConfig.accessCodeGrant === null, 'a non-trial code must never leave a pending accessCodeGrant behind')
 
   const userRecord = await getUserByEmail(pending.tenantIdReserved, body.email)
   assert(userRecord && userRecord.role === 'owner' && userRecord.locationIds === '*' && userRecord.disabled === false && userRecord.sessionVersion === 1)
@@ -299,7 +318,7 @@ async function testIdempotentRetryReusesReservedTenantIdAfterPartialFailure() {
   // before upsertUser/deletePendingRegistration -- exactly what
   // createTenantForVerifiedRegistration()'s ORDER comment describes as the
   // safe-to-retry partial-failure state.
-  await upsertTenantConfig(pending.tenantIdReserved, { displayName: body.companyName, commercial: { plan: 'core', source: 'access_code' } }, { allowCreate: true, creationSource: 'self_service' })
+  await upsertTenantConfig(pending.tenantIdReserved, { displayName: body.companyName, commercial: { commercialStatus: 'active', plan: 'core', planSource: 'access_code', trial: null, limitsOverride: null, suspension: null, cancellation: null, overLimit: null, accessCodeHash: 'test-hash', discountPercent: null, discountFixedCents: null, paymentRequired: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() } }, { allowCreate: true, creationSource: 'self_service' })
   const configAfterSimulatedPartialFailure = await getTenantConfig(pending.tenantIdReserved)
   assert(configAfterSimulatedPartialFailure.configVersion === 1)
 
