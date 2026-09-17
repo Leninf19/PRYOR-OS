@@ -19,12 +19,15 @@ import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError, User
 import { appendAuditEntry } from '../_lib/auditLog.js'
 import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID, isValidTenantId } from '../_lib/tenants.js'
 import { generateTenantId } from '../_lib/tenantIdGenerator.js'
-import { getTenantConfig, TenantConfigStoreUnavailableError, reconcileStuckProvisioningDispatch } from '../_lib/tenantConfigStore.js'
+import {
+  getTenantConfig, upsertTenantConfig, ConfigVersionConflictError,
+  TenantConfigStoreUnavailableError, reconcileStuckProvisioningDispatch,
+} from '../_lib/tenantConfigStore.js'
 import { resolveTenantEntitlements } from '../_lib/entitlements.js'
 import { resolveTenantEntitlementsFromConfig } from '../_lib/entitlementResolution.js'
 import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
 import {
-  maybeStartTrial, maybeStartAccessCodeTrial, activatePaidSubscriptionIfValid,
+  maybeStartTrial, maybeStartAccessCodeTrial, maybeStartComplimentaryAccess, activatePaidSubscriptionIfValid,
   recordPastDueIfValid, suspendForTerminalUnpaidIfValid, syncCancellationIntentIfValid, completeCancellationIfValid,
   getEffectiveScheduledCancellation,
 } from '../_lib/trialLifecycle.js'
@@ -58,6 +61,11 @@ import {
   AccessCodeInvalidError, AccessCodeRestrictedError, AccessCodeStoreUnavailableError,
 } from '../_lib/accessCodeStore.js'
 import { buildAccessCodeCommercialWrite, PaymentRequiredNotSupportedError, InvalidAccessCodeGrantError } from '../_lib/accessCodeCommercial.js'
+import {
+  redeemComplimentaryCode, getComplimentaryRedemptionClaim, clearComplimentaryRedemptionClaim,
+  ComplimentaryCodeInvalidError, ComplimentaryAccessStoreUnavailableError,
+} from '../_lib/complimentaryAccessStore.js'
+import { buildComplimentaryAccessCommercialWrite, InvalidComplimentaryGrantError } from '../_lib/complimentaryAccessCommercial.js'
 import { isValidPlanId, PLANS } from '../_lib/plans.js'
 import { isSelfServicePlan, resolvePlanIdForStripePriceId } from '../_lib/stripePriceMap.js'
 import { CURRENT_BILLING_TERMS_VERSION } from '../_lib/billingTerms.js'
@@ -268,6 +276,15 @@ function toSafeCommercialView(entitlements) {
     trialStartedAt: entitlements.trialStartedAt ?? null,
     trialEndsAt: entitlements.trialEndsAt ?? null,
     trialSecondsRemaining,
+    // Complimentary Restaurant Access Codes -- same discipline as the
+    // trial fields immediately above (a display translation of the
+    // resolver's own already-safe bundle, never a claim token/code hash/
+    // any other internal anti-fraud metadata). Null for every tenant with
+    // no complimentary provenance at all.
+    complimentaryStartedAt: entitlements.complimentaryStartedAt ?? null,
+    complimentaryEndsAt: entitlements.complimentaryEndsAt ?? null,
+    complimentaryMaxLocations: entitlements.complimentaryMaxLocations ?? null,
+    complimentaryMaxUsers: entitlements.complimentaryMaxUsers ?? null,
     limits: entitlements.limits,
     features: entitlements.features,
     reason: entitlements.reason,
@@ -353,6 +370,10 @@ async function tenantStatus(req, res) {
   // trialLifecycle.js's own header). Chained the same way: a no-op unless
   // this specific tenant has a pending access-code trial grant.
   config = await maybeStartAccessCodeTrial(tenantId, config)
+  // Complimentary Restaurant Access Codes -- the SAME lazy, read-time
+  // activation pattern, chained identically: a no-op unless this specific
+  // tenant has a pending complimentary-access grant.
+  config = await maybeStartComplimentaryAccess(tenantId, config)
   const commercialForResponse = config === configBeforeTrialCheck ? commercial : toSafeCommercialView(resolveTenantEntitlementsFromConfig(config))
 
   // Phase B.12 -- RECONCILIATION/FALLBACK ONLY. The primary, reliable
@@ -1441,6 +1462,227 @@ async function redeemAccessCodeAction(req, res) {
   }
 }
 
+// POST /api/session/redeem-complimentary-code  { code }
+//
+// Complimentary Restaurant Access Codes -- lets an AUTHENTICATED tenant
+// Owner unlock complimentary commercial access for their OWN,
+// ALREADY-EXISTING tenant. Deliberately, structurally distinct from
+// redeemAccessCodeAction() above: that action mints a BRAND NEW tenant from
+// a pending, not-yet-verified registration identity for PRYOR's own
+// platform-admin sales/invite access-code system; this one operates on an
+// authenticated session's OWN already-created tenant, for the unrelated
+// complimentary-pilot mechanism (complimentaryAccessStore.js). The two
+// systems never share storage, never share codes, and never interpret each
+// other's grants.
+//
+// OWNER-ONLY: requireAuth(req, res, ['owner']) is the entire authorization
+// boundary -- a Manager/Employee session is rejected before any tenant
+// state is even read, matching this feature's explicit requirement that
+// only a tenant Owner may change tenant commercial access.
+//
+// CLIENT INPUT: the request body carries `code` and NOTHING else that is
+// ever trusted. tenantId comes from the authenticated session
+// (resolveTenantId(account)); plan/duration/location-limit/user-limit/
+// commercial status/expiration all come from the server-validated,
+// atomically-redeemed complimentary-code record itself
+// (complimentaryAccessStore.js) -- there is no code path here that reads
+// any of those fields from `req.body`.
+async function redeemComplimentaryCodeAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `redeem-complimentary-code:${clientIp(req)}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+  const secondAllowed = await enforceRateLimit(req, res, `redeem-complimentary-code-identity:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 * 10 })
+  if (!secondAllowed) return
+
+  const tenantId = resolveTenantId(account)
+  if (tenantId === DEFAULT_TENANT_ID) {
+    return res.status(400).json({ error: 'invalid_request', message: 'This code cannot be redeemed for this account.' })
+  }
+
+  let config
+  try {
+    config = await getTenantConfig(tenantId)
+  } catch (err) {
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[session/redeem-complimentary-code] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+  if (!config) {
+    return res.status(400).json({ error: 'invalid_request', message: 'This code cannot be redeemed for this account.' })
+  }
+
+  // Anti-stacking / eligibility gate -- see complimentaryAccessCommercial.js's
+  // own header for the full policy. A tenant that has EVER redeemed
+  // complimentary access before (complimentaryGrant is written once and
+  // NEVER cleared), or that has a pending grant from the OTHER, unrelated
+  // access-code system, or that already has ANY other real commercial
+  // consumption (an active trial, an active/past_due/suspended/canceled
+  // paid relationship) is refused. The only eligible starting states are
+  // "no commercial decision at all yet" (commercial === null) or the
+  // not-yet-started 'trial_pending_activation' shape -- exactly the window
+  // this feature's own described product flow (redeem BEFORE connecting
+  // GBP) puts every tenant in.
+  if (config.complimentaryGrant != null) {
+    return res.status(400).json({ error: 'invalid_request', message: 'This account has already used a complimentary access code.' })
+  }
+  if (config.accessCodeGrant != null) {
+    return res.status(400).json({ error: 'invalid_request', message: 'This code cannot be redeemed for this account.' })
+  }
+  const currentStatus = config.commercial?.commercialStatus ?? null
+  if (currentStatus === 'active') {
+    return res.status(400).json({ error: 'already_subscribed', message: 'This account already has an active subscription.' })
+  }
+  if (currentStatus !== null && currentStatus !== 'trial_pending_activation') {
+    // Generic message for every other ineligible state (an already-running
+    // trial, past_due, suspended, canceled) -- never distinguishes which,
+    // so this never becomes a state-enumeration oracle either.
+    return res.status(400).json({ error: 'invalid_request', message: 'This code cannot be redeemed for this account.' })
+  }
+
+  const { code: rawCode } = req.body ?? {}
+  if (typeof rawCode !== 'string' || !rawCode.trim()) {
+    return res.status(400).json({ error: 'invalid_request', message: 'A complimentary access code is required.' })
+  }
+
+  // Resume from a durable post-redemption claim FIRST, mirroring
+  // redeemAccessCodeAction()'s own precedent exactly: if a prior attempt
+  // already atomically consumed this tenant's redemption slot but the
+  // tenant_config write below never completed (a CAS conflict, a transient
+  // outage, the browser closing mid-request), this recovers the SAME grant
+  // result rather than either erroring forever (the code is genuinely
+  // already consumed) or leaving the tenant stuck with no grant applied.
+  let redemption
+  try {
+    redemption = await getComplimentaryRedemptionClaim(tenantId)
+  } catch (err) {
+    if (err instanceof ComplimentaryAccessStoreUnavailableError) {
+      console.error(`[session/redeem-complimentary-code] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+
+  if (!redemption) {
+    try {
+      // ATOMIC consume -- see complimentaryAccessStore.js's own REDEEM_SCRIPT.
+      // Two concurrent requests for the SAME single-use code can never both
+      // reach this successfully: the loser gets ComplimentaryCodeInvalidError
+      // below, identical to an unknown/expired/exhausted code, revealing
+      // nothing about why it lost the race.
+      redemption = await redeemComplimentaryCode({ rawCode, tenantId, userId: account.userId })
+    } catch (err) {
+      if (err instanceof ComplimentaryCodeInvalidError) {
+        return res.status(400).json({ error: 'invalid_code', message: err.message })
+      }
+      if (err instanceof ComplimentaryAccessStoreUnavailableError) {
+        console.error(`[session/redeem-complimentary-code] ${err.message}`)
+        return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+      }
+      throw err
+    }
+  }
+
+  let commercial, complimentaryGrant
+  try {
+    ;({ commercial, complimentaryGrant } = buildComplimentaryAccessCommercialWrite(redemption, {
+      initialSyncCompletedAt: config.initialSync?.completedAt ?? null,
+      redeemedByUserId: account.userId,
+    }))
+  } catch (err) {
+    if (err instanceof InvalidComplimentaryGrantError) {
+      console.error(`[session/redeem-complimentary-code] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This code could not be processed. Please contact support.' })
+    }
+    throw err
+  }
+
+  // The code is now IRREVERSIBLY consumed (the durable claim above is what
+  // makes everything from here safely retryable). Apply the canonical
+  // tenant_config write with a small bounded CAS retry -- a conflict here
+  // means something else touched this tenant's config in the same instant
+  // (e.g. a second, racing request from another browser tab that already
+  // discovered and is replaying the SAME claim); re-reading fresh state
+  // each attempt, and adopting an already-applied grant rather than
+  // clobbering it with a cosmetically-different timestamp, keeps this
+  // idempotent under real concurrency.
+  let updated = null
+  for (let attempt = 0; attempt < 3 && !updated; attempt++) {
+    let freshConfig
+    try {
+      freshConfig = await getTenantConfig(tenantId)
+    } catch (err) {
+      if (err instanceof TenantConfigStoreUnavailableError) {
+        console.error(`[session/redeem-complimentary-code] ${err.message}`)
+        return res.status(503).json({ error: 'service_unavailable', message: 'Your code was accepted, but we could not finish applying it. Please try again shortly.' })
+      }
+      throw err
+    }
+    if (!freshConfig) {
+      return res.status(503).json({ error: 'service_unavailable', message: 'Your code was accepted, but we could not finish applying it. Please try again shortly.' })
+    }
+    if (freshConfig.complimentaryGrant != null) {
+      // Another concurrent request (replaying the same durable claim)
+      // already applied this exact grant -- adopt it rather than writing a
+      // second, redundant copy.
+      updated = freshConfig
+      break
+    }
+    try {
+      updated = await upsertTenantConfig(tenantId, { commercial, complimentaryGrant }, { expectedVersion: freshConfig.configVersion })
+    } catch (err) {
+      if (err instanceof ConfigVersionConflictError) continue
+      throw err
+    }
+  }
+  if (!updated) {
+    return res.status(503).json({ error: 'service_unavailable', message: 'Your code was accepted, but we could not finish applying it. Please try again shortly.' })
+  }
+
+  // Best-effort -- a failure here has no security consequence: the grant is
+  // already durably applied to tenant_config above, and this claim is only
+  // ever consulted as a resume-on-retry safety net (a lingering, inert
+  // claim self-expires after 30 days regardless).
+  await clearComplimentaryRedemptionClaim(tenantId)
+
+  try {
+    await appendAuditEntry(tenantId, {
+      actorId: account.userId, actorEmail: account.email, ip: clientIp(req),
+      action: 'complimentary_code_redeemed', entity: 'tenant', entityId: tenantId,
+      result: 'success',
+      // Never the plaintext code, never the code hash -- plan/duration/
+      // limits only, matching this feature's own explicit audit-logging
+      // requirement.
+      message: `Complimentary access redeemed (plan: ${complimentaryGrant.planId}, durationDays: ${complimentaryGrant.durationDays}, maxLocations: ${complimentaryGrant.maxLocations}, maxUsers: ${complimentaryGrant.maxUsers}).`,
+    })
+  } catch (err) {
+    console.error(`[session/redeem-complimentary-code] failed to record audit entry (non-fatal): ${err.message}`)
+  }
+
+  const planMeta = PLANS[complimentaryGrant.planId]
+  // Read the commercial status into a local before comparing it -- this
+  // endpoint file is structurally scanned (test_commercial_feature_gating.js)
+  // to ensure only entitlementResolution.js ever branches on that field via
+  // a direct property comparison.
+  const updatedCommercialStatus = updated.commercial.commercialStatus
+  return res.status(200).json({
+    complimentary: {
+      state: updatedCommercialStatus === 'complimentary' ? 'active' : 'pending',
+      planId: complimentaryGrant.planId,
+      planName: planMeta?.name ?? complimentaryGrant.planId,
+      durationDays: complimentaryGrant.durationDays,
+      maxLocations: complimentaryGrant.maxLocations,
+      maxUsers: complimentaryGrant.maxUsers,
+      startedAt: updated.commercial.complimentary?.startedAt ?? null,
+      endsAt: updated.commercial.complimentary?.endsAt ?? null,
+    },
+  })
+}
+
 // POST /api/session/select-plan  { plan, recurringBillingAccepted }
 //
 // Phase B.11 -- the first real Stripe payment-method-collection path. This
@@ -2473,9 +2715,52 @@ async function billingStatusAction(req, res) {
     planAfterTrial = { id: meta.id, name: meta.name, priceCents: meta.priceCents }
   }
 
+  // Complimentary Restaurant Access Codes -- a small, additive, explicitly
+  // allowlisted view (never a raw tenant_config/complimentaryGrant spread,
+  // never a code hash) so Billing.jsx can render the pending/active/expired
+  // complimentary states without any further server round-trip. `null`
+  // whenever this tenant has no complimentary provenance at all -- the
+  // ordinary case for every non-complimentary tenant, byte-for-byte
+  // unaffected by this addition.
+  let complimentary = null
+  // Read the commercial status into a local before comparing it -- same
+  // discipline as updatedCommercialStatus above.
+  const currentCommercialStatus = commercial.commercialStatus
+  if (config?.complimentaryGrant != null) {
+    const grant = config.complimentaryGrant
+    const planMeta = PLANS[grant.planId]
+    if (currentCommercialStatus === 'complimentary_pending_activation') {
+      complimentary = {
+        state: 'pending', planId: grant.planId, planName: planMeta?.name ?? grant.planId,
+        durationDays: grant.durationDays, maxLocations: grant.maxLocations, maxUsers: grant.maxUsers,
+        startedAt: null, endsAt: null,
+      }
+    } else if (currentCommercialStatus === 'complimentary') {
+      complimentary = {
+        state: 'active', planId: grant.planId, planName: planMeta?.name ?? grant.planId,
+        durationDays: grant.durationDays, maxLocations: commercial.complimentaryMaxLocations ?? grant.maxLocations,
+        maxUsers: commercial.complimentaryMaxUsers ?? grant.maxUsers,
+        startedAt: commercial.complimentaryStartedAt, endsAt: commercial.complimentaryEndsAt,
+      }
+    } else if (currentCommercialStatus === 'suspended' && commercial.reason === 'complimentary_expired') {
+      complimentary = {
+        state: 'expired', planId: grant.planId, planName: planMeta?.name ?? grant.planId,
+        durationDays: grant.durationDays, maxLocations: grant.maxLocations, maxUsers: grant.maxUsers,
+        startedAt: commercial.complimentaryStartedAt, endsAt: commercial.complimentaryEndsAt,
+      }
+    }
+  }
+
   return res.status(200).json({
     plan: commercial.plan,
     commercialStatus: commercial.commercialStatus,
+    // The resolver's own already-vetted, safe reason string (e.g.
+    // 'trial_expired', 'complimentary_expired', 'past_due_grace') -- never
+    // raw internal state. Needed so the frontend can distinguish a
+    // complimentary-access expiration from an ordinary Stripe suspension,
+    // both of which otherwise resolve to the SAME commercialStatus:
+    // 'suspended'.
+    reason: commercial.reason,
     trialStatus: commercial.trialStatus,
     trialStartedAt: commercial.trialStartedAt,
     trialEndsAt: commercial.trialEndsAt,
@@ -2485,6 +2770,7 @@ async function billingStatusAction(req, res) {
     pastDueSince: record?.pastDueSince ?? null,
     subscriptionPresent: Boolean(record?.stripeSubscriptionId),
     planAfterTrial,
+    complimentary,
   })
 }
 
@@ -2592,6 +2878,7 @@ async function billingActivationCallback(req, res) {
   // who isn't eligible at all.
   config = await maybeStartTrial(tenantId, config)
   config = await maybeStartAccessCodeTrial(tenantId, config)
+  config = await maybeStartComplimentaryAccess(tenantId, config)
 
   let subscriptionResult
   try {
@@ -2648,6 +2935,7 @@ export default async function handler(req, res) {
     case 'verify-email':           return verifyEmail(req, res)
     case 'get-started-status':     return getStartedStatus(req, res)
     case 'redeem-access-code':     return redeemAccessCodeAction(req, res)
+    case 'redeem-complimentary-code': return redeemComplimentaryCodeAction(req, res)
     case 'select-plan':            return selectPlan(req, res)
     case 'finalize-registration':  return finalizeRegistration(req, res)
     case 'stripe-webhook':         return stripeWebhookAction(req, res)

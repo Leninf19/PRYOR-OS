@@ -53,3 +53,23 @@ export async function createBillingPortalSession() {
   }
   return body
 }
+
+// POST /api/session/redeem-complimentary-code  { code } -- owner-only. The
+// ONLY value ever sent is the raw code string the owner typed in; plan,
+// duration, and location/user limits are all server-resolved and returned
+// in the response, never supplied by this function.
+export async function redeemComplimentaryCode(code) {
+  const res = await fetch('/api/session/redeem-complimentary-code', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  })
+  await handleAuthFailure(res, 'redeeming a complimentary access code')
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const err = new Error(body.message || `Failed to redeem code: ${res.status}`)
+    err.code = body.error
+    throw err
+  }
+  return body
+}

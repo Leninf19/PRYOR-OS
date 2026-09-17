@@ -190,6 +190,18 @@ export async function maybeStartTrial(tenantId, config) {
   // marker," which the guard below already checks, for defense in depth).
   if (config.accessCodeGrant != null) return config
 
+  // Complimentary Restaurant Access Codes -- the SAME durable exclusion,
+  // for the SAME reason: a tenant that has EVER redeemed a complimentary
+  // code (config.complimentaryGrant is written once, at redemption, and
+  // NEVER cleared -- see complimentaryAccessCommercial.js's own header)
+  // must never ALSO receive the automatic self-service 7-day trial,
+  // whether the complimentary grant is still pending activation, currently
+  // active, or has already expired. This is the explicit anti-stacking
+  // policy this feature's own design requires: a complimentary pilot
+  // REPLACES, not adds to, the normal promotional trial opportunity for
+  // this tenant.
+  if (config.complimentaryGrant != null) return config
+
   // A pending-activation commercialStatus is NECESSARY but never
   // SUFFICIENT by itself -- an explicit,
   // server-controlled trialEligibility marker is REQUIRED too, mirroring
@@ -398,6 +410,80 @@ export async function maybeStartAccessCodeTrial(tenantId, config) {
   }
 }
 
+// Complimentary Restaurant Access Codes -- the lazy activation counterpart
+// to maybeStartAccessCodeTrial() above, for an EXPLICIT complimentary-access
+// grant instead of an access-code trial. Called from the SAME read-time
+// hook (session/[action].js's tenantStatus(), immediately after
+// maybeStartAccessCodeTrial()) so this is just as naturally recurring and
+// client-trigger-free.
+//
+// Mirrors maybeStartAccessCodeTrial()'s structure line for line: only a
+// tenant sitting in the explicit 'complimentary_pending_activation'
+// commercial shape, with its accompanying complimentaryGrant, is eligible;
+// the authoritative clock anchor is tenant_config.initialSync.completedAt,
+// NEVER Date.now() or any client-supplied timestamp (per this feature's own
+// explicit "do not rely on browser/client time" requirement); the write is
+// CAS-bound to the SAME config snapshot this function was handed, so a
+// concurrent write fails closed via ConfigVersionConflictError and is
+// retried on the next observation, recomputing the identical result from
+// the same immutable inputs (grant.durationDays, initialSync.completedAt)
+// every time.
+export async function maybeStartComplimentaryAccess(tenantId, config) {
+  if (!config) return config
+
+  // No LTA/BOOTSTRAP read or write, ever -- identical discipline to every
+  // other lazy-activation function in this file.
+  if (locationCatalogModeFor(tenantId) === LocationCatalogMigrationMode.BOOTSTRAP) return config
+
+  // Only a tenant sitting in the explicit 'complimentary_pending_activation'
+  // commercial shape, with its accompanying grant, is eligible. Any OTHER
+  // commercial state is never touched again -- "once consumed, never again"
+  // falls out of this precondition itself, exactly like every other
+  // activation function here.
+  if (config.commercial?.commercialStatus !== 'complimentary_pending_activation') return config
+  if (config.complimentaryGrant == null) return config
+
+  // Same authoritative-anchor requirement as every other trial/grant start:
+  // GBP OAuth connection + first successful initial sync, represented by
+  // tenant_config.status === 'active', never inferred from anything else.
+  if (config.status !== 'active') return config
+
+  const authoritativeActivationAt = config.initialSync?.completedAt
+  if (typeof authoritativeActivationAt !== 'string' || !authoritativeActivationAt) {
+    console.error(`[trialLifecycle] tenant ${JSON.stringify(tenantId)} is 'active' with a pending complimentary-access grant but has no initialSync.completedAt -- refusing to start without an authoritative clock anchor`)
+    return config
+  }
+
+  const grant = config.complimentaryGrant
+  const startedAt = authoritativeActivationAt
+  const endsAt = new Date(Date.parse(startedAt) + grant.durationDays * 24 * 60 * 60 * 1000).toISOString()
+
+  const newCommercial = {
+    commercialStatus: 'complimentary',
+    plan: grant.planId,
+    planSource: 'complimentary_access',
+    trial: null,
+    complimentary: { status: 'active', startedAt, endsAt, consumedAt: startedAt, maxLocations: grant.maxLocations, maxUsers: grant.maxUsers, codeHash: grant.codeHash },
+    limitsOverride: null, suspension: null, cancellation: null, overLimit: null,
+    accessCodeHash: null, discountPercent: null, discountFixedCents: null, paymentRequired: false,
+    createdAt: startedAt, updatedAt: new Date().toISOString(),
+  }
+
+  try {
+    return await upsertTenantConfig(tenantId, { commercial: newCommercial }, { expectedVersion: config.configVersion })
+  } catch (err) {
+    if (err instanceof ConfigVersionConflictError) {
+      console.log(`[trialLifecycle] tenant ${JSON.stringify(tenantId)} complimentary-access start CAS conflict -- will retry on next observation`)
+      return config
+    }
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[trialLifecycle] tenant config store unavailable during complimentary-access start for tenant ${JSON.stringify(tenantId)}: ${err.message}`)
+      return config
+    }
+    throw err
+  }
+}
+
 // Phase B.12 -- the ONE place tenant_config.commercial ever transitions from
 // the completed-trial state into the existing, already-resolver-recognized
 // canonical PAID-ACTIVE state (commercialStatus: 'active') -- mirrors
@@ -419,21 +505,33 @@ export async function maybeStartAccessCodeTrial(tenantId, config) {
 // [action].js's handleSubscriptionProjectionEvent()) is responsible for
 // every customer/price/subscription cross-check BEFORE calling this.
 //
-// ONE-DIRECTIONAL, "ONCE CONSUMED, NEVER AGAIN" -- Phase B.13 amendment:
-// this now transitions OUT OF THREE states, never any other:
+// ONE-DIRECTIONAL, "ONCE CONSUMED, NEVER AGAIN" -- Phase B.13 amendment
+// (extended by Complimentary Restaurant Access Codes): this now transitions
+// OUT OF FOUR states, never any other:
 //   - 'trial'                                          -> genuine first activation (B.12, unchanged)
+//   - 'complimentary'                                  -> a complimentary tenant becomes a real paying customer
 //   - 'past_due'                                       -> delinquency recovery (B.13)
 //   - 'suspended' WITH suspension.reason === 'stripe_unpaid_terminal' -> billing-failure recovery (B.13)
 // A tenant already 'active' (duplicate/redelivered event, a second
 // observation racing this same one) is a pure, harmless no-op. Every OTHER
-// existing state (canceled, trial_pending_activation, or 'suspended' for
-// any OTHER reason -- there is exactly one reason value today, see
-// SUSPENSION_REASONS, but this guard is written to stay correct if a
-// future manual/admin/fraud reason is ever added) is left completely
-// untouched -- this function is never a general-purpose "set
-// commercialStatus" writer, only these specific, narrow transitions, and
-// NEVER auto-resumes a suspension it did not itself create for this exact
-// reason.
+// existing state (canceled, trial_pending_activation,
+// complimentary_pending_activation, or 'suspended' for any OTHER reason --
+// there is exactly one reason value today, see SUSPENSION_REASONS, but this
+// guard is written to stay correct if a future manual/admin/fraud reason is
+// ever added) is left completely untouched -- this function is never a
+// general-purpose "set commercialStatus" writer, only these specific,
+// narrow transitions, and NEVER auto-resumes a suspension it did not
+// itself create for this exact reason.
+//
+// CONVERTING A COMPLIMENTARY TENANT TO PAID: exactly like the
+// trial-activation path, `plan`/`planSource` ARE updated (a customer
+// converting from complimentary access may purchase a DIFFERENT plan than
+// the one their complimentary grant offered). The historical
+// `complimentaryGrant` on tenant_config is NEVER touched or cleared by this
+// function (it is never part of `commercial` at all -- it lives at the
+// tenant_config top level) -- it remains a permanent, auditable record that
+// this tenant once had complimentary access, even after paid billing
+// becomes canonical.
 //
 // NEVER creates or restarts a trial (there is no trial-shaped object
 // written here at all -- the tenant's own historical `trial` sub-object is
@@ -470,9 +568,10 @@ export async function activatePaidSubscriptionIfValid(tenantId, plan) {
   const existingCommercial = config.commercial
   const currentStatus = existingCommercial?.commercialStatus
   const isFromTrial = currentStatus === 'trial'
+  const isFromComplimentary = currentStatus === 'complimentary'
   const isFromPastDue = currentStatus === 'past_due'
   const isFromBillingSuspension = currentStatus === 'suspended' && SUSPENSION_REASONS.includes(existingCommercial?.suspension?.reason) && existingCommercial?.suspension?.reason === 'stripe_unpaid_terminal'
-  if (!isFromTrial && !isFromPastDue && !isFromBillingSuspension) return config
+  if (!isFromTrial && !isFromComplimentary && !isFromPastDue && !isFromBillingSuspension) return config
 
   // Defense in depth -- the caller must already have validated `plan`
   // against real server billing state before ever calling this, but this
@@ -494,19 +593,25 @@ export async function activatePaidSubscriptionIfValid(tenantId, plan) {
 
   const now = new Date().toISOString()
   // Fields explicitly changed by this transition: commercialStatus (->
-  // 'active'), plan/planSource (ONLY set on the trial-activation path --
-  // left completely unchanged on a past_due/suspended recovery, per the
-  // guard above), suspension (cleared to null ONLY on the billing-suspension
-  // recovery path), updatedAt. Every other field -- including `trial`
-  // itself (kept as a historical record only), limitsOverride,
+  // 'active'), plan/planSource (set on the trial-activation AND
+  // complimentary-conversion paths -- a customer converting off either may
+  // purchase a different plan than what they had; left completely
+  // unchanged on a past_due/suspended recovery, per the guard above),
+  // suspension (cleared to null ONLY on the billing-suspension recovery
+  // path), updatedAt. Every other field -- including `trial`/`complimentary`
+  // themselves (kept as historical records only), limitsOverride,
   // cancellation, overLimit, accessCodeHash, discountPercent,
   // discountFixedCents, paymentRequired, createdAt -- is carried forward
   // completely unchanged via this spread, never reset, never reinterpreted.
+  // tenant_config's own top-level `complimentaryGrant` (a SEPARATE field
+  // from `commercial`, never touched here) likewise remains untouched --
+  // it stays the permanent audit record described in this function's own
+  // header.
   const newCommercial = {
     ...existingCommercial,
     commercialStatus: 'active',
-    plan: isFromTrial ? plan : existingCommercial.plan,
-    planSource: isFromTrial ? 'stripe_subscription_active' : existingCommercial.planSource,
+    plan: (isFromTrial || isFromComplimentary) ? plan : existingCommercial.plan,
+    planSource: (isFromTrial || isFromComplimentary) ? 'stripe_subscription_active' : existingCommercial.planSource,
     suspension: isFromBillingSuspension ? null : existingCommercial.suspension,
     updatedAt: now,
   }

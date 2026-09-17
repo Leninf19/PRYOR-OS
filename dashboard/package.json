@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "complimentary-code:create": "node scripts/complimentary-code.js create",
+    "complimentary-code:list": "node scripts/complimentary-code.js list",
+    "complimentary-code:revoke": "node scripts/complimentary-code.js revoke"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.2",
