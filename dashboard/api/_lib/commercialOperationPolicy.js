@@ -161,15 +161,25 @@ export const CommercialOperationClass = Object.freeze({
 // zero numeric allowance via pendingActivationLimits(), so B.4's existing
 // quota checks deny those independently of this table too (belt and
 // suspenders, never a single point of failure).
+//
+// 'complimentary' / 'complimentary_pending_activation' (PRYOR Complimentary
+// Restaurant Access Codes) -- given the IDENTICAL policy shape as their
+// 'trial' / 'trial_pending_activation' counterparts, respectively.
+// Complimentary access is, operationally, a fully-functional (within its
+// own bounded numeric limits) product experience exactly like a trial --
+// there is no reason for it to be denied any operation class a normal trial
+// would be allowed, and the pending variant needs exactly the same bounded
+// onboarding capacity (connect Google, approve the first location) for
+// exactly the same reason.
 const POLICY = Object.freeze({
-  [CommercialOperationClass.READ_BASIC]:            Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true,  trial_pending_activation: true  }),
-  [CommercialOperationClass.SECURITY_MAINTENANCE]:  Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true,  trial_pending_activation: true  }),
-  [CommercialOperationClass.RESOURCE_REDUCTION]:    Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true,  trial_pending_activation: true  }),
-  [CommercialOperationClass.OPERATIONAL_WRITE]:     Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false, trial_pending_activation: false }),
-  [CommercialOperationClass.COST_GENERATING]:       Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false, trial_pending_activation: false }),
-  [CommercialOperationClass.INTEGRATION_OPERATION]: Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false, trial_pending_activation: false }),
-  [CommercialOperationClass.INTEGRATION_EXPANSION]: Object.freeze({ trial: true, active: true, past_due: false, suspended: false, canceled: false, trial_pending_activation: true  }),
-  [CommercialOperationClass.CAPACITY_EXPANSION]:    Object.freeze({ trial: true, active: true, past_due: false, suspended: false, canceled: false, trial_pending_activation: true  }),
+  [CommercialOperationClass.READ_BASIC]:            Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true,  trial_pending_activation: true,  complimentary: true,  complimentary_pending_activation: true  }),
+  [CommercialOperationClass.SECURITY_MAINTENANCE]:  Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true,  trial_pending_activation: true,  complimentary: true,  complimentary_pending_activation: true  }),
+  [CommercialOperationClass.RESOURCE_REDUCTION]:    Object.freeze({ trial: true, active: true, past_due: true,  suspended: true,  canceled: true,  trial_pending_activation: true,  complimentary: true,  complimentary_pending_activation: true  }),
+  [CommercialOperationClass.OPERATIONAL_WRITE]:     Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false, trial_pending_activation: false, complimentary: true,  complimentary_pending_activation: false }),
+  [CommercialOperationClass.COST_GENERATING]:       Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false, trial_pending_activation: false, complimentary: true,  complimentary_pending_activation: false }),
+  [CommercialOperationClass.INTEGRATION_OPERATION]: Object.freeze({ trial: true, active: true, past_due: true,  suspended: false, canceled: false, trial_pending_activation: false, complimentary: true,  complimentary_pending_activation: false }),
+  [CommercialOperationClass.INTEGRATION_EXPANSION]: Object.freeze({ trial: true, active: true, past_due: false, suspended: false, canceled: false, trial_pending_activation: true,  complimentary: true,  complimentary_pending_activation: true  }),
+  [CommercialOperationClass.CAPACITY_EXPANSION]:    Object.freeze({ trial: true, active: true, past_due: false, suspended: false, canceled: false, trial_pending_activation: true,  complimentary: true,  complimentary_pending_activation: true  }),
 })
 
 // Classes safe to ALLOW outright on a genuine resolver failure -- see this

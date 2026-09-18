@@ -9,6 +9,14 @@ import AuthShell, { Field, ErrorBanner, PrimaryButton, LoadingDots } from './aut
 // naturally lands on the completely unmodified Onboarding.jsx (status:
 // onboarding). No client-side session-state plumbing is needed or
 // attempted here.
+//
+// Complimentary Restaurant Access Codes -- this SAME form/endpoint now also
+// redeems a complimentary pilot code (PRYOR-PILOT-...): the server decides
+// which code system a submission belongs to (redeemAccessCodeAction()'s own
+// complimentary-first routing), never this page. The copy below is
+// deliberately generic about code format for that reason -- it must never
+// imply only one code family is accepted, and never reveal which system a
+// rejected code was checked against.
 export default function AccessCodeEntry() {
   const [code, setCode] = useState('')
   const [error, setError] = useState(null)
@@ -40,7 +48,7 @@ export default function AccessCodeEntry() {
   return (
     <AuthShell showPreview={false}>
       <h1 className="font-serif text-[26px] leading-tight mt-9 mb-1.5" style={{ color: 'var(--color-text-1)' }}>Enter your access code</h1>
-      <p className="text-sm mb-8" style={{ color: 'var(--color-text-2)' }}>e.g. LTA-ENT-7K4M9Q2X8P</p>
+      <p className="text-sm mb-8" style={{ color: 'var(--color-text-2)' }}>Enter your PRYOR access or complimentary code.</p>
 
       <form onSubmit={handleSubmit} className="space-y-4" noValidate>
         <Field label="Access code">

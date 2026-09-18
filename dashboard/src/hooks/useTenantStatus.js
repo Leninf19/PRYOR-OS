@@ -89,3 +89,28 @@ export function useApproveLocations() {
     },
   })
 }
+
+// POST /api/google/retry-provisioning -- the ONLY self-service retry this
+// onboarding flow exposes, and only reachable from Onboarding.jsx's
+// 'provisioning_dispatch_failed' screen. Owner-only and tenant-scoped
+// server-side (google/[action].js's retryProvisioning() resolves the
+// tenant from the session, never from anything this hook sends); this
+// mutation takes no arguments and sends no body for that reason.
+export function useRetryProvisioning() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async () => {
+      const res = await fetch('/api/google/retry-provisioning', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        const err = new Error(body.message || `Failed to retry setup: ${res.status}`)
+        err.code = body.error
+        throw err
+      }
+      return body
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: QK })
+    },
+  })
+}

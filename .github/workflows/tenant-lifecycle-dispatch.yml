@@ -173,7 +173,7 @@ name: Tenant Lifecycle Dispatch (pinned)
 #   before merge. Fixed via dispatchTenantLifecycleWorkflow()'s new
 #   resolveLifecycleExecutionRef(): 'production' -> the literal 'main'
 #   (unchanged); 'preview' -> the one fixed, reviewed
-#   APPROVED_PREVIEW_LIFECYCLE_REF constant ('feature/commercial-entitlements'
+#   APPROVED_PREVIEW_LIFECYCLE_REF constant ('feature/complimentary-access'
 #   for this smoke-test phase), cross-checked against Vercel's own
 #   VERCEL_GIT_COMMIT_REF when present; anything else -> null, refused
 #   before any network call. Never caller/request-supplied. "Chain to

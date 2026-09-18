@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import Card from '../../components/ui/Card.jsx'
 import Badge from '../../components/ui/Badge.jsx'
 import Button from '../../components/ui/Button.jsx'
@@ -6,7 +7,7 @@ import ErrorState from '../../components/ui/ErrorState.jsx'
 import EmptyState from '../../components/ui/EmptyState.jsx'
 import { useToast } from '../../components/ui/Toast.jsx'
 import { useAccount } from '../../components/AuthGate.jsx'
-import { useBillingStatus, useCreateBillingPortalSession } from '../../hooks/useBilling.js'
+import { useBillingStatus, useCreateBillingPortalSession, useRedeemComplimentaryCode } from '../../hooks/useBilling.js'
 
 // Billing settings page (Phase B.13.1) -- a read-only view over the existing
 // owner-only GET /api/session/billing-status endpoint, plus a single
@@ -33,9 +34,11 @@ function humanizePlan(plan) {
 
 const STATUS_LABELS = {
   trial: 'Trial', active: 'Active', past_due: 'Past Due', suspended: 'Suspended', canceled: 'Canceled',
+  complimentary: 'Complimentary', complimentary_pending_activation: 'Complimentary (Reserved)',
 }
 const STATUS_BADGE_VARIANTS = {
   trial: 'info', active: 'success', past_due: 'warning', suspended: 'danger', canceled: 'neutral',
+  complimentary: 'success', complimentary_pending_activation: 'info',
 }
 
 function humanizeStatus(status) {
@@ -160,6 +163,118 @@ function BillingStatusCard({ status }) {
   )
 }
 
+// Complimentary Restaurant Access Codes -- three additional, mutually
+// exclusive states, deliberately kept as SEPARATE components from
+// BillingStatusCard above rather than threading more branches into it: none
+// of these states involve a Stripe subscription, a trial, or a cancellation
+// at all, and keeping them separate means the existing, already-tested
+// trial/active/past_due/suspended/canceled rendering above is byte-for-byte
+// unmodified.
+
+function ComplimentaryPendingCard({ complimentary }) {
+  return (
+    <Card className="p-6 space-y-2">
+      <div className="flex items-start justify-between gap-4">
+        <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Complimentary Access Reserved</p>
+        <Badge variant="info">{humanizePlan(complimentary.planId)}</Badge>
+      </div>
+      <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)' }}>
+        Your {complimentary.durationDays} days will begin after your restaurant completes its first successful data sync.
+      </p>
+    </Card>
+  )
+}
+
+function ComplimentaryActiveCard({ complimentary }) {
+  const endsAt = fmtDate(complimentary.endsAt)
+  return (
+    <Card className="p-6 space-y-3">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <p className="text-[10px] font-medium" style={{ color: 'var(--color-text-3)' }}>Complimentary Access</p>
+          <p className="text-sm font-bold mt-0.5" style={{ color: 'var(--color-text-1)' }}>{humanizePlan(complimentary.planId)}</p>
+        </div>
+        <Badge variant="success">Complimentary</Badge>
+      </div>
+      <ul className="text-xs space-y-1" style={{ color: 'var(--color-text-2)' }}>
+        <li>{complimentary.maxLocations} location{complimentary.maxLocations === 1 ? '' : 's'}</li>
+        <li>Up to {complimentary.maxUsers} user{complimentary.maxUsers === 1 ? '' : 's'}</li>
+        <li>No credit card required</li>
+      </ul>
+      {endsAt && <p className="text-xs" style={{ color: 'var(--color-text-2)' }}>Ends: {endsAt}</p>}
+    </Card>
+  )
+}
+
+function ComplimentaryExpiredCard() {
+  return (
+    <Card className="p-6 space-y-2">
+      <div className="flex items-start justify-between gap-4">
+        <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Complimentary Access Ended</p>
+        <Badge variant="neutral">Ended</Badge>
+      </div>
+      <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-2)' }}>
+        Your complimentary access period has ended. Contact us to continue on a paid plan.
+      </p>
+    </Card>
+  )
+}
+
+// "Have a complimentary access code?" -- the ONLY client input this whole
+// feature ever accepts is the raw code string typed here. Shown only for a
+// tenant that has never redeemed complimentary access at all (the parent
+// component hides this once `status.complimentary` is non-null, i.e. once a
+// grant exists in any state -- pending, active, or expired).
+function ComplimentaryRedeemCard() {
+  const toast = useToast()
+  const [code, setCode] = useState('')
+  const redeemMutation = useRedeemComplimentaryCode()
+
+  const handleSubmit = (e) => {
+    e.preventDefault()
+    const trimmed = code.trim()
+    if (!trimmed) return
+    redeemMutation.mutate(trimmed, {
+      onSuccess: (data) => {
+        setCode('')
+        const c = data?.complimentary
+        if (c?.state === 'active') {
+          toast(`Complimentary Access — ${humanizePlan(c.planId)}: ${c.durationDays} days complimentary, ${c.maxLocations} location${c.maxLocations === 1 ? '' : 's'}, up to ${c.maxUsers} users. No credit card required.`, { variant: 'success' })
+        } else {
+          toast('Complimentary access reserved — it will begin once your first data sync completes.', { variant: 'success' })
+        }
+      },
+      onError: (err) => {
+        toast(err?.message || 'Unable to redeem this code. Please try again.', { variant: 'error' })
+      },
+    })
+  }
+
+  return (
+    <Card className="p-6 space-y-3">
+      <div>
+        <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Have a complimentary access code?</p>
+        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
+          Enter your code below to unlock complimentary PRYOR access. No credit card required.
+        </p>
+      </div>
+      <form onSubmit={handleSubmit} className="flex flex-col sm:flex-row gap-2">
+        <input
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+          placeholder="PRYOR-..."
+          className="w-full rounded-lg border px-3 py-2 text-sm font-mono"
+          style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }}
+          disabled={redeemMutation.isPending}
+        />
+        <Button type="submit" variant="primary" disabled={redeemMutation.isPending || !code.trim()}>
+          {redeemMutation.isPending ? 'Redeeming…' : 'Redeem Code'}
+        </Button>
+      </form>
+    </Card>
+  )
+}
+
 function ManageBillingCard() {
   const toast = useToast()
   const portalMutation = useCreateBillingPortalSession()
@@ -194,10 +309,28 @@ function ManageBillingCard() {
   )
 }
 
+// Complimentary provenance -- true for pending/active/expired complimentary
+// states alike. Used to (a) pick which status card to render and (b) hide
+// Manage Billing, which would otherwise lead nowhere for an account with no
+// applicable Stripe billing relationship at all (complimentary access never
+// creates one -- see complimentaryAccessStore.js's own header).
+function isComplimentaryProvenance(status) {
+  return status.commercialStatus === 'complimentary'
+    || status.commercialStatus === 'complimentary_pending_activation'
+    || (status.commercialStatus === 'suspended' && status.reason === 'complimentary_expired')
+}
+
 export default function Billing() {
   const account = useAccount()
   const isOwner = account?.role === 'owner'
   const { data: status, isLoading, isError, refetch } = useBillingStatus()
+
+  const complimentaryProvenance = !isLoading && !isError && status ? isComplimentaryProvenance(status) : false
+  // The redemption form is offered only to a tenant that has NEVER redeemed
+  // complimentary access at all -- once a grant exists (pending, active, or
+  // expired), `status.complimentary` is non-null and the form disappears in
+  // favor of whichever status card above already explains that state.
+  const canRedeem = !isLoading && !isError && status && status.complimentary == null
 
   return (
     <div className="space-y-4">
@@ -222,16 +355,27 @@ export default function Billing() {
             <Card className="p-0 overflow-hidden">
               <ErrorState body="Couldn't load your billing status." onRetry={refetch} />
             </Card>
+          ) : status.commercialStatus === 'complimentary_pending_activation' ? (
+            <ComplimentaryPendingCard complimentary={status.complimentary} />
+          ) : status.commercialStatus === 'complimentary' ? (
+            <ComplimentaryActiveCard complimentary={status.complimentary} />
+          ) : status.commercialStatus === 'suspended' && status.reason === 'complimentary_expired' ? (
+            <ComplimentaryExpiredCard />
           ) : (
             <BillingStatusCard status={status} />
           )}
+
+          {canRedeem && <ComplimentaryRedeemCard />}
 
           {/* Manage Billing is independent of the status query above -- it
               must stay usable even when billing-status fails to load, and
               even for a tenant with no subscription yet (the portal
               endpoint itself is the one authority for readiness, via its
-              own billing_not_ready response -- never duplicated here). */}
-          <ManageBillingCard />
+              own billing_not_ready response -- never duplicated here).
+              Hidden ONLY for complimentary provenance, which never has any
+              applicable Stripe billing state to manage -- every other
+              existing status's behavior here is unchanged. */}
+          {!complimentaryProvenance && <ManageBillingCard />}
         </>
       )}
     </div>

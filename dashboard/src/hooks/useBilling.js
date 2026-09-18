@@ -1,4 +1,4 @@
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import * as billingService from '../services/billingService.js'
 
 const QK = ['billing-status']
@@ -30,5 +30,20 @@ export function useBillingStatus() {
 export function useCreateBillingPortalSession() {
   return useMutation({
     mutationFn: billingService.createBillingPortalSession,
+  })
+}
+
+// "Redeem Code" (complimentary access) -- unlike Manage Billing, a
+// successful redemption DOES immediately change this tenant's canonical
+// commercial state, so the billing-status query is invalidated on success
+// (a manual refetch would otherwise show stale "no complimentary access"
+// data until the query's own staleTime naturally elapses).
+export function useRedeemComplimentaryCode() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: billingService.redeemComplimentaryCode,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: QK })
+    },
   })
 }

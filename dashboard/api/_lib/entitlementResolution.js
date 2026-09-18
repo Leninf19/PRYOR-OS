@@ -70,7 +70,27 @@ import {
 // resolver ever transitions OUT OF via a dedicated activation function
 // (trialLifecycle.js's maybeStartAccessCodeTrial()) rather than staying
 // fixed until an external billing signal changes it.
-export const COMMERCIAL_STATUSES = Object.freeze(['trial', 'active', 'past_due', 'suspended', 'canceled', 'trial_pending_activation'])
+//
+// 'complimentary' / 'complimentary_pending_activation' (PRYOR Complimentary
+// Restaurant Access Codes) -- a THIRD, independent provenance for the same
+// pending-activation pattern, written by complimentaryAccessCommercial.js's
+// buildComplimentaryAccessCommercialWrite() when an authenticated tenant
+// Owner redeems a complimentary code (complimentaryAccessStore.js) against
+// their ALREADY-EXISTING tenant. Deliberately NOT the same status value as
+// 'trial'/'trial_pending_activation' -- a complimentary grant is neither a
+// Stripe-backed trial nor the automatic self-service GBP trial, and the
+// product must be able to tell all three apart (never fake
+// commercialStatus: 'active' to "pass" existing billing checks, and never
+// silently reuse 'trial' just because the entitlement shape happens to be
+// similar). 'complimentary_pending_activation' transitions OUT via
+// trialLifecycle.js's maybeStartComplimentaryAccess() exactly like its
+// access-code-trial sibling; 'complimentary' itself transitions out only via
+// its own live expiry computation (below) or a future genuine paid
+// Subscription (trialLifecycle.js's activatePaidSubscriptionIfValid()).
+export const COMMERCIAL_STATUSES = Object.freeze([
+  'trial', 'active', 'past_due', 'suspended', 'canceled', 'trial_pending_activation',
+  'complimentary', 'complimentary_pending_activation',
+])
 
 // Resolver-OUTPUT-ONLY sentinel statuses -- NEVER legal to write into
 // tenant_config.commercial.commercialStatus; only ever produced by
@@ -153,6 +173,10 @@ function unenforcedLimits() {
 // (storageBytes/assetCount/aiAllowanceMonthly) is zeroed: this state must
 // never grant real product usage, only onboarding capability. NEVER
 // unenforced (null) -- this is an ACTIVE restriction, not a bypassed one.
+// Reused verbatim for 'complimentary_pending_activation' -- the onboarding
+// capacity a complimentary grant needs before its own clock starts is
+// identical in kind to the access-code-trial case; there is no reason for a
+// second, parallel bounded-onboarding shape.
 function pendingActivationLimits() {
   return Object.freeze({
     maxLocations: TRIAL_LIMITS.maxLocations, maxActiveUsers: TRIAL_LIMITS.maxActiveUsers,
@@ -177,6 +201,10 @@ export function unresolvedBundle({ commercialStatus, reason }) {
     trialStartedAt: null,
     trialEndsAt: null,
     trialConsumedAt: null,
+    complimentaryStartedAt: null,
+    complimentaryEndsAt: null,
+    complimentaryMaxLocations: null,
+    complimentaryMaxUsers: null,
     limits: zeroLimits(),
     features: denyAllFeatures(),
     effectiveAt: new Date().toISOString(),
@@ -200,6 +228,10 @@ export function legacyUnmanagedBundle(reason) {
     trialStartedAt: null,
     trialEndsAt: null,
     trialConsumedAt: null,
+    complimentaryStartedAt: null,
+    complimentaryEndsAt: null,
+    complimentaryMaxLocations: null,
+    complimentaryMaxUsers: null,
     limits: unenforcedLimits(),
     features: PLAN_ENTITLEMENTS.growth.features,
     effectiveAt: new Date().toISOString(),
@@ -234,9 +266,21 @@ function resolveNewShapeCommercial(commercial) {
   const now = Date.now()
   const trial = commercial.trial ?? null
   const trialExpired = commercial.commercialStatus === 'trial' && trial?.endsAt != null && Date.parse(trial.endsAt) <= now
-  const effectiveStatus = trialExpired ? 'suspended' : commercial.commercialStatus
+  // Complimentary-access expiry mirrors trial expiry EXACTLY: computed
+  // live, never stored, and collapses to the SAME 'suspended' effective
+  // status (the safest existing non-paying/read-only state) via a distinct
+  // `reason` string -- never writing/touching `commercial.suspension`,
+  // which is reserved exclusively for the Stripe-unpaid-recovery pathway
+  // (SUSPENSION_REASONS in trialLifecycle.js). This is the "safest existing
+  // expired/read-only state, distinguishable by reason" this feature's own
+  // design explicitly requires, reusing the established pattern rather than
+  // inventing a fourth restrictive status.
+  const complimentary = commercial.complimentary ?? null
+  const complimentaryExpired = commercial.commercialStatus === 'complimentary' && complimentary?.endsAt != null && Date.parse(complimentary.endsAt) <= now
+  const effectiveStatus = trialExpired ? 'suspended' : (complimentaryExpired ? 'suspended' : commercial.commercialStatus)
   const isTrialing = effectiveStatus === 'trial'
   const isActive = effectiveStatus === 'active'
+  const isComplimentary = effectiveStatus === 'complimentary'
   // Phase B.7 correction: `past_due` is a TEMPORARY billing-grace state,
   // not a restriction state -- existing restaurant operations (reads,
   // tasks, review publishing, AI/Content subject to their normal plan
@@ -256,11 +300,13 @@ function resolveNewShapeCommercial(commercial) {
   // Phase B.8 pre-commit correction -- see COMMERCIAL_STATUSES's own
   // comment and pendingActivationLimits()'s header. Deliberately checked
   // and handled BEFORE the writesAllowed ternary below: this status is
-  // neither "full real access" (isActive/isTrialing/isPastDue) nor
-  // "deny-all" (suspended/canceled/zeroLimits) -- it is its own explicit,
+  // neither "full real access" (isActive/isTrialing/isPastDue/isComplimentary)
+  // nor "deny-all" (suspended/canceled/zeroLimits) -- it is its own explicit,
   // THIRD shape (bounded onboarding capacity, zero cost-relevant capacity),
   // so it must never fall through either branch of that ternary.
-  const isPendingActivation = effectiveStatus === 'trial_pending_activation'
+  // 'complimentary_pending_activation' is the SAME shape, different
+  // provenance -- see COMMERCIAL_STATUSES's own comment.
+  const isPendingActivation = effectiveStatus === 'trial_pending_activation' || effectiveStatus === 'complimentary_pending_activation'
 
   const base = isTrialing ? TRIAL_ENTITLEMENTS : PLAN_ENTITLEMENTS[commercial.plan]
 
@@ -275,27 +321,51 @@ function resolveNewShapeCommercial(commercial) {
     // platform safety ceiling.
     const { hardSafetyOverrideApproved: _reservedForFutureReview, ...overrideLimits } = override
     planLimits = clampToSafetyCeiling({ ...base.limits, ...overrideLimits })
+  } else if (isComplimentary && complimentary) {
+    // Complimentary Restaurant Access Codes -- combines the PLAN's own
+    // capability set (`base.features`, computed above from
+    // PLAN_ENTITLEMENTS[commercial.plan]) with the GRANT's own,
+    // independently-set location/user ceilings. Deliberately Math.min()'d
+    // against the plan's own real limit, never trusted as a raw override --
+    // a complimentary code is meant to grant a SMALLER slice of a plan
+    // (e.g. Growth features, but only 1 location/3 users, per this
+    // feature's own default invite profile), never a LARGER one than the
+    // plan itself would normally allow. This is what makes "Growth features
+    // but only 1 location and 3 users" true by construction, and makes an
+    // operator's mistakenly-oversized grant harmless (it silently clamps
+    // down to the plan's own ceiling instead of exceeding it).
+    const grantMaxLocations = complimentary.maxLocations
+    const grantMaxUsers = complimentary.maxUsers
+    planLimits = {
+      ...base.limits,
+      maxLocations: Number.isInteger(grantMaxLocations) ? Math.min(base.limits.maxLocations, grantMaxLocations) : base.limits.maxLocations,
+      maxActiveUsers: Number.isInteger(grantMaxUsers) ? Math.min(base.limits.maxActiveUsers, grantMaxUsers) : base.limits.maxActiveUsers,
+    }
   }
 
-  // Commercial-status effect table: 'active', 'trial', AND (Phase B.7)
-  // 'past_due' grant real features/limits. Only 'suspended'/'canceled' (or
-  // a just-computed trial_expired->suspended) collapse to deny-all --
-  // WITHOUT changing `plan`/`effectivePlan` (an owner should see "you're on
-  // Growth, suspended," never "you have no plan"). 'trial_pending_activation'
-  // (Phase B.8) is its own explicit third case, handled first.
+  // Commercial-status effect table: 'active', 'trial', 'complimentary', AND
+  // (Phase B.7) 'past_due' grant real features/limits. Only
+  // 'suspended'/'canceled' (or a just-computed trial_expired/
+  // complimentary_expired->suspended) collapse to deny-all -- WITHOUT
+  // changing `plan`/`effectivePlan` (an owner should see "you're on Growth,
+  // suspended," never "you have no plan"). 'trial_pending_activation' /
+  // 'complimentary_pending_activation' (Phase B.8 / Complimentary Restaurant
+  // Access Codes) are their own explicit third case, handled first.
   let limits, features, reason
   if (isPendingActivation) {
     limits = pendingActivationLimits()
     features = denyAllFeatures()
-    reason = 'trial_pending_activation'
+    reason = effectiveStatus === 'complimentary_pending_activation' ? 'complimentary_pending_activation' : 'trial_pending_activation'
   } else {
-    const writesAllowed = isActive || isTrialing || isPastDue
+    const writesAllowed = isActive || isTrialing || isPastDue || isComplimentary
     limits = writesAllowed ? planLimits : zeroLimits()
     features = writesAllowed ? base.features : denyAllFeatures()
     if (trialExpired) reason = 'trial_expired'
+    else if (complimentaryExpired) reason = 'complimentary_expired'
     else if (isActive) reason = 'active_plan'
     else if (isTrialing) reason = 'trial_active'
     else if (isPastDue) reason = 'past_due_grace'
+    else if (isComplimentary) reason = 'complimentary_active'
     else reason = effectiveStatus // suspended / canceled
   }
 
@@ -324,6 +394,14 @@ function resolveNewShapeCommercial(commercial) {
     trialStartedAt: trial?.startedAt ?? null,
     trialEndsAt: trial?.endsAt ?? null,
     trialConsumedAt: trial?.consumedAt ?? null,
+    // Same discipline as trialStartedAt/trialEndsAt above, for the
+    // complimentary-access equivalent -- a caller never needs to reach into
+    // raw tenant_config.commercial.complimentary itself. Null whenever no
+    // complimentary grant is (or ever was) active for this tenant.
+    complimentaryStartedAt: complimentary?.startedAt ?? null,
+    complimentaryEndsAt: complimentary?.endsAt ?? null,
+    complimentaryMaxLocations: complimentary?.maxLocations ?? null,
+    complimentaryMaxUsers: complimentary?.maxUsers ?? null,
     limits,
     features,
     effectiveAt: new Date().toISOString(),

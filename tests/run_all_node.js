@@ -186,6 +186,8 @@ const TESTS = [
   'test_billing_status.js',
   // Phase B.13.1 -- Owner Billing / Manage Subscription UI.
   'test_billing_ui.js',
+  // PRYOR Complimentary Restaurant Access Codes
+  'test_complimentary_access.js',
 ]
 
 const results = {}

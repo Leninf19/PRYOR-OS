@@ -215,6 +215,20 @@ async function tenantStatus(token) {
   return res
 }
 
+// Phase 4O.1 -- self-service provisioning retry. `body` defaults to {} but
+// a test may pass an arbitrary shape (e.g. a forged tenantId) to prove the
+// endpoint never reads it.
+async function retry(token, body = {}) {
+  const req = { method: 'POST', query: { action: 'retry-provisioning' }, body, headers: { cookie: `${SESSION_COOKIE}=${token}` } }
+  const res = fakeRes()
+  await googleHandler(req, res)
+  return res
+}
+
+async function tokenForRole(userId, email, tenantId, role) {
+  return signSession({ userId, email, role, locationIds: '*', tenantId, sessionVersion: 1 })
+}
+
 async function approveFreshLocation(tenantId, accountName, googleLocationId, fetchImpl) {
   await setupTenant(tenantId, { userId: `usr_${tenantId}`, email: `${tenantId}@example.com` })
   const token = await tokenFor(`usr_${tenantId}`, `${tenantId}@example.com`, tenantId)
@@ -469,6 +483,137 @@ async function testProvisioningDispatchFailedBlocksSelfServiceReapproval() {
     `'provisioning_dispatch_failed' must not be self-service re-approvable -- recovery is the operator's pinned manual dispatcher only, got ${threw?.constructor?.name ?? 'no throw'}`)
 }
 
+// ===========================================================================
+// 6. Self-service provisioning retry (Phase 4O.1) -- google/[action].js's
+//    retryProvisioning(). Deliberately narrower than the block above: this
+//    is NOT a re-approval (approvedLocations never changes), it is a retry
+//    of the SAME already-committed entitlement's dispatch, only reachable
+//    from 'provisioning_dispatch_failed'.
+// ===========================================================================
+
+async function testRetryFromDispatchFailedActuallyDispatchesAgain() {
+  wireSharedStores()
+  await setupTenant(TENANT_A, { userId: 'usr_a', email: 'a@example.com' })
+  await seedStuckProvisioning(TENANT_A, { dispatchedAgoMs: 6 * 60 * 1000 })
+  await reconcileStuckProvisioningDispatch(TENANT_A) // -> 'provisioning_dispatch_failed'
+  const before = await getTenantConfig(TENANT_A)
+  assert(before.status === 'provisioning_dispatch_failed', `sanity: expected 'provisioning_dispatch_failed', got ${before.status}`)
+
+  let dispatchCallCount = 0
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('api.github.com/repos/') && String(url).includes('/actions/workflows/')) {
+      dispatchCallCount += 1
+      return { status: 204 }
+    }
+    throw new Error(`unexpected fetch in test: ${url}`)
+  }
+
+  const res = await retry(await tokenFor('usr_a', 'a@example.com', TENANT_A))
+  assert(res.statusCode === 200, `expected 200, got ${res.statusCode} ${JSON.stringify(res.body)}`)
+  assert(res.body.status === 'provisioning', `expected the retry to return the tenant to 'provisioning', got ${res.body.status}`)
+  assert(dispatchCallCount === 1, `expected exactly one new GitHub dispatch call, got ${dispatchCallCount}`)
+
+  const after = await getTenantConfig(TENANT_A)
+  assert(after.status === 'provisioning', `expected 'provisioning' persisted, got ${after.status}`)
+  assert(after.provisioning.dispatchAttemptId !== before.provisioning.dispatchAttemptId,
+    'a retry must record a genuinely NEW dispatch attempt id, never reuse the failed attempt\'s own id')
+}
+
+async function testRetryDeniedForNonOwner() {
+  wireSharedStores()
+  await seedStuckProvisioning(TENANT_A, { dispatchedAgoMs: 6 * 60 * 1000 })
+  await reconcileStuckProvisioningDispatch(TENANT_A)
+  const record = { userId: 'usr_marketing', email: 'marketing@example.com', passwordHash: await passwordHash(), role: 'marketing', locationIds: '*', sessionVersion: 1, disabled: false, tenantId: TENANT_A }
+  setUserRedis(() => fakeUserRedis({ usr_marketing: JSON.stringify(record) }))
+
+  let dispatchCallCount = 0
+  globalThis.fetch = async () => { dispatchCallCount += 1; return { status: 204 } }
+
+  const res = await retry(await tokenForRole('usr_marketing', 'marketing@example.com', TENANT_A, 'marketing'))
+  assert(res.statusCode === 403, `expected 403 for a non-owner role, got ${res.statusCode} ${JSON.stringify(res.body)}`)
+  assert(dispatchCallCount === 0, 'a denied caller must never trigger a dispatch attempt')
+
+  const config = await getTenantConfig(TENANT_A)
+  assert(config.status === 'provisioning_dispatch_failed', `tenant status must be untouched by a denied retry, got ${config.status}`)
+}
+
+async function testRetryIgnoresClientSuppliedTenantId() {
+  wireSharedStores()
+  const TENANT_B = 't_phase4o-retry-b'
+  await setupTenant(TENANT_A, { userId: 'usr_a2', email: 'a2@example.com' })
+  await seedStuckProvisioning(TENANT_A, { dispatchedAgoMs: 6 * 60 * 1000 })
+  await reconcileStuckProvisioningDispatch(TENANT_A)
+  // TENANT_B: a real, DIFFERENT tenant that is NOT eligible for retry --
+  // proves a forged tenantId in the body cannot redirect the retry onto it
+  // (it would 409 if it were somehow consulted, never dispatch).
+  await upsertTenantConfig(TENANT_B, {}, { allowCreate: true, creationSource: 'migration' })
+
+  let dispatchCallCount = 0
+  globalThis.fetch = async () => { dispatchCallCount += 1; return { status: 204 } }
+
+  const res = await retry(await tokenFor('usr_a2', 'a2@example.com', TENANT_A), { tenantId: TENANT_B })
+  assert(res.statusCode === 200, `expected 200 acting on the SESSION tenant, got ${res.statusCode} ${JSON.stringify(res.body)}`)
+  assert(res.body.tenantId === TENANT_A, `expected the response to reflect the session-derived tenant ${TENANT_A}, got ${res.body.tenantId}`)
+  assert(dispatchCallCount === 1, `expected exactly one dispatch, for TENANT_A only, got ${dispatchCallCount}`)
+
+  const configA = await getTenantConfig(TENANT_A)
+  assert(configA.status === 'provisioning', `expected TENANT_A to be retried, got ${configA.status}`)
+  const configB = await getTenantConfig(TENANT_B)
+  assert(configB.status === 'onboarding', `a forged tenantId in the request body must have ZERO effect on the other tenant, got ${configB.status}`)
+}
+
+async function testRetryDeniedFromUnrelatedStates() {
+  wireSharedStores()
+  const unrelatedStatuses = ['onboarding', 'locations_approved', 'provisioning', 'provisioned', 'active']
+  for (const status of unrelatedStatuses) {
+    const tenantId = `t_phase4o-retry-state-${status.replace(/_/g, '-')}`
+    await setupTenant(tenantId, { userId: `usr_${status}`, email: `${status}@example.com` })
+    await upsertTenantConfig(tenantId, { status })
+
+    let dispatchCallCount = 0
+    globalThis.fetch = async () => { dispatchCallCount += 1; return { status: 204 } }
+
+    const res = await retry(await tokenFor(`usr_${status}`, `${status}@example.com`, tenantId))
+    assert(res.statusCode === 409, `expected 409 for status ${JSON.stringify(status)}, got ${res.statusCode} ${JSON.stringify(res.body)}`)
+    assert(dispatchCallCount === 0, `retry from status ${JSON.stringify(status)} must never dispatch`)
+
+    const config = await getTenantConfig(tenantId)
+    assert(config.status === status, `retry must never change status ${JSON.stringify(status)}, got ${config.status}`)
+  }
+}
+
+async function testConcurrentRetryAttemptsResultInExactlyOneDispatch() {
+  wireSharedStores()
+  await setupTenant(TENANT_A, { userId: 'usr_a3', email: 'a3@example.com' })
+  await seedStuckProvisioning(TENANT_A, { dispatchedAgoMs: 6 * 60 * 1000 })
+  await reconcileStuckProvisioningDispatch(TENANT_A)
+
+  let dispatchCallCount = 0
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('api.github.com/repos/') && String(url).includes('/actions/workflows/')) {
+      dispatchCallCount += 1
+      return { status: 204 }
+    }
+    throw new Error(`unexpected fetch in test: ${url}`)
+  }
+
+  const token = await tokenFor('usr_a3', 'a3@example.com', TENANT_A)
+  const [r1, r2] = await Promise.all([retry(token), retry(token)])
+  // With this fake store's near-synchronous timing, the first request's
+  // whole chain (claim + dispatch) completes before the second request's
+  // own eligibility read runs -- exactly the same "eligibility gate blocks
+  // the second attempt before any second dispatch" outcome as
+  // testDoubleSubmitApprovalIsRejectedByTheEligibilityGateBeforeAnySecondDispatch
+  // above, just for retry instead of approve. Either ordering is an
+  // acceptable, safe outcome; what matters is exactly one dispatch.
+  const statuses = [r1.statusCode, r2.statusCode].sort()
+  assert(statuses[0] === 200 && statuses[1] === 409, `expected exactly one 200 and one 409 (eligibility gate) across the concurrent retries, got ${statuses.join('/')}`)
+  assert(dispatchCallCount === 1, `expected exactly ONE GitHub dispatch call across both concurrent retries, got ${dispatchCallCount}`)
+
+  const config = await getTenantConfig(TENANT_A)
+  assert(config.status === 'provisioning', `expected 'provisioning' after the single winning retry claim, got ${config.status}`)
+}
+
 const tests = [
   ['acceptedDispatchLeavesTenantInProvisioningNoError', testAcceptedDispatchLeavesTenantInProvisioningNoError],
   ['rejected4xxDispatchMarksProvisioningDispatchFailedImmediately', testRejected4xxDispatchMarksProvisioningDispatchFailedImmediately],
@@ -482,6 +627,11 @@ const tests = [
   ['reconciliationMarksDispatchFailedAfterTimeoutWithNoProgress', testReconciliationMarksDispatchFailedAfterTimeoutWithNoProgress],
   ['reconciliationIsWiredIntoTheRealTenantStatusEndpoint', testReconciliationIsWiredIntoTheRealTenantStatusEndpoint],
   ['provisioningDispatchFailedBlocksSelfServiceReapproval', testProvisioningDispatchFailedBlocksSelfServiceReapproval],
+  ['retryFromDispatchFailedActuallyDispatchesAgain', testRetryFromDispatchFailedActuallyDispatchesAgain],
+  ['retryDeniedForNonOwner', testRetryDeniedForNonOwner],
+  ['retryIgnoresClientSuppliedTenantId', testRetryIgnoresClientSuppliedTenantId],
+  ['retryDeniedFromUnrelatedStates', testRetryDeniedFromUnrelatedStates],
+  ['concurrentRetryAttemptsResultInExactlyOneDispatch', testConcurrentRetryAttemptsResultInExactlyOneDispatch],
 ]
 
 for (const [name, fn] of tests) {
