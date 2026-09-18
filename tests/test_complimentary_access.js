@@ -139,6 +139,23 @@ async function testCreateShowsRawCodeOnceAndOnlyHashPersists() {
   assert(JSON.stringify(stored) === JSON.stringify(record))
 }
 
+// Security-strengthening correction -- code entropy raised from ~49 bits
+// (2 random segments) to ~70+ bits (3 random segments), still drawn from the
+// crypto-secure, visually-unambiguous 30-character alphabet.
+async function testCodeEntropyIsAtLeast70Bits() {
+  wireComplimentary()
+  const { rawCode } = await createComplimentaryCode({ planId: 'growth', durationDays: 30, maxLocations: 1, maxUsers: 3, createdBy: 'op' })
+  assert(/^PRYOR-PILOT-[23456789ABCDEFGHJKMNPQRSTVWXYZ]{5}-[23456789ABCDEFGHJKMNPQRSTVWXYZ]{5}-[23456789ABCDEFGHJKMNPQRSTVWXYZ]{5}$/.test(rawCode),
+    `expected PRYOR-PILOT-XXXXX-XXXXX-XXXXX using only the visually-unambiguous alphabet, got ${rawCode}`)
+  const randomChars = rawCode.replace('PRYOR-PILOT-', '').replace(/-/g, '')
+  assert(randomChars.length === 15, `expected 15 random characters, got ${randomChars.length}`)
+  const alphabetSize = 30 // 0/O, 1/I/L, U excluded
+  const bitsOfEntropy = randomChars.length * Math.log2(alphabetSize)
+  assert(bitsOfEntropy >= 70, `expected at least ~70 bits of entropy, computed ${bitsOfEntropy.toFixed(1)}`)
+  // Never absurdly long either -- stays a small, fixed, human-typable format.
+  assert(rawCode.length < 40, 'the code must stay reasonably human-friendly, never unnecessarily enormous')
+}
+
 async function testListNeverExposesRawCode() {
   wireComplimentary()
   const { rawCode } = await createComplimentaryCode({ planId: 'core', durationDays: 14, maxLocations: 1, maxUsers: 2, createdBy: 'op' })
@@ -260,13 +277,82 @@ function testPendingCaseWhenNoInitialSync() {
   assert(complimentaryGrant.redeemedByUserId === 'usr_1')
 }
 
-function testImmediateActivationWhenInitialSyncAlreadyCompleted() {
-  const anchor = new Date('2026-04-01T00:00:00.000Z').toISOString()
-  const { commercial } = buildComplimentaryAccessCommercialWrite(redemptionFor(), { initialSyncCompletedAt: anchor, redeemedByUserId: 'usr_1' })
+// Pre-push correction: a tenant whose initial sync ALREADY completed before
+// redemption must get a FRESH period starting at REDEMPTION time, never
+// backdated to the historical initialSync.completedAt.
+function testImmediateActivationAnchorsToRedemptionTimeNotHistoricalSync() {
+  const beforeCall = Date.now()
+  const historicalSync = new Date('2026-04-01T00:00:00.000Z').toISOString() // long in the past
+  const { commercial } = buildComplimentaryAccessCommercialWrite(redemptionFor(), { initialSyncCompletedAt: historicalSync, redeemedByUserId: 'usr_1' })
+  const afterCall = Date.now()
   assert(commercial.commercialStatus === 'complimentary')
-  assert(commercial.complimentary.startedAt === anchor, 'must anchor to the tenant\'s own initialSync.completedAt, never Date.now()')
-  const expectedEnds = new Date(Date.parse(anchor) + 30 * 24 * 60 * 60 * 1000).toISOString()
-  assert(commercial.complimentary.endsAt === expectedEnds)
+  assert(commercial.complimentary.startedAt !== historicalSync, 'must NEVER anchor startedAt to the historical initialSync.completedAt')
+  const startedAtMs = Date.parse(commercial.complimentary.startedAt)
+  assert(startedAtMs >= beforeCall && startedAtMs <= afterCall, `startedAt must be the server's own redemption-time timestamp (now), got ${commercial.complimentary.startedAt}`)
+  const expectedEnds = new Date(startedAtMs + 30 * 24 * 60 * 60 * 1000).toISOString()
+  assert(commercial.complimentary.endsAt === expectedEnds, 'endsAt must be startedAt + durationDays')
+}
+
+// Regression A -- an existing, long-since-synced tenant redeeming a 30-day
+// code must get startedAt === redemption time, NOT initialSync.completedAt,
+// and must NOT resolve as already expired.
+function testExistingSyncedTenantGetsFreshPeriodFromRedemption() {
+  const longAgo = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString() // ~200 days ago
+  const { commercial } = buildComplimentaryAccessCommercialWrite(redemptionFor({ durationDays: 30 }), { initialSyncCompletedAt: longAgo, redeemedByUserId: 'usr_1' })
+  assert(commercial.complimentary.startedAt !== longAgo, 'startedAt must not equal the historical initialSync.completedAt')
+  const startedAtMs = Date.parse(commercial.complimentary.startedAt)
+  assert(Math.abs(startedAtMs - Date.now()) < 5000, 'startedAt must be essentially "now" (redemption time), not the historical sync date')
+  const entitlements = resolveTenantEntitlementsFromConfig({
+    configVersion: 1, status: 'active', commercial, complimentaryGrant: { grantType: 'complimentary', planId: 'growth', durationDays: 30, maxLocations: 1, maxUsers: 3, codeHash: 'h', grantedAt: new Date().toISOString(), redeemedByUserId: 'usr_1' },
+  })
+  assert(entitlements.commercialStatus === 'complimentary', `a freshly-redeemed grant must be immediately active and NOT already expired, got ${entitlements.commercialStatus}/${entitlements.reason}`)
+}
+
+// Regression B -- an unsynced tenant redeems (pending), and only once the
+// FIRST successful initial sync later occurs does the real clock start,
+// anchored to that sync's own timestamp.
+async function testUnsyncedTenantActivatesAtFirstSyncTimestampNotRedemptionTime() {
+  const redeemedAt = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString() // redeemed 10 days ago
+  const { commercial: pendingCommercial, complimentaryGrant } = buildComplimentaryAccessCommercialWrite(
+    redemptionFor({ durationDays: 30 }), { initialSyncCompletedAt: null, redeemedByUserId: 'usr_1' }
+  )
+  assert(pendingCommercial.commercialStatus === 'complimentary_pending_activation', 'sanity: must remain pending while unsynced')
+  assert(complimentaryGrant.grantedAt != null, 'redeemedAt (grantedAt) must be preserved separately even while pending')
+
+  // Simulate the redemption having actually happened 10 days ago (override
+  // grantedAt for the scenario), then the first successful sync occurring
+  // just now.
+  const grant = { ...complimentaryGrant, grantedAt: redeemedAt }
+  const firstSyncAt = new Date().toISOString()
+  const config = {
+    configVersion: 1, status: 'active', initialSync: { completedAt: firstSyncAt },
+    commercial: pendingCommercial, complimentaryGrant: grant,
+  }
+  installFakeTenantConfigStoreSeededWith('t_unsynced', config)
+  const updated = await maybeStartComplimentaryAccess('t_unsynced', config)
+  assert(updated.commercial.commercialStatus === 'complimentary')
+  assert(updated.commercial.complimentary.startedAt === firstSyncAt, `startedAt must equal the FIRST successful initialSync.completedAt, got ${updated.commercial.complimentary.startedAt}`)
+  assert(updated.commercial.complimentary.startedAt !== redeemedAt, 'startedAt must NOT equal the original redemption time -- setup time must not consume the complimentary period')
+  const expectedEnds = new Date(Date.parse(firstSyncAt) + 30 * 24 * 60 * 60 * 1000).toISOString()
+  assert(updated.commercial.complimentary.endsAt === expectedEnds, 'endsAt must derive from the first-sync timestamp, not the redemption timestamp')
+}
+
+// Regression C -- a historical initial sync (from long before redemption)
+// must never be able to SHORTEN a newly-redeemed complimentary period --
+// proven by an extreme case where anchoring to the historical date would
+// have made the grant already expired the instant it was redeemed.
+function testHistoricalSyncCannotShortenNewlyRedeemedPeriod() {
+  const veryOldSync = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString() // 400 days ago
+  const { commercial } = buildComplimentaryAccessCommercialWrite(redemptionFor({ durationDays: 7 }), { initialSyncCompletedAt: veryOldSync, redeemedByUserId: 'usr_1' })
+  // If startedAt had wrongly anchored to veryOldSync, a 7-day grant would
+  // have expired ~393 days ago -- assert it did NOT.
+  const entitlements = resolveTenantEntitlementsFromConfig({
+    configVersion: 1, status: 'active', commercial,
+    complimentaryGrant: { grantType: 'complimentary', planId: 'growth', durationDays: 7, maxLocations: 1, maxUsers: 3, codeHash: 'h', grantedAt: new Date().toISOString(), redeemedByUserId: 'usr_1' },
+  })
+  assert(entitlements.commercialStatus === 'complimentary', 'a historical sync date must never cause an immediately-expired grant')
+  assert(entitlements.reason === 'complimentary_active')
+  assert(Date.parse(commercial.complimentary.endsAt) > Date.now(), 'endsAt must be in the future relative to redemption time')
 }
 
 function testInvalidGrantFieldsRejectedDefensively() {
@@ -533,6 +619,30 @@ async function seedPendingActivationOwnerSession(tenantId, { role = 'owner' } = 
   return { cookie: `${SESSION_COOKIE}=${cookieValue}`, tenantId, userId: record.userId }
 }
 
+// The rarer/defensive Case A window: a tenant whose first initial sync
+// ALREADY completed (long ago) but that has not yet consumed any real
+// commercial decision -- still sitting in 'trial_pending_activation'
+// (reachable e.g. for a tenant provisioned without trialEligibility ever
+// being set, so the automatic self-service trial never claims it). Used to
+// prove the corrected redemption-time anchor end-to-end, through the real
+// HTTP action.
+async function seedAlreadySyncedOwnerSession(tenantId, { role = 'owner', initialSyncCompletedAt } = {}) {
+  await upsertTenantConfig(tenantId, {
+    status: 'active',
+    initialSync: { completedAt: initialSyncCompletedAt },
+    commercial: {
+      commercialStatus: 'trial_pending_activation', plan: 'growth', planSource: 'self_service_trial',
+      trial: null, limitsOverride: null, suspension: null, cancellation: null, overLimit: null,
+      accessCodeHash: null, discountPercent: null, discountFixedCents: null, paymentRequired: null,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    },
+  }, { allowCreate: true, creationSource: 'self_service' })
+  const record = { userId: `usr_${role}_${tenantId}`, email: `${role}-${tenantId}@example.com`, role, locationIds: '*', tenantId, sessionVersion: 1, disabled: false, displayName: 'Test Owner' }
+  await upsertUser(tenantId, { ...record, passwordHash: 'x' }, { creationMode: UserCreationMode.MIGRATION, sourceIdentity: record })
+  const cookieValue = await signSession({ userId: record.userId, email: record.email, role, locationIds: '*', tenantId, sessionVersion: 1 })
+  return { cookie: `${SESSION_COOKIE}=${cookieValue}`, tenantId, userId: record.userId }
+}
+
 function installHttpFakes() {
   const sessionRedis = fakeSessionRedis()
   const complimentaryRedis = fakeComplimentaryStoreRedisForHttp()
@@ -559,6 +669,27 @@ async function testOwnerCanRedeemValidCodeAndBecomesPending() {
   const config = await getTenantConfig(tenantId)
   assert(config.commercial.commercialStatus === 'complimentary_pending_activation')
   assert(config.complimentaryGrant.maxLocations === 1 && config.complimentaryGrant.maxUsers === 3)
+}
+
+// End-to-end proof of the pre-push correction through the REAL HTTP action:
+// a tenant whose initial sync completed long ago must be activated
+// immediately with startedAt at redemption time, not the historical sync
+// date, and must not resolve as already expired.
+async function testAlreadySyncedTenantGetsFreshPeriodOverHttp() {
+  installHttpFakes()
+  const longAgo = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString()
+  const { cookie, tenantId } = await seedAlreadySyncedOwnerSession(freshTenantId(), { initialSyncCompletedAt: longAgo })
+  const { rawCode } = await makeComplimentaryCode({ durationDays: 30 })
+  const beforeMs = Date.now()
+  const res = await invoke('redeem-complimentary-code', { code: rawCode }, { cookie })
+  const afterMs = Date.now()
+  assert(res.statusCode === 200, `expected 200, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  assert(res.body.complimentary.state === 'active', 'already-synced tenant must activate immediately, not pending')
+  const startedAtMs = Date.parse(res.body.complimentary.startedAt)
+  assert(startedAtMs >= beforeMs && startedAtMs <= afterMs, `startedAt must be redemption time, got ${res.body.complimentary.startedAt} vs window [${beforeMs},${afterMs}]`)
+  assert(res.body.complimentary.startedAt !== longAgo, 'startedAt must never equal the historical initialSync.completedAt')
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'complimentary', 'must be immediately active, never expired')
 }
 
 async function testCodeHashNeverExposedInResponse() {
@@ -782,6 +913,7 @@ function testServiceAndHookWireComplimentaryRedemption() {
 
 const tests = [
   ['create shows the raw code once and only the hash persists', testCreateShowsRawCodeOnceAndOnlyHashPersists],
+  ['generated code entropy is at least ~70 bits, using the crypto-secure visually-unambiguous alphabet', testCodeEntropyIsAtLeast70Bits],
   ['list never exposes the raw code', testListNeverExposesRawCode],
   ['creation validates duration/locations/users against sane ceilings', testCreationValidatesDurationLocationsUsers],
   ['Enterprise can never be granted complimentary access', testEnterpriseCannotBeGrantedComplimentary],
@@ -794,7 +926,10 @@ const tests = [
   ['preview never mutates redemptionCount', testPreviewNeverMutatesRedemptionCount],
   ['the post-redemption claim supports tenantId-keyed recovery', testPostRedemptionClaimSupportsRecoveryByTenantId],
   ['pending case (no initialSync) defers commercial to complimentary_pending_activation', testPendingCaseWhenNoInitialSync],
-  ['immediate-activation case anchors to the tenant\'s own initialSync.completedAt', testImmediateActivationWhenInitialSyncAlreadyCompleted],
+  ['immediate-activation case anchors to redemption time, never the historical initialSync.completedAt', testImmediateActivationAnchorsToRedemptionTimeNotHistoricalSync],
+  ['regression A: an existing long-since-synced tenant gets a fresh period from redemption time', testExistingSyncedTenantGetsFreshPeriodFromRedemption],
+  ['regression B: an unsynced tenant activates at the first sync timestamp, not redemption time', testUnsyncedTenantActivatesAtFirstSyncTimestampNotRedemptionTime],
+  ['regression C: a historical initial sync cannot shorten a newly-redeemed period', testHistoricalSyncCannotShortenNewlyRedeemedPeriod],
   ['invalid grant fields are rejected defensively', testInvalidGrantFieldsRejectedDefensively],
   ['pending activation grants bounded, zero-cost onboarding capacity only', testPendingActivationBoundedOnboardingCapacity],
   ['active complimentary grants Growth features with the grant\'s own location/user ceilings', testActiveComplimentaryGrantsGrowthFeaturesWithGrantLimits],
@@ -808,6 +943,7 @@ const tests = [
   ['a complimentaryGrant excludes the automatic self-service trial (anti-stacking)', testComplimentaryGrantExcludesAutomaticSelfServiceTrial],
   ['a genuine paid subscription can supersede complimentary access safely', testPaidSubscriptionCanSupersedeComplimentaryAccess],
   ['an owner can redeem a valid code; pending when no initial sync yet', testOwnerCanRedeemValidCodeAndBecomesPending],
+  ['an already-synced tenant gets a fresh period at redemption time over HTTP (end-to-end)', testAlreadySyncedTenantGetsFreshPeriodOverHttp],
   ['the code hash and plaintext code are never exposed in the HTTP response', testCodeHashNeverExposedInResponse],
   ['a tenant that already redeemed cannot redeem a second complimentary code (anti-stacking)', testCodeCannotBeRedeemedTwiceBySameTenant],
   ['a single-use code cannot be redeemed by a second tenant', testCodeCannotBeUsedByASecondTenant],

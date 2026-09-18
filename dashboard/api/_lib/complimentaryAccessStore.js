@@ -26,13 +26,19 @@
 // EXACTLY ONCE at creation, and never persisted or retrievable again in any
 // form.
 //
-// FORMAT: "PRYOR-PILOT-{5 chars}-{5 chars}", drawn from the same
+// FORMAT: "PRYOR-PILOT-{5 chars}-{5 chars}-{5 chars}", drawn from the same
 // visually-unambiguous 30-character alphabet accessCodeStore.js already
-// uses (no 0/O, 1/I/L, U) -- 10 random characters from that alphabet is
-// ~49 bits of entropy, matching accessCodeStore.js's own budget. The label
-// a human types in at creation time (e.g. "Agave D'Oro Pilot") is stored
-// separately as metadata (`label`) and carries NO security weight -- only
-// the random suffix does.
+// uses (no 0/O, 1/I/L, U). Pre-push security-strengthening correction: a
+// complimentary code is handed to an external party (a restaurant owner,
+// possibly over an insecure channel) and is the SOLE credential guarding a
+// real commercial grant, so its budget was raised from two random segments
+// (~49 bits, matching accessCodeStore.js's own internal-admin-issued code,
+// which is never shared as widely) to three (15 random characters * log2(30)
+// ~= 73.6 bits) -- comfortably above the ~70-bit target while remaining
+// three short, human-typable groups, never an unnecessarily long string.
+// The label a human types in at creation time (e.g. "Agave D'Oro Pilot") is
+// stored separately as metadata (`label`) and carries NO security weight --
+// only the random segments do.
 //
 // ATOMICITY: redemption is a single Redis EVAL (mirrors accessCodeStore.js's
 // own REDEEM_SCRIPT precedent exactly) that re-checks status/expiry/
@@ -49,6 +55,9 @@ import { isSelfServicePlan } from './stripePriceMap.js'
 const STORE_KEY = 'complimentary_access_codes:v1'
 const HUMAN_SAFE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTVWXYZ' // no 0/O, 1/I/L, U
 const SEGMENT_LENGTH = 5
+// Pre-push security-strengthening correction -- see this file's own FORMAT
+// comment above for the entropy math (3 segments * 5 chars ~= 73.6 bits).
+const SEGMENT_COUNT = 3
 const CODE_PREFIX = 'PRYOR-PILOT'
 
 // Conservative, explicit ceilings -- structurally impossible for a
@@ -155,7 +164,7 @@ export async function createComplimentaryCode({
   }
   if (!createdBy) throw new TypeError('createComplimentaryCode: createdBy is required')
 
-  const rawCode = `${CODE_PREFIX}-${randomSegment()}-${randomSegment()}`
+  const rawCode = `${CODE_PREFIX}-${Array.from({ length: SEGMENT_COUNT }, randomSegment).join('-')}`
   const codeHash = hashComplimentaryCode(rawCode)
   const now = new Date().toISOString()
   const record = {
