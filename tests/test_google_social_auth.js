@@ -765,6 +765,152 @@ function testGoogleLoginScopeIsolationFromGbp() {
   assert(!/scope:\s*['"`][^'"`]*business\.manage/.test(content), 'the login client must never assign the GBP scope to any scope parameter')
 }
 
+// ===========================================================================
+// 9. Pending-registration resume (real Preview bug fix)
+// ===========================================================================
+
+// The exact reported bug: a Google identity that completed
+// google-signup-complete() and reached /get-started, but never chose a
+// commercial path, logging out and returning with the SAME Google account
+// must resume /get-started directly -- never /complete-signup again, never
+// a second pending registration, never re-asking for name/company.
+async function testReturningGoogleAfterGetStartedResumesWithoutAskingAgain() {
+  installFakeRedis()
+  installWorkingEmailTransport()
+
+  const { callbackRes: firstCb } = await startAndCallback({ sub: 'google-sub-resume-1', email: 'resume1@example.com' })
+  const signupPendingCookie = cookieFromRes(firstCb, 'lta_google_signup_pending')
+  const completeRes = await invokePost('google-signup-complete', { companyName: 'Resume Test Co', displayName: 'Resume Owner' }, { cookie: signupPendingCookie })
+  assert(completeRes.statusCode === 200, `sanity: expected 200, got ${completeRes.statusCode} ${JSON.stringify(completeRes.body)}`)
+  const originalPending = await getPendingRegistration('resume1@example.com')
+  assert(originalPending.status === 'verified_awaiting_plan', 'sanity: expected the pending registration to reach verified_awaiting_plan')
+
+  // "Logout" here means simply not carrying any session/cookie forward --
+  // no real session was ever issued for a pending registration in the
+  // first place (Part 4), so there is nothing to clear.
+
+  // Returning: SAME providerSubject, no invite, no existing real account.
+  const { callbackRes: secondCb } = await startAndCallback({ sub: 'google-sub-resume-1', email: 'resume1@example.com' })
+  assert(secondCb.statusCode === 302, `expected a redirect, got ${secondCb.statusCode}`)
+  assert(secondCb.headers.Location === '/get-started', `expected a direct resume to /get-started, got ${secondCb.headers.Location}`)
+  assert(!cookieFromRes(secondCb, 'lta_google_signup_pending'), 'must never re-enter the /complete-signup flow for an already-completed pending registration')
+  const resumedPendingSignupCookie = cookieFromRes(secondCb, 'lta_pending_signup')
+  assert(resumedPendingSignupCookie, 'expected a real lta_pending_signup cookie so /get-started can load normally')
+  assert(!cookieFromRes(secondCb, SESSION_COOKIE), 'must never issue a real tenant session merely to resume pending onboarding')
+
+  // The resumed cookie must actually work against get-started-status.
+  const statusRes = await invokeGet('get-started-status', {}, { cookie: resumedPendingSignupCookie })
+  assert(statusRes.statusCode === 200 && statusRes.body.companyName === 'Resume Test Co', 'the resumed session must reach the SAME pending registration')
+
+  // No duplicate registration was created; name/company are unchanged.
+  const afterPending = await getPendingRegistration('resume1@example.com')
+  assert(afterPending.userId === originalPending.userId, 'must resolve to the exact SAME pending registration, never a new one')
+  assert(afterPending.companyName === 'Resume Test Co' && afterPending.displayName === 'Resume Owner', 'name/company must remain exactly as originally submitted, never reset or asked again')
+}
+
+async function testReturningBeforeCompleteSignupResumesCompleteSignupAgain() {
+  installFakeRedis()
+  installWorkingEmailTransport()
+
+  const { callbackRes: firstCb } = await startAndCallback({ sub: 'google-sub-resume-2', email: 'resume2@example.com' })
+  assert(firstCb.headers.Location === '/complete-signup', 'sanity: first callback must land on /complete-signup')
+  // Deliberately never call google-signup-complete -- nothing is persisted
+  // to Redis yet (Case E's whole point).
+  assert(!(await getPendingRegistration('resume2@example.com')), 'sanity: no pending registration should exist yet')
+
+  const { callbackRes: secondCb } = await startAndCallback({ sub: 'google-sub-resume-2', email: 'resume2@example.com' })
+  assert(secondCb.headers.Location === '/complete-signup', `expected /complete-signup again (nothing to resume yet), got ${secondCb.headers.Location}`)
+  assert(cookieFromRes(secondCb, 'lta_google_signup_pending'), 'expected a fresh lta_google_signup_pending cookie')
+  assert(!(await getPendingRegistration('resume2@example.com')), 'still no pending registration -- Case E never writes to Redis by itself')
+}
+
+async function testExpiredPendingRegistrationStartsFresh() {
+  installFakeRedis()
+  installWorkingEmailTransport()
+
+  const { callbackRes: firstCb } = await startAndCallback({ sub: 'google-sub-resume-3', email: 'resume3@example.com' })
+  const signupPendingCookie = cookieFromRes(firstCb, 'lta_google_signup_pending')
+  await invokePost('google-signup-complete', { companyName: 'Expiring Co' }, { cookie: signupPendingCookie })
+  assert(await getPendingRegistration('resume3@example.com'), 'sanity: pending registration must exist before expiry')
+
+  // Simulates the record's own 7-day Redis TTL elapsing -- the resulting
+  // state (getPendingRegistration returns null) is identical either way.
+  const { deletePendingRegistration } = await import('../dashboard/api/_lib/pendingRegistrationStore.js')
+  await deletePendingRegistration('resume3@example.com')
+
+  const { callbackRes: secondCb } = await startAndCallback({ sub: 'google-sub-resume-3', email: 'resume3@example.com' })
+  assert(secondCb.statusCode === 302 && secondCb.headers.Location === '/complete-signup', `expired registration must start a genuinely fresh signup, got ${secondCb.statusCode} ${secondCb.headers.Location}`)
+  assert(!secondCb.headers.Location.includes('googleAuthError'), 'an expired pending registration must never surface as a technical error -- just a normal fresh signup')
+}
+
+// Covers both "a different providerSubject cannot resume someone else's
+// pending signup" and "the same email with a different providerSubject
+// does not hijack a pending registration" -- the same underlying
+// invariant viewed from either identity's side.
+async function testDifferentProviderSubjectCannotHijackAnotherPendingRegistration() {
+  installFakeRedis()
+  installWorkingEmailTransport()
+
+  const { callbackRes: ownerCb } = await startAndCallback({ sub: 'google-sub-owner-real', email: 'shared-email@example.com' })
+  const signupPendingCookie = cookieFromRes(ownerCb, 'lta_google_signup_pending')
+  await invokePost('google-signup-complete', { companyName: 'Owner Co' }, { cookie: signupPendingCookie })
+  const beforeAttack = await getPendingRegistration('shared-email@example.com')
+  assert(beforeAttack.googleIdentity?.providerSubject === 'google-sub-owner-real', 'sanity: the pending registration belongs to the real owner\'s identity')
+
+  // A DIFFERENT Google account presents the SAME email (contrived, but
+  // proves the store-level invariant holds regardless of how it happens).
+  const { callbackRes: attackerCb } = await startAndCallback({ sub: 'google-sub-attacker', email: 'shared-email@example.com' })
+  assert(attackerCb.headers.Location.startsWith('/login'), `expected a redirect to /login, got ${attackerCb.headers.Location}`)
+  assert(attackerCb.headers.Location.includes('googleAuthError=existing_account'), `expected existing_account, got ${attackerCb.headers.Location}`)
+  assert(!cookieFromRes(attackerCb, 'lta_pending_signup'), 'the mismatched identity must never receive a pending-signup cookie')
+  assert(!cookieFromRes(attackerCb, SESSION_COOKIE), 'the mismatched identity must never receive a real session')
+
+  // The real owner's own pending registration must be completely
+  // untouched by the failed attempt.
+  const afterAttack = await getPendingRegistration('shared-email@example.com')
+  assert(afterAttack.googleIdentity?.providerSubject === 'google-sub-owner-real', 'the original owner\'s pending registration must remain untouched')
+  assert(afterAttack.companyName === 'Owner Co', 'the original data must be unchanged')
+}
+
+async function testPermanentUserTakesPrecedenceOverStalePendingState() {
+  installFakeRedis()
+  installWorkingEmailTransport()
+
+  // Complete the full chain through real tenant creation.
+  const { callbackRes: cb } = await startAndCallback({ sub: 'google-sub-permanent', email: 'permanent@example.com' })
+  const signupPendingCookie = cookieFromRes(cb, 'lta_google_signup_pending')
+  const completeRes = await invokePost('google-signup-complete', { companyName: 'Permanent Co' }, { cookie: signupPendingCookie })
+  const pendingSignupCookie = cookieFromRes(completeRes, 'lta_pending_signup')
+  const rawCode = await makeAccessCode()
+  const redeemRes = await invokePost('redeem-access-code', { code: rawCode }, { cookie: pendingSignupCookie })
+  const sessionCookie = cookieFromRes(redeemRes, SESSION_COOKIE)
+  const claims = await verifySession(sessionCookie.split('=')[1])
+  assert(!(await getPendingRegistration('permanent@example.com')), 'sanity: the pending registration must be deleted once the real tenant exists')
+
+  // Defensively re-insert a stale pending registration under the SAME
+  // email (should never happen in the real flow, since it's deleted in
+  // the same transaction -- this proves the ORDERING is correct even if
+  // it somehow did).
+  const { createPendingRegistration } = await import('../dashboard/api/_lib/pendingRegistrationStore.js')
+  await createPendingRegistration({
+    email: 'permanent@example.com', passwordHash: null, displayName: 'Stale', companyName: 'Stale Co',
+    userId: 'usr_stale_leftover', tenantIdReserved: 't_stale-leftover-abcdef',
+  })
+
+  const { callbackRes: returningCb } = await startAndCallback({ sub: 'google-sub-permanent', email: 'permanent@example.com' })
+  const returningSessionCookie = cookieFromRes(returningCb, SESSION_COOKIE)
+  assert(returningSessionCookie, 'the PERMANENT user must be resolved, issuing a real session')
+  const returningClaims = await verifySession(returningSessionCookie.split('=')[1])
+  assert(returningClaims.userId === claims.userId && returningClaims.tenantId === claims.tenantId, 'must resolve to the real, permanent account -- never the stale pending leftover')
+  // issueRealSessionAndRedirect() actively CLEARS lta_pending_signup (a
+  // real Set-Cookie header with an empty/expired value) -- cookieFromRes()
+  // would still match that header by name, so the real assertion is that
+  // the cookie's VALUE is empty, never a genuine active pending-signup
+  // token.
+  const clearedPendingCookie = cookieFromRes(returningCb, 'lta_pending_signup')
+  assert(!clearedPendingCookie || clearedPendingCookie === 'lta_pending_signup=', 'must never issue an ACTIVE pending-signup cookie once a permanent account exists')
+}
+
 const tests = [
   ['new Google signup creates a real tenant after complete-signup', testNewGoogleSignupCreatesRealTenantAfterCompleteSignup],
   ['returning login for an already-linked identity', testReturningLoginForAnAlreadyLinkedIdentity],
@@ -785,6 +931,11 @@ const tests = [
   ['session restoration (whoami) and logout work after Google login', testSessionRestorationAndLogout],
   ['CRITICAL: login identity and GBP manager are fully separated', testCriticalSeparationBetweenLoginIdentityAndGbpManager],
   ['Google login scope is isolated from GBP', testGoogleLoginScopeIsolationFromGbp],
+  ['returning Google after /get-started resumes without asking again', testReturningGoogleAfterGetStartedResumesWithoutAskingAgain],
+  ['returning before complete-signup resumes complete-signup again', testReturningBeforeCompleteSignupResumesCompleteSignupAgain],
+  ['expired pending registration starts fresh', testExpiredPendingRegistrationStartsFresh],
+  ['different providerSubject cannot hijack another pending registration', testDifferentProviderSubjectCannotHijackAnotherPendingRegistration],
+  ['permanent user takes precedence over stale pending state', testPermanentUserTakesPrecedenceOverStalePendingState],
 ]
 
 for (const [name, fn] of tests) {

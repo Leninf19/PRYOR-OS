@@ -1608,6 +1608,63 @@ async function googleLoginCallback(req, res) {
     }
   }
 
+  // ---- Case D0 (pending-registration resume): a Google-originated
+  // pending registration already exists for this email -- e.g. the user
+  // completed google-signup-complete() previously but never finished the
+  // commercial-onboarding step (Stripe/access-code/complimentary), logged
+  // out, and is now returning with the SAME Google account. Looked up by
+  // email (pendingRegistrationStore.js's only lookup key -- the email
+  // comes from Google's own VERIFIED id_token, never client input), but
+  // NEVER trusted on email alone: the record's own
+  // googleIdentity.providerSubject must match this exact providerSubject,
+  // or this is refused as a conflict -- never silently resumed, never
+  // merged, never a second registration created for the same email.
+  //
+  // Deliberately no new providerSubject-keyed index: the per-email
+  // pendingRegistrationStore record already carries `googleIdentity` once
+  // google-signup-complete() has run, so a second index would only be
+  // duplicate state to keep in sync -- it would also need its own
+  // cleanup-on-completion/expiry, which this design gets for free (the
+  // record's existing 7-day TTL IS the expiry; deletePendingRegistration()
+  // in createTenantForVerifiedRegistration() IS the cleanup; an expired
+  // record simply returns null here and falls through to Case E below,
+  // starting a genuinely fresh signup rather than reviving anything).
+  let pendingGoogleRegistration
+  try {
+    pendingGoogleRegistration = await getPendingRegistration(providerEmail)
+  } catch (err) {
+    console.error(`[session/google-login-callback] ${err.message}`)
+    return redirectWithGoogleAuthError(res, '/login', 'account_unavailable')
+  }
+  if (pendingGoogleRegistration) {
+    if (
+      pendingGoogleRegistration.googleIdentity?.providerSubject !== providerSubject ||
+      pendingGoogleRegistration.status === 'blocked_email_occupied'
+    ) {
+      // Either this pending registration was never linked to THIS Google
+      // identity (started with a password, or a DIFFERENT Google account
+      // -- never resume/merge on email equality alone), or a prior
+      // tenant-creation attempt already discovered a real account exists
+      // for this email. Same friendly outcome as Case D below either way.
+      return redirectWithGoogleAuthError(res, '/login', 'existing_account')
+    }
+    // 'pending_verification' (should not normally occur for a Google-
+    // originated record, but resuming it is still safe if it somehow
+    // does), 'verified_awaiting_plan', and 'creating_tenant' (a rare,
+    // harmless overlap with an in-flight tenant-creation transaction from
+    // another tab) all resume at the SAME place: /get-started, via the
+    // SAME pending-signup cookie every other registrant uses -- never a
+    // real session (this must not fake tenant/user creation), and never
+    // /complete-signup again, since name/company are already on this
+    // exact record. `returnTo` is deliberately ignored here (it defaults
+    // to '/', which would just bounce back to the unauthenticated login
+    // screen since no real session exists yet) -- the correct resume
+    // target for pending onboarding is always /get-started.
+    const pendingSignupToken = await signPendingSignupToken({ userId: pendingGoogleRegistration.userId, email: pendingGoogleRegistration.email })
+    setCookie(res, PENDING_SIGNUP_COOKIE, pendingSignupToken, { maxAgeSeconds: PENDING_SIGNUP_TTL_SECONDS })
+    return res.redirect(302, '/get-started')
+  }
+
   // ---- Case D: brand-new identity, but a REAL account already exists
   // for this email (password-based, or any other already-provisioned
   // identity) -- Part 7's explicit requirement: NEVER auto-merge on email

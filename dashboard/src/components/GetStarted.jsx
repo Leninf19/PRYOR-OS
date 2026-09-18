@@ -51,10 +51,10 @@ export default function GetStarted() {
   return (
     <AuthShell>
       <h1 className="font-serif text-[26px] leading-tight mt-9 mb-1.5" style={{ color: 'var(--color-text-1)' }}>
-        Welcome, {info.companyName}
+        Welcome to PRYOR
       </h1>
       <p className="text-sm mb-8" style={{ color: 'var(--color-text-2)' }}>
-        Your email is verified. Choose how you'd like to get started.
+        Your account is verified. Choose how you'd like to get started.
       </p>
 
       <div className="space-y-3">
