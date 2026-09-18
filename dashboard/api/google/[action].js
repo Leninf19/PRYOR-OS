@@ -1976,12 +1976,12 @@ function resolveLifecycleExecutionEnvironment() {
 // only way to change it).
 //
 // For this smoke-test phase, the one approved Preview lifecycle ref is
-// 'feature/complimentary-access' (bumped from 'feature/commercial-
-// entitlements' now that THIS branch is the one under Preview smoke test).
-// Bumping this to a different branch later (e.g. once merged to main) is a
-// deliberate, reviewed one-line change here, exactly like bumping
-// PINNED_LIFECYCLE_SHA in the workflow file.
-const APPROVED_PREVIEW_LIFECYCLE_REF = 'feature/complimentary-access'
+// 'feature/google-social-auth' (bumped from 'feature/complimentary-access'
+// now that THIS branch is the one under Preview smoke test). Bumping this
+// to a different branch later (e.g. once merged to main) is a deliberate,
+// reviewed one-line change here, exactly like bumping PINNED_LIFECYCLE_SHA
+// in the workflow file.
+const APPROVED_PREVIEW_LIFECYCLE_REF = 'feature/google-social-auth'
 
 // Defense in depth beyond the fixed constant above: Vercel's own
 // VERCEL_GIT_COMMIT_REF (set by Vercel itself from the actual git ref this

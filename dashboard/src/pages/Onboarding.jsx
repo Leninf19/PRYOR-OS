@@ -99,7 +99,8 @@ function ConnectStep({ isOwner, gbpStatus, onConnect }) {
       {isOwner ? (
         <>
           <StepBody>
-            To get started, connect the Google account that manages your business locations on Google.
+            Use the Google account that manages your restaurant's Business Profile. It can be
+            different from the account you used to sign in to PRYOR.
           </StepBody>
           {gbpStatus?.state === 'auth_failed' && <ErrorBanner message="Google authorization failed. Please try connecting again." />}
           {gbpStatus?.state === 'quota_blocked' && <ErrorBanner message="Google Business Profile access is temporarily unavailable for this account. Please try again shortly, or contact support." />}
@@ -114,7 +115,7 @@ function ConnectStep({ isOwner, gbpStatus, onConnect }) {
 
 // --- Steps 2-3: Discover + choose locations -----------------------------
 
-function DiscoverApproveStep({ isOwner }) {
+function DiscoverApproveStep({ isOwner, onConnect }) {
   const discoverMutation = useDiscoverLocations()
   const approveMutation = useApproveLocations()
   const [discovery, setDiscovery] = useState(null) // { discoverySessionId, expiresAt, locations }
@@ -153,16 +154,25 @@ function DiscoverApproveStep({ isOwner }) {
   }
 
   // No locations discovered at all -- a distinct, actionable state, never
-  // silently treated the same as a fetch error.
+  // silently treated the same as a fetch error. The recovery action must
+  // restart GBP AUTHORIZATION itself (onConnect -> the same
+  // useConnectGoogle().connect() ConnectStep uses, which navigates to
+  // /api/google/auth and lets the user pick a DIFFERENT Google account),
+  // never a bare re-run of discovery against the SAME already-connected
+  // (wrong) credential -- that would just rediscover zero locations again.
+  // The PRYOR login session is completely untouched by this: GBP
+  // authorization is a separate OAuth system from login (see Part 12's own
+  // copy on ConnectStep), so restarting it here can never log the user out
+  // or reset any onboarding progress beyond this one step.
   if ((discovery.locations ?? []).length === 0) {
     return (
       <OnboardingShell activeStep="discover">
-        <StepTitle>No locations found</StepTitle>
+        <StepTitle>No Business Profiles found</StepTitle>
         <StepBody>
-          We couldn't find any Google Business Profile locations on the connected Google account.
-          Make sure you connected the account that actually manages your business locations, then try again.
+          We couldn't find any restaurant locations connected to this Google account. Try another
+          Google account that manages your restaurant's Business Profile.
         </StepBody>
-        <Button variant="secondary" className="w-full justify-center" onClick={() => setDiscovery(null)}>Try again</Button>
+        <Button variant="secondary" className="w-full justify-center" onClick={onConnect}>Choose another Google account</Button>
       </OnboardingShell>
     )
   }
@@ -305,7 +315,7 @@ export default function Onboarding() {
   if (status === 'onboarding') {
     const isConnected = gbpStatus?.state === 'connected'
     if (!isConnected) return <ConnectStep isOwner={isOwner} gbpStatus={gbpStatus} onConnect={connect} />
-    return <DiscoverApproveStep isOwner={isOwner} />
+    return <DiscoverApproveStep isOwner={isOwner} onConnect={connect} />
   }
 
   // Multi-Tenant Phase 4O: locations_approved and provisioning are now

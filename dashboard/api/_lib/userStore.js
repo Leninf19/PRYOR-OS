@@ -253,6 +253,12 @@ function parseRecord(value) {
 export function deriveUserStatus(record) {
   if (!record) return null
   if (record.disabled) return 'disabled'
+  // Google Sign-In (PRYOR login identity) -- a user who authenticated via a
+  // linked Google identity (googleIdentityStore.js's linkGoogleIdentity())
+  // is fully activated regardless of whether a password was ever set: a
+  // Google-only account legitimately has passwordHash: null forever, and
+  // must never be reported as merely 'invited'.
+  if (record.googleIdentity) return 'active'
   // A static (ACCOUNT_DIRECTORY_JSON) account has none of the Redis-only
   // invite-tracking fields at all -- the field's ABSENCE (not just a null
   // value) means "never went through the invite flow", i.e. active by

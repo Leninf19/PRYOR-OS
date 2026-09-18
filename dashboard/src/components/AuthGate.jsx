@@ -13,6 +13,7 @@ import GetStarted from './GetStarted.jsx'
 import Pricing from './Pricing.jsx'
 import AccessCodeEntry from './AccessCodeEntry.jsx'
 import SetupComplete from './SetupComplete.jsx'
+import CompleteGoogleSignup from './CompleteGoogleSignup.jsx'
 
 // Paths reachable WITHOUT a session, checked before any loading/
 // authenticated/unauthenticated branching below -- an invitee/locked-out
@@ -42,6 +43,12 @@ const PUBLIC_PATHS = {
   '/pricing': Pricing,
   '/pricing/setup-complete': SetupComplete,
   '/access-code': AccessCodeEntry,
+  // Google Sign-In (PRYOR login identity) -- reachable only via the
+  // short-lived lta_google_signup_pending cookie (see
+  // session/[action].js's googleLoginCallback()); carries its own
+  // narrower, separate cookie, never lta_pending_signup, until it hands
+  // off to /get-started.
+  '/complete-signup': CompleteGoogleSignup,
 }
 
 // "Prevent duplicate/shadow tenant creation" hardening -- a SUBSET of
@@ -58,7 +65,7 @@ const PUBLIC_PATHS = {
 // own dashboard before it can even reach the "Create your workspace"
 // form, rather than leaving it reachable for no reason once a real
 // session already exists.
-const WORKSPACE_CREATION_PATHS = new Set(['/register', '/verify-email', '/get-started', '/pricing', '/pricing/setup-complete', '/access-code'])
+const WORKSPACE_CREATION_PATHS = new Set(['/register', '/verify-email', '/get-started', '/pricing', '/pricing/setup-complete', '/access-code', '/complete-signup'])
 
 // The authenticated account (userId/email/role/locationIds/displayName from
 // GET /api/session/whoami), available to any component below AuthGate --

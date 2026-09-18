@@ -13,9 +13,9 @@ import { setCookie, clearCookie, parseCookies } from '../google/_lib/cookies.js'
 import { getAccountById, getAccountByEmail, getAccountByEmailRequireRedisHealthy, listAccounts } from '../_lib/accountStore.js'
 import { verifyPassword, hashPassword, validatePasswordStrength } from '../_lib/password.js'
 import { requireAuth } from '../_lib/auth.js'
-import { signSession, SESSION_COOKIE } from '../_lib/session.js'
+import { signSession, verifySession, SESSION_COOKIE } from '../_lib/session.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
-import { touchLastLogin, updateUser, upsertUser, UserStoreUnavailableError, UserCreationMode, lookupTenantIdForUserId } from '../_lib/userStore.js'
+import { touchLastLogin, updateUser, upsertUser, getUserById, UserStoreUnavailableError, UserCreationMode, lookupTenantIdForUserId } from '../_lib/userStore.js'
 import { appendAuditEntry } from '../_lib/auditLog.js'
 import { resolveTenantId, resolveBootstrapTenantId, TenantResolutionError, DEFAULT_TENANT_ID, isValidTenantId } from '../_lib/tenants.js'
 import { generateTenantId } from '../_lib/tenantIdGenerator.js'
@@ -45,7 +45,18 @@ import {
   markVerifyEmailConsumedPending, clearVerifyEmailConsumedPending, revokeVerifyEmailToken,
   TokenStoreUnavailableError,
 } from '../_lib/tokenStore.js'
-import { isValidDisplayName, buildResetUrl, buildVerifyUrl, generateUserId } from '../_lib/userManagement.js'
+import { isValidDisplayName, buildResetUrl, buildVerifyUrl, buildGoogleLoginCallbackUrl, generateUserId } from '../_lib/userManagement.js'
+import {
+  signGoogleLoginState, verifyGoogleLoginState, GOOGLE_LOGIN_STATE_COOKIE, GOOGLE_LOGIN_STATE_TTL_SECONDS,
+  signGoogleSignupPending, verifyGoogleSignupPending, GOOGLE_SIGNUP_PENDING_COOKIE, GOOGLE_SIGNUP_PENDING_TTL_SECONDS,
+} from '../_lib/googleLoginState.js'
+import {
+  buildGoogleAuthorizeUrl, exchangeGoogleAuthCode, verifyGoogleIdToken, requireGoogleAuthClientId, GoogleLoginNotConfiguredError,
+} from '../_lib/googleAuthClient.js'
+import {
+  getIdentityBySubject, linkGoogleIdentity, GoogleIdentityConflictError, GoogleIdentityStoreUnavailableError,
+} from '../_lib/googleIdentityStore.js'
+import { randomBytes } from 'crypto'
 import { buildResetEmail, buildResetEmailSubject } from '../_lib/accountEmailTemplate.js'
 import { buildVerifyEmail, buildVerifyEmailSubject } from '../_lib/registrationEmailTemplate.js'
 import { sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
@@ -1233,7 +1244,17 @@ async function getStartedStatus(req, res) {
 //   4. Delete the pending registration -- from this point on, the ONLY
 //      record of this identity is the real tenant_config/user pair.
 //   5. Release the lock (always, via finally).
-async function createTenantForVerifiedRegistration(email, commercial, accessCodeGrant = null, trialEligibility = null, complimentaryGrant = null) {
+// `googleIdentity`, when present, is the ALREADY-VERIFIED provider identity
+// carried on the pending registration by google-signup-complete() -- see
+// googleLoginCallback()'s header. Linked AFTER createNewTenant() succeeds
+// but BEFORE deletePendingRegistration(): if linking fails, the pending
+// registration is deliberately left intact (never deleted) so a retry of
+// this same call (createNewTenant() is itself idempotent via
+// reservedTenantId, and linkGoogleIdentity() is idempotent for the exact
+// same providerSubject/tenantId/userId triple) can complete it -- a
+// brand-new Google-only owner (passwordHash: null) must never be left with
+// a real tenant/user record but no way to ever sign back in.
+async function createTenantForVerifiedRegistration(email, commercial, accessCodeGrant = null, trialEligibility = null, complimentaryGrant = null, googleIdentity = null) {
   const lockAcquired = await acquireTenantCreationLock(email)
   if (!lockAcquired) {
     throw new TenantCreationInProgressError('Your workspace is already being created. Please wait a moment and try again.')
@@ -1282,6 +1303,10 @@ async function createTenantForVerifiedRegistration(email, commercial, accessCode
       throw err
     }
 
+    if (googleIdentity) {
+      await linkGoogleIdentity(tenantId, userRecord.userId, googleIdentity)
+    }
+
     await deletePendingRegistration(email)
 
     return { tenantId, userRecord }
@@ -1303,6 +1328,475 @@ async function issueRealSessionAndRespond(res, userRecord, tenantId) {
       locationIds: userRecord.locationIds, displayName: userRecord.displayName ?? userRecord.email,
     },
   })
+}
+
+// Same session-issuing contract as issueRealSessionAndRespond() above, but
+// for the browser-redirect (GET, not fetch/XHR) shape every Google-login
+// endpoint below uses -- Google's own authorization-code flow is a full
+// top-level navigation round trip, so the callback's own response must be
+// an HTTP redirect back into the SPA, never a JSON body.
+async function issueRealSessionAndRedirect(res, userRecord, tenantId, returnTo) {
+  const sessionToken = await signSession({
+    userId: userRecord.userId, email: userRecord.email, role: userRecord.role,
+    locationIds: userRecord.locationIds, tenantId, sessionVersion: userRecord.sessionVersion,
+  }, { expiresInSeconds: SESSION_TTL_SECONDS })
+  setCookie(res, SESSION_COOKIE, sessionToken, { maxAgeSeconds: SESSION_TTL_SECONDS })
+  clearCookie(res, PENDING_SIGNUP_COOKIE)
+  const safeReturnTo = typeof returnTo === 'string' && returnTo.startsWith('/') && !returnTo.startsWith('//') ? returnTo : '/'
+  return res.redirect(302, safeReturnTo)
+}
+
+function safeReturnPath(value) {
+  return typeof value === 'string' && value.startsWith('/') && !value.startsWith('//') ? value : '/'
+}
+
+// Every friendly-error redirect below goes through this one function --
+// see Part 11 of this feature's own spec: the browser NEVER sees a raw
+// OAuth/provider error code, only a short machine-readable `googleAuthError`
+// query param the frontend (Login.jsx/Register.jsx/AcceptInvite.jsx)
+// translates into a human-readable message. The underlying reason is
+// always logged server-side (by the caller, before calling this) instead.
+function redirectWithGoogleAuthError(res, path, code) {
+  const base = safeReturnPath(path)
+  const sep = base.includes('?') ? '&' : '?'
+  return res.redirect(302, `${base}${sep}googleAuthError=${encodeURIComponent(code)}`)
+}
+
+// GET /api/session/google-login-start?returnTo=&inviteToken=
+// Google Sign-In (PRYOR login identity) -- begins the standard server-side
+// authorization-code flow for PRYOR's OWN login identity. Structurally
+// unrelated to google/[action].js's auth()/callback() (Google Business
+// Profile): separate OAuth client (GOOGLE_AUTH_CLIENT_ID/SECRET, never
+// GOOGLE_CLIENT_ID/SECRET), separate scope (openid email profile, never
+// business.manage), separate callback path, separate signed-state token
+// family (googleLoginState.js, purpose 'pryor_login_flow', never
+// oauthState.js's 'gbp_oauth_connect'), separate cookie name. Nothing here
+// can ever be confused with, or silently reuse, the GBP connection.
+//
+// `returnTo` is validated to be a same-origin relative path (never an
+// absolute/external URL -- would otherwise be an open-redirect primitive)
+// before being carried through the signed flow-state cookie.
+//
+// `inviteToken`, when present, is carried ONLY in the signed, HttpOnly
+// flow-state cookie -- NEVER in the OAuth `state` query param, which
+// round-trips through Google and would otherwise expose this bearer
+// credential outside PRYOR's own domain (browser history, Referer headers,
+// Google's own access logs). Its validity is re-checked at callback time
+// (peekInviteToken), not here -- this endpoint does no extra I/O beyond
+// what starting the flow itself needs.
+//
+// Account linking to an ALREADY-authenticated session (Settings -> connect
+// Google sign-in) is detected here from the CALLER'S OWN existing
+// lta_session cookie only -- never from a request body/query field, so a
+// caller can never ask this endpoint to link Google onto an arbitrary
+// account.
+async function googleLoginStart(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const allowed = await enforceRateLimit(req, res, `google-login-start:${clientIp(req)}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
+
+  try {
+    requireGoogleAuthClientId()
+  } catch (err) {
+    if (err instanceof GoogleLoginNotConfiguredError) {
+      return res.status(503).json({ error: 'service_unavailable', message: 'Google sign-in is not available right now.' })
+    }
+    throw err
+  }
+
+  const returnTo = safeReturnPath(req.query?.returnTo)
+  const inviteTokenRaw = req.query?.inviteToken
+  const inviteToken = typeof inviteTokenRaw === 'string' && inviteTokenRaw ? inviteTokenRaw : null
+
+  const cookies = parseCookies(req)
+  const existingSession = await verifySession(cookies[SESSION_COOKIE])
+  const linkUserId = existingSession?.userId ?? null
+  const linkTenantId = existingSession?.tenantId ?? null
+
+  const nonce = randomBytes(24).toString('hex')
+  let flowState
+  try {
+    flowState = await signGoogleLoginState({ nonce, returnTo, inviteToken, linkUserId, linkTenantId })
+  } catch (err) {
+    console.error(`[session/google-login-start] ${err.message}`)
+    return res.status(503).json({ error: 'service_unavailable', message: 'Google sign-in is not available right now.' })
+  }
+  setCookie(res, GOOGLE_LOGIN_STATE_COOKIE, flowState, { maxAgeSeconds: GOOGLE_LOGIN_STATE_TTL_SECONDS })
+
+  const redirectUri = buildGoogleLoginCallbackUrl(req)
+  const authorizeUrl = buildGoogleAuthorizeUrl({ state: nonce, redirectUri })
+  return res.redirect(302, authorizeUrl)
+}
+
+// GET /api/session/google-login-callback?code=&state=  (or ?error=...)
+// The single, server-side authorization-code exchange + verification point
+// for PRYOR's own Google Sign-In. See Part 7/8 of this feature's spec for
+// the exact decision tree below -- each branch is a DISTINCT, deliberately
+// fail-closed outcome:
+//   A. an already-authenticated session is LINKING a Google identity
+//   B. a RETURNING login -- providerSubject already linked to a PRYOR user
+//   C. an INVITE continuation -- providerSubject not yet linked, but this
+//      flow started from an invite link and the Google email matches
+//   D. a brand-new Google identity, but a REAL account (password-based, or
+//      any other identity) already exists for this email -- never merge
+//   E. a genuinely new signup -- verified Google identity, no existing
+//      account, no invite
+async function googleLoginCallback(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const cookies = parseCookies(req)
+  const flowState = await verifyGoogleLoginState(cookies[GOOGLE_LOGIN_STATE_COOKIE])
+  clearCookie(res, GOOGLE_LOGIN_STATE_COOKIE) // single-use regardless of outcome
+
+  // Without a valid flow-state cookie there is no trustworthy returnTo --
+  // always fall back to /login, never anything request-derived.
+  if (!flowState) {
+    return redirectWithGoogleAuthError(res, '/login', 'state_invalid')
+  }
+  const returnTo = flowState.returnTo
+
+  const { error: oauthError, state: stateParam, code } = req.query ?? {}
+  if (oauthError) {
+    // e.g. 'access_denied' -- the user clicked Cancel on Google's own
+    // consent screen. Never surfaced verbatim (Part 11).
+    return redirectWithGoogleAuthError(res, returnTo, 'canceled')
+  }
+  if (typeof stateParam !== 'string' || !stateParam || stateParam !== flowState.nonce) {
+    // CSRF / double-submit failure -- the bare nonce round-tripped through
+    // Google must match the one bound into this same-origin cookie.
+    return redirectWithGoogleAuthError(res, returnTo, 'state_invalid')
+  }
+  if (typeof code !== 'string' || !code) {
+    return redirectWithGoogleAuthError(res, returnTo, 'state_invalid')
+  }
+
+  const redirectUri = buildGoogleLoginCallbackUrl(req)
+  let claims
+  try {
+    const tokens = await exchangeGoogleAuthCode({ code, redirectUri })
+    claims = await verifyGoogleIdToken(tokens.id_token)
+  } catch (err) {
+    // Never the underlying message (may echo Google API error shapes) --
+    // logged server-side only.
+    console.error(`[session/google-login-callback] ${err.message}`)
+    return redirectWithGoogleAuthError(res, returnTo, 'exchange_failed')
+  }
+
+  const providerSubject = claims.sub
+  const providerEmail = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : null
+  if (!providerSubject || !providerEmail || claims.email_verified !== true) {
+    // Missing/unverified email -- fail closed. Google login is identity
+    // verification; an unverified email is not a verified identity.
+    return redirectWithGoogleAuthError(res, returnTo, 'email_unverified')
+  }
+
+  // ---- Case A: linking to an ALREADY-authenticated PRYOR session ----
+  if (flowState.linkUserId && flowState.linkTenantId) {
+    const currentSession = await verifySession(cookies[SESSION_COOKIE])
+    if (!currentSession || currentSession.userId !== flowState.linkUserId || currentSession.tenantId !== flowState.linkTenantId) {
+      // The session that started this flow is gone or has changed --
+      // never trust the flow-state's own claim alone for something this
+      // sensitive.
+      return redirectWithGoogleAuthError(res, '/login', 'link_session_mismatch')
+    }
+    try {
+      const existingIdentity = await getIdentityBySubject(providerSubject)
+      if (existingIdentity && existingIdentity.userId !== flowState.linkUserId) {
+        return redirectWithGoogleAuthError(res, returnTo, 'identity_conflict')
+      }
+      await linkGoogleIdentity(flowState.linkTenantId, flowState.linkUserId, { providerSubject, providerEmail, providerEmailVerified: true })
+    } catch (err) {
+      if (err instanceof GoogleIdentityConflictError) {
+        return redirectWithGoogleAuthError(res, returnTo, 'identity_conflict')
+      }
+      console.error(`[session/google-login-callback] ${err.message}`)
+      return redirectWithGoogleAuthError(res, returnTo, 'account_unavailable')
+    }
+    await appendAuditEntry(flowState.linkTenantId, {
+      actorId: flowState.linkUserId, actorEmail: currentSession.email, ip: clientIp(req),
+      action: 'user.google_identity_linked', entity: 'user', entityId: flowState.linkUserId,
+      result: 'success', message: 'Linked a Google identity for sign-in.',
+    })
+    return res.redirect(302, returnTo)
+  }
+
+  // ---- Case B: returning login -- providerSubject already linked ----
+  let existingIdentity
+  try {
+    existingIdentity = await getIdentityBySubject(providerSubject)
+  } catch (err) {
+    console.error(`[session/google-login-callback] ${err.message}`)
+    return redirectWithGoogleAuthError(res, '/login', 'account_unavailable')
+  }
+  if (existingIdentity) {
+    const userRecord = await getUserById(existingIdentity.tenantId, existingIdentity.userId)
+    if (!userRecord || userRecord.disabled) {
+      return redirectWithGoogleAuthError(res, '/login', 'account_unavailable')
+    }
+    await touchLastLogin(existingIdentity.tenantId, userRecord.userId)
+    await appendAuditEntry(existingIdentity.tenantId, {
+      actorId: userRecord.userId, actorEmail: userRecord.email, ip: clientIp(req),
+      action: 'user.login', entity: 'user', entityId: userRecord.userId,
+      result: 'success', message: 'Signed in with Google.',
+    })
+    return issueRealSessionAndRedirect(res, userRecord, existingIdentity.tenantId, returnTo)
+  }
+
+  // ---- Case C: invite continuation ----
+  if (flowState.inviteToken) {
+    let peeked
+    try {
+      peeked = await peekInviteToken(flowState.inviteToken)
+    } catch (err) {
+      console.error(`[session/google-login-callback] ${err.message}`)
+      return redirectWithGoogleAuthError(res, returnTo, 'invite_unavailable')
+    }
+    // Never allow another Google account to consume someone else's invite
+    // (Part 8) -- checked BEFORE the invite is ever consumed, exactly like
+    // acceptInvite()'s own commercial-eligibility check runs before consume.
+    if (peeked && peeked.payload.email.trim().toLowerCase() !== providerEmail) {
+      return redirectWithGoogleAuthError(res, returnTo, 'invite_identity_mismatch')
+    }
+    let consumed = null
+    try {
+      if (peeked) {
+        const denial = await resolveAcceptInviteDenial(peeked.payload, req)
+        if (denial) return redirectWithGoogleAuthError(res, returnTo, 'commercial_denied')
+        consumed = await consumeInviteToken(flowState.inviteToken)
+      } else {
+        // No fresh primary key -- resolve via the pending-retry fallback,
+        // exactly like acceptInvite()'s own dual path.
+        consumed = await consumeInviteToken(flowState.inviteToken)
+        if (consumed && consumed.payload.email.trim().toLowerCase() !== providerEmail) {
+          return redirectWithGoogleAuthError(res, returnTo, 'invite_identity_mismatch')
+        }
+        if (consumed) {
+          const denial = await resolveAcceptInviteDenial(consumed.payload, req)
+          if (denial) return redirectWithGoogleAuthError(res, returnTo, 'commercial_denied')
+        }
+      }
+    } catch (err) {
+      console.error(`[session/google-login-callback] ${err.message}`)
+      return redirectWithGoogleAuthError(res, returnTo, 'invite_unavailable')
+    }
+    if (!consumed) {
+      return redirectWithGoogleAuthError(res, returnTo, 'invite_invalid')
+    }
+
+    const { payload, tokenHash, fromPending } = consumed
+    const { userId } = payload
+    if (!fromPending) await markInviteConsumedPending(tokenHash, payload)
+
+    try {
+      const indexedTenantId = await lookupTenantIdForUserId(userId)
+      const targetTenantId = indexedTenantId ?? resolveBootstrapTenantId()
+      const updated = await updateUser(targetTenantId, userId, {})
+      if (!updated) return redirectWithGoogleAuthError(res, returnTo, 'account_unavailable')
+      await linkGoogleIdentity(targetTenantId, userId, { providerSubject, providerEmail, providerEmailVerified: true })
+      const tenantId = resolveTenantId(updated)
+      await clearInviteConsumedPending(tokenHash)
+      await appendAuditEntry(tenantId, {
+        actorId: userId, actorEmail: updated.email, ip: clientIp(req),
+        action: 'invitation.accepted', entity: 'user', entityId: userId,
+        result: 'success', message: 'Invitation accepted via Google sign-in.',
+      })
+      return issueRealSessionAndRedirect(res, updated, tenantId, returnTo)
+    } catch (err) {
+      console.error(`[session/google-login-callback] ${err.message}`)
+      return redirectWithGoogleAuthError(res, returnTo, 'account_unavailable')
+    }
+  }
+
+  // ---- Case D0 (pending-registration resume): a Google-originated
+  // pending registration already exists for this email -- e.g. the user
+  // completed google-signup-complete() previously but never finished the
+  // commercial-onboarding step (Stripe/access-code/complimentary), logged
+  // out, and is now returning with the SAME Google account. Looked up by
+  // email (pendingRegistrationStore.js's only lookup key -- the email
+  // comes from Google's own VERIFIED id_token, never client input), but
+  // NEVER trusted on email alone: the record's own
+  // googleIdentity.providerSubject must match this exact providerSubject,
+  // or this is refused as a conflict -- never silently resumed, never
+  // merged, never a second registration created for the same email.
+  //
+  // Deliberately no new providerSubject-keyed index: the per-email
+  // pendingRegistrationStore record already carries `googleIdentity` once
+  // google-signup-complete() has run, so a second index would only be
+  // duplicate state to keep in sync -- it would also need its own
+  // cleanup-on-completion/expiry, which this design gets for free (the
+  // record's existing 7-day TTL IS the expiry; deletePendingRegistration()
+  // in createTenantForVerifiedRegistration() IS the cleanup; an expired
+  // record simply returns null here and falls through to Case E below,
+  // starting a genuinely fresh signup rather than reviving anything).
+  let pendingGoogleRegistration
+  try {
+    pendingGoogleRegistration = await getPendingRegistration(providerEmail)
+  } catch (err) {
+    console.error(`[session/google-login-callback] ${err.message}`)
+    return redirectWithGoogleAuthError(res, '/login', 'account_unavailable')
+  }
+  if (pendingGoogleRegistration) {
+    if (
+      pendingGoogleRegistration.googleIdentity?.providerSubject !== providerSubject ||
+      pendingGoogleRegistration.status === 'blocked_email_occupied'
+    ) {
+      // Either this pending registration was never linked to THIS Google
+      // identity (started with a password, or a DIFFERENT Google account
+      // -- never resume/merge on email equality alone), or a prior
+      // tenant-creation attempt already discovered a real account exists
+      // for this email. Same friendly outcome as Case D below either way.
+      return redirectWithGoogleAuthError(res, '/login', 'existing_account')
+    }
+    // 'pending_verification' (should not normally occur for a Google-
+    // originated record, but resuming it is still safe if it somehow
+    // does), 'verified_awaiting_plan', and 'creating_tenant' (a rare,
+    // harmless overlap with an in-flight tenant-creation transaction from
+    // another tab) all resume at the SAME place: /get-started, via the
+    // SAME pending-signup cookie every other registrant uses -- never a
+    // real session (this must not fake tenant/user creation), and never
+    // /complete-signup again, since name/company are already on this
+    // exact record. `returnTo` is deliberately ignored here (it defaults
+    // to '/', which would just bounce back to the unauthenticated login
+    // screen since no real session exists yet) -- the correct resume
+    // target for pending onboarding is always /get-started.
+    const pendingSignupToken = await signPendingSignupToken({ userId: pendingGoogleRegistration.userId, email: pendingGoogleRegistration.email })
+    setCookie(res, PENDING_SIGNUP_COOKIE, pendingSignupToken, { maxAgeSeconds: PENDING_SIGNUP_TTL_SECONDS })
+    return res.redirect(302, '/get-started')
+  }
+
+  // ---- Case D: brand-new identity, but a REAL account already exists
+  // for this email (password-based, or any other already-provisioned
+  // identity) -- Part 7's explicit requirement: NEVER auto-merge on email
+  // equality alone. The owner must prove ownership by signing in with
+  // their existing method first, then link Google from an authenticated
+  // session (Case A above). ----
+  let realAccount
+  try {
+    realAccount = await getAccountByEmailRequireRedisHealthy(providerEmail)
+  } catch (err) {
+    console.error(`[session/google-login-callback] ${err.message}`)
+    return redirectWithGoogleAuthError(res, '/login', 'account_unavailable')
+  }
+  if (realAccount) {
+    return redirectWithGoogleAuthError(res, '/login', 'existing_account')
+  }
+
+  // ---- Case E: genuinely new signup. Google's email is already verified,
+  // so email/password registration's own verification step is skipped
+  // (Part 5) -- but PRYOR still needs a company/restaurant name before a
+  // tenant can be reserved, and Google's identity-only scope never
+  // provides one. Holds the verified identity in a short-lived, signed,
+  // HttpOnly cookie (never written to Redis yet -- this is not a
+  // registration attempt until google-signup-complete() runs) and sends
+  // the browser to the one small additional step this flow needs. ----
+  let pendingToken
+  try {
+    pendingToken = await signGoogleSignupPending({ providerSubject, providerEmail, name: claims.name })
+  } catch (err) {
+    console.error(`[session/google-login-callback] ${err.message}`)
+    return redirectWithGoogleAuthError(res, '/register', 'account_unavailable')
+  }
+  setCookie(res, GOOGLE_SIGNUP_PENDING_COOKIE, pendingToken, { maxAgeSeconds: GOOGLE_SIGNUP_PENDING_TTL_SECONDS })
+  return res.redirect(302, '/complete-signup')
+}
+
+// GET /api/session/google-signup-status -- lets /complete-signup render
+// the Google-provided name/email before the user submits anything, mirrors
+// get-started-status's own read-only status pattern.
+async function googleSignupStatus(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+  const cookies = parseCookies(req)
+  const pendingGoogle = await verifyGoogleSignupPending(cookies[GOOGLE_SIGNUP_PENDING_COOKIE])
+  if (!pendingGoogle) {
+    return res.status(401).json({ error: 'unauthenticated', message: 'This Google sign-in has expired. Please try again.' })
+  }
+  return res.status(200).json({ email: pendingGoogle.providerEmail, name: pendingGoogle.name })
+}
+
+// POST /api/session/google-signup-complete  { companyName, displayName? }
+// Only reachable with the short-lived lta_google_signup_pending cookie set
+// by googleLoginCallback()'s Case E above -- there is no other way to reach
+// this action, and it never accepts a provider identity from the request
+// body. Creates (or resumes) a pending registration exactly like
+// register()/verifyEmail() together would, but collapses both steps into
+// one (Google's own email_verified=true already proved the email) and
+// never creates a password -- passwordHash stays null, exactly like an
+// invited user before they set one. Continues into the SAME
+// lta_pending_signup-gated onboarding chain (get-started/pricing/
+// access-code) as every other registrant.
+async function googleSignupComplete(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const allowed = await enforceRateLimit(req, res, `google-signup-complete:${clientIp(req)}`, { requestsPerWindow: 8, windowSeconds: 60 })
+  if (!allowed) return
+
+  const cookies = parseCookies(req)
+  const pendingGoogle = await verifyGoogleSignupPending(cookies[GOOGLE_SIGNUP_PENDING_COOKIE])
+  if (!pendingGoogle) {
+    return res.status(401).json({ error: 'unauthenticated', message: 'This Google sign-in has expired. Please try again.' })
+  }
+
+  const { companyName: rawCompanyName, displayName: rawDisplayName } = req.body ?? {}
+  const companyName = typeof rawCompanyName === 'string' ? rawCompanyName.trim() : ''
+  if (!companyName || companyName.length > 100) {
+    return res.status(400).json({ error: 'invalid_request', message: 'Your company or restaurant group name is required.' })
+  }
+  const fallbackName = isValidDisplayName(pendingGoogle.name) ? pendingGoogle.name.trim() : null
+  const displayName = isValidDisplayName(rawDisplayName) ? rawDisplayName.trim() : fallbackName
+  if (!displayName) {
+    return res.status(400).json({ error: 'invalid_request', message: 'Your name is required.' })
+  }
+
+  const email = pendingGoogle.providerEmail
+
+  let realAccount
+  try {
+    realAccount = await getAccountByEmailRequireRedisHealthy(email)
+  } catch (err) {
+    console.error(`[session/google-signup-complete] ${err.message}`)
+    return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+  }
+  if (realAccount) {
+    // Someone else completed registration/linking for this email between
+    // the Google callback and this step (e.g. two tabs) -- never proceed.
+    return res.status(409).json({ error: 'existing_account', message: 'An account already exists for this email. Please sign in instead.' })
+  }
+
+  try {
+    let pending = await getPendingRegistration(email)
+    if (!pending) {
+      const userId = generateUserId()
+      const tenantIdReserved = await generateTenantId(companyName)
+      pending = await createPendingRegistration({
+        email, passwordHash: null, displayName, companyName, userId, tenantIdReserved,
+      })
+      if (!pending) pending = await getPendingRegistration(email)
+    }
+    if (pending.status === 'pending_verification') {
+      pending = await updatePendingRegistration(email, {
+        emailVerified: true, verifiedAt: new Date().toISOString(), status: 'verified_awaiting_plan', verifyTokenHash: null,
+      })
+    }
+    // Carries the already-verified Google identity through to tenant-
+    // creation time -- see createTenantForVerifiedRegistration()'s own
+    // googleIdentity param.
+    pending = await updatePendingRegistration(email, {
+      googleIdentity: { providerSubject: pendingGoogle.providerSubject, providerEmail: pendingGoogle.providerEmail, providerEmailVerified: true },
+    })
+
+    const pendingSignupToken = await signPendingSignupToken({ userId: pending.userId, email: pending.email })
+    setCookie(res, PENDING_SIGNUP_COOKIE, pendingSignupToken, { maxAgeSeconds: PENDING_SIGNUP_TTL_SECONDS })
+    clearCookie(res, GOOGLE_SIGNUP_PENDING_COOKIE)
+
+    return res.status(200).json({ email: pending.email, companyName: pending.companyName })
+  } catch (err) {
+    if (err instanceof PendingRegistrationStoreUnavailableError || err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[session/google-signup-complete] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not finish setting up your account. Please try again shortly.' })
+    }
+    throw err
+  }
 }
 
 // Complimentary Restaurant Access Codes -- SHARED authoritative
@@ -1392,7 +1886,7 @@ async function finishComplimentaryOnboarding(req, res, pending, redemption) {
   }
 
   try {
-    const { tenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, commercial, null, null, complimentaryGrant)
+    const { tenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, commercial, null, null, complimentaryGrant, pending.googleIdentity ?? null)
     // Best-effort -- see clearComplimentaryRedemptionClaim()'s own comment
     // for why a failure here has no security consequence (createNewTenant()'s
     // identity check already makes a genuine second tenant for this email
@@ -1648,7 +2142,7 @@ async function redeemAccessCodeAction(req, res) {
   }
 
   try {
-    const { tenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, commercial, accessCodeGrant)
+    const { tenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, commercial, accessCodeGrant, null, null, pending.googleIdentity ?? null)
     // Best-effort -- see clearAccessCodeRedemptionClaim()'s own comment for
     // why a failure here has no security consequence (createNewTenant()'s
     // identity check already makes a genuine second tenant for this email
@@ -2084,7 +2578,7 @@ async function finalizeRegistration(req, res) {
   const { commercial, trialEligibility } = buildSelfServicePendingActivationCommercial()
 
   try {
-    const { tenantId: createdTenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, commercial, null, trialEligibility)
+    const { tenantId: createdTenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, commercial, null, trialEligibility, null, pending.googleIdentity ?? null)
     await appendAuditEntry(createdTenantId, {
       actorId: userRecord.userId, actorEmail: userRecord.email, ip: clientIp(req),
       action: 'tenant.created_via_self_service_billing', entity: 'tenant', entityId: createdTenantId,
@@ -3111,6 +3605,10 @@ export default async function handler(req, res) {
     case 'verify-email-status':    return verifyEmailStatus(req, res)
     case 'verify-email':           return verifyEmail(req, res)
     case 'get-started-status':     return getStartedStatus(req, res)
+    case 'google-login-start':     return googleLoginStart(req, res)
+    case 'google-login-callback':  return googleLoginCallback(req, res)
+    case 'google-signup-status':   return googleSignupStatus(req, res)
+    case 'google-signup-complete': return googleSignupComplete(req, res)
     case 'redeem-access-code':     return redeemAccessCodeAction(req, res)
     case 'redeem-complimentary-code': return redeemComplimentaryCodeAction(req, res)
     case 'select-plan':            return selectPlan(req, res)

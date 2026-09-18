@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import AuthShell, { Field, ErrorBanner, SuccessBanner, PrimaryButton, LoadingDots } from './auth/AuthShell.jsx'
+import AuthShell, { Field, ErrorBanner, SuccessBanner, PrimaryButton, LoadingDots, GoogleButton, OrDivider, useGoogleAuthError } from './auth/AuthShell.jsx'
 
 // Multi-Tenant Phase 4Q.1 -- POST /api/session/register. Always shows the
 // SAME success message regardless of what the server actually did
@@ -12,6 +12,7 @@ export default function Register() {
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [submitted, setSubmitted] = useState(false)
+  const googleAuthError = useGoogleAuthError()
 
   function set(field) {
     return e => setForm(f => ({ ...f, [field]: e.target.value }))
@@ -61,6 +62,11 @@ export default function Register() {
     <AuthShell>
       <h1 className="font-serif text-[26px] leading-tight mt-9 mb-1.5" style={{ color: 'var(--color-text-1)' }}>Create your workspace</h1>
       <p className="text-sm mb-8" style={{ color: 'var(--color-text-2)' }}>Register now to get started with PRYOR</p>
+
+      {googleAuthError && <div className="mb-4"><ErrorBanner>{googleAuthError}</ErrorBanner></div>}
+
+      <GoogleButton href={`/api/session/google-login-start?returnTo=${encodeURIComponent('/')}`} />
+      <OrDivider />
 
       <form onSubmit={handleSubmit} className="space-y-4" noValidate>
         <Field label="Your name">
