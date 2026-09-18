@@ -37,10 +37,10 @@ process.env.GOOGLE_CLIENT_SECRET = 'fake-client-secret'
 process.env.CREDENTIAL_ENCRYPTION_KEY = 'test-encryption-key-not-a-real-secret'
 // This whole synthetic journey is modeled as running on the real Preview
 // deployment named in this operation's brief -- proves the lifecycle
-// dispatch resolves environment=preview / ref=feature/complimentary-access
+// dispatch resolves environment=preview / ref=feature/google-social-auth
 // for this exact tenant's own automatic dispatch (Phase 3 item T).
 process.env.VERCEL_ENV = 'preview'
-process.env.VERCEL_GIT_COMMIT_REF = 'feature/complimentary-access'
+process.env.VERCEL_GIT_COMMIT_REF = 'feature/google-social-auth'
 
 import Stripe from 'stripe'
 import sessionHandler from '../dashboard/api/session/[action].js'
@@ -598,7 +598,7 @@ async function main() {
   })
 
   // --- Stage 7: location discovery + approval -> automatic dispatch ---------
-  await stage('7. location approval triggers automatic Preview lifecycle dispatch (environment=preview, ref=feature/complimentary-access)', async () => {
+  await stage('7. location approval triggers automatic Preview lifecycle dispatch (environment=preview, ref=feature/google-social-auth)', async () => {
     globalThis.fetch = mockFetchRouter(
       { [SYNTHETIC_GOOGLE_ACCOUNT_SHARED]: [{ name: 'locations/1', title: 'Smoke Test Restaurant' }] },
       { githubDispatch: async () => ({ status: 204 }), onGithubDispatch: (_url, opts) => { dispatchBodyA = JSON.parse(opts.body); dispatchCallCountA += 1 } },
@@ -608,7 +608,7 @@ async function main() {
     assert(approveRes.body.status === 'provisioning', `expected 'provisioning' after an accepted dispatch, got ${approveRes.body.status}`)
     assert(dispatchCallCountA === 1, 'exactly one GitHub dispatch call must occur')
     assert(dispatchBodyA.inputs.environment === 'preview', `expected environment 'preview', got ${JSON.stringify(dispatchBodyA.inputs.environment)}`)
-    assert(dispatchBodyA.ref === 'feature/complimentary-access', `expected the approved Preview ref, got ${JSON.stringify(dispatchBodyA.ref)}`)
+    assert(dispatchBodyA.ref === 'feature/google-social-auth', `expected the approved Preview ref, got ${JSON.stringify(dispatchBodyA.ref)}`)
 
     const config = await getTenantConfig(tenantAId)
     assert(config.approvedLocations.length === 1, `expected exactly 1 approved location, got ${config.approvedLocations.length}`) // Phase3-C/H
