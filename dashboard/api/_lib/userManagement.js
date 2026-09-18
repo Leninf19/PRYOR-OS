@@ -182,3 +182,14 @@ export function buildResetUrl(req, rawToken) {
 export function buildVerifyUrl(req, rawToken) {
   return `${buildOrigin(req)}/verify-email?token=${encodeURIComponent(rawToken)}`
 }
+
+// Google Sign-In (PRYOR login identity) -- the ONE place the login OAuth
+// client's redirect_uri is computed, exactly the same request-host-derived
+// way every other link in this file is built (never DASHBOARD_BASE_URL --
+// see this file's own established convention). This is the exact value
+// that must be registered as an Authorized Redirect URI for the SEPARATE
+// "PRYOR Identity" Google Cloud OAuth client (never the existing GBP
+// client's redirect_uri, which points at /api/google/callback instead).
+export function buildGoogleLoginCallbackUrl(req) {
+  return `${buildOrigin(req)}/api/session/google-login-callback`
+}

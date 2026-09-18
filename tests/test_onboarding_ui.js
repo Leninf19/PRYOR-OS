@@ -72,7 +72,13 @@ function testLocationSelectionIsBuiltOnlyFromDiscoveredLocations() {
 }
 
 function testNoLocationsDiscoveredIsADistinctState() {
-  assert(/No locations found/.test(content), 'must have a distinct "no locations discovered" state')
+  // Part 13 (Google Sign-In feature) -- copy updated to "No Business
+  // Profiles found" with a "Choose another Google account" recovery
+  // action (onConnect, restarting GBP authorization itself) rather than a
+  // bare re-run of discovery against the same already-connected account.
+  assert(/No Business Profiles found/.test(content), 'must have a distinct "no locations discovered" state')
+  assert(/Choose another Google account/.test(content) && /onConnect/.test(content),
+    'the recovery action must restart GBP authorization (onConnect), never merely reset local discovery state')
   assert(/\(discovery\.locations \?\? \[\]\)\.length === 0/.test(content), 'the empty-discovery state must be checked explicitly, not treated as a generic error')
 }
 

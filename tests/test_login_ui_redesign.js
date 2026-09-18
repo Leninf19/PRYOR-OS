@@ -2,10 +2,21 @@
 // visual rewrite of dashboard/src/components/Login.jsx did not change any
 // authentication behavior: same endpoint, same request body shape, same
 // success/failure contract, no invented fields (no "remember me" -- the
-// backend has never accepted one), no Google/OAuth login option, and the
-// register/access-code affordances are plain navigation links (real
-// routes as of Multi-Tenant Phase 4Q.1), never a fetch() fired directly
-// from this screen.
+// backend has never accepted one), and the register/access-code
+// affordances are plain navigation links (real routes as of Multi-Tenant
+// Phase 4Q.1), never a fetch() fired directly from this screen.
+//
+// Google Sign-In (PRYOR login identity) update: this file's own frozen
+// "no Google/OAuth login option" invariant was a deliberate CHOICE at the
+// time, not a permanent architectural rule -- it recorded that GBP
+// connection must never be confused with login, never that PRYOR could
+// never offer its OWN separate "Continue with Google" identity option. Now
+// that this feature exists, testGoogleLoginOptionIsPresentAndSafelyWired()
+// below proves the opposite half of the SAME concern that motivated the
+// original assertion: a real Google option is present, but it points at
+// PRYOR's own login-identity endpoint (google-login-start), is a plain
+// navigation (never a fetch/XHR), and NEVER touches
+// google/[action].js's GBP auth()/callback() routes.
 //
 // Plain source-text regex assertions, matching this project's established
 // convention for a file with no React render-test harness (see
@@ -68,8 +79,13 @@ function testForgotPasswordLinkUnchanged() {
   assert(/href="\/forgot-password"/.test(content), 'the Forgot password link must still point to /forgot-password')
 }
 
-function testNoGoogleOrThirdPartyLoginOption() {
-  assert(!/google/i.test(content), 'must never add a Google/OAuth login option -- GBP connection is a separate, later onboarding concept, not login')
+function testGoogleLoginOptionIsPresentAndSafelyWired() {
+  assert(/GoogleButton/.test(content), 'must render the shared GoogleButton "Continue with Google" affordance')
+  assert(/\/api\/session\/google-login-start/.test(content), 'the Google option must navigate to PRYOR\'s own login-identity endpoint')
+  // Never the GBP connection endpoint -- the two OAuth systems must never
+  // be wireable from the same control.
+  assert(!/\/api\/google\/auth/.test(content), 'must never point the login Google button at the GBP connect endpoint')
+  assert(!/GOOGLE_CLIENT_ID|business\.manage/.test(content), 'must never reference the GBP OAuth client or its scope')
 }
 
 function testPasswordVisibilityToggleExists() {
@@ -102,7 +118,7 @@ const tests = [
   ['still calls onSuccess(data.account) only on a 200', testCallsOnSuccessWithTheAccountOnlyOn200],
   ['preserves the three real server-message fallback paths', testPreservesTheThreeRealServerMessagePaths],
   ['Forgot password link is unchanged', testForgotPasswordLinkUnchanged],
-  ['no Google/OAuth login option', testNoGoogleOrThirdPartyLoginOption],
+  ['Google login option is present and safely wired', testGoogleLoginOptionIsPresentAndSafelyWired],
   ['password show/hide toggle exists', testPasswordVisibilityToggleExists],
   ['register/access-code links are real navigation, not fetch calls', testRegisterAndAccessCodeLinksAreRealNavigationNotFetchCalls],
   ['autocomplete hints are unchanged', testStillUsesTheCorrectAutocompleteHints],

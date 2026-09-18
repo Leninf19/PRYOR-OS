@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { GoogleButton, OrDivider, useGoogleAuthError } from './auth/AuthShell.jsx'
 
 const MIN_PASSWORD_LENGTH = 10
 
@@ -27,6 +28,7 @@ export default function AcceptInvite() {
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [done, setDone] = useState(false)
+  const googleAuthError = useGoogleAuthError()
 
   useEffect(() => {
     if (!token) { setStatus('invalid'); return }
@@ -114,7 +116,7 @@ export default function AcceptInvite() {
         )}
 
         {status === 'valid' && !done && (
-          <form onSubmit={handleSubmit} className="space-y-4">
+          <>
             <div className="text-center space-y-1 pb-1">
               <p className="text-sm font-semibold" style={{ color: 'var(--color-text-1)' }}>
                 You've been invited to Pryor OS
@@ -124,6 +126,19 @@ export default function AcceptInvite() {
               </p>
             </div>
 
+            {googleAuthError && (
+              <p className="text-xs text-center mt-3" style={{ color: 'var(--color-danger, #dc2626)' }}>{googleAuthError}</p>
+            )}
+
+            <div className="mt-4">
+              <GoogleButton
+                href={`/api/session/google-login-start?returnTo=${encodeURIComponent('/')}&inviteToken=${encodeURIComponent(token)}`}
+                label="Continue with Google"
+              />
+            </div>
+            <OrDivider />
+
+          <form onSubmit={handleSubmit} className="space-y-4">
             <div>
               <label className="text-xs font-semibold block mb-1.5" style={{ color: 'var(--color-text-2)' }}>
                 Your name
@@ -181,6 +196,7 @@ export default function AcceptInvite() {
               {submitting ? 'Setting up your account…' : 'Create account'}
             </button>
           </form>
+          </>
         )}
       </div>
     </div>

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { GoogleButton, OrDivider, useGoogleAuthError } from './auth/AuthShell.jsx'
 
 // Split-screen redesign (UI/UX only -- see README/commit message for the
 // exact scope). Every network call, field name, status-code handling, and
@@ -28,6 +29,7 @@ export default function Login({ onSuccess }) {
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const googleAuthError = useGoogleAuthError()
 
   async function handleSubmit(e) {
     e.preventDefault()
@@ -68,6 +70,19 @@ export default function Login({ onSuccess }) {
           <p className="text-sm mb-8" style={{ color: 'var(--color-text-2)' }}>
             Sign in to your PRYOR workspace
           </p>
+
+          {googleAuthError && (
+            <div
+              role="alert"
+              className="rounded-lg border px-3.5 py-2.5 text-xs font-medium mb-4"
+              style={{ background: 'var(--color-danger-bg)', borderColor: 'var(--color-danger-border)', color: 'var(--color-danger)' }}
+            >
+              {googleAuthError}
+            </div>
+          )}
+
+          <GoogleButton href={`/api/session/google-login-start?returnTo=${encodeURIComponent('/')}`} />
+          <OrDivider />
 
           <form onSubmit={handleSubmit} className="space-y-4" noValidate>
             <Field label="Email">
