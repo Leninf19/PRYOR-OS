@@ -1976,11 +1976,12 @@ function resolveLifecycleExecutionEnvironment() {
 // only way to change it).
 //
 // For this smoke-test phase, the one approved Preview lifecycle ref is
-// 'feature/commercial-entitlements'. Bumping this to a different branch
-// later (e.g. once merged to main) is a deliberate, reviewed one-line
-// change here, exactly like bumping PINNED_LIFECYCLE_SHA in the workflow
-// file.
-const APPROVED_PREVIEW_LIFECYCLE_REF = 'feature/commercial-entitlements'
+// 'feature/complimentary-access' (bumped from 'feature/commercial-
+// entitlements' now that THIS branch is the one under Preview smoke test).
+// Bumping this to a different branch later (e.g. once merged to main) is a
+// deliberate, reviewed one-line change here, exactly like bumping
+// PINNED_LIFECYCLE_SHA in the workflow file.
+const APPROVED_PREVIEW_LIFECYCLE_REF = 'feature/complimentary-access'
 
 // Defense in depth beyond the fixed constant above: Vercel's own
 // VERCEL_GIT_COMMIT_REF (set by Vercel itself from the actual git ref this
@@ -2324,6 +2325,75 @@ async function approveLocations(req, res) {
   return res.status(200).json({ success: true, tenantId, activatedLocationCount: config.approvedLocations.length, status: responseStatus })
 }
 
+// Multi-Tenant Phase 4O.1 -- owner-initiated self-service recovery from a
+// DEFINITE dispatch failure ('provisioning_dispatch_failed' only -- never
+// 'provisioning_failed'/'initial_sync_failed', which mean provision_tenant.py
+// or initial_sync.py itself ran and failed; those remain the operator's
+// pinned manual dispatcher's job, unchanged). Deliberately reuses
+// triggerAutomaticProvisioning() UNCHANGED rather than re-implementing the
+// claim+dispatch+outcome-handling sequence a second time: this is the exact
+// same one-winner-per-configVersion CAS claim automatic provisioning
+// already uses, just invoked from an explicit owner action instead of the
+// approve-locations handoff, so there is no second dispatch code path to
+// keep in sync with the first.
+//
+// tenantId is SESSION-derived only (resolveTenantId(account)) -- nothing in
+// the request body/query is ever consulted for it, so a caller cannot ask
+// this endpoint to retry any tenant but their own.
+//
+// Eligibility is re-checked against a FRESH read immediately before the
+// claim, and the claim itself is a CAS on that exact configVersion (inside
+// triggerAutomaticProvisioning -> markTenantProvisioningDispatched): if a
+// concurrent retry (or the lazy reconciliation sweep, or a fresh automatic
+// dispatch) already changed the tenant's state between this read and the
+// claim, only one of them wins the CAS and actually calls GitHub -- the
+// loser's markTenantProvisioningDispatched throws ConfigVersionConflictError
+// and triggerAutomaticProvisioning returns immediately without dispatching
+// anything, exactly like the existing concurrent-approval-claim guarantee.
+async function retryProvisioning(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed', message: 'Method not allowed' })
+
+  const account = await requireAuth(req, res, ['owner'])
+  if (!account) return
+  // SERVER-DERIVED ONLY -- see approveLocations()'s identical comment above.
+  const tenantId = resolveTenantId(account)
+
+  const allowed = await enforceRateLimit(req, res, `retry-provisioning:${account.userId}`, { requestsPerWindow: 10, windowSeconds: 60 })
+  if (!allowed) return
+
+  const config = await getTenantConfig(tenantId)
+  if (!config) return res.status(404).json({ error: 'not_found', message: 'Tenant not found.' })
+
+  if (config.status !== 'provisioning_dispatch_failed') {
+    await appendAuditEntry(tenantId, {
+      actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+      entity: 'tenant_provisioning', entityId: tenantId, action: 'provisioning.retry_denied_not_eligible', changes: null, result: 'denied',
+      message: `Provisioning retry was denied: tenant status is ${JSON.stringify(config.status)}.`,
+    })
+    return res.status(409).json({
+      error: 'not_eligible',
+      message: 'Setup can only be retried after a definite setup failure.',
+    })
+  }
+
+  await appendAuditEntry(tenantId, {
+    actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+    entity: 'tenant_provisioning', entityId: tenantId, action: 'provisioning.retry_requested', changes: null, result: 'success',
+    message: 'Owner requested a provisioning retry after a dispatch failure.',
+  })
+
+  // Returns the tenant to 'provisioning' only if THIS call wins the CAS
+  // claim -- see triggerAutomaticProvisioning()'s own header. A lost race
+  // returns early with no dispatch and no status change; a genuine
+  // dispatch attempt that is itself rejected/ambiguous is handled exactly
+  // as it already is for the automatic path (immediate re-failure, or left
+  // for the next reconciliation sweep).
+  await triggerAutomaticProvisioning(tenantId, config)
+  const fresh = await getTenantConfig(tenantId)
+
+  return res.status(200).json({ success: true, tenantId, status: fresh ? fresh.status : config.status })
+}
+
 // ---------------------------------------------------------------------------
 
 export default async function handler(req, res) {
@@ -2339,6 +2409,7 @@ export default async function handler(req, res) {
     case 'disconnect':         return disconnect(req, res)
     case 'discover-locations': return discoverLocations(req, res)
     case 'approve-locations':  return approveLocations(req, res)
+    case 'retry-provisioning': return retryProvisioning(req, res)
     default:                   return res.status(404).json({ error: 'not_found' })
   }
 }

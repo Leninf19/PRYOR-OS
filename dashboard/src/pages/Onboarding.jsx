@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useAccount } from '../components/AuthGate.jsx'
-import { useTenantStatus, useDiscoverLocations, useApproveLocations } from '../hooks/useTenantStatus.js'
+import { useTenantStatus, useDiscoverLocations, useApproveLocations, useRetryProvisioning } from '../hooks/useTenantStatus.js'
 import { useGoogleOAuthStatus, useConnectGoogle } from '../hooks/useGoogleOAuthStatus.js'
 import Button from '../components/ui/Button.jsx'
 
@@ -26,13 +26,18 @@ import Button from '../components/ui/Button.jsx'
 // provisioning genuinely succeeds) -- never by anything this component
 // does. Before Phase 4O, both were dispatched manually by a human
 // platform operator; that pinned dispatcher remains fully available as an
-// operator recovery path for any of the failure states below. This
-// component's ENTIRE job during every waiting/failure state is to poll
-// and display status (useTenantStatus()'s refetchInterval) -- there is no
-// "Retry" button that re-triggers anything server-side; "retryable" here
-// means the failure is clearly explained and the user can re-check status
-// on demand (a plain refetch) while the platform (or an operator) recovers
-// it, never a hidden self-service dispatcher.
+// operator recovery path for every failure state below EXCEPT one.
+//
+// Phase 4O.1 -- the ONE deliberate exception: 'provisioning_dispatch_failed'
+// (a CONFIRMED no-workflow-was-ever-dispatched outcome, never a real
+// provision_tenant.py/initial_sync.py run that itself failed) now offers a
+// self-service "Retry setup" action (useRetryProvisioning(), POST
+// /api/google/retry-provisioning) alongside the plain refetch. It is
+// Owner-only, tenant-scoped server-side, and reuses the exact same
+// dispatch helper the automatic path uses -- see that endpoint's own
+// header. 'provisioning_failed' and 'initial_sync_failed' still have no
+// such button: those mean the automation itself ran and failed, which
+// remains the operator's manual pinned-dispatcher recovery story.
 
 const STEP_ORDER = ['connect', 'discover', 'approve', 'provisioning', 'initial_sync', 'ready']
 
@@ -223,13 +228,23 @@ function WaitingStep({ step, title, message, onRefresh }) {
 // unpolished copy, since that string was never written with an end user as
 // its audience. `lastError` is still read (so a future need to branch on it
 // is easy), just never interpolated into what the Owner sees.
-function FailedStep({ step, title, lastError, onRefresh }) {
+function FailedStep({ step, title, lastError, onRefresh, onRetry, retryPending, retryError }) {
   void lastError
   return (
     <OnboardingShell activeStep={step}>
       <StepTitle>{title}</StepTitle>
       <ErrorBanner message="Something went wrong on our end." />
-      <StepBody>Our team has been notified and will retry this shortly. You can check back here anytime.</StepBody>
+      {retryError && <ErrorBanner message={retryError} />}
+      <StepBody>
+        {onRetry
+          ? 'You can retry setup now, or check back here anytime.'
+          : 'Our team has been notified and will retry this shortly. You can check back here anytime.'}
+      </StepBody>
+      {onRetry && (
+        <Button variant="primary" className="w-full justify-center mb-2" onClick={onRetry} disabled={retryPending}>
+          {retryPending ? 'Retrying…' : 'Retry setup'}
+        </Button>
+      )}
       <Button variant="secondary" className="w-full justify-center" onClick={onRefresh}>Check again</Button>
     </OnboardingShell>
   )
@@ -277,6 +292,7 @@ export default function Onboarding() {
   const { data: tenantStatus, isLoading, isError, refetch } = useTenantStatus()
   const { data: gbpStatus } = useGoogleOAuthStatus()
   const { connect } = useConnectGoogle()
+  const retryMutation = useRetryProvisioning()
 
   if (isLoading) return <LoadingStep />
   if (isError || !tenantStatus) return <TenantStatusUnavailableStep onRetry={refetch} />
@@ -308,7 +324,10 @@ export default function Onboarding() {
       message="We're setting up your account's storage now -- this usually only takes a few minutes." onRefresh={refetch} />
   }
   if (status === 'provisioning_dispatch_failed') {
-    return <FailedStep step="provisioning" title="Setup couldn't start" lastError={tenantStatus.provisioning?.lastError} onRefresh={refetch} />
+    return <FailedStep step="provisioning" title="Setup couldn't start" lastError={tenantStatus.provisioning?.lastError} onRefresh={refetch}
+      onRetry={isOwner ? () => retryMutation.mutate() : undefined}
+      retryPending={retryMutation.isPending}
+      retryError={retryMutation.isError ? (retryMutation.error?.message || 'Could not retry setup. Please try again.') : null} />
   }
   if (status === 'provisioning_failed') {
     return <FailedStep step="provisioning" title="Setup couldn't complete" lastError={tenantStatus.provisioning?.lastError} onRefresh={refetch} />

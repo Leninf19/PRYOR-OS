@@ -227,7 +227,7 @@ async function testPreviewVercelEnvSendsPreviewEnvironment() {
   // copy of the WORKFLOW FILE executes) must be the approved Preview ref,
   // never 'main' -- main does not yet contain the Preview-isolation
   // workflow logic being smoke-tested.
-  assert(capturedBody?.ref === 'feature/commercial-entitlements', `expected ref 'feature/commercial-entitlements', got ${JSON.stringify(capturedBody?.ref)}`)
+  assert(capturedBody?.ref === 'feature/complimentary-access', `expected ref 'feature/complimentary-access', got ${JSON.stringify(capturedBody?.ref)}`)
 }
 
 // ===========================================================================
@@ -269,7 +269,7 @@ async function testPreviewRefMismatchWithDeployedRefFailsClosed() {
 async function testPreviewRefMatchingDeployedRefSucceeds() {
   wireSharedStores()
   process.env.VERCEL_ENV = 'preview'
-  process.env.VERCEL_GIT_COMMIT_REF = 'feature/commercial-entitlements'
+  process.env.VERCEL_GIT_COMMIT_REF = 'feature/complimentary-access'
   let capturedBody = null
   const { approveRes } = await approveFreshLocation('accounts/1', 'locations/1',
     mockFetchRouter({ 'accounts/1': [{ name: 'locations/1', title: 'Location' }] }, {
@@ -278,7 +278,7 @@ async function testPreviewRefMatchingDeployedRefSucceeds() {
     }))
   assert(approveRes.statusCode === 200)
   assert(approveRes.body.status === 'provisioning', `expected 'provisioning', got ${approveRes.body.status}`)
-  assert(capturedBody?.ref === 'feature/commercial-entitlements', `expected the approved Preview ref, got ${JSON.stringify(capturedBody?.ref)}`)
+  assert(capturedBody?.ref === 'feature/complimentary-access', `expected the approved Preview ref, got ${JSON.stringify(capturedBody?.ref)}`)
 }
 
 async function testPreviewWithoutDeployedRefMetadataStillUsesApprovedConstant() {
@@ -294,7 +294,7 @@ async function testPreviewWithoutDeployedRefMetadataStillUsesApprovedConstant() 
       onGithubDispatch: (_url, opts) => { capturedBody = JSON.parse(opts.body) },
     }))
   assert(approveRes.body.status === 'provisioning')
-  assert(capturedBody?.ref === 'feature/commercial-entitlements')
+  assert(capturedBody?.ref === 'feature/complimentary-access')
 }
 
 // ===========================================================================
@@ -386,7 +386,7 @@ async function testForgedRefFieldsInRequestBodyAreIgnored() {
     }),
     { ref: 'main', gitRef: 'main', branch: 'main', workflowRef: 'main' })
   assert(approveRes.statusCode === 200, `sanity: approval must succeed, got ${approveRes.statusCode}`)
-  assert(capturedBody?.ref === 'feature/commercial-entitlements',
+  assert(capturedBody?.ref === 'feature/complimentary-access',
     `a browser-supplied ref-shaped field must be completely ignored -- expected the SERVER's own approved Preview ref to win, got ${JSON.stringify(capturedBody?.ref)}`)
 }
 
