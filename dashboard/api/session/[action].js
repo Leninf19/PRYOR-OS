@@ -62,7 +62,7 @@ import {
 } from '../_lib/accessCodeStore.js'
 import { buildAccessCodeCommercialWrite, PaymentRequiredNotSupportedError, InvalidAccessCodeGrantError } from '../_lib/accessCodeCommercial.js'
 import {
-  redeemComplimentaryCode, getComplimentaryRedemptionClaim, clearComplimentaryRedemptionClaim,
+  previewComplimentaryCode, redeemComplimentaryCode, getComplimentaryRedemptionClaim, clearComplimentaryRedemptionClaim,
   ComplimentaryCodeInvalidError, ComplimentaryAccessStoreUnavailableError,
 } from '../_lib/complimentaryAccessStore.js'
 import { buildComplimentaryAccessCommercialWrite, InvalidComplimentaryGrantError } from '../_lib/complimentaryAccessCommercial.js'
@@ -1189,9 +1189,14 @@ async function getStartedStatus(req, res) {
 }
 
 // The tenant-creation transaction -- the ONE path both redeemAccessCode()
-// and selectPlan() (once Phase 4Q.2 wires real payment) funnel into.
+// and selectPlan() (once Phase 4Q.2 wires real payment) funnel into, now
+// joined by a complimentary-code redemption at the SAME onboarding gate
+// (see redeemAccessCodeAction()'s own complimentary-first routing below).
 // `commercial` is plain descriptive metadata (see tenantConfigStore.js's
 // `commercial` field) -- never consulted by any authorization check.
+// `complimentaryGrant` is mutually exclusive with `accessCodeGrant`/
+// `trialEligibility` -- a tenant created via a complimentary code has
+// neither of the other two set.
 //
 // ORDER, and why:
 //   1. Acquire a short-lived per-email lock (pendingRegistrationStore.js)
@@ -1228,7 +1233,7 @@ async function getStartedStatus(req, res) {
 //   4. Delete the pending registration -- from this point on, the ONLY
 //      record of this identity is the real tenant_config/user pair.
 //   5. Release the lock (always, via finally).
-async function createTenantForVerifiedRegistration(email, commercial, accessCodeGrant = null, trialEligibility = null) {
+async function createTenantForVerifiedRegistration(email, commercial, accessCodeGrant = null, trialEligibility = null, complimentaryGrant = null) {
   const lockAcquired = await acquireTenantCreationLock(email)
   if (!lockAcquired) {
     throw new TenantCreationInProgressError('Your workspace is already being created. Please wait a moment and try again.')
@@ -1267,7 +1272,7 @@ async function createTenantForVerifiedRegistration(email, commercial, accessCode
         companyName: fresh.companyName,
         ownerEmail: fresh.email, ownerUserId: fresh.userId, ownerPasswordHash: fresh.passwordHash,
         ownerDisplayName: fresh.displayName, ownerPasswordSetAt: fresh.createdAt,
-        commercial, accessCodeGrant, trialEligibility,
+        commercial, accessCodeGrant, trialEligibility, complimentaryGrant,
       }))
     } catch (err) {
       if (err instanceof IdentityAlreadyExistsError) {
@@ -1300,11 +1305,141 @@ async function issueRealSessionAndRespond(res, userRecord, tenantId) {
   })
 }
 
+// Complimentary Restaurant Access Codes -- SHARED authoritative
+// eligibility/redemption logic, used by BOTH the onboarding access-code
+// gate (redeemAccessCodeAction() below, no tenant exists yet) and the
+// Settings -> Billing redemption action (redeemComplimentaryCodeAction()
+// further below, an ALREADY-EXISTING tenant). Extracted so there is
+// exactly ONE reviewable implementation of "is this account eligible" and
+// "consume this code," never two independently-maintained copies that
+// could silently drift apart.
+//
+// Pure -- no I/O, no request/response handling. `config` is the tenant's
+// current tenant_config record, or `null` for a brand-new registrant at
+// the onboarding gate (who structurally cannot have any commercial
+// consumption yet, since no tenant_config exists at all) -- `null` is
+// therefore always eligible. For an existing tenant, the ONLY eligible
+// starting states are "no commercial decision at all yet" (commercial ===
+// null) or the not-yet-started 'trial_pending_activation' shape -- see
+// complimentaryAccessCommercial.js's own header for the full anti-stacking
+// policy this implements (never allow stacking on an active trial, active
+// paid subscription, past_due, suspended, canceled, an existing
+// complimentaryGrant, or a grant from the OTHER, unrelated access-code
+// system).
+function evaluateComplimentaryEligibility(config) {
+  if (config == null) return { eligible: true }
+  if (config.complimentaryGrant != null) {
+    return { eligible: false, error: 'invalid_request', message: 'This account has already used a complimentary access code.' }
+  }
+  if (config.accessCodeGrant != null) {
+    return { eligible: false, error: 'invalid_request', message: 'This code cannot be redeemed for this account.' }
+  }
+  const currentStatus = config.commercial?.commercialStatus ?? null
+  if (currentStatus === 'active') {
+    return { eligible: false, error: 'already_subscribed', message: 'This account already has an active subscription.' }
+  }
+  if (currentStatus !== null && currentStatus !== 'trial_pending_activation') {
+    // Generic message for every other ineligible state (an already-running
+    // trial, past_due, suspended, canceled) -- never distinguishes which,
+    // so this never becomes a state-enumeration oracle either.
+    return { eligible: false, error: 'invalid_request', message: 'This code cannot be redeemed for this account.' }
+  }
+  return { eligible: true }
+}
+
+// Resume-on-retry + atomic consume, shared by both complimentary-redemption
+// call sites. If this tenant/identity already has a durable post-redemption
+// claim (a prior attempt consumed the code but a later write -- the
+// tenant_config update, or the tenant-creation transaction itself -- never
+// completed), that SAME result is returned rather than re-attempting a
+// redemption the code has already, irreversibly, given up. Otherwise
+// performs the real, atomic, single-use consume. Throws
+// ComplimentaryCodeInvalidError / ComplimentaryAccessStoreUnavailableError,
+// exactly as complimentaryAccessStore.js's own functions do -- every caller
+// maps these to the same HTTP responses.
+async function resolveComplimentaryRedemption({ rawCode, tenantId, userId }) {
+  const claimed = await getComplimentaryRedemptionClaim(tenantId)
+  if (claimed) return claimed
+  return redeemComplimentaryCode({ rawCode, tenantId, userId })
+}
+
+// Shared tail for a successful complimentary-code redemption discovered at
+// the onboarding gate: builds the canonical commercial write (the SAME
+// pure builder Settings -> Billing uses), creates the brand-new tenant with
+// it, and issues a real session. Mirrors createTenantForVerifiedRegistration()'s
+// own existing error-handling contract for the sales/access-code path
+// exactly, so a partial failure here is exactly as safely retryable as that
+// already-proven flow. `initialSyncCompletedAt` is always null here -- a
+// tenant being created right now has structurally never completed (or even
+// started) an initial sync, so this always produces the explicit
+// 'complimentary_pending_activation' shape, never an immediately-active
+// one; trialLifecycle.js's maybeStartComplimentaryAccess() activates it
+// later, anchored to this tenant's own FIRST initialSync.completedAt, once
+// Google onboarding actually completes.
+async function finishComplimentaryOnboarding(req, res, pending, redemption) {
+  let commercial, complimentaryGrant
+  try {
+    ;({ commercial, complimentaryGrant } = buildComplimentaryAccessCommercialWrite(redemption, {
+      initialSyncCompletedAt: null,
+      redeemedByUserId: pending.userId,
+    }))
+  } catch (err) {
+    if (err instanceof InvalidComplimentaryGrantError) {
+      console.error(`[session/redeem-access-code] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This code could not be processed. Please contact support.' })
+    }
+    throw err
+  }
+
+  try {
+    const { tenantId, userRecord } = await createTenantForVerifiedRegistration(pending.email, commercial, null, null, complimentaryGrant)
+    // Best-effort -- see clearComplimentaryRedemptionClaim()'s own comment
+    // for why a failure here has no security consequence (createNewTenant()'s
+    // identity check already makes a genuine second tenant for this email
+    // impossible regardless).
+    await clearComplimentaryRedemptionClaim(tenantId)
+    await appendAuditEntry(tenantId, {
+      actorId: userRecord.userId, actorEmail: userRecord.email, ip: clientIp(req),
+      action: 'tenant.created_via_complimentary_code', entity: 'tenant', entityId: tenantId,
+      result: 'success',
+      message: `Tenant created via complimentary code (plan: ${complimentaryGrant.planId}, durationDays: ${complimentaryGrant.durationDays}, pending activation).`,
+    })
+    return issueRealSessionAndRespond(res, userRecord, tenantId)
+  } catch (err) {
+    if (err instanceof EmailNowOccupiedError) {
+      return res.status(409).json({ error: 'email_occupied', message: err.message })
+    }
+    if (err instanceof TenantCreationInProgressError) {
+      return res.status(409).json({ error: 'creation_in_progress', message: err.message })
+    }
+    if (err instanceof PendingRegistrationNotFoundError) {
+      return res.status(404).json({ error: 'not_found', message: err.message })
+    }
+    if (err instanceof PendingRegistrationStoreUnavailableError || err instanceof TenantConfigStoreUnavailableError || err instanceof UserStoreUnavailableError) {
+      console.error(`[session/redeem-access-code] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'Could not finish setting up your workspace. Please try again in a moment.' })
+    }
+    throw err
+  }
+}
+
 // POST /api/session/redeem-access-code  { code }
 // Identity comes ONLY from the lta_pending_signup cookie -- the client
 // sends the raw code string and nothing else. tenantId/userId used for
 // redemption bookkeeping are the SAME server-derived values used for
 // tenant creation, never request input.
+//
+// Complimentary Restaurant Access Codes -- this action now ALSO recognizes
+// a complimentary pilot code (PRYOR-PILOT-...), tried FIRST and entirely
+// server-side (never by client-visible prefix): a non-destructive
+// previewComplimentaryCode() peek determines whether the submitted code
+// belongs to the complimentary system at all. If it does, this registrant
+// is redeemed through finishComplimentaryOnboarding() above and the
+// unrelated sales/registration access-code system below is never
+// consulted for it. If it doesn't, this falls through to the EXISTING,
+// byte-for-byte-unmodified access-code logic below -- the two systems
+// remain structurally independent storage/business-logic-wise; only the
+// onboarding-gate UI and this routing decision are shared.
 //
 // Phase B.8 corrections:
 //   1. (Part E) previewAccessCode() -- a non-destructive peek -- runs
@@ -1345,6 +1480,41 @@ async function redeemAccessCodeAction(req, res) {
   const secondAllowed = await enforceRateLimit(req, res, `redeem-access-code-identity:${pending.userId}`, { requestsPerWindow: 10, windowSeconds: 60 * 10 })
   if (!secondAllowed) return
 
+  // Complimentary Restaurant Access Codes -- checked FIRST, before the
+  // unrelated sales/registration access-code claim below. A durable
+  // complimentary claim, keyed by this registrant's own pre-reserved
+  // tenantIdReserved (the SAME identity createTenantForVerifiedRegistration()
+  // will use), resumes a prior attempt whose tenant-creation transaction
+  // never completed -- exactly mirroring the sales-code claim's own
+  // resume-on-retry contract below, just keyed by tenantId instead of email
+  // (there is no tenant/email pairing yet to key on until creation
+  // succeeds, but tenantIdReserved is just as stable and unique per
+  // registrant).
+  //
+  // FAIL OPEN to the unrelated sales-code system on a genuine store outage
+  // here -- the two systems are independent by design, and the old system's
+  // availability must NEVER depend on the complimentary store being
+  // reachable. This routing check only ever WIDENS which code formats are
+  // recognized; it must never NARROW the old system's own availability.
+  // Once a code is actually confirmed to belong to the complimentary system
+  // (previewComplimentaryCode succeeding, below) a subsequent store failure
+  // during the real redemption still fails closed with 503, exactly like
+  // the sales-code system's own redeemAccessCode() failure path -- that is
+  // the correct place to fail closed, not this best-effort routing check.
+  let complimentaryClaim = null
+  try {
+    complimentaryClaim = await getComplimentaryRedemptionClaim(pending.tenantIdReserved)
+  } catch (err) {
+    if (err instanceof ComplimentaryAccessStoreUnavailableError) {
+      console.error(`[session/redeem-access-code] complimentary claim check unavailable (falling through to the sales/registration access-code system): ${err.message}`)
+    } else {
+      throw err
+    }
+  }
+  if (complimentaryClaim) {
+    return finishComplimentaryOnboarding(req, res, pending, complimentaryClaim)
+  }
+
   let redemption
   try {
     redemption = await getAccessCodeRedemptionClaim(pending.email)
@@ -1362,6 +1532,55 @@ async function redeemAccessCodeAction(req, res) {
       return res.status(400).json({ error: 'invalid_request', message: 'An access code is required.' })
     }
     const rawCode = code.trim()
+
+    // Server-side determines WHICH code system a submitted code belongs to
+    // -- NEVER by a client-visible prefix. A non-destructive
+    // previewComplimentaryCode() peek checks whether this exact code exists
+    // and is currently valid in the complimentary store; if so, this
+    // registrant is redeeming a complimentary pilot code and the unrelated
+    // sales/registration access-code system below is never consulted for
+    // it. An invalid/unknown-to-that-system code falls straight through to
+    // the existing logic below, unmodified -- there is no way for a caller
+    // to tell from the response which system was actually checked.
+    //
+    // FAIL OPEN to the sales-code system on a genuine complimentary-store
+    // outage here too -- same reasoning as the claim check above. A code
+    // this outage prevents us from confirming as complimentary is simply
+    // tried against the (unaffected) sales-code system next; if it isn't a
+    // valid sales code either, that system's own existing error handling
+    // reports it, never this routing check.
+    let complimentaryPreview = null
+    try {
+      complimentaryPreview = await previewComplimentaryCode({ rawCode })
+    } catch (err) {
+      if (err instanceof ComplimentaryCodeInvalidError) {
+        complimentaryPreview = null
+      } else if (err instanceof ComplimentaryAccessStoreUnavailableError) {
+        console.error(`[session/redeem-access-code] complimentary preview unavailable (falling through to the sales/registration access-code system): ${err.message}`)
+      } else {
+        throw err
+      }
+    }
+
+    if (complimentaryPreview) {
+      let freshComplimentaryRedemption
+      try {
+        freshComplimentaryRedemption = await resolveComplimentaryRedemption({ rawCode, tenantId: pending.tenantIdReserved, userId: pending.userId })
+      } catch (err) {
+        if (err instanceof ComplimentaryCodeInvalidError) {
+          // Same generic message the sales-code system's own unknown/
+          // revoked/expired code path uses -- never distinguishable from a
+          // guessed sales code that also happened to be invalid.
+          return res.status(400).json({ error: 'invalid_access_code', message: 'This code is invalid or can no longer be used.' })
+        }
+        if (err instanceof ComplimentaryAccessStoreUnavailableError) {
+          console.error(`[session/redeem-access-code] ${err.message}`)
+          return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+        }
+        throw err
+      }
+      return finishComplimentaryOnboarding(req, res, pending, freshComplimentaryRedemption)
+    }
 
     let preview
     try {
@@ -1516,32 +1735,12 @@ async function redeemComplimentaryCodeAction(req, res) {
     return res.status(400).json({ error: 'invalid_request', message: 'This code cannot be redeemed for this account.' })
   }
 
-  // Anti-stacking / eligibility gate -- see complimentaryAccessCommercial.js's
-  // own header for the full policy. A tenant that has EVER redeemed
-  // complimentary access before (complimentaryGrant is written once and
-  // NEVER cleared), or that has a pending grant from the OTHER, unrelated
-  // access-code system, or that already has ANY other real commercial
-  // consumption (an active trial, an active/past_due/suspended/canceled
-  // paid relationship) is refused. The only eligible starting states are
-  // "no commercial decision at all yet" (commercial === null) or the
-  // not-yet-started 'trial_pending_activation' shape -- exactly the window
-  // this feature's own described product flow (redeem BEFORE connecting
-  // GBP) puts every tenant in.
-  if (config.complimentaryGrant != null) {
-    return res.status(400).json({ error: 'invalid_request', message: 'This account has already used a complimentary access code.' })
-  }
-  if (config.accessCodeGrant != null) {
-    return res.status(400).json({ error: 'invalid_request', message: 'This code cannot be redeemed for this account.' })
-  }
-  const currentStatus = config.commercial?.commercialStatus ?? null
-  if (currentStatus === 'active') {
-    return res.status(400).json({ error: 'already_subscribed', message: 'This account already has an active subscription.' })
-  }
-  if (currentStatus !== null && currentStatus !== 'trial_pending_activation') {
-    // Generic message for every other ineligible state (an already-running
-    // trial, past_due, suspended, canceled) -- never distinguishes which,
-    // so this never becomes a state-enumeration oracle either.
-    return res.status(400).json({ error: 'invalid_request', message: 'This code cannot be redeemed for this account.' })
+  // Anti-stacking / eligibility gate -- SHARED with the onboarding-gate
+  // path (see evaluateComplimentaryEligibility()'s own header for the full
+  // policy this implements).
+  const eligibility = evaluateComplimentaryEligibility(config)
+  if (!eligibility.eligible) {
+    return res.status(400).json({ error: eligibility.error, message: eligibility.message })
   }
 
   const { code: rawCode } = req.body ?? {}
@@ -1549,42 +1748,20 @@ async function redeemComplimentaryCodeAction(req, res) {
     return res.status(400).json({ error: 'invalid_request', message: 'A complimentary access code is required.' })
   }
 
-  // Resume from a durable post-redemption claim FIRST, mirroring
-  // redeemAccessCodeAction()'s own precedent exactly: if a prior attempt
-  // already atomically consumed this tenant's redemption slot but the
-  // tenant_config write below never completed (a CAS conflict, a transient
-  // outage, the browser closing mid-request), this recovers the SAME grant
-  // result rather than either erroring forever (the code is genuinely
-  // already consumed) or leaving the tenant stuck with no grant applied.
+  // Resume-on-retry + atomic consume -- SHARED with the onboarding-gate
+  // path (see resolveComplimentaryRedemption()'s own header).
   let redemption
   try {
-    redemption = await getComplimentaryRedemptionClaim(tenantId)
+    redemption = await resolveComplimentaryRedemption({ rawCode, tenantId, userId: account.userId })
   } catch (err) {
+    if (err instanceof ComplimentaryCodeInvalidError) {
+      return res.status(400).json({ error: 'invalid_code', message: err.message })
+    }
     if (err instanceof ComplimentaryAccessStoreUnavailableError) {
       console.error(`[session/redeem-complimentary-code] ${err.message}`)
       return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
     }
     throw err
-  }
-
-  if (!redemption) {
-    try {
-      // ATOMIC consume -- see complimentaryAccessStore.js's own REDEEM_SCRIPT.
-      // Two concurrent requests for the SAME single-use code can never both
-      // reach this successfully: the loser gets ComplimentaryCodeInvalidError
-      // below, identical to an unknown/expired/exhausted code, revealing
-      // nothing about why it lost the race.
-      redemption = await redeemComplimentaryCode({ rawCode, tenantId, userId: account.userId })
-    } catch (err) {
-      if (err instanceof ComplimentaryCodeInvalidError) {
-        return res.status(400).json({ error: 'invalid_code', message: err.message })
-      }
-      if (err instanceof ComplimentaryAccessStoreUnavailableError) {
-        console.error(`[session/redeem-complimentary-code] ${err.message}`)
-        return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
-      }
-      throw err
-    }
   }
 
   let commercial, complimentaryGrant

@@ -104,6 +104,16 @@ const SELF_SERVICE_TENANT_ID_PATTERN = /^t_[a-z0-9-]*-[a-z0-9]{6}$/
  *   window this pairing exists to close). Always null for the
  *   access-code/admin/migration paths -- mutually exclusive with
  *   `accessCodeGrant` by convention (never both non-null on the same call).
+ * @param {object} [params.complimentaryGrant] - Complimentary Restaurant
+ *   Access Codes (onboarding-gate support): a PENDING complimentary-access
+ *   grant (complimentaryAccessCommercial.js's buildComplimentaryAccessCommercialWrite()
+ *   output) written alongside the explicit `complimentary_pending_activation`
+ *   `commercial` shape -- see trialLifecycle.js's maybeStartComplimentaryAccess()
+ *   for the lazy activation that later converts this into real commercial
+ *   state. Mutually exclusive with `accessCodeGrant`/`trialEligibility` by
+ *   the same convention -- a brand-new tenant created via a complimentary
+ *   code at the onboarding gate has neither of those set. Always null for
+ *   every other caller.
  * @param {string} [params.createdByType] - 'user'|'admin'|'system' (provenance only)
  * @param {string} [params.createdByActorId] - provenance only
  * @returns {Promise<{tenantId: string, userRecord: object}>}
@@ -111,7 +121,7 @@ const SELF_SERVICE_TENANT_ID_PATTERN = /^t_[a-z0-9-]*-[a-z0-9]{6}$/
 export async function createNewTenant({
   mode, tenantIdOverride, reservedTenantId, companyName,
   ownerEmail, ownerUserId, ownerPasswordHash, ownerDisplayName, ownerPasswordSetAt,
-  commercial = null, accessCodeGrant = null, trialEligibility = null,
+  commercial = null, accessCodeGrant = null, trialEligibility = null, complimentaryGrant = null,
   createdByType = null, createdByActorId = null,
 }) {
   if (!Object.values(TenantCreationMode).includes(mode)) {
@@ -192,7 +202,7 @@ export async function createNewTenant({
     // recordLocationApproval()'s own defensive, non-attacker-reachable
     // allowCreate use) permitted to pass allowCreate: true. creationSource
     // is exactly `mode` -- the two enums are deliberately identical sets.
-    await upsertTenantConfig(tenantId, { displayName: companyName ?? tenantId, commercial, accessCodeGrant, trialEligibility }, {
+    await upsertTenantConfig(tenantId, { displayName: companyName ?? tenantId, commercial, accessCodeGrant, trialEligibility, complimentaryGrant }, {
       allowCreate: true, creationSource: mode, createdByType, createdByActorId,
     })
   }

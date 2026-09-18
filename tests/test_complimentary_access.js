@@ -58,6 +58,16 @@ import {
 } from '../dashboard/api/_lib/billingStore.js'
 import { _resetLimiterFactoryForTests, _setLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
 import { _setRedisClientForTests as setAuditClient, _resetRedisClientForTests as resetAuditClient, listAuditEntries } from '../dashboard/api/_lib/auditLog.js'
+import {
+  _setRedisClientForTests as setPendingClient, _resetRedisClientForTests as resetPendingClient, getPendingRegistration,
+} from '../dashboard/api/_lib/pendingRegistrationStore.js'
+import { _setRedisClientForTests as setTokenClient, _resetRedisClientForTests as resetTokenClient } from '../dashboard/api/_lib/tokenStore.js'
+import {
+  createAccessCode, getAccessCodeByHash,
+  _setRedisClientForTests as setAccessCodeClient, _resetRedisClientForTests as resetAccessCodeClient,
+} from '../dashboard/api/_lib/accessCodeStore.js'
+import { _setTransportForTests, _resetTransportForTests } from '../dashboard/api/_lib/emailSender.js'
+import { PENDING_SIGNUP_COOKIE } from '../dashboard/api/_lib/pendingSignupSession.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -74,6 +84,7 @@ async function run(name, fn) {
     results.push(false)
   } finally {
     resetComplimentaryClient(); resetConfigClient(); resetUserClient(); resetBillingClient(); resetAuditClient()
+    resetPendingClient(); resetTokenClient(); resetAccessCodeClient(); _resetTransportForTests()
     _resetLimiterFactoryForTests()
   }
 }
@@ -910,6 +921,244 @@ function testServiceAndHookWireComplimentaryRedemption() {
 }
 
 // ===========================================================================
+// Part 8: onboarding-gate complimentary redemption (end-to-end) -- fixes the
+// discovered onboarding dead-end: a brand-new registrant can now redeem a
+// complimentary code at POST /api/session/redeem-access-code (the SAME
+// endpoint/UI as the unrelated LTA-ENT sales/registration codes), server-side
+// routed by real store lookups, never a client-visible prefix.
+// ===========================================================================
+
+// A single fake Redis client whose eval() emulates BOTH atomic-script shapes
+// this suite's onboarding flow touches: tenantConfigStore.js/userStore.js's
+// generic CAS_UPSERT_SCRIPT (1 key, [field, expectedVersionStr, nextJson]),
+// and the REDEEM_SCRIPT shape shared structurally (though never storage-wise)
+// by accessCodeStore.js and complimentaryAccessStore.js (2 keys, [codeHash,
+// tenantId, userId, nowIso, claimPayload, ttl]) -- distinguished purely by
+// argument count/shape, exactly like test_access_code_commercial_modernization.js's
+// own established fakeRedis() convention for the same reason.
+function fakeOnboardingRedis() {
+  const hashes = {}
+  const strings = {}
+  return {
+    async hget(key, field) { return hashes[key]?.[field] ?? null },
+    async hgetall(key) { return { ...(hashes[key] ?? {}) } },
+    async hset(key, fields) { hashes[key] = { ...(hashes[key] ?? {}), ...fields } },
+    async hdel(key, field) { if (hashes[key]) delete hashes[key][field] },
+    async get(key) { return strings[key] ?? null },
+    async set(key, value, opts = {}) {
+      if (opts.nx && key in strings) return null
+      strings[key] = value
+      return 'OK'
+    },
+    async getdel(key) { const v = strings[key] ?? null; delete strings[key]; return v },
+    async del(key) { const had = key in strings; delete strings[key]; return had ? 1 : 0 },
+    async lpush(key, value) { strings[`__list__${key}`] = [value, ...(strings[`__list__${key}`] ?? [])]; return strings[`__list__${key}`].length },
+    async ltrim(key, start, stop) { strings[`__list__${key}`] = (strings[`__list__${key}`] ?? []).slice(start, stop + 1) },
+    async lrange(key, start, stop) { return (strings[`__list__${key}`] ?? []).slice(start, stop === -1 ? undefined : stop + 1) },
+    async eval(_script, keys, args) {
+      if (keys.length === 1) {
+        // Generic CAS_UPSERT_SCRIPT shape.
+        const key = keys[0]
+        const [field, expectedVersionStr, nextJson] = args
+        const raw = hashes[key]?.[field] ?? null
+        let currentVersion = '0'
+        if (raw) { try { const d = JSON.parse(raw); if (d?.configVersion !== undefined) currentVersion = String(d.configVersion) } catch {} }
+        if (currentVersion !== expectedVersionStr) return raw ?? false
+        hashes[key] = { ...(hashes[key] ?? {}), [field]: nextJson }
+        return true
+      }
+      // Generic REDEEM_SCRIPT shape (either code system).
+      const key = keys[0]
+      const claimKey = keys[1]
+      const [codeHash, tenantId, userId, nowIso, claimPayload] = args
+      const raw = hashes[key]?.[codeHash]
+      if (!raw) return false
+      let code
+      try { code = JSON.parse(raw) } catch { return false }
+      if (code.status !== 'active') return false
+      const hasComplimentaryShape = 'redeemedAt' in code
+      const deadline = hasComplimentaryShape ? code.redemptionDeadline : code.expiresAt
+      if (deadline && deadline < nowIso) return false
+      if (code.redemptionCount >= code.maxRedemptions) return false
+      code.redemptionCount += 1
+      code.redemptions = code.redemptions || []
+      code.redemptions.push({ tenantId, userId, redeemedAt: nowIso })
+      if (hasComplimentaryShape) { code.redeemedAt = nowIso; code.redeemedByUserId = userId; code.tenantId = tenantId }
+      hashes[key] = { ...(hashes[key] ?? {}), [codeHash]: JSON.stringify(code) }
+      if (claimKey && claimPayload !== undefined) strings[claimKey] = claimPayload
+      return JSON.stringify(code)
+    },
+  }
+}
+
+function installOnboardingFakes() {
+  const client = fakeOnboardingRedis()
+  setPendingClient(() => client)
+  setTokenClient(() => client)
+  setConfigClient(() => client)
+  setUserClient(() => client)
+  setAccessCodeClient(() => client)
+  setComplimentaryClient(() => client)
+  setAuditClient(() => client)
+  setBillingClient(() => client)
+  _setLimiterFactoryForTests(() => ({ limit: async () => ({ success: true, remaining: 99 }) }))
+  return client
+}
+
+let onboardingSentEmails
+function installOnboardingEmailTransport() {
+  onboardingSentEmails = []
+  _setTransportForTests(() => ({
+    sendMail: async (opts) => { onboardingSentEmails.push(opts); return { messageId: 'test-message-id', response: '250 OK' } },
+  }))
+}
+
+function onboardingRegisterBody(overrides = {}) {
+  const VALID_PASSWORD = 'correct-horse-battery-staple'
+  return {
+    email: 'newowner@example.com', password: VALID_PASSWORD, passwordConfirmation: VALID_PASSWORD,
+    displayName: 'New Owner', companyName: 'Agave Pilot Group', ...overrides,
+  }
+}
+
+function extractOnboardingVerifyToken() {
+  const { text } = onboardingSentEmails[onboardingSentEmails.length - 1]
+  return decodeURIComponent(text.match(/token=([A-Za-z0-9%_-]+)/)[1])
+}
+
+function onboardingCookieFromRes(res, name) {
+  const setCookie = res.headers['Set-Cookie']
+  if (!setCookie) return null
+  const list = Array.isArray(setCookie) ? setCookie : [setCookie]
+  for (const c of list) {
+    if (c.startsWith(`${name}=`)) return `${name}=${c.split(`${name}=`)[1].split(';')[0]}`
+  }
+  return null
+}
+
+// Registers + verifies a brand-new email, landing at the exact pending-signup
+// identity the onboarding access-code gate operates on -- no tenant, no
+// user record, no session cookie exist yet; only the lta_pending_signup
+// cookie, exactly matching AccessCodeEntry.jsx's own real precondition.
+async function registerAndVerifyForOnboarding(overrides = {}) {
+  const body = onboardingRegisterBody(overrides)
+  await invoke('register', body)
+  const token = extractOnboardingVerifyToken()
+  const verifyRes = await invoke('verify-email', { token })
+  const cookie = onboardingCookieFromRes(verifyRes, PENDING_SIGNUP_COOKIE)
+  const pending = await getPendingRegistration(body.email)
+  return { body, cookie, pending }
+}
+
+async function testOnboardingGateRedeemsComplimentaryCodeForBrandNewRegistrant() {
+  installOnboardingFakes(); installOnboardingEmailTransport()
+  const { cookie, pending } = await registerAndVerifyForOnboarding({ email: 'onboarding-owner@example.com' })
+  // Sanity: this registrant has no tenant/session yet at all -- the exact
+  // "dashboard gate is currently blocking normal access" precondition.
+  assert(pending.status === 'verified_awaiting_plan', 'sanity: registrant must be sitting at the gate, not already past it')
+  assert((await getTenantConfig(pending.tenantIdReserved)) === null, 'sanity: no tenant exists yet')
+
+  const { rawCode } = await makeComplimentaryCode({ planId: 'growth', durationDays: 30, maxLocations: 1, maxUsers: 3 })
+  const res = await invoke('redeem-access-code', { code: rawCode }, { cookie })
+  assert(res.statusCode === 200, `expected 200, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  assert(res.body.account?.role === 'owner', 'the newly-created user must be the tenant Owner')
+
+  const tenantId = pending.tenantIdReserved
+  const config = await getTenantConfig(tenantId)
+  assert(config !== null, 'a real tenant_config must now exist')
+  assert(config.commercial.commercialStatus === 'complimentary_pending_activation', `no initialSync yet -- must remain pending, got ${config.commercial.commercialStatus}`)
+  assert(config.commercial.complimentary === null, 'the complimentary timer must NOT have started yet')
+  assert(config.complimentaryGrant.planId === 'growth' && config.complimentaryGrant.durationDays === 30)
+  assert(config.complimentaryGrant.maxLocations === 1 && config.complimentaryGrant.maxUsers === 3)
+  assert(config.accessCodeGrant == null && config.trialEligibility == null, 'must never also carry the unrelated sales-code/self-service-trial provenance')
+
+  // Zero Stripe side effects -- no Stripe client is wired anywhere in this
+  // test's fakes; a real call would throw and fail this test with an
+  // uncaught error rather than silently succeeding.
+  const billing = await getBillingRecord(tenantId)
+  assert(billing === null || billing === undefined || !billing.stripeCustomerId, 'complimentary onboarding must never create a Stripe customer')
+}
+
+async function testOnboardingCompleteFlowThroughFirstSyncActivation() {
+  installOnboardingFakes(); installOnboardingEmailTransport()
+  const { cookie, pending } = await registerAndVerifyForOnboarding({ email: 'full-flow-owner@example.com' })
+  const { rawCode } = await makeComplimentaryCode({ planId: 'growth', durationDays: 30, maxLocations: 1, maxUsers: 3 })
+  const res = await invoke('redeem-access-code', { code: rawCode }, { cookie })
+  assert(res.statusCode === 200)
+  const tenantId = pending.tenantIdReserved
+
+  // "Google onboarding can occur afterward" -- simulate the tenant reaching
+  // status: 'active' with a first successful initial sync, exactly as
+  // initial_sync.py's own real write would, then run the SAME lazy
+  // activation tenantStatus() polling already triggers.
+  const beforeSync = await getTenantConfig(tenantId)
+  const syncCompletedAt = new Date().toISOString()
+  await upsertTenantConfig(tenantId, { status: 'active', initialSync: { completedAt: syncCompletedAt } }, { expectedVersion: beforeSync.configVersion })
+  const afterSync = await getTenantConfig(tenantId)
+  const activated = await maybeStartComplimentaryAccess(tenantId, afterSync)
+
+  assert(activated.commercial.commercialStatus === 'complimentary', 'first successful sync must activate complimentary Growth')
+  assert(activated.commercial.complimentary.startedAt === syncCompletedAt, `startsAt must equal initialSync.completedAt, got ${activated.commercial.complimentary.startedAt}`)
+  const expectedEnds = new Date(Date.parse(syncCompletedAt) + 30 * 24 * 60 * 60 * 1000).toISOString()
+  assert(activated.commercial.complimentary.endsAt === expectedEnds, 'endsAt must be startsAt + the configured duration')
+
+  const entitlements = resolveTenantEntitlementsFromConfig(activated)
+  assert(entitlements.features.advancedIntelligence === true, 'activated complimentary access must grant real Growth features')
+  assert(entitlements.limits.maxLocations === 1 && entitlements.limits.maxActiveUsers === 3)
+}
+
+async function testOnboardingGateStillAcceptsOldSalesAccessCodesUnchanged() {
+  installOnboardingFakes(); installOnboardingEmailTransport()
+  const { cookie, pending } = await registerAndVerifyForOnboarding({ email: 'sales-code-owner@example.com' })
+  const { rawCode } = await createAccessCode({ prefix: 'LTA-ENT', plan: 'growth', paymentRequired: false, createdBy: 'usr_admin' })
+  const res = await invoke('redeem-access-code', { code: rawCode }, { cookie })
+  assert(res.statusCode === 200, `old LTA-ENT codes must still work exactly as before, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  const config = await getTenantConfig(pending.tenantIdReserved)
+  assert(config.commercial.commercialStatus === 'active' && config.commercial.plan === 'growth')
+  assert(config.commercial.planSource === 'access_code', 'the unrelated sales-code system\'s own provenance must be completely unaffected')
+  assert(config.complimentaryGrant == null, 'an old-system redemption must never write a complimentaryGrant')
+}
+
+async function testOnboardingGateRejectsInvalidCodeInEitherSystem() {
+  installOnboardingFakes(); installOnboardingEmailTransport()
+  const { cookie } = await registerAndVerifyForOnboarding({ email: 'bad-code-owner@example.com' })
+  const res = await invoke('redeem-access-code', { code: 'TOTALLY-BOGUS-CODE-0000' }, { cookie })
+  assert(res.statusCode === 400 && res.body.error === 'invalid_access_code', `an unrecognized code must be rejected generically, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  assert(!/complimentary|sales|LTA-ENT|PRYOR-PILOT/i.test(res.body.message ?? ''), 'the rejection must never reveal which code system(s) were checked')
+}
+
+async function testOnboardingGateCodeHashAndPlaintextNeverExposed() {
+  installOnboardingFakes(); installOnboardingEmailTransport()
+  const { cookie } = await registerAndVerifyForOnboarding({ email: 'no-leak-owner@example.com' })
+  const { rawCode, record } = await makeComplimentaryCode()
+  const res = await invoke('redeem-access-code', { code: rawCode }, { cookie })
+  assert(res.statusCode === 200)
+  const serialized = JSON.stringify(res.body)
+  assert(!serialized.includes(rawCode) && !serialized.includes(record.codeHash), 'the onboarding response must never contain the plaintext code or its hash')
+}
+
+// Structural proof that the dashboard-lifecycle gate (AuthGate.jsx) never
+// branches on commercial/commercialStatus at all -- it only ever gates on
+// the tenant's Google-connection/sync `status` field, which is completely
+// orthogonal to commercial state. This is what makes
+// 'complimentary_pending_activation' and 'complimentary' already valid,
+// unmodified dashboard-access states: there is nothing that could reject
+// them, because nothing client-side ever inspects commercialStatus outside
+// Billing.jsx.
+function testDashboardGateNeverBranchesOnCommercialStatus() {
+  const authGate = readSrc('components/AuthGate.jsx')
+  assert(/data\.status !== 'active'/.test(authGate), 'the tenant-lifecycle gate must key off tenant_config.status only')
+  assert(!/commercialStatus/.test(authGate) && !/data\.commercial/.test(authGate),
+    'AuthGate.jsx must never branch on commercial/commercialStatus -- complimentary_pending_activation and complimentary must reach the dashboard exactly like every other status')
+}
+
+function testAccessCodeEntryUiNoLongerImpliesOnlySalesCodes() {
+  const content = readSrc('components/AccessCodeEntry.jsx')
+  assert(!/LTA-ENT/.test(content), 'the onboarding gate copy must no longer imply only LTA-ENT codes are accepted')
+  assert(/complimentary/i.test(content), 'the onboarding gate copy must acknowledge complimentary codes too')
+}
+
+// ===========================================================================
 
 const tests = [
   ['create shows the raw code once and only the hash persists', testCreateShowsRawCodeOnceAndOnlyHashPersists],
@@ -961,6 +1210,13 @@ const tests = [
   ['Billing UI never exposes a code hash or raw Stripe identifiers', testBillingUiHidesRawIdentifiersForComplimentary],
   ['Manage Billing is hidden specifically for complimentary provenance', testManageBillingHiddenForComplimentaryProvenance],
   ['the service/hook layer wires the redeem-complimentary-code endpoint', testServiceAndHookWireComplimentaryRedemption],
+  ['onboarding gate: a brand-new registrant can redeem a complimentary code before any trial/Stripe flow', testOnboardingGateRedeemsComplimentaryCodeForBrandNewRegistrant],
+  ['onboarding gate: full flow through first-sync activation (startsAt/endsAt correct)', testOnboardingCompleteFlowThroughFirstSyncActivation],
+  ['onboarding gate: old LTA-ENT sales/registration codes still work exactly as before', testOnboardingGateStillAcceptsOldSalesAccessCodesUnchanged],
+  ['onboarding gate: an invalid code is rejected without revealing which system was checked', testOnboardingGateRejectsInvalidCodeInEitherSystem],
+  ['onboarding gate: no raw code or code hash is ever exposed in the response', testOnboardingGateCodeHashAndPlaintextNeverExposed],
+  ['dashboard gate never branches on commercial/commercialStatus (complimentary states already reach it)', testDashboardGateNeverBranchesOnCommercialStatus],
+  ['AccessCodeEntry UI no longer implies only sales/LTA-ENT codes are accepted', testAccessCodeEntryUiNoLongerImpliesOnlySalesCodes],
 ]
 
 for (const [name, fn] of tests) await run(name, fn)
