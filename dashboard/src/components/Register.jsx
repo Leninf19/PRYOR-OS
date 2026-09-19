@@ -71,27 +71,27 @@ export default function Register() {
       <form onSubmit={handleSubmit} className="space-y-4" noValidate>
         <Field label="Your name">
           <input required autoComplete="name" value={form.displayName} onChange={set('displayName')} disabled={submitting}
-            className="w-full rounded-lg border px-3.5 py-2.5 text-sm outline-none"
+            className="w-full rounded-lg border px-3.5 py-2.5 text-base outline-none"
             style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }} />
         </Field>
         <Field label="Company / restaurant group name">
           <input required value={form.companyName} onChange={set('companyName')} disabled={submitting}
-            className="w-full rounded-lg border px-3.5 py-2.5 text-sm outline-none"
+            className="w-full rounded-lg border px-3.5 py-2.5 text-base outline-none"
             style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }} />
         </Field>
         <Field label="Email">
           <input type="email" required autoComplete="username" value={form.email} onChange={set('email')} disabled={submitting}
-            className="w-full rounded-lg border px-3.5 py-2.5 text-sm outline-none"
+            className="w-full rounded-lg border px-3.5 py-2.5 text-base outline-none"
             style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }} />
         </Field>
         <Field label="Password">
           <input type="password" required autoComplete="new-password" minLength={10} value={form.password} onChange={set('password')} disabled={submitting}
-            className="w-full rounded-lg border px-3.5 py-2.5 text-sm outline-none"
+            className="w-full rounded-lg border px-3.5 py-2.5 text-base outline-none"
             style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }} />
         </Field>
         <Field label="Confirm password">
           <input type="password" required autoComplete="new-password" minLength={10} value={form.passwordConfirmation} onChange={set('passwordConfirmation')} disabled={submitting}
-            className="w-full rounded-lg border px-3.5 py-2.5 text-sm outline-none"
+            className="w-full rounded-lg border px-3.5 py-2.5 text-base outline-none"
             style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }} />
         </Field>
 

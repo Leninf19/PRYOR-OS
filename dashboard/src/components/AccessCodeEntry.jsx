@@ -55,7 +55,7 @@ export default function AccessCodeEntry() {
           <input
             required autoComplete="off" autoCapitalize="characters" value={code}
             onChange={e => setCode(e.target.value)} disabled={submitting}
-            className="w-full rounded-lg border px-3.5 py-2.5 text-sm outline-none tracking-wide font-mono uppercase"
+            className="w-full rounded-lg border px-3.5 py-2.5 text-base outline-none tracking-wide font-mono uppercase"
             style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }}
           />
         </Field>

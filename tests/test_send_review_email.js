@@ -14,6 +14,10 @@ import handler from '../dashboard/api/actions/[action].js'
 import { signSession } from '../dashboard/api/_lib/session.js'
 import { _setRedisClientForTests, _resetRedisClientForTests } from '../dashboard/api/_lib/actionStore.js'
 import { _setContactsForTests, _resetContactsForTests } from '../dashboard/api/_lib/locationContacts.js'
+import {
+  _setRedisClientForTests as setContactRedis,
+  _resetRedisClientForTests as resetContactRedis,
+} from '../dashboard/api/_lib/contactStore.js'
 import { _setTransportForTests, _resetTransportForTests } from '../dashboard/api/_lib/emailSender.js'
 import { _resetLimiterFactoryForTests } from '../dashboard/api/_lib/rateLimit.js'
 import { _setReviewLocationIndexForTests, _resetReviewLocationIndexForTests } from '../dashboard/api/_lib/reviewLocationIndex.js'
@@ -35,6 +39,7 @@ async function run(name, fn) {
   } finally {
     _resetRedisClientForTests()
     _resetContactsForTests()
+    resetContactRedis()
     _resetTransportForTests()
     _resetLimiterFactoryForTests()
     _resetReviewLocationIndexForTests()
@@ -53,6 +58,20 @@ function fakeRes() {
 }
 
 function fakeRedis(initial = {}) {
+  const store = { ...initial }
+  return {
+    hgetall: async () => ({ ...store }),
+    hget: async (_key, field) => store[field] ?? null,
+    hset: async (_key, fields) => { Object.assign(store, fields) },
+  }
+}
+
+// contactStore.js's own Redis client (separate from actionStore.js's fake
+// above, which the plain fakeRedis()/_setRedisClientForTests() pair
+// configures) -- used only by the new PART 18/19 CC-merge tests below,
+// which need a REAL Redis-backed contact record (ccEmails included), not
+// the legacy locationContacts.js fallback _setContactsForTests() models.
+function fakeContactRedis(initial = {}) {
   const store = { ...initial }
   return {
     hgetall: async () => ({ ...store }),
@@ -207,6 +226,94 @@ async function testCcCannotBeOverriddenByClient() {
   assert(res.statusCode === 200)
   assert(JSON.stringify(capturedCc) === JSON.stringify(['martin@example.com', 'ruffy@example.com']),
     `cc must always come from REVIEW_ESCALATION_CC_EMAILS, got ${JSON.stringify(capturedCc)}`)
+}
+
+// --- PART 18/19: the location's own ccEmails (Settings -> Restaurant
+// Contacts, Redis-only) are ADDITIVE to the mandatory env-var CC list -----
+
+async function testLocationOwnCcIsMergedAdditivelyIntoSendCc() {
+  await setDirectory()
+  process.env.REVIEW_ESCALATION_CC_EMAILS = 'martin@example.com,ruffy@example.com'
+  _setRedisClientForTests(() => fakeRedis())
+  setContactRedis(() => fakeContactRedis({ 3: JSON.stringify({ locationId: 3, primaryEmail: 'restaurant@example.com', active: true, ccEmails: ['owner-of-location@example.com'] }) }))
+  let capturedCc = null
+  _setTransportForTests(() => ({ sendMail: async (msg) => { capturedCc = msg.cc; return { messageId: 'x' } } }))
+
+  const res = await invoke({
+    action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'),
+    body: sendBody(),
+  })
+  assert(res.statusCode === 200, `expected 200, got ${res.statusCode}, body=${JSON.stringify(res.body)}`)
+  assert(capturedCc.includes('martin@example.com') && capturedCc.includes('ruffy@example.com'),
+    `the mandatory env CC list must still be present, got ${JSON.stringify(capturedCc)}`)
+  assert(capturedCc.includes('owner-of-location@example.com'),
+    `the location's own configured CC must be merged in additively, got ${JSON.stringify(capturedCc)}`)
+}
+
+async function testLocationOwnCcDeduplicatedAgainstEnvCc() {
+  await setDirectory()
+  process.env.REVIEW_ESCALATION_CC_EMAILS = 'martin@example.com,ruffy@example.com'
+  // The location's own CC happens to already be one of the mandatory env
+  // addresses -- must not appear twice in the final list.
+  _setRedisClientForTests(() => fakeRedis())
+  setContactRedis(() => fakeContactRedis({ 3: JSON.stringify({ locationId: 3, primaryEmail: 'restaurant@example.com', active: true, ccEmails: ['martin@example.com'] }) }))
+  let capturedCc = null
+  _setTransportForTests(() => ({ sendMail: async (msg) => { capturedCc = msg.cc; return { messageId: 'x' } } }))
+
+  await invoke({ action: 'send-review-email', method: 'POST', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), body: sendBody() })
+  const occurrences = capturedCc.filter(addr => addr === 'martin@example.com').length
+  assert(occurrences === 1, `'martin@example.com' must appear exactly once after dedup, got ${occurrences} times in ${JSON.stringify(capturedCc)}`)
+}
+
+async function testLocationOwnCcMergedIntoPreviewToo() {
+  await setDirectory()
+  process.env.REVIEW_ESCALATION_CC_EMAILS = 'martin@example.com,ruffy@example.com'
+  _setRedisClientForTests(() => fakeRedis())
+  setContactRedis(() => fakeContactRedis({ 3: JSON.stringify({ locationId: 3, primaryEmail: 'restaurant@example.com', active: true, ccEmails: ['owner-of-location@example.com'] }) }))
+
+  const res = await invoke({ action: 'preview-review-email', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), query: { id: 'review-1', locationId: '3' } })
+  assert(res.statusCode === 200)
+  assert(res.body.cc.includes('owner-of-location@example.com'), `preview must also merge the location's own CC, got ${JSON.stringify(res.body.cc)}`)
+  assert(res.body.cc.includes('martin@example.com') && res.body.cc.includes('ruffy@example.com'), 'the mandatory env CC must still be present in the preview')
+}
+
+async function testDisabledContactsCcNeverMergedIn() {
+  await setDirectory()
+  process.env.REVIEW_ESCALATION_CC_EMAILS = 'martin@example.com,ruffy@example.com'
+  _setRedisClientForTests(() => fakeRedis())
+  setContactRedis(() => fakeContactRedis({ 3: JSON.stringify({ locationId: 3, primaryEmail: 'restaurant@example.com', active: false, ccEmails: ['should-not-appear@example.com'] }) }))
+  const res = await invoke({ action: 'preview-review-email', token: await tokenFor('usr_owner', 'owner@example.com', 'owner'), query: { id: 'review-1', locationId: '3' } })
+  assert(res.statusCode === 200)
+  assert(!res.body.cc.includes('should-not-appear@example.com'), 'a disabled contact\'s CC must never be merged in')
+}
+
+// PART 19 -- editing a manager's contact (email AND CC) must cause the VERY
+// NEXT send to use the new values, never a stale cached one. Two sequential
+// sends against the SAME fakeRedis client/store, with the record updated
+// in between, proves this without needing any real Redis TTL/cache layer.
+async function testEditingContactBetweenTwoSendsUsesTheNewEmailAndCc() {
+  await setDirectory()
+  process.env.REVIEW_ESCALATION_CC_EMAILS = 'martin@example.com'
+  _setRedisClientForTests(() => fakeRedis())
+  const client = fakeContactRedis({ 3: JSON.stringify({ locationId: 3, primaryEmail: 'old-manager@example.com', active: true, ccEmails: ['old-cc@example.com'] }) })
+  setContactRedis(() => client)
+  const captured = []
+  _setTransportForTests(() => ({ sendMail: async (msg) => { captured.push({ to: msg.to, cc: msg.cc }); return { messageId: 'x' } } }))
+  const token = await tokenFor('usr_owner', 'owner@example.com', 'owner')
+
+  const first = await invoke({ action: 'send-review-email', method: 'POST', token, body: sendBody({ id: 'review-a' }) })
+  assert(first.statusCode === 200, `first send expected 200, got ${first.statusCode}`)
+  assert(captured[0].to === 'old-manager@example.com')
+  assert(captured[0].cc.includes('old-cc@example.com'))
+
+  // Simulate replacing a fired manager: new name/email AND a new CC list.
+  client.hset('contacts:v1', { 3: JSON.stringify({ locationId: 3, primaryEmail: 'new-manager@example.com', active: true, ccEmails: ['new-cc@example.com'] }) })
+
+  const second = await invoke({ action: 'send-review-email', method: 'POST', token, body: sendBody({ id: 'review-b' }) })
+  assert(second.statusCode === 200, `second send expected 200, got ${second.statusCode}`)
+  assert(captured[1].to === 'new-manager@example.com', `the second send must use the newly-edited email, got ${captured[1].to}`)
+  assert(!captured[1].cc.includes('old-cc@example.com'), 'the old CC must never still be used after the edit')
+  assert(captured[1].cc.includes('new-cc@example.com'), 'the new CC must be used')
 }
 
 async function testReplyToConfiguredFromEnv() {
@@ -555,6 +662,11 @@ async function main() {
   await run('send-review-email: read_only rejected -> 403', testSendReadOnlyRejected)
   await run('recipient is always resolved server-side from locationId, never the client', testRecipientResolvedFromLocationIdNotClient)
   await run('CC cannot be overridden by the client -- always REVIEW_ESCALATION_CC_EMAILS', testCcCannotBeOverriddenByClient)
+  await run("PART 18/19: the location's own configured CC is merged additively into send", testLocationOwnCcIsMergedAdditivelyIntoSendCc)
+  await run("PART 18/19: the location's own CC is deduplicated against the mandatory env CC", testLocationOwnCcDeduplicatedAgainstEnvCc)
+  await run("PART 18/19: the location's own CC is also merged into preview-review-email", testLocationOwnCcMergedIntoPreviewToo)
+  await run("PART 18/19: a disabled contact's CC is never merged in", testDisabledContactsCcNeverMergedIn)
+  await run('PART 19: editing a contact\'s email and CC between two sends uses the new values, never stale ones', testEditingContactBetweenTwoSendsUsesTheNewEmailAndCc)
   await run('Reply-To is always the server-configured value, never client-supplied', testReplyToConfiguredFromEnv)
   await run('a location with no configured contact prevents sending', testMissingContactPreventsSending)
   await run('send-review-email: fails with 503 when REVIEW_ESCALATION_CC_EMAILS is unconfigured', testSendFailsWhenCcNotConfigured)

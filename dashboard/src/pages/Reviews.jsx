@@ -18,7 +18,7 @@ import { useRestaurantContacts } from '../hooks/useRestaurantContacts.js'
 import ContactEditorModal from './settings/ContactEditorModal.jsx'
 import { useAccount } from '../components/AuthGate.jsx'
 import { EMAIL_STATUS_META, DUPLICATE_EMAIL_STATUSES } from '../utils/actionWorkspaceUtils.js'
-import { REPLY_STATE_META, computeReplyState, isActionableReplyState, isAnsweredReplyState, isSeriousReview, computeReplyStateCounts } from '../utils/replyState.js'
+import { REPLY_STATE_META, computeReplyState, isActionableReplyState, isAnsweredReplyState, classifyReviewRiskClient, CATEGORY_UI_LABELS, computeReplyStateCounts } from '../utils/replyState.js'
 
 const PAGE_SIZE = 40
 
@@ -84,6 +84,7 @@ const FAIL_REASONS = {
   network_error:     'Network error. Check your connection and try again.',
   location_mismatch: 'Could not match this review to a verified Google location.',
   already_replied:   'This review already has an owner response on Google.',
+  urgent_review_confirmation_required: 'This review involves a serious concern — check "I\'ve reviewed this and I\'m ready to respond" above before publishing.',
   // Recovery Milestone 5: distinct from network_error -- this means OUR
   // OWN watchdog gave up waiting, not that the request definitely failed.
   // Google's reply endpoint is a PUT (an idempotent upsert), so retrying
@@ -499,14 +500,26 @@ function ReviewRow({ r, selected, onSelect, wsEntry, bridgeEntry }) {
 // this one class) before Confirm & Publish becomes clickable. Resets
 // per-review (keyed by rid via the parent unmounting/remounting this
 // component on selection change -- see Reviews.jsx's master-detail panel).
-function SeriousReviewWarning({ acknowledged, onAcknowledge }) {
+// Review Response Quality, PART 8: explicit "Urgent" / "Health & Safety" /
+// "Needs Manager Review" UI treatment for a high-risk review, replacing the
+// single generic "Needs Management Review" label with the actual detected
+// category/categories -- so a manager can tell at a glance whether this is
+// a health/safety concern (illness, injury, foreign object, allergy) versus
+// a conduct/legal one (threats, discrimination, legal threat, fraud),
+// without reading the review text first. Never frightening language beyond
+// what's needed to make clear this should not be handled like a routine
+// bad review.
+function SeriousReviewWarning({ categories, acknowledged, onAcknowledge }) {
+  const labels = [...new Set((categories ?? []).map(c => CATEGORY_UI_LABELS[c] ?? 'Needs Manager Review'))]
+  const labelText = labels.length > 0 ? labels.join(' · ') : 'Needs Manager Review'
   return (
     <div className="mb-3 p-3 rounded-xl text-xs leading-relaxed"
          style={{ background: 'var(--color-danger-bg)', border: '1px solid var(--color-danger-border)', color: 'var(--color-danger)' }}>
-      <p className="font-bold mb-1">⚠ Needs Management Review</p>
+      <p className="font-bold mb-1">⚠ Urgent — {labelText}</p>
       <p className="mb-2" style={{ color: 'var(--color-text-2)' }}>
         This review mentions something serious (a safety, legal, or conduct concern). Read it carefully before
-        responding — a contact invitation may be appropriate here, unlike a routine review.
+        responding — a contact invitation may be appropriate here, unlike a routine review. This cannot be published
+        until you confirm you've reviewed it.
       </p>
       <label className="flex items-center gap-2 cursor-pointer" style={{ color: 'var(--color-text-1)' }}>
         <input type="checkbox" checked={acknowledged} onChange={e => onAcknowledge(e.target.checked)} />
@@ -524,7 +537,8 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess, next
   const statusMeta       = STATUS_META[status] ?? STATUS_META.needs_review
   const isDone            = statusMeta.done
   const failReason       = wsEntry?.failReason ?? null
-  const serious          = useMemo(() => isSeriousReview(r), [r])
+  const riskClassification = useMemo(() => classifyReviewRiskClient(r), [r])
+  const serious          = riskClassification.isHighRisk
 
   const [localDraft, setLocalDraft]   = useState(wsEntry?.editedDraft ?? draft?.draft ?? '')
   const [activeTone, setActiveTone]   = useState(null)
@@ -688,6 +702,16 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess, next
           // no durable, cross-browser record of having done so.
           localReviewId: rid,
           reviewDate: r.review_date ?? null,
+          // Review Response Quality, PART 7/13/14: the server independently
+          // re-classifies risk from the ORIGINAL review's own text (never
+          // trusting this component's own `serious`/`acknowledged` state as
+          // the enforcement boundary) -- see google/[action].js's publish()
+          // for the actual gate. `confirmedUrgent` mirrors the same
+          // checkbox this UI already requires before publishBlocked allows
+          // the click at all; sending it explicitly lets the server refuse
+          // any OTHER caller that skips this UI entirely.
+          reviewText: r.review_text ?? '',
+          confirmedUrgent: serious ? acknowledged : undefined,
         }),
         signal: controller.signal,
       })
@@ -795,7 +819,7 @@ function ResponseWorkspace({ r, draft, wsEntry, onUpdate, onPublishSuccess, next
         </div>
       ) : (
         <div className="space-y-3">
-          {serious && <SeriousReviewWarning acknowledged={acknowledged} onAcknowledge={setAcknowledged} />}
+          {serious && <SeriousReviewWarning categories={riskClassification.categories} acknowledged={acknowledged} onAcknowledge={setAcknowledged} />}
 
           <div>
             <div className="flex items-center justify-between mb-1.5">

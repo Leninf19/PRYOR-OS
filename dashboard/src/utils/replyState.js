@@ -123,31 +123,102 @@ export function computeReplyStateCounts(reviews, ws, bridges) {
   return counts
 }
 
-// Mirrors ai_engine.py's _SERIOUS_KEYWORDS/_SERIOUS_RE and
-// dashboard/api/_lib/rewriteEngine.js's SERIOUS_KEYWORDS/SERIOUS_RE exactly -- the
-// THIRD independent copy of this word-boundary keyword check, kept in sync
-// by comment reference the same way the other two already were before this
-// milestone. Used only for the Reviews inbox's own "Needs Management
-// Review" warning gate (Phase 14) -- never used to generate or alter
-// response text, and never a substitute for the deterministic guard those
-// two modules already apply to whatever draft text actually gets used.
-const SERIOUS_KEYWORDS = [
-  'sick', 'ill', 'vomit', 'vomiting', 'food poisoning', 'diarrhea',
-  'hospital', 'hospitalized', 'doctor', 'health department', 'health code',
-  'cockroach', 'roach', 'rat', 'rats', 'mouse', 'mice', 'rodent', 'rodents',
-  'insect', 'insects', 'pest', 'pests',
-  'injury', 'injured', 'unsafe', 'accident',
-  'discrimination', 'discriminated', 'racist', 'racism', 'harassment', 'harassed',
-  'hostile', 'threatening', 'threatened',
-  'lawsuit', 'lawyer', 'attorney', 'sue', 'sued', 'legal action',
-  'police', 'assault', 'assaulted', 'stole', 'stolen', 'theft',
-  'never coming back', 'health violation', 'shut down',
-]
-const SERIOUS_RE = new RegExp(
-  '\\b(' + SERIOUS_KEYWORDS.map(kw => kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')\\b',
-  'i'
+// Review Response Quality -- mirrors dashboard/api/_lib/
+// reviewRiskClassifier.js's RISK_CATEGORIES exactly, categorized (not just
+// a flat boolean) so this inbox can show WHICH kind of concern was
+// detected (Urgent / Health & Safety / Needs Manager Review -- see
+// CATEGORY_UI_LABELS below). This is the THIRD independent copy of this
+// keyword check (ai_engine.py's _SERIOUS_KEYWORDS/_SERIOUS_RE and
+// rewriteEngine.js's/reviewRiskClassifier.js's server copy are the other
+// two), kept in sync by comment reference -- a browser-bundled file cannot
+// import a server-only `_lib` module, and this project's established
+// pattern for that boundary is a clearly cross-referenced, kept-in-sync
+// duplicate, never a cross-boundary import (see reviewRiskClassifier.js's
+// own header for the fuller reasoning). Used only for THIS inbox's own
+// "Needs Management Review" warning gate -- never used to generate or
+// alter response text, and never the actual publish-time enforcement
+// boundary (google/[action].js's publish() re-classifies independently,
+// server-side, from the SAME category list, and is the real safety gate).
+const RISK_CATEGORIES = {
+  food_poisoning: [
+    'sick', 'ill', 'illness', 'vomit', 'vomiting', 'threw up', 'food poisoning',
+    'diarrhea', 'nausea', 'nauseous', 'stomach ache', 'upset stomach', 'cramping',
+  ],
+  allergic_reaction: [
+    'allergic', 'allergy', 'allergies', 'anaphylaxis', 'anaphylactic', 'epipen',
+    'epi-pen', 'throat closing', 'throat swelling', 'swelling', 'hives',
+    'difficulty breathing', 'trouble breathing', "can't breathe", 'cant breathe',
+    'passed out', 'unconscious', 'lost consciousness',
+  ],
+  injury: [
+    'injury', 'injured', 'cut myself', 'burned', 'burn', 'choke', 'choked',
+    'choking', 'broken tooth', 'chipped tooth', 'fell', 'fall', 'accident',
+    'bleeding', 'stitches', 'hospital', 'hospitalized', 'doctor', 'er visit',
+    'emergency room',
+  ],
+  foreign_object: [
+    'glass', 'metal', 'plastic', 'staple', 'wire', 'bug', 'insect', 'cockroach',
+    'roach', 'fly in my', 'hair in my food', 'foreign object', 'band-aid', 'bandaid',
+  ],
+  unsafe_food: [
+    'raw chicken', 'undercooked', 'undercooked chicken', 'spoiled', 'rotten',
+    'expired', 'mold', 'moldy', 'rancid', 'smelled off', 'tasted off',
+  ],
+  sanitation: [
+    'rat', 'rats', 'mouse', 'mice', 'rodent', 'rodents', 'pest', 'pests',
+    'health department', 'health code', 'health violation', 'dirty kitchen',
+    'unsanitary', 'filthy', 'shut down',
+  ],
+  threat_violence: [
+    'threatened', 'threatening', 'assault', 'assaulted', 'violent', 'violence',
+    'weapon', 'gun', 'knife pulled',
+  ],
+  discrimination_harassment: [
+    'discrimination', 'discriminated', 'racist', 'racism', 'harassment',
+    'harassed', 'hostile', 'homophobic', 'sexist',
+  ],
+  legal_threat: [
+    'lawsuit', 'lawyer', 'attorney', 'sue', 'sued', 'legal action', 'police',
+    'subpoena', 'file a complaint',
+  ],
+  fraud_payment: [
+    'stole', 'stolen', 'theft', 'fraud', 'fraudulent', 'overcharged', 'scam', 'scammed',
+  ],
+}
+
+export const CATEGORY_UI_LABELS = {
+  food_poisoning: 'Health & Safety',
+  allergic_reaction: 'Health & Safety',
+  injury: 'Health & Safety',
+  foreign_object: 'Health & Safety',
+  unsafe_food: 'Health & Safety',
+  sanitation: 'Health & Safety',
+  threat_violence: 'Needs Manager Review',
+  discrimination_harassment: 'Needs Manager Review',
+  legal_threat: 'Needs Manager Review',
+  fraud_payment: 'Needs Manager Review',
+}
+
+function buildWordBoundaryRegex(keywords) {
+  const escaped = keywords.map(kw => kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  return new RegExp('\\b(' + escaped.join('|') + ')\\b', 'i')
+}
+
+const CATEGORY_PATTERNS = Object.fromEntries(
+  Object.entries(RISK_CATEGORIES).map(([category, keywords]) => [category, buildWordBoundaryRegex(keywords)])
 )
 
+// Returns { isHighRisk, categories } for a review object (reads
+// `r.review_text`, same field isSeriousReview() below always read).
+export function classifyReviewRiskClient(r) {
+  const text = r?.review_text || ''
+  if (!text.trim()) return { isHighRisk: false, categories: [] }
+  const categories = Object.entries(CATEGORY_PATTERNS)
+    .filter(([, re]) => re.test(text))
+    .map(([category]) => category)
+  return { isHighRisk: categories.length > 0, categories }
+}
+
 export function isSeriousReview(r) {
-  return SERIOUS_RE.test(r?.review_text || '')
+  return classifyReviewRiskClient(r).isHighRisk
 }
