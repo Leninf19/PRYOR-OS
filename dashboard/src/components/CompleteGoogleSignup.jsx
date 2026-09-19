@@ -99,12 +99,12 @@ export default function CompleteGoogleSignup() {
       <form onSubmit={handleSubmit} className="space-y-4" noValidate>
         <Field label="Your name">
           <input required autoComplete="name" value={displayName} onChange={e => setDisplayName(e.target.value)} disabled={submitting}
-            className="w-full rounded-lg border px-3.5 py-2.5 text-sm outline-none"
+            className="w-full rounded-lg border px-3.5 py-2.5 text-base outline-none"
             style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }} />
         </Field>
         <Field label="Company / restaurant group name">
           <input required autoFocus value={companyName} onChange={e => setCompanyName(e.target.value)} disabled={submitting}
-            className="w-full rounded-lg border px-3.5 py-2.5 text-sm outline-none"
+            className="w-full rounded-lg border px-3.5 py-2.5 text-base outline-none"
             style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }} />
         </Field>
 

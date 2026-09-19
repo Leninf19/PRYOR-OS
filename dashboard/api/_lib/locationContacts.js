@@ -62,6 +62,32 @@ export async function getLocationContact(tenantId, locationId) {
   return getLegacyContact(tenantId, locationId)
 }
 
+// PART 18/19 -- previously, the ONLY CC recipients on a restaurant
+// escalation email came from the mandatory REVIEW_ESCALATION_CC_EMAILS env
+// var (reviewEmailConfig.js), completely disconnected from the per-location
+// `ccEmails` array Settings -> Restaurant Contacts already lets an Owner
+// manage. Editing a CC in that UI had zero effect on real alert emails --
+// only the separate "Send Test Email" button ever read it. This resolves
+// the SAME live Redis contact record getLocationContact() already reads
+// (never a second, possibly-stale read) and returns just its `ccEmails`
+// array (or [] if none/disabled/unreachable) so the caller can MERGE it
+// with the env var list rather than replace it -- the env var remains the
+// mandatory baseline; the location's own CCs are additive.
+export async function getLocationContactCcEmails(tenantId, locationId) {
+  try {
+    const record = await getRedisContact(tenantId, locationId)
+    if (record && record.active && Array.isArray(record.ccEmails)) {
+      return record.ccEmails
+    }
+  } catch (err) {
+    if (!(err instanceof ContactStoreUnavailableError)) throw err
+    // Redis unavailable -- degrade to no additional CCs, same "reads
+    // degrade rather than fail closed" philosophy as getLocationContact()
+    // above; the mandatory env var CC list is unaffected either way.
+  }
+  return []
+}
+
 // Test-only seam -- lets tests inject a fixed legacy-fallback contact map
 // (for the given tenantId) without touching the real filesystem path or
 // dashboard/private-data/. Redis itself is mocked independently via

@@ -54,6 +54,7 @@ import { reconcileApprovedLocationsAgainstDiscovery, UnreconciledApprovedLocatio
 import { discoverGoogleLocationIdsForReconciliation } from '../_lib/googleLocationDiscovery.js'
 import { resolveTenantEntitlements } from '../_lib/entitlements.js'
 import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
+import { classifyReviewRisk } from '../_lib/reviewRiskClassifier.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -1332,10 +1333,37 @@ async function publish(req, res) {
     })
   }
 
-  const { reviewName, locationName, reviewerName, replyText, localReviewId, reviewDate } = req.body ?? {}
+  const { reviewName, locationName, reviewerName, replyText, localReviewId, reviewDate, reviewText, confirmedUrgent } = req.body ?? {}
 
   if (!replyText || (!reviewName && !locationName)) {
     return res.status(400).json({ error: 'api_error', message: 'Missing replyText, and either reviewName or locationName.' })
+  }
+
+  // Review Response Quality -- PART 7/13/14's server-authoritative safety
+  // gate: a high-risk review (food poisoning, allergic reaction, injury,
+  // foreign object, threats, discrimination, legal, fraud -- see
+  // reviewRiskClassifier.js) may never be published without an EXPLICIT
+  // `confirmedUrgent: true` flag. This re-classifies independently from
+  // `reviewText` on every publish call rather than trusting a client-echoed
+  // risk flag -- the frontend's own checkbox (Reviews.jsx's
+  // SeriousReviewWarning/`acknowledged` state) is real UX, but it is
+  // advisory only; THIS check is the actual enforcement boundary. It runs
+  // after the credential lookup above (a Redis read, not a Google API
+  // call) but before any actual Google network request
+  // (getAccessToken()/replyViaReviewName() below), so a rejected publish
+  // still costs zero upstream Google requests. `reviewText` here is the ORIGINAL
+  // review's own text (never `replyText`, the outgoing reply) -- if the
+  // caller omits it, classification simply finds nothing to flag, exactly
+  // like any other review with no matching keywords; there is no way to
+  // spoof "not urgent" by omitting text for a review that genuinely has it,
+  // since the frontend always has and sends the real review text it is
+  // replying to.
+  const { isHighRisk } = classifyReviewRisk(reviewText)
+  if (isHighRisk && confirmedUrgent !== true) {
+    return res.status(409).json({
+      error: 'urgent_review_confirmation_required',
+      message: 'This review involves a serious concern and needs explicit manager confirmation before publishing.',
+    })
   }
 
   // A location-scoped account (location_manager, or a location-scoped

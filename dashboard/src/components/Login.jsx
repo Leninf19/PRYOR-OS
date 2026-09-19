@@ -94,7 +94,7 @@ export default function Login({ onSuccess }) {
                 value={email}
                 onChange={e => setEmail(e.target.value)}
                 disabled={submitting}
-                className="w-full rounded-lg border px-3.5 py-2.5 text-sm outline-none transition-colors focus:ring-2"
+                className="w-full rounded-lg border px-3.5 py-2.5 text-base outline-none transition-colors focus:ring-2"
                 style={{
                   background: 'var(--color-surface)',
                   borderColor: 'var(--color-border)',
@@ -113,7 +113,7 @@ export default function Login({ onSuccess }) {
                   value={password}
                   onChange={e => setPassword(e.target.value)}
                   disabled={submitting}
-                  className="w-full rounded-lg border pl-3.5 pr-10 py-2.5 text-sm outline-none transition-colors focus:ring-2"
+                  className="w-full rounded-lg border pl-3.5 pr-10 py-2.5 text-base outline-none transition-colors focus:ring-2"
                   style={{
                     background: 'var(--color-surface)',
                     borderColor: 'var(--color-border)',

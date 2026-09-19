@@ -67,7 +67,7 @@ export default function ForgotPassword() {
                 autoComplete="username"
                 value={email}
                 onChange={e => setEmail(e.target.value)}
-                className="w-full rounded-lg border px-3 py-2 text-sm"
+                className="w-full rounded-lg border px-3 py-2 text-base"
                 style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }}
               />
             </div>
