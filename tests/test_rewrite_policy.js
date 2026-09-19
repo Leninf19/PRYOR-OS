@@ -147,6 +147,88 @@ async function testWithinLimitsStillSucceeds() {
   assert(getCalls() === 1, 'exactly one upstream call must have been made')
 }
 
+// --- PARTS 5-6/24: no-text reviews -- deterministic, zero-fabrication -------
+// A review with no text (null/empty/whitespace) must NEVER reach the model,
+// so these assert both the returned shape AND (via installNeverCalledFetch)
+// that no Anthropic call was made at all -- the structural guarantee against
+// hallucinated detail, not just a hope that the prompt discourages it.
+
+async function testFiveStarNoTextNeverCallsModelAndVaries() {
+  installNeverCalledFetch()
+  const seen = new Set()
+  for (let i = 0; i < 30; i++) {
+    const result = await generateRewrite({ tone: 'friendly', reviewText: '', stars: 5 })
+    assert(result.ok === true, `no-text 5-star must succeed without an API key/fetch, got ${JSON.stringify(result)}`)
+    assert(typeof result.rewritten === 'string' && result.rewritten.length > 0)
+    assert(result.riskLevel === 'low_risk' && Array.isArray(result.riskCategories) && result.riskCategories.length === 0)
+    seen.add(result.rewritten)
+  }
+  assert(seen.size > 1, 'a no-text 5-star review must not always produce the identical sentence (PART 5 variation requirement)')
+}
+
+async function testWhitespaceOnlyReviewTextTreatedAsNoText() {
+  installNeverCalledFetch()
+  const result = await generateRewrite({ tone: 'friendly', reviewText: '   \n\t  ', stars: 5 })
+  assert(result.ok === true, 'whitespace-only text must be treated identically to genuinely empty text (no Anthropic call, no error)')
+  assert(typeof result.rewritten === 'string' && result.rewritten.length > 0)
+}
+
+async function testFourStarNoTextNeverInventsAProblem() {
+  installNeverCalledFetch()
+  const result = await generateRewrite({ tone: 'friendly', reviewText: null, stars: 4 })
+  assert(result.ok === true)
+  assert(!/sorry|apologize|improve|issue|problem/i.test(result.rewritten),
+    'a no-text 4-star response must never invent a problem or apologize for one')
+}
+
+async function testThreeStarNoTextAcknowledgesNeutrallyWithoutInventing() {
+  installNeverCalledFetch()
+  const result = await generateRewrite({ tone: 'friendly', reviewText: undefined, stars: 3 })
+  assert(result.ok === true)
+  assert(!/tacos|margaritas|specific|the dish|your order/i.test(result.rewritten),
+    'a no-text 3-star response must never fabricate specific menu/order details')
+}
+
+async function testOneStarNoTextInvitesDetailWithoutInventing() {
+  installNeverCalledFetch()
+  const result = await generateRewrite({ tone: 'friendly', reviewText: '', stars: 1 })
+  assert(result.ok === true)
+  assert(/more|details|happened|share/i.test(result.rewritten),
+    'a no-text 1-star response should invite the guest to share what happened, not guess at it')
+}
+
+async function testUnknownStarRatingFallsBackToThreeStarTier() {
+  installNeverCalledFetch()
+  const result = await generateRewrite({ tone: 'friendly', reviewText: '', stars: 999 })
+  assert(result.ok === true, `an out-of-range star value must still resolve to some no-text tier, got ${JSON.stringify(result)}`)
+}
+
+// --- PART 24: riskLevel/riskCategories are surfaced on a real (non-empty)
+// generation too, driving the publish-time gate and the UI badge --------
+
+async function testHighRiskReviewSurfacesRiskLevelAndCategories() {
+  installSuccessFetch()
+  const result = await generateRewrite(
+    { tone: 'friendly', reviewText: 'I found glass in my food and got injured.', stars: 1 },
+    { tenantId: DEFAULT_TENANT_ID },
+  )
+  assert(result.ok === true)
+  assert(result.riskLevel === 'high_risk', `expected high_risk, got ${result.riskLevel}`)
+  assert(result.riskCategories.includes('foreign_object') && result.riskCategories.includes('injury'),
+    `expected both foreign_object and injury categories, got ${JSON.stringify(result.riskCategories)}`)
+}
+
+async function testOrdinaryNegativeReviewIsNormalRiskNotHighRisk() {
+  installSuccessFetch()
+  const result = await generateRewrite(
+    { tone: 'friendly', reviewText: 'The wait was too long and the food came out cold.', stars: 2 },
+    { tenantId: DEFAULT_TENANT_ID },
+  )
+  assert(result.ok === true)
+  assert(result.riskLevel === 'normal', `an ordinary negative review must classify as normal, not high_risk, got ${result.riskLevel}`)
+  assert(result.riskCategories.length === 0)
+}
+
 const tests = [
   ['Casa Tequila Prime regression text is never flagged serious', testCasaTequilaPrimeNeverSerious],
   ["'no issues' does not trigger the 'sue' keyword (root cause)", testNoIssuesDoesNotTriggerSueKeyword],
@@ -162,6 +244,14 @@ const tests = [
   ['PHASE A4: oversized reviewerName rejected (400), zero Anthropic calls', testOversizedReviewerNameRejectedNoFetch],
   ['PHASE A4: oversized location rejected (400), zero Anthropic calls', testOversizedLocationRejectedNoFetch],
   ['PHASE A4: a normal, within-limits request still succeeds', testWithinLimitsStillSucceeds],
+  ['PARTS 5/24: no-text 5-star never calls the model and varies across calls', testFiveStarNoTextNeverCallsModelAndVaries],
+  ['PARTS 5/6: whitespace-only reviewText is treated identically to empty text', testWhitespaceOnlyReviewTextTreatedAsNoText],
+  ['PART 6: no-text 4-star never invents a problem', testFourStarNoTextNeverInventsAProblem],
+  ['PART 6: no-text 3-star never fabricates specific details', testThreeStarNoTextAcknowledgesNeutrallyWithoutInventing],
+  ['PART 6: no-text 1-star invites detail without inventing specifics', testOneStarNoTextInvitesDetailWithoutInventing],
+  ['an out-of-range star value still resolves to a no-text tier rather than erroring', testUnknownStarRatingFallsBackToThreeStarTier],
+  ['PART 24: a high-risk review surfaces riskLevel=high_risk and its categories', testHighRiskReviewSurfacesRiskLevelAndCategories],
+  ['PART 24: an ordinary negative review surfaces riskLevel=normal, never high_risk', testOrdinaryNegativeReviewIsNormalRiskNotHighRisk],
 ]
 
 for (const [name, fn] of tests) await run(name, fn)

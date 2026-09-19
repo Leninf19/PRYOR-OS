@@ -107,7 +107,7 @@ export default function ResetPassword() {
                 autoComplete="new-password"
                 value={password}
                 onChange={e => setPassword(e.target.value)}
-                className="w-full rounded-lg border px-3 py-2 text-sm"
+                className="w-full rounded-lg border px-3 py-2 text-base"
                 style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }}
               />
               <p className="text-[11px] mt-1" style={{ color: 'var(--color-text-3, var(--color-text-2))' }}>
@@ -124,7 +124,7 @@ export default function ResetPassword() {
                 autoComplete="new-password"
                 value={confirmPassword}
                 onChange={e => setConfirmPassword(e.target.value)}
-                className="w-full rounded-lg border px-3 py-2 text-sm"
+                className="w-full rounded-lg border px-3 py-2 text-base"
                 style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text-1)' }}
               />
             </div>

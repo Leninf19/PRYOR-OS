@@ -30,7 +30,7 @@ import { Permission, roleHasPermission } from '../_lib/permissions.js'
 import { resolveLocationIdForReview, resolveLocationIdForReviewOrDeny } from '../_lib/reviewLocationIndex.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import { getAllActions, getAction, upsertAction, ActionStoreUnavailableError } from '../_lib/actionStore.js'
-import { getLocationContact } from '../_lib/locationContacts.js'
+import { getLocationContact, getLocationContactCcEmails } from '../_lib/locationContacts.js'
 import { resolveTenantId } from '../_lib/tenants.js'
 import { getEscalationCcEmails, getReplyToEmail } from '../_lib/reviewEmailConfig.js'
 import { sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
@@ -198,18 +198,30 @@ async function previewReviewEmail(req, res) {
   }
 
   // Management visibility (Martin/Ruffy) on every restaurant escalation is
-  // a business requirement, not a nicety -- an empty CC list means the
-  // whole feature is unusable right now, not "send anyway with no CC".
-  // Checked here too (not just in the send action) so the confirmation
-  // panel shows this failure before the user ever reaches Send.
-  const cc = getEscalationCcEmails()
-  if (cc.length === 0) {
+  // a business requirement, not a nicety -- an empty MANDATORY (env var)
+  // CC list means the whole feature is unusable right now, not "send
+  // anyway with no CC". Checked here too (not just in the send action) so
+  // the confirmation panel shows this failure before the user ever reaches
+  // Send. This gate is deliberately independent of the location's own
+  // ccEmails (merged in below) -- a location with no CC configured must
+  // never be treated as "escalation not configured."
+  const envCc = getEscalationCcEmails()
+  if (envCc.length === 0) {
     console.error('[actions/preview-review-email] REVIEW_ESCALATION_CC_EMAILS is not configured')
     return res.status(503).json({ error: 'service_unavailable', message: 'Review escalation recipients are not configured.' })
   }
 
   try {
-    const [contact, existing] = await Promise.all([getLocationContact(resolveTenantId(account), locationId), getAction(resolveTenantId(account), id)])
+    const [contact, locationCc, existing] = await Promise.all([
+      getLocationContact(resolveTenantId(account), locationId),
+      getLocationContactCcEmails(resolveTenantId(account), locationId),
+      getAction(resolveTenantId(account), id),
+    ])
+    // PART 18/19 -- the location's own ccEmails (Settings -> Restaurant
+    // Contacts) are ADDITIVE to the mandatory env-var CC list, never a
+    // replacement -- deduplicated since the same address could appear in
+    // both.
+    const cc = [...new Set([...envCc, ...locationCc])]
     return res.status(200).json({
       recipient: contact ? { email: contact.email, name: contact.name ?? null } : null,
       cc,
@@ -280,18 +292,23 @@ async function sendReviewEmailAction(req, res) {
   }
 
   // Management visibility (Martin/Ruffy) on every restaurant escalation is
-  // a business requirement -- refuse to send with no CC rather than
-  // silently omitting them. Checked before any Redis/contact lookup since
-  // it's a pure config check.
-  const cc = getEscalationCcEmails()
-  if (cc.length === 0) {
+  // a business requirement -- refuse to send with no MANDATORY (env var)
+  // CC rather than silently omitting them. Checked before any Redis/
+  // contact lookup since it's a pure config check. Independent of the
+  // location's own ccEmails (merged in below).
+  const envCc = getEscalationCcEmails()
+  if (envCc.length === 0) {
     console.error('[actions/send-review-email] REVIEW_ESCALATION_CC_EMAILS is not configured -- refusing to send without management visibility')
     return res.status(503).json({ error: 'service_unavailable', message: 'Review escalation recipients are not configured.' })
   }
 
-  let contact, existing
+  let contact, locationCc, existing
   try {
-    ;[contact, existing] = await Promise.all([getLocationContact(resolveTenantId(account), locationId), getAction(resolveTenantId(account), id)])
+    ;[contact, locationCc, existing] = await Promise.all([
+      getLocationContact(resolveTenantId(account), locationId),
+      getLocationContactCcEmails(resolveTenantId(account), locationId),
+      getAction(resolveTenantId(account), id),
+    ])
   } catch (err) {
     if (err instanceof ActionStoreUnavailableError) {
       console.error(`[actions/send-review-email] ${err.message}`)
@@ -299,6 +316,10 @@ async function sendReviewEmailAction(req, res) {
     }
     throw err
   }
+
+  // PART 18/19 -- the location's own ccEmails are ADDITIVE to the
+  // mandatory env-var CC list, never a replacement -- deduplicated.
+  const cc = [...new Set([...envCc, ...locationCc])]
 
   // Recipient is ALWAYS resolved server-side from locationId -- the
   // request body has no recipient/cc field for this action to ever read.
@@ -558,7 +579,13 @@ async function rewrite(req, res) {
 
   const result = await generateRewrite(req.body, { tenantId, userId: account.userId })
   if (!result.ok) return res.status(result.status).json({ error: result.error })
-  return res.status(200).json({ rewritten: result.rewritten })
+  // Review Response Quality -- surfaces the server-computed risk
+  // classification alongside the draft so the frontend can render the
+  // Urgent/Health & Safety/Needs Manager Review treatment (PART 8) without
+  // re-deriving it client-side. This is advisory for the UI only -- the
+  // actual publish-time enforcement re-classifies independently server-side
+  // in google/[action].js's publish() (never trusts a client-echoed value).
+  return res.status(200).json({ rewritten: result.rewritten, riskLevel: result.riskLevel ?? 'normal', riskCategories: result.riskCategories ?? [] })
 }
 
 export default async function handler(req, res) {

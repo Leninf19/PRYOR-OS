@@ -11,6 +11,7 @@
 
 import {
   getLocationContact,
+  getLocationContactCcEmails,
   _setContactsForTests,
   _resetContactsForTests,
 } from '../dashboard/api/_lib/locationContacts.js'
@@ -109,6 +110,65 @@ async function testRedisContactExplicitlyDisabledNeverFallsBackToLegacy() {
   assert(contact === null, 'an explicitly disabled Redis contact must resolve to null, never the legacy fallback')
 }
 
+// --- getLocationContactCcEmails() (PART 18/19) ------------------------------
+// The location's own ccEmails (Settings -> Restaurant Contacts, Redis-only
+// -- the legacy JSON fallback never modeled CCs at all) merged additively
+// into the mandatory REVIEW_ESCALATION_CC_EMAILS env-var list by the caller
+// (actions/[action].js). This function itself never merges anything -- it
+// only resolves the ONE location's own list, or [] when there is none.
+
+async function testReturnsConfiguredCcEmails() {
+  _setRedisClientForTests(() => fakeRedis({ 9: JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', active: true, ccEmails: ['martin@example.com', 'ruffy@example.com'] }) }))
+  const cc = await getLocationContactCcEmails(DEFAULT_TENANT_ID, 9)
+  assert(JSON.stringify(cc) === JSON.stringify(['martin@example.com', 'ruffy@example.com']), `expected the configured ccEmails, got ${JSON.stringify(cc)}`)
+}
+
+async function testReturnsEmptyArrayForUnconfiguredLocation() {
+  _setRedisClientForTests(() => fakeRedis())
+  const cc = await getLocationContactCcEmails(DEFAULT_TENANT_ID, 999)
+  assert(Array.isArray(cc) && cc.length === 0, 'an unconfigured location must resolve to [], never throw')
+}
+
+async function testReturnsEmptyArrayWhenCcEmailsFieldMissing() {
+  _setRedisClientForTests(() => fakeRedis({ 9: JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', active: true }) }))
+  const cc = await getLocationContactCcEmails(DEFAULT_TENANT_ID, 9)
+  assert(Array.isArray(cc) && cc.length === 0, 'a contact record with no ccEmails field must resolve to [], not throw')
+}
+
+async function testReturnsEmptyArrayForExplicitlyDisabledContact() {
+  _setRedisClientForTests(() => fakeRedis({ 9: JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', active: false, ccEmails: ['martin@example.com'] }) }))
+  const cc = await getLocationContactCcEmails(DEFAULT_TENANT_ID, 9)
+  assert(Array.isArray(cc) && cc.length === 0, 'a disabled contact\'s CCs must never be used, even though the record still has them')
+}
+
+async function testReturnsEmptyArrayWhenRedisUnavailable() {
+  _setRedisClientForTests(() => ({ hget: async () => { throw new Error('ECONNREFUSED fake-upstash-outage') } }))
+  const cc = await getLocationContactCcEmails(DEFAULT_TENANT_ID, 9)
+  assert(Array.isArray(cc) && cc.length === 0, 'a Redis outage must degrade to no additional CCs, never throw (reads degrade rather than fail closed)')
+}
+
+async function testReturnsEmptyArrayWhenRedisUnconfigured() {
+  // No test seam applied at all -- exercises the real "Redis not configured" path.
+  const cc = await getLocationContactCcEmails(DEFAULT_TENANT_ID, 9)
+  assert(Array.isArray(cc) && cc.length === 0, 'an unconfigured Redis store must degrade to [], never throw')
+}
+
+// PART 19 -- editing a location's CC list must make the VERY NEXT read see
+// the new list, never a stale cached value (the same live-Redis-first
+// resolution getLocationContact() already guarantees for the primary email).
+async function testUpdatedCcEmailsAreReflectedOnNextRead() {
+  const client = fakeRedis({ 9: JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', active: true, ccEmails: ['old@example.com'] }) })
+  _setRedisClientForTests(() => client)
+  const before = await getLocationContactCcEmails(DEFAULT_TENANT_ID, 9)
+  assert(JSON.stringify(before) === JSON.stringify(['old@example.com']))
+
+  client.hget = async () => JSON.stringify({ locationId: 9, primaryEmail: 'redis@example.com', active: true, ccEmails: ['new@example.com'] })
+
+  const after = await getLocationContactCcEmails(DEFAULT_TENANT_ID, 9)
+  assert(JSON.stringify(after) === JSON.stringify(['new@example.com']), `expected the updated ccEmails, got ${JSON.stringify(after)}`)
+  assert(!after.includes('old@example.com'), 'the stale CC must never still be returned after an edit')
+}
+
 async function main() {
   await run('returns the configured contact for a known locationId', testReturnsConfiguredContact)
   await run('returns null (never a guessed value) for an unconfigured locationId', testReturnsNullForUnconfiguredLocation)
@@ -117,6 +177,13 @@ async function main() {
   await run('a Redis-configured contact takes priority over the legacy file', testRedisContactTakesPriorityOverLegacyFile)
   await run('a Redis outage falls back to the legacy file', testRedisUnavailableFallsBackToLegacyFile)
   await run('an explicitly disabled Redis contact resolves to null, never the legacy fallback', testRedisContactExplicitlyDisabledNeverFallsBackToLegacy)
+  await run('getLocationContactCcEmails: returns the configured ccEmails', testReturnsConfiguredCcEmails)
+  await run('getLocationContactCcEmails: returns [] for an unconfigured location', testReturnsEmptyArrayForUnconfiguredLocation)
+  await run('getLocationContactCcEmails: returns [] when the record has no ccEmails field', testReturnsEmptyArrayWhenCcEmailsFieldMissing)
+  await run('getLocationContactCcEmails: returns [] for an explicitly disabled contact', testReturnsEmptyArrayForExplicitlyDisabledContact)
+  await run('getLocationContactCcEmails: returns [] (never throws) on a Redis outage', testReturnsEmptyArrayWhenRedisUnavailable)
+  await run('getLocationContactCcEmails: returns [] (never throws) when Redis is unconfigured', testReturnsEmptyArrayWhenRedisUnconfigured)
+  await run('getLocationContactCcEmails: an updated CC list is reflected on the very next read, never stale', testUpdatedCcEmailsAreReflectedOnNextRead)
 
   console.log()
   if (results.every(Boolean)) {
