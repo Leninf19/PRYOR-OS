@@ -10,17 +10,22 @@ import { reviewId } from './dataUtils.js'
 // Root cause this fix addresses (full audit: Casa Tequila Brighton /
 // reviewer "Terry", local review id 35738): this file used to collapse
 // "a publish-bridge record merely exists" OR "the browser's own
-// localStorage says published" into a single 'confirmed' state -- which is
-// exactly what let PRYOR show "Confirmed" for a reply Google had actually
-// left pending or rejected in moderation. Bridge existence alone, and
-// localStorage alone, must NEVER produce an approved/confirmed state again.
+// localStorage says published" into a single 'confirmed' state. Manually
+// verified after the read-only diagnostic: Terry's reply did NOT fail and
+// was never rejected -- PRYOR's PUT succeeded, Google's API stored the
+// exact comment, and it later became publicly visible; the delay was
+// ordinary Google moderation/propagation lag, not a defect. That is
+// exactly why bridge existence alone, and localStorage alone, must never
+// produce an approved/confirmed state -- and why a later comment match
+// alone (REPLY_RECORDED) must never be silently upgraded to APPROVED
+// either. Public Maps/Search visibility can lag behind API acceptance and
+// retrieval, and this app has no mechanism to verify it directly.
 export const ModerationState = Object.freeze({
-  SENT_TO_GOOGLE:       'sent_to_google',
-  PENDING_APPROVAL:     'pending_google_approval',
-  APPROVED:             'approved_by_google',
-  REJECTED:             'rejected_by_google',
-  VERIFICATION_DELAYED: 'verification_delayed',
-  EXTERNALLY_REPLIED:   'externally_replied',
+  SENT_TO_GOOGLE:   'sent_to_google',
+  REPLY_RECORDED:   'reply_recorded',
+  PENDING_APPROVAL: 'pending_google_approval',
+  APPROVED:         'approved_by_google',
+  REJECTED:         'rejected_by_google',
 })
 
 const KNOWN_MODERATION_STATES = new Set(Object.values(ModerationState))
@@ -39,6 +44,19 @@ export function resolveBridgeModerationState(bridgeEntry) {
   return ModerationState.SENT_TO_GOOGLE
 }
 
+// Production-readiness durability fix: reads the review's OWN durable
+// reviews.db columns (gbp_reply_moderation_state/gbp_reply_policy_violation,
+// exported by export_chunks.py) -- unlike the bridge, this SURVIVES the
+// short-lived Redis publish-bridge record expiring or being cleared, which
+// is exactly how a PRYOR-published reply's REJECTED/PENDING/APPROVED
+// outcome could otherwise silently disappear once its bridge record was
+// gone. Returns null (no durable signal at all) rather than ever guessing
+// -- a missing or unrecognized value here is NOT evidence of anything.
+export function resolveDurableModerationState(r) {
+  const state = r?.gbp_reply_moderation_state
+  return typeof state === 'string' && KNOWN_MODERATION_STATES.has(state) ? state : null
+}
+
 // M5's reply-state model (Navigation/Design System/Execution Master Plan
 // v1.0) -- a presentation-layer mapping over the existing workspace `status`
 // + `owner_response` fields, extended by the Google Reply Moderation State
@@ -48,19 +66,19 @@ export function resolveBridgeModerationState(bridgeEntry) {
 //  - draft:                status is draft_ready or edited (an AI or edited
 //                           draft exists, not yet sent) -- real field.
 //  - sent_to_google:        Google accepted the reply at the HTTP layer, but
-//                           no conclusive moderation state is known yet --
-//                           this is what localStorage alone, or a bridge
+//                           no read-back has independently confirmed it yet
+//                           -- this is what localStorage alone, or a bridge
 //                           record with no/legacy moderationState, means.
+//  - reply_recorded:        a later Google API read (bridge reconciliation
+//                           or an ordinary full sync) independently
+//                           confirmed the matching comment, with no
+//                           explicit reviewReplyState -- Google has it on
+//                           record; public visibility is not confirmed.
 //  - pending_google_approval / approved_by_google / rejected_by_google:
-//                           Google's own reviewReplyState, read from the
-//                           publish-bridge record (see replyModerationState.js).
-//  - verification_delayed: a check was attempted but stayed inconclusive
-//                           (timeout, unreadable state, delayed reconciliation).
+//                           Google's own explicit reviewReplyState, from
+//                           either the live bridge or the durable reviews.db
+//                           snapshot (see replyModerationState.js).
 //  - failed:                status === 'failed' -- real field, unchanged.
-//  - externally_replied:    owner_response is populated but this app's
-//                           workspace/bridge never recorded publishing it --
-//                           a reply exists on Google that didn't come from
-//                           here. Computed from already-real fields.
 //  - pending:               INERT STUB, unchanged from before this fix --
 //                           no code path in this app ever sets
 //                           wsEntry.status to 'pending_confirmation'.
@@ -74,59 +92,63 @@ export function resolveBridgeModerationState(bridgeEntry) {
 // the Execution Master Plan v1.0 explicitly says needs this exact model)
 // reuses it instead of duplicating the mapping.
 export const REPLY_STATE_META = {
-  needs_reply:                            { label: 'Needs Reply',             variant: 'danger'  },
-  draft:                                   { label: 'Draft',                   variant: 'accent'  },
-  [ModerationState.SENT_TO_GOOGLE]:        { label: 'Sent to Google',          variant: 'accent'  },
-  [ModerationState.PENDING_APPROVAL]:      { label: 'Pending Google Approval', variant: 'warning' },
-  [ModerationState.APPROVED]:              { label: 'Approved by Google',      variant: 'success' },
-  [ModerationState.REJECTED]:              { label: 'Rejected by Google',      variant: 'danger'  },
-  [ModerationState.VERIFICATION_DELAYED]:  { label: 'Verification Delayed',    variant: 'warning' },
-  failed:                                  { label: 'Failed',                  variant: 'danger'  },
-  [ModerationState.EXTERNALLY_REPLIED]:    { label: 'Externally Replied',      variant: 'info'    },
-  pending:                                 { label: 'Pending',                 variant: 'warning' },
+  needs_reply:                       { label: 'Needs Reply',             variant: 'danger'  },
+  draft:                              { label: 'Draft',                   variant: 'accent'  },
+  [ModerationState.SENT_TO_GOOGLE]:   { label: 'Sent to Google',          variant: 'accent'  },
+  [ModerationState.REPLY_RECORDED]:   { label: 'Reply Recorded by Google', variant: 'info'    },
+  [ModerationState.PENDING_APPROVAL]: { label: 'Pending Google Approval', variant: 'warning' },
+  [ModerationState.APPROVED]:         { label: 'Approved by Google',      variant: 'success' },
+  [ModerationState.REJECTED]:         { label: 'Rejected by Google',      variant: 'danger'  },
+  failed:                             { label: 'Failed',                  variant: 'danger'  },
+  pending:                            { label: 'Pending',                 variant: 'warning' },
 }
 
 // Short, manager-facing supporting text for each state (PART 5's explicit
 // requirement: "include short supporting text explaining the state").
-// A rejected review's reason comes from the bridge record's own
+// A rejected review's reason comes from the bridge/durable record's own
 // policyViolation.summary (never a raw API payload) when available.
 export const MODERATION_STATE_DESCRIPTIONS = Object.freeze({
-  [ModerationState.SENT_TO_GOOGLE]:       'Google accepted the reply. Approval has not been confirmed yet.',
-  [ModerationState.PENDING_APPROVAL]:     'Google is still reviewing this reply before it can appear publicly.',
-  [ModerationState.APPROVED]:             'Google has approved this reply. It may take additional time to appear on every public surface.',
-  [ModerationState.REJECTED]:             'Google rejected this reply and it will not appear publicly. Write a new reply below.',
-  [ModerationState.VERIFICATION_DELAYED]: "We couldn't confirm this reply's status with Google yet. It will keep checking automatically.",
+  [ModerationState.SENT_TO_GOOGLE]:   'Google accepted the request. It has not been independently confirmed yet.',
+  [ModerationState.REPLY_RECORDED]:   'Google has received this reply. It may take time to appear publicly.',
+  [ModerationState.PENDING_APPROVAL]: 'Google is still reviewing this reply before it can appear publicly.',
+  [ModerationState.APPROVED]:         "Google has approved this reply. Public Maps/Search visibility can lag behind approval and isn't guaranteed immediately.",
+  [ModerationState.REJECTED]:         'Google rejected this reply and it will not appear publicly. Write a new reply below.',
 })
 
-// Recovery Milestone 6B, Part 3 reply-state priority, revised by the Google
-// Reply Moderation State fix. Priority order:
-//   1. Google owner_response -- always authoritative (an independent sync
-//      actually saw Google serving this comment back). Combined with a
-//      live bridge record, this app's own publish produced it -- treated
-//      as APPROVED (the strongest signal this system has, though still not
-//      literal proof of every public surface having propagated it); alone,
-//      it's a reply this app never recorded making (EXTERNALLY_REPLIED).
-//   2. The durable Redis bridge (see dashboard/api/_lib/publishBridgeStore.js)
-//      -- its OWN moderationState field is now what's actually inspected
-//      (resolveBridgeModerationState() above), never just its existence.
-//      This is the literal fix for the "Confirmed but missing on Google"
-//      defect: a bridge record can now resolve to SENT_TO_GOOGLE, PENDING,
-//      APPROVED, REJECTED, or VERIFICATION_DELAYED, never a blanket
-//      'confirmed'.
-//   3. wsEntry.status === 'published' -- kept as a same-browser fallback
-//      for when the bridge itself couldn't be read (Redis unreachable,
-//      pre-fix client), but PART 5's explicit requirement: localStorage
-//      alone may support temporary UI continuity, never canonical
-//      confirmation -- so this resolves to SENT_TO_GOOGLE, never APPROVED.
-//   4/5. failed / draft -- unchanged, only reachable when neither signal
-//      above says otherwise.
+// Recovery Milestone 6B, Part 3 reply-state priority, revised by the
+// Production-readiness durability fix. Priority order (strongest,
+// deterministic server-side evidence first; browser-only continuity last
+// and never overriding anything above it):
+//   1. Explicit REJECTED/PENDING -- from the LIVE bridge (freshest) or the
+//      DURABLE reviews.db snapshot (survives the bridge disappearing
+//      entirely -- TTL expiry, an outage, anything). Either source is
+//      trusted equally; whichever says REJECTED/PENDING wins, and neither
+//      is ever downgraded by owner_response/comment presence.
+//   2. Explicit APPROVED -- same two sources. This is what lets a
+//      PRYOR-published reply keep being correctly attributed to PRYOR
+//      (never misclassified once its bridge is gone) -- durable provenance,
+//      not just "an owner_response happens to exist."
+//   3. owner_response present with nothing above resolved -- Google's API
+//      has a reply on record (REPLY_RECORDED); this app cannot reliably
+//      tell a PRYOR-published reply whose bridge/durable history predates
+//      this fix (the Terry case) apart from a genuinely independent reply,
+//      so it does not pretend to -- both get this one honest label.
+//   4. A live bridge with no resolved state yet (SENT_TO_GOOGLE or
+//      REPLY_RECORDED already returned by resolveBridgeModerationState()).
+//   5. Browser-only continuity (wsEntry) -- weakest signal, NEVER
+//      overrides any of the above, even when they contradict it.
 //
 // `bridgeEntry` is optional (undefined for any caller not yet passing
 // bridge data) so every existing call site keeps working unchanged.
 export function computeReplyState(r, wsEntry, bridgeEntry) {
-  const hasBridge = Boolean(bridgeEntry)
-  if (r.owner_response) return hasBridge ? ModerationState.APPROVED : ModerationState.EXTERNALLY_REPLIED
-  if (hasBridge) return resolveBridgeModerationState(bridgeEntry)
+  const bridgeState = bridgeEntry ? resolveBridgeModerationState(bridgeEntry) : null
+  const durableState = resolveDurableModerationState(r)
+
+  if (bridgeState === ModerationState.REJECTED || durableState === ModerationState.REJECTED) return ModerationState.REJECTED
+  if (bridgeState === ModerationState.PENDING_APPROVAL || durableState === ModerationState.PENDING_APPROVAL) return ModerationState.PENDING_APPROVAL
+  if (bridgeState === ModerationState.APPROVED || durableState === ModerationState.APPROVED) return ModerationState.APPROVED
+  if (r.owner_response) return ModerationState.REPLY_RECORDED
+  if (bridgeState) return bridgeState
   if (wsEntry?.status === 'pending_confirmation') return 'pending' // see comment above -- never set
   if (wsEntry?.status === 'failed') return 'failed'
   if (wsEntry?.status === 'published') return ModerationState.SENT_TO_GOOGLE
@@ -134,21 +156,26 @@ export function computeReplyState(r, wsEntry, bridgeEntry) {
   return 'needs_reply'
 }
 
-// Recovery Milestone 6B, Part 9, revised by the Google Reply Moderation
-// State fix: true once a review is answered by a signal strong enough that
-// generating another AI draft / showing the compose workspace would risk a
-// duplicate publish attempt. A REJECTED bridge is the one deliberate
-// exception -- Google will never make that reply public, so the review is
-// NOT actually answered and must re-open for a genuinely new reply (PART 4/
-// 8's "never automatically republish" requirement is about not retrying the
-// SAME rejected text automatically; a manager writing and submitting a new
-// one through the normal compose flow is exactly the intended recovery
-// path). SENT_TO_GOOGLE/PENDING_APPROVAL/APPROVED/VERIFICATION_DELAYED all
-// still count as "answered" here to prevent inviting a duplicate publish
-// while the outcome is in flight or unresolved.
+// Recovery Milestone 6B, Part 9, revised by the Production-readiness
+// durability fix: true once a review is answered by a signal strong enough
+// that generating another AI draft / showing the compose workspace would
+// risk a duplicate publish attempt. An explicit REJECTED outcome (live
+// bridge OR the durable reviews.db snapshot -- checked the same way
+// computeReplyState() does) is the one deliberate exception -- Google will
+// never make that reply public, so the review is NOT actually answered and
+// must re-open for a genuinely new reply (PART 4/8's "never automatically
+// republish" requirement is about not retrying the SAME rejected text
+// automatically; a manager writing and submitting a new one through the
+// normal compose flow is exactly the intended recovery path). Every other
+// state still counts as "answered" here to prevent inviting a duplicate
+// publish while the outcome is in flight, recorded-but-unresolved, or
+// approved.
 export function isAnsweredReplyState(r, wsEntry, bridgeEntry) {
+  const bridgeState = bridgeEntry ? resolveBridgeModerationState(bridgeEntry) : null
+  const durableState = resolveDurableModerationState(r)
+  if (bridgeState === ModerationState.REJECTED || durableState === ModerationState.REJECTED) return false
   if (r.owner_response) return true
-  if (bridgeEntry) return resolveBridgeModerationState(bridgeEntry) !== ModerationState.REJECTED
+  if (bridgeEntry) return true
   return wsEntry?.status === 'published'
 }
 
@@ -177,9 +204,8 @@ export function isActionableReplyState(state) {
 export function computeReplyStateCounts(reviews, ws, bridges) {
   const counts = {
     needs_reply: 0, draft: 0, failed: 0,
-    [ModerationState.SENT_TO_GOOGLE]: 0, [ModerationState.PENDING_APPROVAL]: 0,
-    [ModerationState.APPROVED]: 0, [ModerationState.REJECTED]: 0,
-    [ModerationState.VERIFICATION_DELAYED]: 0, [ModerationState.EXTERNALLY_REPLIED]: 0,
+    [ModerationState.SENT_TO_GOOGLE]: 0, [ModerationState.REPLY_RECORDED]: 0,
+    [ModerationState.PENDING_APPROVAL]: 0, [ModerationState.APPROVED]: 0, [ModerationState.REJECTED]: 0,
   }
   reviews.forEach(r => {
     const id = reviewId(r)

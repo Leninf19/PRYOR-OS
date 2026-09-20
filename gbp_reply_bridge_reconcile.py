@@ -73,7 +73,7 @@ REQUEST_TIMEOUT_SECONDS = 10
 # Google Reply Moderation State fix: matches
 # dashboard/api/_lib/publishBridgeStore.js's BRIDGE_TTL_SECONDS exactly --
 # used only when this script itself re-writes a bridge record (PENDING/
-# REJECTED/VERIFICATION_DELAYED updates via set_bridge_record()) so an
+# REJECTED/REPLY_RECORDED updates via set_bridge_record()) so an
 # actively-rechecked record's TTL is refreshed the same way the original
 # write's TTL was set, rather than drifting to a different lifetime policy.
 BRIDGE_TTL_SECONDS = 60 * 60 * 48
@@ -194,35 +194,77 @@ def find_local_review(conn, gbp_review_name: str):
     ).fetchone()
 
 
+def _persist_moderation_state(conn, local_row, gbp_review_name, moderation_state, policy_violation, now_iso):
+    """Production-readiness fix (durability closure): writes ONLY the two
+    moderation columns to reviews.db -- never owner_response, never
+    review_text/star_rating -- via the same upsert_review() every other
+    caller uses (idempotent, no fake revision: an empty owner_response
+    never overwrites the existing one, and moderation fields are outside
+    review_revisions' comparison set entirely -- see db.py).
+
+    Why this exists: the Terry diagnostic proved Google's ordinary
+    reviews.get()/reviews.list() read surface does not reliably return
+    reviewReplyState at all in real production data -- so reconcile_one()'s
+    OWN fresh GET essentially never independently re-discovers a
+    PENDING/REJECTED outcome after the fact. The only place that signal
+    ever reliably appears is the original updateReply PUT response, and
+    the bridge record already carries whatever it captured there. Without
+    this durable write, that captured signal lived ONLY in the short-lived
+    (48h, self-renewing-on-touch) Redis bridge record -- if reconciliation
+    ever went fully silent past that window, or the bridge was cleared for
+    any other reason, the fact "this was explicitly REJECTED/PENDING" would
+    disappear with no trace. Persisting it to reviews.db on every touch
+    means it survives bridge expiration/deletion unconditionally."""
+    if not local_row:
+        return
+    row = {
+        "gbp_review_name": gbp_review_name,
+        "owner_response": "",
+        "gbp_reply_moderation_state": moderation_state,
+        "gbp_reply_policy_violation": policy_violation,
+    }
+    db.upsert_review(conn, local_row["location_id"], local_row["location_name"], row, now_iso)
+    conn.commit()
+
+
 def reconcile_one(conn, key: str, record: dict, dry_run: bool, tenant_id: str,
                    fetch_review=None, delete_record=None, set_record=None) -> str:
     """Returns one of: 'confirmed', 'rejected', 'pending_approval',
-    'still_pending', 'verification_delayed', 'skipped_no_gbp_id',
+    'still_pending', 'reply_recorded', 'skipped_no_gbp_id',
     'skipped_not_found_locally', 'fetch_failed'.
 
     Google Reply Moderation State fix: this used to treat ANY non-empty
     `reviewReply.comment` as proof the reply was live and write it straight
     to reviews.db -- the exact root cause of PRYOR showing a reply as
-    resolved when Google's own moderation had actually left it pending or
-    rejected (see the read-only audit for Casa Tequila Brighton / reviewer
-    "Terry", local review id 35738). Now `reviewReply.reviewReplyState` is
-    read and trusted FIRST:
-      - APPROVED (+ a non-empty comment) -> write reviews.db, clear bridge.
-      - REJECTED -> update the bridge record in place with the rejection +
-        policy reason, NEVER write reviews.db, NEVER delete the bridge
-        (PART 4/8's "never automatically republish" -- the bridge record's
-        terminal REJECTED state is what the UI shows; a genuinely new reply
-        goes through the normal publish flow, which writes a fresh bridge
-        record with its own new key/outcome, not a mutation of this one).
-      - PENDING -> update the bridge in place, keep waiting.
+    resolved before it had evidence of Google's own decision. Manually
+    verified after the read-only Terry diagnostic: that specific review was
+    never rejected -- PRYOR's PUT succeeded and the reply is now publicly
+    visible; the gap was ordinary moderation/propagation delay, not a
+    failure. `reviewReply.reviewReplyState` is read and trusted FIRST:
+      - APPROVED (+ a non-empty comment) -> write reviews.db (durably
+        stamping gbp_reply_moderation_state too, so PRYOR-provenance
+        survives even after this bridge record is later cleared -- Google
+        approval is still not a promise of immediate public Maps/Search
+        visibility, only that Google's own moderation resolved positively),
+        clear bridge.
+      - REJECTED -> durably persist the rejection + policy reason to
+        reviews.db AND update the bridge record in place, NEVER write
+        owner_response, NEVER delete the bridge (PART 4/8's "never
+        automatically republish" -- the bridge's terminal REJECTED state is
+        what the UI shows; a genuinely new reply goes through the normal
+        publish flow, which writes a fresh bridge record, not a mutation of
+        this one).
+      - PENDING -> durably persist + update the bridge in place, keep waiting.
       - missing/unspecified/unrecognized reviewReplyState:
           - no comment at all yet -> 'still_pending' (the original,
             benign, overwhelmingly common case: nothing to evaluate yet).
           - a comment IS present but Google gave no resolvable moderation
-            state -> 'verification_delayed', NEVER 'confirmed'. This is
-            PART 2's explicit requirement ("missing/unspecified moderation
-            state must not be interpreted as approval or rejection") and
-            the literal fix for the reported bug.
+            state -> 'reply_recorded', NEVER 'confirmed'. Google's API has
+            the reply on record; that is not proof of moderation approval
+            or public visibility. This is PART 2's explicit requirement
+            ("missing/unspecified moderation state must not be interpreted
+            as approval or rejection") and the literal fix for the
+            reported bug.
 
     fetch_review/delete_record/set_record default to the real
     google_api.get_review() (bound to tenant_id)/delete_bridge_record()/
@@ -250,26 +292,36 @@ def reconcile_one(conn, key: str, record: dict, dry_run: bool, tenant_id: str,
         print(f"[reconcile] {key}: no local review row has gbp_review_name={gbp_review_name!r} -- skipping")
         return "skipped_not_found_locally"
 
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     if (local_row["owner_response"] or "").strip():
         # Already reconciled by something else (e.g. the full sync ran
         # since this record was written) -- just clean up the now-redundant
-        # bridge record and move on.
+        # bridge record. A bridge existed for this review at all, so this
+        # app's own pipeline is what produced the reply: durably stamp
+        # APPROVED provenance now, so a LATER full sync (or this bridge's
+        # own eventual expiry) can never cause it to misclassify as an
+        # unattributed "Reply Recorded" -- see computeReplyState()'s
+        # precedence for why this matters.
         print(f"[reconcile] {key}: reviews.db already has owner_response for this review -- clearing stale bridge record")
         if not dry_run:
+            _persist_moderation_state(conn, local_row, gbp_review_name, rms.APPROVED, None, now_iso)
             delete_record(key)
         return "confirmed"
 
-    try:
-        api_review = fetch_review(gbp_review_name)
-    except Exception as e:  # noqa: BLE001 -- a fetch failure for one review must never abort the run
-        print(f"[reconcile] {key}: fetch failed ({type(e).__name__}: {e}) -- leaving bridge record in place, TTL is the backstop")
-        return "fetch_failed"
-
-    reply = api_review.get("reviewReply") or {}
-    comment = (reply.get("comment") or "").strip()
-    review_reply_state = reply.get("reviewReplyState")
-    outcome_state = rms.classify_moderation_outcome(review_reply_state)
-    now_iso = datetime.now(timezone.utc).isoformat()
+    # Production-readiness fix: the bridge record's OWN moderationState
+    # (captured at publish time, or by an earlier reconcile pass) is
+    # checked BEFORE relying on a fresh GET -- see _persist_moderation_state's
+    # own docstring for why a fresh GET essentially never independently
+    # re-discovers this in real Google API behavior. This durably persists
+    # an already-known REJECTED/PENDING outcome even if the upcoming GET
+    # below fails, times out, or (the common case) simply confirms nothing
+    # new -- the explicit signal this app already has is never allowed to
+    # quietly depend on a GET that will likely never corroborate it.
+    existing_bridge_state = rms.resolve_bridge_moderation_state(record)
+    if existing_bridge_state in (rms.REJECTED, rms.PENDING_APPROVAL) and not dry_run:
+        existing_policy = record.get("policyViolation")
+        _persist_moderation_state(conn, local_row, gbp_review_name, existing_bridge_state, existing_policy, now_iso)
 
     # Phase 7 observability (Google Reply Moderation State fix): this
     # workflow's cron is configured for every 15 minutes, but the actual
@@ -291,6 +343,17 @@ def reconcile_one(conn, key: str, record: dict, dry_run: bool, tenant_id: str,
         except (ValueError, TypeError):
             pass  # malformed timestamp -- never let observability logging break reconciliation itself
 
+    try:
+        api_review = fetch_review(gbp_review_name)
+    except Exception as e:  # noqa: BLE001 -- a fetch failure for one review must never abort the run
+        print(f"[reconcile] {key}: fetch failed ({type(e).__name__}: {e}) -- leaving bridge record in place, TTL is the backstop")
+        return "fetch_failed"
+
+    reply = api_review.get("reviewReply") or {}
+    comment = (reply.get("comment") or "").strip()
+    review_reply_state = reply.get("reviewReplyState")
+    outcome_state = rms.classify_moderation_outcome(review_reply_state)
+
     if outcome_state == rms.APPROVED and comment:
         print(f"[reconcile] {key}: Google approved the reply -- writing owner_response to reviews.db (review id={local_row['id']})")
         if not dry_run:
@@ -300,6 +363,7 @@ def reconcile_one(conn, key: str, record: dict, dry_run: bool, tenant_id: str,
                     "gbp_review_name": gbp_review_name,
                     "owner_response": comment,
                     "gbp_reply_update_time": reply.get("updateTime"),
+                    "gbp_reply_moderation_state": rms.APPROVED,
                 },
                 now_iso,
             )
@@ -312,6 +376,7 @@ def reconcile_one(conn, key: str, record: dict, dry_run: bool, tenant_id: str,
         print(f"[reconcile] {key}: Google rejected this reply ({policy['summary'] if policy else 'no reason given'}) -- "
               f"marking the bridge record rejected, never auto-republishing")
         if not dry_run:
+            _persist_moderation_state(conn, local_row, gbp_review_name, rms.REJECTED, policy, now_iso)
             updated = {
                 **record,
                 "moderationState": rms.REJECTED,
@@ -326,6 +391,7 @@ def reconcile_one(conn, key: str, record: dict, dry_run: bool, tenant_id: str,
     if outcome_state == rms.PENDING_APPROVAL:
         print(f"[reconcile] {key}: Google reports this reply as still pending approval")
         if not dry_run:
+            _persist_moderation_state(conn, local_row, gbp_review_name, rms.PENDING_APPROVAL, None, now_iso)
             updated = {
                 **record,
                 "moderationState": rms.PENDING_APPROVAL,
@@ -341,20 +407,23 @@ def reconcile_one(conn, key: str, record: dict, dry_run: bool, tenant_id: str,
         return "still_pending"
 
     # A comment IS present, but reviewReplyState was missing/unspecified/
-    # unrecognized -- exactly the gap the audit found. Never silently
-    # confirm; mark inconclusive and keep checking.
-    print(f"[reconcile] {key}: Google shows reply text but no resolvable moderation state -- verification delayed, not confirmed")
+    # unrecognized -- exactly the gap the audit found, and exactly what the
+    # manually-verified Terry case turned out to be (an accepted, recorded
+    # reply that later became publicly visible with no explicit moderation
+    # signal ever surfacing on a read). Never silently confirm; record the
+    # honest "Google has this on record" state and keep checking.
+    print(f"[reconcile] {key}: Google shows reply text but no resolvable moderation state -- reply recorded, not confirmed")
     if not dry_run:
         updated = {
             **record,
-            "moderationState": rms.VERIFICATION_DELAYED,
+            "moderationState": rms.REPLY_RECORDED,
             "reviewReplyState": review_reply_state,
             "googleUpdateTime": reply.get("updateTime"),
             "replyTextMatches": rms.reply_text_matches(comment, record.get("responseText")),
             "moderationCheckedAt": now_iso,
         }
         set_record(key, updated, BRIDGE_TTL_SECONDS)
-    return "verification_delayed"
+    return "reply_recorded"
 
 
 def run_reconcile(conn, tenant_id: str, dry_run: bool = False, *,
@@ -385,7 +454,7 @@ def run_reconcile(conn, tenant_id: str, dry_run: bool = False, *,
 
     counts = {
         "confirmed": 0, "rejected": 0, "pending_approval": 0, "still_pending": 0,
-        "verification_delayed": 0, "skipped_no_gbp_id": 0, "skipped_not_found_locally": 0, "fetch_failed": 0,
+        "reply_recorded": 0, "skipped_no_gbp_id": 0, "skipped_not_found_locally": 0, "fetch_failed": 0,
     }
     for key in keys:
         record = get_record(key)

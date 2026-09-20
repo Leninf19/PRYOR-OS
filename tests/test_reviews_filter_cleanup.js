@@ -127,7 +127,12 @@ function testCountsReflectRealReplyStatesAcrossTheGlobalScope() {
   // never the old blanket 'confirmed' -- localStorage alone must never
   // establish canonical confirmation.
   assert(counts[ModerationState.SENT_TO_GOOGLE] === 1, `Delta was marked published, got ${counts[ModerationState.SENT_TO_GOOGLE]}`)
-  assert(counts.externally_replied === 1, `Echo has an owner_response with no bridge/published record, got ${counts.externally_replied}`)
+  // Google Reply Moderation State fix (durability revision): an
+  // owner_response with no bridge and no durable provenance marker is now
+  // 'reply_recorded', not 'externally_replied' -- this app cannot reliably
+  // tell a PRYOR-published reply whose history predates the fix apart from
+  // a genuinely independent one, so it no longer pretends to.
+  assert(counts[ModerationState.REPLY_RECORDED] === 1, `Echo has an owner_response with no bridge/published record, got ${counts[ModerationState.REPLY_RECORDED]}`)
   assert(counts.needs_reply === 3, `the remaining 3 (Alpha, Charlie, Foxtrot) are plain needs_reply, got ${counts.needs_reply}`)
   const total = Object.values(counts).reduce((sum, n) => sum + n, 0)
   assert(total === CORPUS.length, `counts must never lose or duplicate a review -- expected ${CORPUS.length}, got ${total}`)
@@ -207,7 +212,7 @@ function main() {
   run('"All Locations" (empty array) represents every authorized location', testAllLocationsRepresentsEveryAuthorizedLocation)
   run('a global date range change recalculates the status counts', testGlobalDateRangeChangeRecalculatesStatusCounts)
   run('a global stars filter change recalculates the status counts', testGlobalStarsFilterChangesStatusCounts)
-  run('counts reflect real reply states (draft/confirmed/externally_replied/needs_reply) across the global scope', testCountsReflectRealReplyStatesAcrossTheGlobalScope)
+  run('counts reflect real reply states (draft/sent_to_google/reply_recorded/needs_reply) across the global scope', testCountsReflectRealReplyStatesAcrossTheGlobalScope)
   run('a local status filter never expands beyond the globally-filtered dataset', testLocalStatusFilterNeverExpandsBeyondTheGlobalScope)
   run('no second location selector exists in Reviews.jsx', testNoSecondLocationSelectorExistsInReviews)
   run('no duplicate star selector exists in Reviews.jsx', testNoDuplicateStarSelectorExistsInReviews)

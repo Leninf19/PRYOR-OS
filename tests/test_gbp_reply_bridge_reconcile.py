@@ -175,11 +175,11 @@ def test_rejected_reply_updates_bridge_with_policy_reason_never_writes_db_never_
     assert "flagged as fake engagement" in updated_record["policyViolation"]["summary"]
 
 
-def test_comment_present_but_no_moderation_state_is_verification_delayed_never_confirmed():
+def test_comment_present_but_no_moderation_state_is_reply_recorded_never_confirmed():
     """THE reported bug, reproduced directly: Google's read-back echoes the
     submitted comment text but supplies no resolvable reviewReplyState --
     the exact shape that used to silently write reviews.db and mark the
-    review resolved. Must now become verification_delayed, never confirmed."""
+    review resolved. Must now become reply_recorded, never confirmed."""
     conn = _fresh_db()
     loc_id = _add_location(conn)
     review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
@@ -194,10 +194,10 @@ def test_comment_present_but_no_moderation_state_is_verification_delayed_never_c
         set_record=lambda k, v, ttl: set_calls.append((k, v, ttl)),
     )
     row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
-    assert counts["verification_delayed"] == 1, counts
+    assert counts["reply_recorded"] == 1, counts
     assert counts["confirmed"] == 0, "must never be silently confirmed just because comment text is present"
     assert row["owner_response"] == "", row["owner_response"]
-    assert set_calls[0][1]["moderationState"] == "verification_delayed"
+    assert set_calls[0][1]["moderationState"] == "reply_recorded"
 
 
 def test_unspecified_review_reply_state_is_treated_as_missing_not_approved():
@@ -213,7 +213,7 @@ def test_unspecified_review_reply_state_is_treated_as_missing_not_approved():
         delete_record=lambda k: (_ for _ in ()).throw(AssertionError("must never delete/confirm on REVIEW_REPLY_STATE_UNSPECIFIED")),
         set_record=lambda k, v, ttl: None,
     )
-    assert counts["verification_delayed"] == 1, counts
+    assert counts["reply_recorded"] == 1, counts
     assert counts["confirmed"] == 0
 
 
@@ -230,13 +230,13 @@ def test_unknown_future_review_reply_state_is_treated_as_missing_not_approved():
         delete_record=lambda k: (_ for _ in ()).throw(AssertionError("an unrecognized future state must never be treated as approval")),
         set_record=lambda k, v, ttl: None,
     )
-    assert counts["verification_delayed"] == 1, counts
+    assert counts["reply_recorded"] == 1, counts
     assert counts["confirmed"] == 0
 
 
 def test_malformed_reviewreply_shape_never_crashes():
     """reviewReply present but not a dict, or the whole api_review missing
-    expected keys -- must degrade to still_pending/verification_delayed,
+    expected keys -- must degrade to still_pending/reply_recorded,
     never raise."""
     conn = _fresh_db()
     loc_id = _add_location(conn)
@@ -476,6 +476,129 @@ def test_independent_external_reply_full_sync_populates_owner_response_no_bridge
     row = conn.execute("SELECT owner_response, gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
     assert row["owner_response"] == "Glad you enjoyed it!"
     assert row["gbp_reply_moderation_state"] == "approved_by_google"
+
+
+# === Production-readiness durability fix ===================================
+# Proves the state each of these branches captures SURVIVES the bridge
+# record disappearing entirely afterward (TTL expiry, an outage, or any
+# other reason it's gone) -- not just that the bridge itself is momentarily
+# correct while still present. Simulates "the bridge is now gone" by simply
+# calling reconcile.run_reconcile() a second time with an EMPTY keys list
+# (nothing left to process) and reading reviews.db directly.
+
+def test_rejected_state_persisted_durably_survives_bridge_disappearing():
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    store = {"publish_bridge:v1:r1": _bridge_record()}
+
+    reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: list(store.keys()),
+        get_record=lambda k: store.get(k),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "REJECTED", "policyViolation": "SPAM"}},
+        delete_record=lambda k: store.pop(k, None),
+        set_record=lambda k, v, ttl: store.__setitem__(k, v),
+    )
+    assert "publish_bridge:v1:r1" in store, "sanity check: bridge should still exist right after this pass"
+
+    # Now simulate the bridge disappearing entirely (TTL expiry/outage) --
+    # NOT deleted by reconcile itself, just gone from Redis by the time the
+    # next pass (or the frontend) looks for it.
+    store.clear()
+
+    row = conn.execute("SELECT owner_response, gbp_reply_moderation_state, gbp_reply_policy_violation FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == "", "a rejected reply must never appear as a live owner_response"
+    assert row["gbp_reply_moderation_state"] == "rejected_by_google", "REJECTED must survive the bridge disappearing -- this is the durability fix"
+    assert json.loads(row["gbp_reply_policy_violation"])["reasonCodes"] == ["SPAM"]
+
+    # A subsequent reconcile pass over the (now empty) bridge keyspace must
+    # not need this record at all -- reviews.db already has the answer.
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: list(store.keys()),
+        get_record=lambda k: store.get(k),
+        fetch_review=lambda name: (_ for _ in ()).throw(AssertionError("must not be called -- no bridge keys left")),
+        delete_record=lambda k: store.pop(k, None),
+        set_record=lambda k, v, ttl: store.__setitem__(k, v),
+    )
+    assert counts["confirmed"] == 0 and counts["rejected"] == 0, "nothing left to reconcile -- the durable record is the source of truth now"
+
+
+def test_pending_state_persisted_durably_survives_bridge_disappearing():
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    store = {"publish_bridge:v1:r1": _bridge_record()}
+
+    reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: list(store.keys()),
+        get_record=lambda k: store.get(k),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "PENDING"}},
+        delete_record=lambda k: store.pop(k, None),
+        set_record=lambda k, v, ttl: store.__setitem__(k, v),
+    )
+    store.clear()  # bridge disappears
+
+    row = conn.execute("SELECT owner_response, gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == ""
+    assert row["gbp_reply_moderation_state"] == "pending_google_approval", "PENDING must survive the bridge disappearing"
+
+
+def test_rejected_bridge_persists_immediately_even_before_any_fresh_google_call():
+    """The core empirical finding from the Terry diagnostic: Google's own
+    GET essentially never independently re-confirms a moderation state, so
+    reconcile_one() must durably persist the BRIDGE's OWN already-known
+    REJECTED state up front -- not depend on a fresh GET to reveal it. This
+    test's fetch_review deliberately returns nothing new (no reviewReply at
+    all) to prove persistence happens anyway, from the bridge's own prior
+    state."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    already_rejected_bridge = {
+        **_bridge_record(),
+        "moderationState": "rejected_by_google",
+        "policyViolation": {"reasonCodes": ["SPAM"], "summary": "Rejected by Google -- flagged as spam."},
+    }
+
+    reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: already_rejected_bridge,
+        fetch_review=lambda name: {},  # Google's GET reveals nothing new -- the realistic case
+        delete_record=lambda k: (_ for _ in ()).throw(AssertionError("must not delete")),
+        set_record=lambda k, v, ttl: None,
+    )
+    row = conn.execute("SELECT gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["gbp_reply_moderation_state"] == "rejected_by_google", (
+        "the bridge's own already-known REJECTED state must be persisted immediately, "
+        "not deferred to a fresh GET that Google's real API essentially never populates"
+    )
+
+
+def test_approved_provenance_persisted_when_already_answered_locally_branch_fires():
+    """Item 6: when a bridge exists AND owner_response is already present
+    (the 'self-healed by an independent full sync' branch), the review is
+    durably stamped APPROVED -- this is what lets computeReplyState() later
+    keep attributing it to PRYOR instead of misclassifying it as an
+    unattributed 'Reply Recorded' once this bridge is gone."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc", owner_response="Already replied via full sync")
+    deleted = []
+
+    reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: (_ for _ in ()).throw(AssertionError("must not call Google -- already answered locally")),
+        delete_record=lambda k: deleted.append(k),
+    )
+    row = conn.execute("SELECT gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["gbp_reply_moderation_state"] == "approved_by_google"
+    assert deleted == ["publish_bridge:v1:r1"]
 
 
 def test_already_answered_locally_clears_stale_bridge_without_google_call():
@@ -866,7 +989,7 @@ def main() -> int:
         ("still-pending record leaves the row and bridge untouched", test_still_pending_leaves_row_and_bridge_untouched),
         ("PENDING moderation state updates the bridge, never writes reviews.db", test_pending_approval_updates_bridge_never_writes_db),
         ("REJECTED moderation state updates the bridge with policy reason, never writes DB, never deletes", test_rejected_reply_updates_bridge_with_policy_reason_never_writes_db_never_deletes),
-        ("comment present but no moderation state -> verification_delayed, never confirmed (the reported bug)", test_comment_present_but_no_moderation_state_is_verification_delayed_never_confirmed),
+        ("comment present but no moderation state -> reply_recorded, never confirmed (the reported bug)", test_comment_present_but_no_moderation_state_is_reply_recorded_never_confirmed),
         ("REVIEW_REPLY_STATE_UNSPECIFIED is treated as missing, never approved", test_unspecified_review_reply_state_is_treated_as_missing_not_approved),
         ("an unrecognized future reviewReplyState is treated as missing, never approved", test_unknown_future_review_reply_state_is_treated_as_missing_not_approved),
         ("a malformed/empty reviewReply response never crashes reconciliation", test_malformed_reviewreply_shape_never_crashes),
@@ -877,6 +1000,10 @@ def main() -> int:
         ("full-sync gap: active bridge + APPROVED full sync lets the next reconcile confirm without a Google call", test_active_bridge_plus_approved_full_sync_lets_reconcile_confirm_on_next_run),
         ("full-sync gap: active bridge + REJECTED full sync never writes DB, bridge stays visible", test_active_bridge_plus_rejected_full_sync_never_writes_db_bridge_stays_visible),
         ("full-sync gap: an independent external APPROVED reply populates owner_response with no bridge needed", test_independent_external_reply_full_sync_populates_owner_response_no_bridge_needed),
+        ("durability: REJECTED state survives the bridge record disappearing entirely", test_rejected_state_persisted_durably_survives_bridge_disappearing),
+        ("durability: PENDING state survives the bridge record disappearing entirely", test_pending_state_persisted_durably_survives_bridge_disappearing),
+        ("durability: an already-REJECTED bridge persists immediately, without waiting on a fresh Google GET", test_rejected_bridge_persists_immediately_even_before_any_fresh_google_call),
+        ("durability: APPROVED provenance is stamped when the already-answered-locally branch fires", test_approved_provenance_persisted_when_already_answered_locally_branch_fires),
         ("already-answered locally clears a stale bridge without calling Google", test_already_answered_locally_clears_stale_bridge_without_google_call),
         ("a fetch failure leaves everything untouched", test_fetch_failure_leaves_everything_untouched),
         ("a record with no gbpReviewName is skipped, not crashed", test_no_gbp_review_name_is_skipped_not_crashed),

@@ -1,9 +1,18 @@
 """
 Google Reply Moderation State -- Python mirror of dashboard/api/_lib/
 replyModerationState.js. See that module's own header for the full
-root-cause story (Casa Tequila Brighton / reviewer "Terry", local review id
-35738: a reply that showed "Confirmed" in PRYOR while missing from the
-public Google listing) and design rationale.
+root-cause story and design rationale.
+
+Resolution note (manually verified against the public listing after the
+read-only Terry diagnostic): Casa Tequila Brighton / reviewer "Terry",
+local review id 35738 did NOT fail and was never rejected -- PRYOR's PUT
+succeeded, Google stored the exact comment, and it later became publicly
+visible. The delay was ordinary Google moderation/propagation lag, not a
+rejection. This is exactly why PRYOR must never claim "Confirmed" (or
+"Approved"/"publicly visible") from an accepted request or a later comment
+match alone -- REPLY_RECORDED below exists specifically to describe that
+honest, in-between state without asserting a public-visibility guarantee
+this app has no mechanism to verify.
 
 Kept in sync by comment reference, not imported -- Python and JS cannot
 share a module here. Same cross-language duplication convention this
@@ -19,14 +28,23 @@ import re
 
 # The complete state model (mirrors ModerationState in the JS module).
 SENT_TO_GOOGLE = "sent_to_google"
+# A later Google API read (a reconciliation GET, or an ordinary full sync)
+# independently confirmed the matching reply comment, but Google gave no
+# explicit reviewReplyState -- merges what earlier drafts of this fix
+# called VERIFICATION_DELAYED (bridge-tracked, comment confirmed, state
+# unresolved) and EXTERNALLY_REPLIED (owner_response populated with no
+# other provenance signal): both describe the exact same epistemic
+# position ("Google has this reply on record; no stronger claim can be
+# made"), and this app has no reliable way to tell them apart once a
+# publish-bridge record has expired, so presenting them as one honest label
+# is more accurate than pretending to distinguish them.
+REPLY_RECORDED = "reply_recorded"
 PENDING_APPROVAL = "pending_google_approval"
 APPROVED = "approved_by_google"
 REJECTED = "rejected_by_google"
-VERIFICATION_DELAYED = "verification_delayed"
-EXTERNALLY_REPLIED = "externally_replied"
 
 KNOWN_MODERATION_STATES = {
-    SENT_TO_GOOGLE, PENDING_APPROVAL, APPROVED, REJECTED, VERIFICATION_DELAYED, EXTERNALLY_REPLIED,
+    SENT_TO_GOOGLE, REPLY_RECORDED, PENDING_APPROVAL, APPROVED, REJECTED,
 }
 
 # Google's own documented reviewReplyState enum. Anything else (a future

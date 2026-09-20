@@ -2,6 +2,16 @@
 // Google" discrepancy found in the read-only audit of this same feature
 // (Casa Tequila Brighton / reviewer "Terry", local review id 35738).
 //
+// Resolution note: manually verified against the public listing after the
+// read-only Terry diagnostic -- that reply did NOT fail and was never
+// rejected. PRYOR's PUT succeeded, Google's API stored the exact comment,
+// and it later became publicly visible; the delay was ordinary Google
+// moderation/propagation lag. This is exactly why "Confirmed"/"Approved"/
+// "publicly visible" must never be inferred from an accepted request or a
+// later comment match alone -- see REPLY_RECORDED below, the state that
+// exists specifically to describe that honest, in-between position without
+// asserting a public-visibility guarantee this app has no way to verify.
+//
 // Root cause (see that audit): replyViaReviewName() discarded Google's
 // updateReply response body entirely, and every downstream consumer
 // (publishBridgeStore.js, gbp_reply_bridge_reconcile.py,
@@ -29,18 +39,30 @@
 // missing, or future/unrecognized value is NEVER interpreted as approval or
 // rejection -- it always falls back to the weakest, most honest state
 // available ("sent to Google, nothing conclusive yet" at write time, or
-// "verification delayed" once a read-back was attempted but stayed
-// inconclusive). This module never throws; it never lets a malformed or
-// unexpected Google payload crash the publish flow.
+// "reply recorded by Google" once a read-back independently confirmed the
+// comment but no explicit reviewReplyState came back). This module never
+// throws; it never lets a malformed or unexpected Google payload crash the
+// publish flow.
 
 // The complete state model (PART 2 of this fix). Ordered roughly from
 // "least confirmed" to "most confirmed terminal" for readability only --
 // callers must not assume ordering carries meaning.
 export const ModerationState = Object.freeze({
   // Google accepted the PUT at the HTTP layer. No conclusive moderation
-  // state has been retrieved yet. This is the correct, honest label for
+  // state has been retrieved yet, and no later read-back has independently
+  // confirmed the comment either. This is the correct, honest label for
   // what the OLD code called "Confirmed" -- never call this "Confirmed".
   SENT_TO_GOOGLE: 'sent_to_google',
+  // A LATER Google API read (reconciliation, or an ordinary full sync)
+  // independently returned the matching reply comment, but Google gave no
+  // explicit reviewReplyState. This proves Google's API has the reply on
+  // record -- it does NOT prove moderation approval, and it does NOT prove
+  // public Maps/Search visibility, which can lag behind API
+  // acceptance/retrieval by an unknown amount (the manually-verified Terry
+  // case is exactly this: recorded first, publicly visible later, with no
+  // rejection ever involved). Never silently upgraded to APPROVED merely
+  // because the comment matches.
+  REPLY_RECORDED: 'reply_recorded',
   // Google explicitly returned reviewReplyState: PENDING.
   PENDING_APPROVAL: 'pending_google_approval',
   // Google explicitly returned reviewReplyState: APPROVED. This proves the
@@ -51,18 +73,6 @@ export const ModerationState = Object.freeze({
   // Google explicitly returned reviewReplyState: REJECTED. Terminal --
   // never auto-retried/auto-republished (PART 4/8's explicit requirement).
   REJECTED: 'rejected_by_google',
-  // The outcome is inconclusive: a timeout, an unavailable read-back, a
-  // missing/unspecified/unrecognized reviewReplyState value, or a
-  // reconciliation pass that hasn't found a conclusive state yet. Distinct
-  // from SENT_TO_GOOGLE only in that a check was actually attempted and
-  // still came back inconclusive (useful for UI/observability, not for any
-  // different enforcement behavior -- both states equally forbid treating
-  // the reply as approved).
-  VERIFICATION_DELAYED: 'verification_delayed',
-  // Unchanged, pre-existing meaning: a reply this app never itself
-  // published, discovered via reviews.db's owner_response with no bridge
-  // record backing it.
-  EXTERNALLY_REPLIED: 'externally_replied',
 })
 
 // Google's own documented reviewReplyState enum. Anything else (a future
@@ -162,8 +172,9 @@ export function parseGoogleReplyResponse(rawBody) {
 // Turns a normalized Google reviewReplyState into this app's ModerationState.
 // Returns null when the state is unresolved -- callers decide the correct
 // fallback for their own context (SENT_TO_GOOGLE right after a fresh PUT,
-// VERIFICATION_DELAYED after a reconciliation check that came back
-// inconclusive) rather than this shared function guessing one.
+// REPLY_RECORDED after a reconciliation check that independently confirmed
+// the comment but got no explicit state) rather than this shared function
+// guessing one.
 export function classifyModerationOutcome(reviewReplyState) {
   const normalized = normalizeReviewReplyState(reviewReplyState)
   if (normalized === 'APPROVED') return ModerationState.APPROVED
@@ -196,26 +207,22 @@ export function resolveBridgeModerationState(bridgeRecord) {
 export const MODERATION_STATE_UI = Object.freeze({
   [ModerationState.SENT_TO_GOOGLE]: {
     label: 'Sent to Google',
-    description: 'Google accepted the reply. Approval has not been confirmed yet.',
+    description: 'Google accepted the request. It has not been independently confirmed yet.',
+  },
+  [ModerationState.REPLY_RECORDED]: {
+    label: 'Reply Recorded by Google',
+    description: 'Google has received this reply. It may take time to appear publicly.',
   },
   [ModerationState.PENDING_APPROVAL]: {
-    label: 'Pending Google approval',
+    label: 'Pending Google Approval',
     description: 'Google is still reviewing this reply before it can appear publicly.',
   },
   [ModerationState.APPROVED]: {
     label: 'Approved by Google',
-    description: 'Google has approved this reply. It may take additional time to appear on every public surface.',
+    description: "Google has approved this reply. Public Maps/Search visibility can lag behind approval and isn't guaranteed immediately.",
   },
   [ModerationState.REJECTED]: {
     label: 'Rejected by Google',
     description: 'Google rejected this reply and it will not appear publicly. A new reply is needed.',
-  },
-  [ModerationState.VERIFICATION_DELAYED]: {
-    label: 'Verification delayed',
-    description: "We couldn't confirm this reply's status with Google yet. It will keep checking automatically.",
-  },
-  [ModerationState.EXTERNALLY_REPLIED]: {
-    label: 'Externally replied',
-    description: 'Google shows a reply for this review that was not published through PRYOR.',
   },
 })

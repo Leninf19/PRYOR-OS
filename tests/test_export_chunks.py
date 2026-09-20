@@ -109,6 +109,58 @@ def test_review_to_dict_includes_locationId():
         assert isinstance(rec["locationId"], int), "locationId must be numeric"
 
 
+# --- Google Reply Moderation State fix (data-flow closure): the two
+# durable moderation columns must reach the exported review dict, parsed
+# back into a real object (never a double-encoded JSON string), and a
+# legacy/NULL row must export safely with None -- never crash, never a
+# fabricated value. ---------------------------------------------------------
+
+def test_review_to_dict_exposes_moderation_state_and_parses_policy_violation():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Test Location Beta")
+        _add_review(ex.conn, loc_id, "2026-01-01", reviewer_name="Rejected Case")
+        ex.conn.execute(
+            "UPDATE reviews SET gbp_reply_moderation_state = ?, gbp_reply_policy_violation = ? WHERE location_id = ?",
+            ("rejected_by_google", json.dumps({"reasonCodes": ["SPAM"], "summary": "Rejected by Google -- flagged as spam."}), loc_id),
+        )
+        ex.conn.commit()
+        row = ex.conn.execute("SELECT * FROM reviews WHERE location_id = ?", (loc_id,)).fetchone()
+        loc = dict(ex.conn.execute("SELECT * FROM locations WHERE id = ?", (loc_id,)).fetchone())
+        rec = export_chunks.review_to_dict(row, loc)
+        assert rec["gbp_reply_moderation_state"] == "rejected_by_google"
+        assert rec["gbp_reply_policy_violation"] == {"reasonCodes": ["SPAM"], "summary": "Rejected by Google -- flagged as spam."}, (
+            "must be a real object, not a JSON string the frontend has to decode again"
+        )
+
+
+def test_review_to_dict_legacy_row_with_null_moderation_fields_exports_safely():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Test Location Gamma")
+        _add_review(ex.conn, loc_id, "2026-01-01", reviewer_name="Legacy Row", owner_response="An old confirmed reply")
+        row = ex.conn.execute("SELECT * FROM reviews WHERE location_id = ?", (loc_id,)).fetchone()
+        loc = dict(ex.conn.execute("SELECT * FROM locations WHERE id = ?", (loc_id,)).fetchone())
+        rec = export_chunks.review_to_dict(row, loc)
+        assert rec["gbp_reply_moderation_state"] is None
+        assert rec["gbp_reply_policy_violation"] is None
+        assert rec["owner_response"] == "An old confirmed reply", "the legacy reply itself must still export normally"
+
+
+def test_review_to_dict_malformed_policy_violation_json_never_crashes():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Test Location Delta")
+        _add_review(ex.conn, loc_id, "2026-01-01", reviewer_name="Malformed Case")
+        ex.conn.execute(
+            "UPDATE reviews SET gbp_reply_moderation_state = ?, gbp_reply_policy_violation = ? WHERE location_id = ?",
+            ("rejected_by_google", "{not valid json", loc_id),
+        )
+        ex.conn.commit()
+        row = ex.conn.execute("SELECT * FROM reviews WHERE location_id = ?", (loc_id,)).fetchone()
+        loc = dict(ex.conn.execute("SELECT * FROM locations WHERE id = ?", (loc_id,)).fetchone())
+        rec = export_chunks.review_to_dict(row, loc)  # must not raise
+        assert rec["gbp_reply_moderation_state"] == "rejected_by_google"
+        assert rec["gbp_reply_policy_violation"] is None
+
+
 # --- export_meta -------------------------------------------------------------
 
 def test_export_meta_locationId_matches_db_id_not_sort_position():
@@ -614,6 +666,9 @@ def test_export_location_contacts_keyed_by_location_id_string():
 
 def main():
     run("review_to_dict() includes a numeric locationId matching locations.id", test_review_to_dict_includes_locationId)
+    run("review_to_dict() exposes gbp_reply_moderation_state and parses policyViolation into a real object", test_review_to_dict_exposes_moderation_state_and_parses_policy_violation)
+    run("review_to_dict() exports a legacy row with NULL moderation fields safely", test_review_to_dict_legacy_row_with_null_moderation_fields_exports_safely)
+    run("review_to_dict() never crashes on malformed policyViolation JSON", test_review_to_dict_malformed_policy_violation_json_never_crashes)
     run("export_meta(): locationId matches the DB id, not the sorted list position", test_export_meta_locationId_matches_db_id_not_sort_position)
     run("export_meta(): locationId is unaffected by a location name change", test_export_meta_locationId_unaffected_by_name_change)
     run("export_meta(): locationId is stable across repeated exports", test_export_meta_locationId_stable_across_repeated_exports)
