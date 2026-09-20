@@ -29,6 +29,7 @@ import db
 import gbp_reply_bridge_reconcile as reconcile
 import tenant_keys
 import tenant_paths
+from provider_gbp import GBPProvider
 
 TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 SYNTHETIC_TENANT_ID = "t_synthetic-second-tenant"
@@ -339,6 +340,142 @@ def test_legacy_bridge_record_with_no_moderation_fields_reconciles_safely():
     assert counts["confirmed"] == 1, counts
     assert row["owner_response"] == "Thank you!"
     assert deleted == ["publish_bridge:v1:r1"]
+
+
+# === Full-sync + active-bridge integration (Google Reply Moderation State
+# fix, full-sync gap closure). Proves the ACTUAL end-to-end interaction: a
+# regular full sync (provider_gbp.py's _to_provider_review() ->
+# db.upsert_review(), simulated here exactly as gbp_sync.py would drive it)
+# happening independently while a PRYOR publish-bridge record is still
+# active must never corrupt or short-circuit reconciliation. ===============
+
+def _full_sync_upsert(conn, loc_id, api_review):
+    """Simulates exactly what gbp_sync.py does for one review: convert the
+    raw Google payload via the real GBPProvider._to_provider_review(), then
+    persist it via the real db.upsert_review() -- no shortcuts, no
+    reimplemented logic, so this test exercises the ACTUAL production path."""
+    provider_review = GBPProvider._to_provider_review(api_review)
+    return db.upsert_review(conn, loc_id, "Casa Tequila Testtown", provider_review.as_row(), "2026-09-20T12:00:00Z")
+
+
+def test_active_bridge_plus_pending_full_sync_never_clears_bridge_or_writes_db():
+    """Item 10: while a bridge is active, an UNRELATED full sync observing
+    a PENDING reply must leave owner_response empty -- reconciliation's own
+    'already answered locally' check must never short-circuit on it, and
+    must proceed to check Google directly (which also reports PENDING)."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+
+    _full_sync_upsert(conn, loc_id, {
+        "name": "accounts/1/locations/2/reviews/abc", "reviewer": {"displayName": "Jane Doe"},
+        "createTime": "2026-08-07T00:00:00Z", "starRating": "FIVE", "comment": "Great food",
+        "reviewReply": {"comment": "Thanks!", "reviewReplyState": "PENDING"},
+    })
+    conn.commit()
+
+    deleted = []
+    set_calls = []
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "PENDING"}},
+        delete_record=lambda k: deleted.append(k),
+        set_record=lambda k, v, ttl: set_calls.append((k, v, ttl)),
+    )
+    row = conn.execute("SELECT owner_response, gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == "", "an independent full sync must never populate owner_response for a PENDING reply"
+    assert row["gbp_reply_moderation_state"] == "pending_google_approval"
+    assert counts["pending_approval"] == 1, counts
+    assert deleted == [], "the bridge must not be cleared while the reply is still pending"
+
+
+def test_active_bridge_plus_approved_full_sync_lets_reconcile_confirm_on_next_run():
+    """Item 11: an independent full sync that observes an APPROVED,
+    matching reply correctly populates owner_response -- the NEXT
+    reconciliation pass then finds it already answered locally and clears
+    the bridge without needing its own extra Google call."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+
+    _full_sync_upsert(conn, loc_id, {
+        "name": "accounts/1/locations/2/reviews/abc", "reviewer": {"displayName": "Jane Doe"},
+        "createTime": "2026-08-07T00:00:00Z", "starRating": "FIVE", "comment": "Great food",
+        "reviewReply": {"comment": "Thanks!", "reviewReplyState": "APPROVED", "updateTime": "2026-08-22T14:00:00Z"},
+    })
+    conn.commit()
+
+    deleted = []
+    fetch_calls = []
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: fetch_calls.append(name) or {},
+        delete_record=lambda k: deleted.append(k),
+    )
+    row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == "Thanks!"
+    assert counts["confirmed"] == 1, counts
+    assert deleted == ["publish_bridge:v1:r1"]
+    assert fetch_calls == [], "reconciliation must trust the already-answered-locally signal, not re-check Google"
+
+
+def test_active_bridge_plus_rejected_full_sync_never_writes_db_bridge_stays_visible():
+    """Item 12: an independent full sync observing a REJECTED reply must
+    never populate owner_response -- reconciliation proceeds to check
+    Google directly, which also reports REJECTED, and the bridge remains a
+    visible terminal-rejection record rather than being cleared."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+
+    _full_sync_upsert(conn, loc_id, {
+        "name": "accounts/1/locations/2/reviews/abc", "reviewer": {"displayName": "Jane Doe"},
+        "createTime": "2026-08-07T00:00:00Z", "starRating": "FIVE", "comment": "Great food",
+        "reviewReply": {"comment": "Thanks!", "reviewReplyState": "REJECTED", "policyViolation": "SPAM"},
+    })
+    conn.commit()
+
+    deleted = []
+    set_calls = []
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "REJECTED", "policyViolation": "SPAM"}},
+        delete_record=lambda k: deleted.append(k),
+        set_record=lambda k, v, ttl: set_calls.append((k, v, ttl)),
+    )
+    row = conn.execute("SELECT owner_response, gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == "", "a rejected reply must never be persisted as a live owner_response"
+    assert row["gbp_reply_moderation_state"] == "rejected_by_google"
+    assert counts["rejected"] == 1, counts
+    assert deleted == [], "a rejected bridge record must stay visible, never silently deleted"
+    assert set_calls and set_calls[0][1]["moderationState"] == "rejected_by_google"
+
+
+def test_independent_external_reply_full_sync_populates_owner_response_no_bridge_needed():
+    """Item 13: an APPROVED, independently-discovered reply (no PRYOR
+    bridge ever existed for it) must still populate owner_response through
+    the ordinary full-sync path -- proving the fix does not regress
+    Externally Replied detection for the general case."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/xyz")
+
+    _full_sync_upsert(conn, loc_id, {
+        "name": "accounts/1/locations/2/reviews/xyz", "reviewer": {"displayName": "Jane Doe"},
+        "createTime": "2026-08-07T00:00:00Z", "starRating": "FIVE", "comment": "Great food",
+        "reviewReply": {"comment": "Glad you enjoyed it!", "reviewReplyState": "APPROVED"},
+    })
+    conn.commit()
+
+    row = conn.execute("SELECT owner_response, gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == "Glad you enjoyed it!"
+    assert row["gbp_reply_moderation_state"] == "approved_by_google"
 
 
 def test_already_answered_locally_clears_stale_bridge_without_google_call():
@@ -736,6 +873,10 @@ def main() -> int:
         ("a pending reply later becomes approved across two reconcile runs", test_pending_reply_later_becomes_approved_across_two_runs),
         ("a pending reply later becomes rejected across two reconcile runs", test_pending_reply_later_becomes_rejected_across_two_runs),
         ("a legacy bridge record (no moderation fields) reconciles safely once approved", test_legacy_bridge_record_with_no_moderation_fields_reconciles_safely),
+        ("full-sync gap: active bridge + PENDING full sync never clears bridge or writes DB", test_active_bridge_plus_pending_full_sync_never_clears_bridge_or_writes_db),
+        ("full-sync gap: active bridge + APPROVED full sync lets the next reconcile confirm without a Google call", test_active_bridge_plus_approved_full_sync_lets_reconcile_confirm_on_next_run),
+        ("full-sync gap: active bridge + REJECTED full sync never writes DB, bridge stays visible", test_active_bridge_plus_rejected_full_sync_never_writes_db_bridge_stays_visible),
+        ("full-sync gap: an independent external APPROVED reply populates owner_response with no bridge needed", test_independent_external_reply_full_sync_populates_owner_response_no_bridge_needed),
         ("already-answered locally clears a stale bridge without calling Google", test_already_answered_locally_clears_stale_bridge_without_google_call),
         ("a fetch failure leaves everything untouched", test_fetch_failure_leaves_everything_untouched),
         ("a record with no gbpReviewName is skipped, not crashed", test_no_gbp_review_name_is_skipped_not_crashed),

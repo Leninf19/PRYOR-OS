@@ -161,6 +161,92 @@ def test_two_providers_for_different_tenants_never_cross_call():
     )
 
 
+# === Google Reply Moderation State fix: full-sync gap closure ============
+# _to_provider_review() must never let a PENDING/REJECTED reviewReplyState
+# populate owner_response, must never block on a missing/unspecified/
+# unknown state (the long-standing, general-purpose "externally replied"
+# signal predates this fix and must keep working), and must always surface
+# gbp_reply_moderation_state/gbp_reply_policy_violation for display.
+
+def _api_review(reply_overrides=None, **overrides):
+    review = {
+        "reviewer": {"displayName": "Jane Doe"},
+        "createTime": "2026-09-01T00:00:00Z",
+        "starRating": "FIVE",
+        "comment": "Great food!",
+        "name": "accounts/1/locations/2/reviews/abc",
+        "updateTime": "2026-09-01T00:00:00Z",
+    }
+    review.update(overrides)
+    reply = {"comment": "Thanks!", "updateTime": "2026-09-01T01:00:00Z"}
+    if reply_overrides is not None:
+        reply.update(reply_overrides)
+        review["reviewReply"] = reply
+    return review
+
+
+def test_approved_reply_populates_owner_response_and_moderation_state():
+    pr = GBPProvider._to_provider_review(_api_review(reply_overrides={"reviewReplyState": "APPROVED"}))
+    assert pr.owner_response == "Thanks!"
+    assert pr.gbp_reply_update_time == "2026-09-01T01:00:00Z"
+    assert pr.gbp_reply_moderation_state == "approved_by_google"
+    assert pr.gbp_reply_policy_violation is None
+
+
+def test_pending_reply_withholds_owner_response():
+    pr = GBPProvider._to_provider_review(_api_review(reply_overrides={"reviewReplyState": "PENDING"}))
+    assert pr.owner_response == "", "a PENDING reply must never populate owner_response"
+    assert pr.gbp_reply_update_time is None
+    assert pr.gbp_reply_moderation_state == "pending_google_approval"
+
+
+def test_rejected_reply_withholds_owner_response_and_preserves_policy_violation():
+    pr = GBPProvider._to_provider_review(_api_review(reply_overrides={
+        "reviewReplyState": "REJECTED", "policyViolation": "HARASSMENT",
+    }))
+    assert pr.owner_response == "", "a REJECTED reply must never populate owner_response"
+    assert pr.gbp_reply_update_time is None
+    assert pr.gbp_reply_moderation_state == "rejected_by_google"
+    assert pr.gbp_reply_policy_violation == {"reasonCodes": ["HARASSMENT"], "summary": "Rejected by Google -- flagged for harassment."}
+
+
+def test_missing_moderation_state_still_populates_owner_response():
+    """THE general-case protection: Google's ordinary read surface may never
+    carry reviewReplyState at all for the vast majority of reviews --
+    withholding owner_response here would break externally-replied
+    detection wholesale, not just fix the reported bug."""
+    pr = GBPProvider._to_provider_review(_api_review(reply_overrides={}))
+    assert pr.owner_response == "Thanks!"
+    assert pr.gbp_reply_update_time == "2026-09-01T01:00:00Z"
+    assert pr.gbp_reply_moderation_state is None
+
+
+def test_unspecified_state_behaves_same_as_missing():
+    pr = GBPProvider._to_provider_review(_api_review(reply_overrides={"reviewReplyState": "REVIEW_REPLY_STATE_UNSPECIFIED"}))
+    assert pr.owner_response == "Thanks!"
+    assert pr.gbp_reply_moderation_state is None
+
+
+def test_unknown_future_state_behaves_same_as_missing_never_blocks():
+    pr = GBPProvider._to_provider_review(_api_review(reply_overrides={"reviewReplyState": "SOME_FUTURE_STATE"}))
+    assert pr.owner_response == "Thanks!", "an unrecognized future state must never be treated as PENDING/REJECTED"
+    assert pr.gbp_reply_moderation_state is None
+
+
+def test_no_reply_at_all_yields_empty_owner_response():
+    pr = GBPProvider._to_provider_review(_api_review(reply_overrides=None))
+    assert pr.owner_response == ""
+    assert pr.gbp_reply_moderation_state is None
+
+
+def test_malformed_policy_violation_never_crashes():
+    pr = GBPProvider._to_provider_review(_api_review(reply_overrides={
+        "reviewReplyState": "REJECTED", "policyViolation": {"unexpectedShape": True},
+    }))
+    assert pr.gbp_reply_moderation_state == "rejected_by_google"
+    assert pr.gbp_reply_policy_violation["reasonCodes"] == []
+
+
 def test_invalid_tenant_id_rejected_at_construction():
     for bad in (None, "", "not-a-tenant-id", "T_LOS-TRES-AMIGOS"):
         try:
@@ -179,6 +265,14 @@ def main():
         ("GBPProvider threads its own tenant_id into every google_api.py call", test_provider_threads_its_own_tenant_id_into_every_google_api_call),
         ("two providers for different tenants never cross-call each other's tenant", test_two_providers_for_different_tenants_never_cross_call),
         ("an invalid tenant_id is rejected at GBPProvider construction", test_invalid_tenant_id_rejected_at_construction),
+        ("_to_provider_review(): APPROVED reply populates owner_response + moderation state", test_approved_reply_populates_owner_response_and_moderation_state),
+        ("_to_provider_review(): PENDING reply withholds owner_response", test_pending_reply_withholds_owner_response),
+        ("_to_provider_review(): REJECTED reply withholds owner_response, preserves policyViolation", test_rejected_reply_withholds_owner_response_and_preserves_policy_violation),
+        ("_to_provider_review(): missing moderation state still populates owner_response (general-case protection)", test_missing_moderation_state_still_populates_owner_response),
+        ("_to_provider_review(): REVIEW_REPLY_STATE_UNSPECIFIED behaves same as missing", test_unspecified_state_behaves_same_as_missing),
+        ("_to_provider_review(): an unrecognized future state behaves same as missing, never blocks", test_unknown_future_state_behaves_same_as_missing_never_blocks),
+        ("_to_provider_review(): no reply at all yields empty owner_response", test_no_reply_at_all_yields_empty_owner_response),
+        ("_to_provider_review(): a malformed policyViolation shape never crashes", test_malformed_policy_violation_never_crashes),
     ]
     for name, fn in tests:
         run(name, fn)

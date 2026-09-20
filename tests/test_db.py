@@ -17,6 +17,7 @@ dashboard/reviews.db.
 
 Run directly: py tests/test_db.py
 """
+import json
 import sqlite3
 import sys
 import tempfile
@@ -875,6 +876,163 @@ def test_multiple_reviews_revision_history_stays_isolated():
     assert _revision_count(conn, review_id=review_b["id"]) == 0, "review B's whitespace-only resyncs must never produce revisions"
 
 
+# ===========================================================================
+# Google Reply Moderation State fix -- full-sync gap closure. Covers
+# upsert_review()'s persistence of gbp_reply_moderation_state/
+# gbp_reply_policy_violation, the "never let PENDING/REJECTED overwrite an
+# existing owner_response" guarantee, and "no fake revision from a
+# moderation-only change."
+# ===========================================================================
+
+def _moderation_row(**overrides):
+    row = {
+        "gbp_review_name": "reviews/MOD1",
+        "reviewer_name": "Terry",
+        "review_date": "2026-09-20",
+        "star_rating": 1,
+        "review_text": "",
+        "owner_response": "",
+        "review_url": "",
+        "gbp_update_time": None,
+        "gbp_reply_update_time": None,
+        "gbp_reply_moderation_state": None,
+        "gbp_reply_policy_violation": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_approved_reply_persists_owner_response_and_moderation_state():
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-20T00:00:00Z"
+    result = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _moderation_row(
+        owner_response="Thanks!", gbp_reply_update_time=now, gbp_reply_moderation_state="approved_by_google",
+    ), now)
+    conn.commit()
+    assert result == "new"
+    row = conn.execute("SELECT * FROM reviews WHERE gbp_review_name = 'reviews/MOD1'").fetchone()
+    assert row["owner_response"] == "Thanks!"
+    assert row["gbp_reply_moderation_state"] == "approved_by_google"
+    assert row["gbp_reply_policy_violation"] is None
+
+
+def test_rejected_reply_persists_moderation_state_and_policy_violation_json():
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-20T00:00:00Z"
+    result = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _moderation_row(
+        owner_response="", gbp_reply_moderation_state="rejected_by_google",
+        gbp_reply_policy_violation={"reasonCodes": ["HARASSMENT"], "summary": "Rejected by Google -- flagged for harassment."},
+    ), now)
+    conn.commit()
+    assert result == "new"
+    row = conn.execute("SELECT * FROM reviews WHERE gbp_review_name = 'reviews/MOD1'").fetchone()
+    assert row["owner_response"] == ""
+    assert row["gbp_reply_moderation_state"] == "rejected_by_google"
+    stored_violation = json.loads(row["gbp_reply_policy_violation"])
+    assert stored_violation["reasonCodes"] == ["HARASSMENT"]
+
+
+def test_existing_owner_response_survives_a_later_payload_with_missing_state():
+    """Case 8: a historical, already-confirmed reply must never disappear
+    just because a later sync's payload omits reviewReplyState entirely."""
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-20T00:00:00Z"
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _moderation_row(
+        owner_response="A genuine, already-approved reply.", gbp_reply_moderation_state="approved_by_google",
+    ), now)
+    conn.commit()
+
+    # A later sync's payload provides comment+state as None/empty (as
+    # provider_gbp.py's own withholding does for PENDING/REJECTED, or as any
+    # provider without moderation awareness would) -- must never erase.
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _moderation_row(
+        owner_response="", gbp_reply_moderation_state=None,
+    ), now)
+    conn.commit()
+
+    row = conn.execute("SELECT * FROM reviews WHERE gbp_review_name = 'reviews/MOD1'").fetchone()
+    assert row["owner_response"] == "A genuine, already-approved reply.", "an existing confirmed reply must never disappear"
+    assert row["gbp_reply_moderation_state"] == "approved_by_google", "a previously-recorded resolved state must survive an unresolved re-read"
+
+
+def test_existing_owner_response_survives_a_later_explicit_rejected_payload():
+    """Case 9: even an explicit REJECTED signal on a LATER sync must never
+    erase an existing, already-stored reply -- provider_gbp.py's own
+    withholding already ensures the incoming payload carries an empty
+    owner_response in this scenario; this proves upsert_review() itself
+    also never destructively overwrites based on the new row's fields."""
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-20T00:00:00Z"
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _moderation_row(
+        owner_response="A genuine, already-approved reply.", gbp_reply_moderation_state="approved_by_google",
+    ), now)
+    conn.commit()
+
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _moderation_row(
+        owner_response="", gbp_reply_moderation_state="rejected_by_google",
+        gbp_reply_policy_violation={"reasonCodes": ["SPAM"], "summary": "Rejected by Google -- flagged as spam."},
+    ), now)
+    conn.commit()
+
+    row = conn.execute("SELECT * FROM reviews WHERE gbp_review_name = 'reviews/MOD1'").fetchone()
+    assert row["owner_response"] == "A genuine, already-approved reply.", "an existing confirmed reply must never be erased by a later rejected attempt"
+    # The moderation-state column itself DOES advance (COALESCE only skips
+    # None, and "rejected_by_google" is not None) -- this correctly records
+    # that the MOST RECENT reply attempt was rejected, without touching the
+    # separately-preserved historical owner_response text.
+    assert row["gbp_reply_moderation_state"] == "rejected_by_google"
+
+
+def test_moderation_state_change_alone_creates_no_owner_response_revision():
+    """Item 14: a moderation-metadata-only change (owner_response and
+    review_text both unchanged) must never appear in review_revisions --
+    that table only ever tracks review_text/owner_response/star_rating."""
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-20T00:00:00Z"
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _moderation_row(
+        owner_response="Thanks!", gbp_reply_moderation_state="pending_google_approval",
+    ), now)
+    conn.commit()
+    review = conn.execute("SELECT id FROM reviews WHERE gbp_review_name = 'reviews/MOD1'").fetchone()
+    assert _revision_count(conn, review_id=review["id"]) == 0
+
+    # owner_response text is IDENTICAL; only the moderation state advances.
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _moderation_row(
+        owner_response="Thanks!", gbp_reply_moderation_state="approved_by_google",
+    ), now)
+    conn.commit()
+    assert _revision_count(conn, review_id=review["id"]) == 0, "a moderation-only change must never create a fake owner_response revision"
+
+
+def test_legacy_row_without_moderation_columns_remains_readable():
+    """Item 18: a row inserted before this fix (raw SQL, no
+    gbp_reply_moderation_state/gbp_reply_policy_violation at all) must
+    still be readable, and a subsequent upsert must not choke on it."""
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-20T00:00:00Z"
+    conn.execute(
+        """INSERT INTO reviews (location_id, dedup_key, gbp_review_name, reviewer_name,
+           review_date, star_rating, review_text, owner_response, first_seen_at, last_seen_at)
+           VALUES (?, 'reviews/LEGACY1', 'reviews/LEGACY1', 'Legacy Reviewer',
+           '2026-01-01', 5, 'Old review', 'Old confirmed reply', ?, ?)""",
+        (loc_id, now, now),
+    )
+    conn.commit()
+
+    row = conn.execute("SELECT * FROM reviews WHERE gbp_review_name = 'reviews/LEGACY1'").fetchone()
+    assert row["gbp_reply_moderation_state"] is None, "a legacy row's new column must read back as NULL, never crash"
+    assert row["owner_response"] == "Old confirmed reply"
+
+    # A later sync with no moderation signal at all must not disturb it.
+    result = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _moderation_row(
+        gbp_review_name="reviews/LEGACY1", owner_response="", gbp_reply_moderation_state=None,
+    ), now)
+    conn.commit()
+    updated = conn.execute("SELECT * FROM reviews WHERE gbp_review_name = 'reviews/LEGACY1'").fetchone()
+    assert updated["owner_response"] == "Old confirmed reply", "a legacy confirmed reply must survive untouched"
+    assert result in ("edited", "unchanged")
+
+
 def main():
     tests = [
         ("Case 1: historically linked row is updated, not duplicated", test_historically_linked_row_is_updated_not_duplicated),
@@ -905,6 +1063,12 @@ def main():
         ("growth-bug: blank incoming owner_response preserves existing, no revision", test_owner_response_blank_incoming_preserves_existing_no_revision),
         ("growth-bug: an unrelated field change never creates an owner_response revision", test_unrelated_field_change_does_not_create_owner_response_revision),
         ("growth-bug: revision history stays isolated across multiple reviews", test_multiple_reviews_revision_history_stays_isolated),
+        ("moderation-state: APPROVED reply persists owner_response + state", test_approved_reply_persists_owner_response_and_moderation_state),
+        ("moderation-state: REJECTED reply persists state + policyViolation JSON", test_rejected_reply_persists_moderation_state_and_policy_violation_json),
+        ("moderation-state: existing owner_response survives a later payload with missing state", test_existing_owner_response_survives_a_later_payload_with_missing_state),
+        ("moderation-state: existing owner_response survives a later explicit REJECTED payload", test_existing_owner_response_survives_a_later_explicit_rejected_payload),
+        ("moderation-state: a moderation-only change creates no fake owner_response revision", test_moderation_state_change_alone_creates_no_owner_response_revision),
+        ("moderation-state: a legacy row with no moderation columns remains readable", test_legacy_row_without_moderation_columns_remains_readable),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()
