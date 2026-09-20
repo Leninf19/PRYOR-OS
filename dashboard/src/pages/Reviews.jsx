@@ -16,6 +16,7 @@ import { useReviewEmailPreview, useSendReviewEmail } from '../hooks/useReviewEma
 import { useGoogleOAuthStatus } from '../hooks/useGoogleOAuthStatus.js'
 import { useRestaurantContacts } from '../hooks/useRestaurantContacts.js'
 import ContactEditorModal from './settings/ContactEditorModal.jsx'
+import ReviewMediaGallery from '../components/ReviewMediaGallery.jsx'
 import { useAccount } from '../components/AuthGate.jsx'
 import { EMAIL_STATUS_META, DUPLICATE_EMAIL_STATUSES } from '../utils/actionWorkspaceUtils.js'
 import {
@@ -1276,6 +1277,14 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpd
            style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-2)' }}>
         {r.review_text ? `"${r.review_text}"` : <em>No review text</em>}
       </div>
+
+      {/* Review Media Feature -- Scale & No-Backfill Audit (Phase 9):
+          Google-provided photos/videos for THIS review only, never a
+          review-table row. Renders nothing when r.media is empty/absent
+          (a pre-activation review, or a review with no media at all --
+          the export layer never distinguishes these for display
+          purposes). PRYOR does not analyze or describe media contents. */}
+      <ReviewMediaGallery items={r.media} />
 
       {/* AI reasoning ("why") */}
       {r.ai_sentiment_reason && (

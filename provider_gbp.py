@@ -25,6 +25,7 @@ from provider_base import (
     CAP_READ_REVIEWS, CAP_REPLY,
 )
 import google_api as ga
+import media_sanitizer
 import reply_moderation_state as rms
 import tenant_keys
 
@@ -156,6 +157,20 @@ class GBPProvider(Provider):
         gbp_reply_update_time = None if blocked else reply.get("updateTime")
         policy_violation = rms.normalize_policy_violation(reply.get("policyViolation")) if outcome == rms.REJECTED else None
 
+        # Review Media Feature -- Scale & No-Backfill Audit (Phase 4):
+        # sanitize UNCONDITIONALLY here (media_sanitizer.py never makes a
+        # network request, never downloads anything -- it only validates/
+        # normalizes the strings already present in this SAME reviewMediaItems
+        # payload this function already reads everything else from, so this
+        # adds zero new Google API calls and zero new pagination). This is
+        # NOT an eligibility decision -- whether `media` is ever actually
+        # PERSISTED is decided later, exclusively by db.upsert_review()'s
+        # gate, using gbp_create_time (the FULL, untruncated timestamp
+        # below) compared against the tenant's own activation instant. This
+        # function has no tenant-activation context at all and must not
+        # attempt that comparison itself.
+        media = media_sanitizer.sanitize_review_media_items(api_review.get("reviewMediaItems"))
+
         return ProviderReview(
             reviewer_name=reviewer.get("displayName") or "A Google User",
             review_date=create_time[:10],
@@ -169,6 +184,8 @@ class GBPProvider(Provider):
             gbp_language_code=api_review.get("languageCode"),
             gbp_reply_moderation_state=outcome,
             gbp_reply_policy_violation=policy_violation,
+            media=media,
+            gbp_create_time=create_time or None,
         )
 
     def reply_to_review(self, gbp_review_name: str, comment: str) -> None:

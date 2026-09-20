@@ -161,6 +161,106 @@ def test_review_to_dict_malformed_policy_violation_json_never_crashes():
         assert rec["gbp_reply_policy_violation"] is None
 
 
+# --- Review Media Feature -- Scale & No-Backfill Audit (Phase 10): export
+# behavior for the gbp_review_media column. -----------------------------------
+
+def test_review_to_dict_exports_valid_media_array():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Media Location Valid")
+        _add_review(ex.conn, loc_id, "2026-01-01", reviewer_name="Has Media")
+        media = [{"type": "photo", "thumbnailUrl": "https://lh3.googleusercontent.com/p1",
+                  "thumbnailLabel": "", "videoUrl": None, "sortOrder": 0}]
+        ex.conn.execute("UPDATE reviews SET gbp_review_media = ? WHERE location_id = ?", (json.dumps(media), loc_id))
+        ex.conn.commit()
+        row = ex.conn.execute("SELECT * FROM reviews WHERE location_id = ?", (loc_id,)).fetchone()
+        loc = dict(ex.conn.execute("SELECT * FROM locations WHERE id = ?", (loc_id,)).fetchone())
+        rec = export_chunks.review_to_dict(row, loc)
+        assert rec["media"] == media
+
+
+def test_review_to_dict_null_media_exports_as_empty_list():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Media Location Null")
+        _add_review(ex.conn, loc_id, "2026-01-01", reviewer_name="No Media")
+        row = ex.conn.execute("SELECT * FROM reviews WHERE location_id = ?", (loc_id,)).fetchone()
+        loc = dict(ex.conn.execute("SELECT * FROM locations WHERE id = ?", (loc_id,)).fetchone())
+        rec = export_chunks.review_to_dict(row, loc)
+        assert rec["media"] == []
+
+
+def test_review_to_dict_malformed_media_json_exports_as_empty_list_never_crashes():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Media Location Malformed")
+        _add_review(ex.conn, loc_id, "2026-01-01", reviewer_name="Malformed Media")
+        ex.conn.execute("UPDATE reviews SET gbp_review_media = ? WHERE location_id = ?", ("{not valid json", loc_id))
+        ex.conn.commit()
+        row = ex.conn.execute("SELECT * FROM reviews WHERE location_id = ?", (loc_id,)).fetchone()
+        loc = dict(ex.conn.execute("SELECT * FROM locations WHERE id = ?", (loc_id,)).fetchone())
+        rec = export_chunks.review_to_dict(row, loc)  # must not raise
+        assert rec["media"] == []
+
+
+def test_review_to_dict_non_list_media_json_exports_as_empty_list():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Media Location NonList")
+        _add_review(ex.conn, loc_id, "2026-01-01", reviewer_name="Non-list Media")
+        ex.conn.execute("UPDATE reviews SET gbp_review_media = ? WHERE location_id = ?", (json.dumps({"not": "a list"}), loc_id))
+        ex.conn.commit()
+        row = ex.conn.execute("SELECT * FROM reviews WHERE location_id = ?", (loc_id,)).fetchone()
+        loc = dict(ex.conn.execute("SELECT * FROM locations WHERE id = ?", (loc_id,)).fetchone())
+        rec = export_chunks.review_to_dict(row, loc)
+        assert rec["media"] == []
+
+
+def test_review_to_dict_legacy_row_missing_media_column_entirely_exports_safely():
+    # Simulates a Row object from a query that never selected gbp_review_media
+    # at all (rather than a NULL value) -- "column in r.keys()" must be False.
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Media Location Legacy Select")
+        _add_review(ex.conn, loc_id, "2026-01-01", reviewer_name="Legacy Select")
+        row = ex.conn.execute(
+            "SELECT id, reviewer_name, review_date, star_rating, review_text, owner_response, review_url, last_seen_at "
+            "FROM reviews WHERE location_id = ?", (loc_id,),
+        ).fetchone()
+        loc = dict(ex.conn.execute("SELECT * FROM locations WHERE id = ?", (loc_id,)).fetchone())
+        rec = export_chunks.review_to_dict(row, loc)  # must not raise KeyError
+        assert rec["media"] == []
+
+
+def test_export_reviews_csv_never_includes_media():
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "CSV Location")
+        _add_review(ex.conn, loc_id, "2026-01-01", reviewer_name="CSV Reviewer")
+        media = [{"type": "photo", "thumbnailUrl": "https://lh3.googleusercontent.com/should-never-leak-into-csv"}]
+        ex.conn.execute("UPDATE reviews SET gbp_review_media = ? WHERE location_id = ?", (json.dumps(media), loc_id))
+        ex.conn.commit()
+        csv_path = ex.private_data_dir.parent / "reviews.csv"
+        export_chunks.export_reviews_csv(ex.conn, out_path=csv_path)
+        csv_text = csv_path.read_text(encoding="utf-8")
+        assert "should-never-leak-into-csv" not in csv_text
+        assert "media" not in csv_text.lower().split("\n")[0]  # header row has no media column
+
+
+def test_ai_prompt_construction_never_serializes_media_field():
+    # Static, source-level guarantee (mirrors the Scale & No-Backfill audit's
+    # own finding): ai_engine.py never blanket-serializes a review object,
+    # so a new `media` field can never leak into an AI prompt by accident.
+    repo_root = Path(__file__).resolve().parent.parent
+    ai_engine_source = (repo_root / "ai_engine.py").read_text(encoding="utf-8")
+    assert "json.dumps(review" not in ai_engine_source.replace(" ", "")
+    assert '"media"' not in ai_engine_source
+    assert "['media']" not in ai_engine_source.replace(" ", "")
+    assert '.get("media")' not in ai_engine_source
+
+
+def test_email_templates_never_reference_media_field():
+    repo_root = Path(__file__).resolve().parent.parent
+    for rel_path in ["dashboard/api/_lib/reviewEmailTemplate.js"]:
+        path = repo_root / rel_path
+        if path.exists():
+            assert "review.media" not in path.read_text(encoding="utf-8")
+
+
 # --- export_meta -------------------------------------------------------------
 
 def test_export_meta_locationId_matches_db_id_not_sort_position():
@@ -669,6 +769,14 @@ def main():
     run("review_to_dict() exposes gbp_reply_moderation_state and parses policyViolation into a real object", test_review_to_dict_exposes_moderation_state_and_parses_policy_violation)
     run("review_to_dict() exports a legacy row with NULL moderation fields safely", test_review_to_dict_legacy_row_with_null_moderation_fields_exports_safely)
     run("review_to_dict() never crashes on malformed policyViolation JSON", test_review_to_dict_malformed_policy_violation_json_never_crashes)
+    run("review_to_dict() exports a valid media array", test_review_to_dict_exports_valid_media_array)
+    run("review_to_dict() exports NULL media as []", test_review_to_dict_null_media_exports_as_empty_list)
+    run("review_to_dict() exports malformed media JSON as [] without crashing", test_review_to_dict_malformed_media_json_exports_as_empty_list_never_crashes)
+    run("review_to_dict() exports non-list media JSON as []", test_review_to_dict_non_list_media_json_exports_as_empty_list)
+    run("review_to_dict() exports safely when gbp_review_media wasn't even selected", test_review_to_dict_legacy_row_missing_media_column_entirely_exports_safely)
+    run("export_reviews_csv() never includes media", test_export_reviews_csv_never_includes_media)
+    run("ai_engine.py never blanket-serializes a review's media field into a prompt", test_ai_prompt_construction_never_serializes_media_field)
+    run("email templates never reference a review's media field", test_email_templates_never_reference_media_field)
     run("export_meta(): locationId matches the DB id, not the sorted list position", test_export_meta_locationId_matches_db_id_not_sort_position)
     run("export_meta(): locationId is unaffected by a location name change", test_export_meta_locationId_unaffected_by_name_change)
     run("export_meta(): locationId is stable across repeated exports", test_export_meta_locationId_stable_across_repeated_exports)

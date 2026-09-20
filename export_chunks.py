@@ -80,6 +80,24 @@ def review_to_dict(r, loc) -> dict:
     except (TypeError, ValueError):
         gbp_reply_policy_violation = None
 
+    # Review Media Feature -- Scale & No-Backfill Audit (Phase 8): exposes
+    # the already-sanitized, already-gated gbp_review_media column (see
+    # db.upsert_review()'s gate -- this export layer makes NO eligibility
+    # decision of its own and NEVER re-checks createTime/activation; a
+    # historical row simply never has anything but NULL here to expose).
+    # NULL (never evaluated) and malformed/legacy JSON both become []
+    # here -- this export layer never distinguishes them for the frontend,
+    # which only ever needs "is there anything to show." A legacy row from
+    # before this column existed (missing entirely from `r.keys()`) is
+    # handled identically to one with a NULL value.
+    media_raw = r["gbp_review_media"] if "gbp_review_media" in r.keys() else None
+    try:
+        media = json.loads(media_raw) if media_raw else []
+        if not isinstance(media, list):
+            media = []
+    except (TypeError, ValueError):
+        media = []
+
     return {
         # Canonical, stable numeric location identifier -- the same
         # locations.id (dashboard/reviews.db) that account locationIds will
@@ -100,6 +118,7 @@ def review_to_dict(r, loc) -> dict:
         "gbp_review_name": r["gbp_review_name"] if "gbp_review_name" in r.keys() else None,
         "gbp_reply_moderation_state": r["gbp_reply_moderation_state"] if "gbp_reply_moderation_state" in r.keys() else None,
         "gbp_reply_policy_violation": gbp_reply_policy_violation,
+        "media": media,
     }
 
 

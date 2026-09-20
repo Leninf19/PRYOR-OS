@@ -12,8 +12,10 @@ import json
 import re
 import sqlite3
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import media_sanitizer
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "dashboard" / "reviews.db"
@@ -300,7 +302,7 @@ def ensure_validation_flags_open_identity_index(conn: sqlite3.Connection) -> boo
 # doesn't control which migrations run. It just lets you tell at a glance,
 # from the DB file alone, whether it's seen the latest migration batch --
 # `sqlite3 reviews.db "PRAGMA user_version"` -- without reading this file.
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 def _column_level_unique_index_name(conn: sqlite3.Connection, table: str, column: str) -> str | None:
@@ -556,6 +558,25 @@ def _migrate_schema(conn: sqlite3.Connection):
         # or NULL.
         "ALTER TABLE reviews ADD COLUMN gbp_reply_moderation_state TEXT",
         "ALTER TABLE reviews ADD COLUMN gbp_reply_policy_violation TEXT",
+        # Review Media Feature -- Scale & No-Backfill Audit (schema v21).
+        # A JSON-serialized array of ALREADY-SANITIZED media items (see
+        # media_sanitizer.py) -- [{type, thumbnailUrl, thumbnailLabel,
+        # videoUrl, sortOrder}, ...] -- or NULL. NULL means "never
+        # evaluated for media at all" (every pre-existing row, and any
+        # review no sync has revisited since this column existed); '[]'
+        # means "evaluated, and either the review was ineligible or
+        # Google currently reports zero media items for it." Both are
+        # rendered identically by the frontend/export (no media shown),
+        # but they are NOT the same fact, and upsert_review()'s gate
+        # below is careful never to collapse the distinction in the
+        # direction that would matter (NULL never gets treated as [] in
+        # a way that would somehow permit a later implicit backfill --
+        # both are simply "nothing to show" today). Actual image/video
+        # bytes are NEVER stored here or anywhere else in this database --
+        # only sanitized Google-hosted URL strings and metadata (see
+        # db.upsert_review()'s own docstring for the full no-backfill
+        # gate this column is written through).
+        "ALTER TABLE reviews ADD COLUMN gbp_review_media TEXT",
     ]
     for sql in migrations:
         try:
@@ -772,12 +793,112 @@ def _normalize_text_field(value) -> str | None:
     return stripped if stripped else None
 
 
-def upsert_review(conn, location_id: int, location_name: str, row: dict, now: str) -> str:
+def _is_valid_iso_utc_timestamp(value) -> bool:
+    """Strict, defensive ISO/RFC3339 validity check -- shared by the media
+    no-backfill gate below for BOTH the activation timestamp and Google's
+    own createTime. A malformed or non-string value is never treated as
+    valid by any caller of this function."""
+    if not isinstance(value, str) or not value:
+        return False
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return True
+
+
+def _parse_iso_utc_timestamp(value: str) -> datetime:
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    dt = datetime.fromisoformat(normalized)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _resolve_review_media_json(row: dict, media_capture_started_at) -> str | None:
+    """THE authoritative no-backfill gate for review media -- see
+    upsert_review()'s own docstring (media_capture_started_at parameter)
+    for the full contract. This is the ONE place in the entire codebase
+    that decides whether a review's media may ever be persisted, and it
+    is called from BOTH the insert and update paths below, on EVERY
+    upsert, unconditionally -- independent of whether any other field
+    changed this sync, so an updateTime-only edit can never bypass it.
+
+    Returns None (meaning: store NULL, never touch `media`) unless ALL of
+    the following independently validate:
+      1. media_capture_started_at is itself a genuinely valid ISO/RFC3339
+         timestamp (a caller passing None, an empty string, or a malformed
+         value -- an inactive tenant, or simply omitting the keyword
+         argument entirely, which is the default -- always fails closed
+         here, never treated as "no restriction").
+      2. row['gbp_create_time'] (the FULL, untruncated Google createTime --
+         never row['review_date'], which is date-only and would make an
+         exact-day activation ambiguous) is itself a genuinely valid
+         timestamp.
+      3. That createTime is >= media_capture_started_at (inclusive) --
+         review_date/gbp_update_time are NEVER consulted for this decision,
+         so an old review being edited after activation can never become
+         eligible, and Google's own updateTime has zero influence on this
+         gate either way.
+    Only once all three hold does this re-sanitize row.get('media') through
+    media_sanitizer.sanitize_review_media_items() -- NEVER trusting a
+    caller's claim that a value is "already sanitized," regardless of
+    which Provider or import/repair path produced it -- and return the
+    JSON-serialized result (which may legitimately be '[]' if Google
+    currently reports zero qualifying media items for an eligible review).
+
+    A pre-activation (or otherwise ineligible) review's `media` payload,
+    however large or well-formed, is discarded here in full -- it is
+    never partially stored, truncated, or queued for a "later" write.
+    Historical media is never preserved merely because it was present in
+    an incoming row."""
+    if not review_qualifies_for_media(row, media_capture_started_at):
+        return None
+    sanitized = media_sanitizer.sanitize_review_media_items(row.get("media"))
+    return json.dumps(sanitized, separators=(",", ":"))
+
+
+def review_qualifies_for_media(row: dict, media_capture_started_at) -> bool:
+    """The pure boolean form of _resolve_review_media_json()'s eligibility
+    check -- factored out so sync orchestration (provider_sync.py) can
+    compute observability counters (qualifying/pre-activation review
+    counts) WITHOUT duplicating the gate's own date logic as a second,
+    independently-maintained copy. This function makes no storage
+    decision by itself and writes nothing; _resolve_review_media_json()
+    (the actual gate) is the only caller that acts on its result to
+    decide what reaches the database."""
+    if not _is_valid_iso_utc_timestamp(media_capture_started_at):
+        return False
+    create_time = row.get("gbp_create_time")
+    if not _is_valid_iso_utc_timestamp(create_time):
+        return False
+    return _parse_iso_utc_timestamp(create_time) >= _parse_iso_utc_timestamp(media_capture_started_at)
+
+
+def upsert_review(conn, location_id: int, location_name: str, row: dict, now: str,
+                   media_capture_started_at: str | None = None) -> str:
     """Insert a new review or update an existing one. Returns 'new', 'edited', or 'unchanged'.
 
     `row` may optionally carry gbp_review_name / gbp_update_time / gbp_reply_update_time /
     gbp_language_code -- populated by the Google Business Profile API sync (gbp_sync.py /
     gbp_import.py), always absent (None) for scraper-sourced rows from auto_update.py.
+
+    `media_capture_started_at`: the calling tenant's OWN validated
+    mediaCapture.startedAt (an ISO/RFC3339 string), or None. Defaults to
+    None -- a SAFE default, deliberately, so every existing and future
+    caller that omits this keyword argument (every current call site,
+    plus any future import/repair script) fails closed and stores no
+    media, without needing to individually opt in. See
+    _resolve_review_media_json() above for the full no-backfill gate this
+    drives; this function itself never inspects row['media'] or
+    row['gbp_create_time'] directly -- it only threads them and this
+    argument through to that one gate function, on every insert AND
+    update, unconditionally.
     When present, gbp_review_name is the canonical identity (see link_review_to_gbp()'s
     docstring for the invariant this upholds) and gbp_update_time becomes an authoritative
     edit signal straight from Google, on top of the existing text/rating/response
@@ -809,6 +930,10 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
     gbp_reply_moderation_state = row.get("gbp_reply_moderation_state")
     _policy_violation_raw = row.get("gbp_reply_policy_violation")
     gbp_reply_policy_violation = json.dumps(_policy_violation_raw) if _policy_violation_raw is not None else None
+    # Review Media Feature -- Scale & No-Backfill Audit: evaluated ONCE per
+    # call, unconditionally, on both the insert and update paths below --
+    # see _resolve_review_media_json()'s own docstring for the full gate.
+    gbp_review_media = _resolve_review_media_json(row, media_capture_started_at)
 
     existing = None
     key = None
@@ -829,14 +954,14 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
                    (location_id, canonical_review_id, dedup_key, reviewer_name, review_date,
                     star_rating, review_text, owner_response, review_url, first_seen_at, last_seen_at,
                     gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
-                    gbp_reply_moderation_state, gbp_reply_policy_violation)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    gbp_reply_moderation_state, gbp_reply_policy_violation, gbp_review_media)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (location_id, canonical_review_id(row.get("review_url", "")), key,
                  row.get("reviewer_name", ""), row.get("review_date", ""),
                  row.get("star_rating") or None, _normalize_text_field(row.get("review_text")) or "",
                  _normalize_text_field(row.get("owner_response")) or "", row.get("review_url", ""), now, now,
                  gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
-                 gbp_reply_moderation_state, gbp_reply_policy_violation),
+                 gbp_reply_moderation_state, gbp_reply_policy_violation, gbp_review_media),
             )
         except sqlite3.IntegrityError as e:
             # Both lookups above missed, yet the database's own constraint still
@@ -912,7 +1037,8 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
            gbp_reply_update_time = COALESCE(?, gbp_reply_update_time),
            gbp_language_code = COALESCE(?, gbp_language_code),
            gbp_reply_moderation_state = COALESCE(?, gbp_reply_moderation_state),
-           gbp_reply_policy_violation = COALESCE(?, gbp_reply_policy_violation)
+           gbp_reply_policy_violation = COALESCE(?, gbp_reply_policy_violation),
+           gbp_review_media = ?
            WHERE id = ?""",
         (final_text, final_response,
          row.get("star_rating") or existing["star_rating"],
@@ -930,6 +1056,19 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
          # already maps it to None, so it behaves exactly like "missing"
          # here: never overwrites, never lost.
          gbp_reply_moderation_state, gbp_reply_policy_violation,
+         # UNCONDITIONAL overwrite -- deliberately NOT a COALESCE, unlike
+         # every field above. gbp_review_media is purely a function of
+         # (row, media_capture_started_at), recomputed by
+         # _resolve_review_media_json() on every single call, so it must
+         # replace whatever was stored before wholesale: an ineligible
+         # review is written back to NULL every time (never "sticky" from
+         # a moment the gate was accidentally satisfied), and an eligible
+         # review's media array is replaced in full, including collapsing
+         # to '[]' the moment Google reports zero qualifying items --
+         # never merged with the previous array, and never bypassed by an
+         # updateTime-only change (this SET runs whether or not
+         # gbp_edit_detected or changed_fields is empty).
+         gbp_review_media,
          existing["id"]),
     )
     return "edited" if (changed_fields or gbp_edit_detected) else "unchanged"
