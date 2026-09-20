@@ -29,6 +29,7 @@ import db
 import gbp_reply_bridge_reconcile as reconcile
 import tenant_keys
 import tenant_paths
+from provider_gbp import GBPProvider
 
 TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
 SYNTHETIC_TENANT_ID = "t_synthetic-second-tenant"
@@ -87,7 +88,7 @@ def test_confirmed_reply_reconciles_db_and_clears_bridge():
     deleted = []
 
     def fake_fetch(name):
-        return {"reviewReply": {"comment": "Thank you so much!", "updateTime": "2026-08-22T13:50:00Z"}}
+        return {"reviewReply": {"comment": "Thank you so much!", "updateTime": "2026-08-22T13:50:00Z", "reviewReplyState": "APPROVED"}}
 
     counts = reconcile.run_reconcile(
         conn, TEST_TENANT_ID, dry_run=False,
@@ -120,6 +121,484 @@ def test_still_pending_leaves_row_and_bridge_untouched():
     assert counts["still_pending"] == 1, counts
     assert row["owner_response"] == "", row["owner_response"]
     assert deleted == [], deleted
+
+
+# === Google Reply Moderation State fix: reviewReplyState/policyViolation ===
+# See gbp_reply_bridge_reconcile.py's reconcile_one() docstring for the full
+# state model. Every test below asserts on TWO things together: the counts
+# outcome AND that reviews.db/the bridge record end up in the exact state
+# the fix requires -- never just a superficial "no crash."
+
+def test_pending_approval_updates_bridge_never_writes_db():
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    set_calls = []
+
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "PENDING"}},
+        delete_record=lambda k: (_ for _ in ()).throw(AssertionError("must never delete a bridge while pending")),
+        set_record=lambda k, v, ttl: set_calls.append((k, v, ttl)),
+    )
+    row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert counts["pending_approval"] == 1, counts
+    assert row["owner_response"] == "", "must never write reviews.db while pending"
+    assert len(set_calls) == 1 and set_calls[0][1]["moderationState"] == "pending_google_approval"
+
+
+def test_rejected_reply_updates_bridge_with_policy_reason_never_writes_db_never_deletes():
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    set_calls = []
+
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: {
+            "reviewReply": {"comment": "Thanks!", "reviewReplyState": "REJECTED", "policyViolation": "FAKE_ENGAGEMENT"},
+        },
+        delete_record=lambda k: (_ for _ in ()).throw(AssertionError("a rejected reply must never be deleted -- it's a visible terminal state")),
+        set_record=lambda k, v, ttl: set_calls.append((k, v, ttl)),
+    )
+    row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert counts["rejected"] == 1, counts
+    assert row["owner_response"] == "", "a rejected reply must never be written to reviews.db as if it were live"
+    assert len(set_calls) == 1
+    updated_record = set_calls[0][1]
+    assert updated_record["moderationState"] == "rejected_by_google"
+    assert updated_record["policyViolation"]["reasonCodes"] == ["FAKE_ENGAGEMENT"]
+    assert "flagged as fake engagement" in updated_record["policyViolation"]["summary"]
+
+
+def test_comment_present_but_no_moderation_state_is_reply_recorded_never_confirmed():
+    """THE reported bug, reproduced directly: Google's read-back echoes the
+    submitted comment text but supplies no resolvable reviewReplyState --
+    the exact shape that used to silently write reviews.db and mark the
+    review resolved. Must now become reply_recorded, never confirmed."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    set_calls = []
+
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "updateTime": "2026-08-22T13:50:00Z"}},
+        delete_record=lambda k: (_ for _ in ()).throw(AssertionError("must never delete/confirm on an unresolved moderation state")),
+        set_record=lambda k, v, ttl: set_calls.append((k, v, ttl)),
+    )
+    row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert counts["reply_recorded"] == 1, counts
+    assert counts["confirmed"] == 0, "must never be silently confirmed just because comment text is present"
+    assert row["owner_response"] == "", row["owner_response"]
+    assert set_calls[0][1]["moderationState"] == "reply_recorded"
+
+
+def test_unspecified_review_reply_state_is_treated_as_missing_not_approved():
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "REVIEW_REPLY_STATE_UNSPECIFIED"}},
+        delete_record=lambda k: (_ for _ in ()).throw(AssertionError("must never delete/confirm on REVIEW_REPLY_STATE_UNSPECIFIED")),
+        set_record=lambda k, v, ttl: None,
+    )
+    assert counts["reply_recorded"] == 1, counts
+    assert counts["confirmed"] == 0
+
+
+def test_unknown_future_review_reply_state_is_treated_as_missing_not_approved():
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "SOME_FUTURE_STATE"}},
+        delete_record=lambda k: (_ for _ in ()).throw(AssertionError("an unrecognized future state must never be treated as approval")),
+        set_record=lambda k, v, ttl: None,
+    )
+    assert counts["reply_recorded"] == 1, counts
+    assert counts["confirmed"] == 0
+
+
+def test_malformed_reviewreply_shape_never_crashes():
+    """reviewReply present but not a dict, or the whole api_review missing
+    expected keys -- must degrade to still_pending/reply_recorded,
+    never raise."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: {},  # no reviewReply key at all
+        delete_record=lambda k: (_ for _ in ()).throw(AssertionError("must not delete")),
+        set_record=lambda k, v, ttl: None,
+    )
+    assert counts["still_pending"] == 1, counts
+
+
+def test_pending_reply_later_becomes_approved_across_two_runs():
+    """PENDING stays unresolved; a LATER Google GET reporting APPROVED
+    safely advances the SAME bridge record to confirmed."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    store = {"publish_bridge:v1:r1": _bridge_record()}
+
+    counts1 = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: list(store.keys()),
+        get_record=lambda k: store.get(k),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "PENDING"}},
+        delete_record=lambda k: store.pop(k, None),
+        set_record=lambda k, v, ttl: store.__setitem__(k, v),
+    )
+    assert counts1["pending_approval"] == 1, counts1
+    assert "publish_bridge:v1:r1" in store, "a pending record must still exist for the next run to re-check"
+
+    counts2 = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: list(store.keys()),
+        get_record=lambda k: store.get(k),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "APPROVED", "updateTime": "2026-08-22T14:00:00Z"}},
+        delete_record=lambda k: store.pop(k, None),
+        set_record=lambda k, v, ttl: store.__setitem__(k, v),
+    )
+    row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert counts2["confirmed"] == 1, counts2
+    assert row["owner_response"] == "Thanks!"
+    assert "publish_bridge:v1:r1" not in store, "an approved record must be cleared once reconciled"
+
+
+def test_pending_reply_later_becomes_rejected_across_two_runs():
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    store = {"publish_bridge:v1:r1": _bridge_record()}
+
+    reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: list(store.keys()),
+        get_record=lambda k: store.get(k),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "PENDING"}},
+        delete_record=lambda k: store.pop(k, None),
+        set_record=lambda k, v, ttl: store.__setitem__(k, v),
+    )
+    counts2 = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: list(store.keys()),
+        get_record=lambda k: store.get(k),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "REJECTED", "policyViolation": "SPAM"}},
+        delete_record=lambda k: store.pop(k, None),
+        set_record=lambda k, v, ttl: store.__setitem__(k, v),
+    )
+    row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert counts2["rejected"] == 1, counts2
+    assert row["owner_response"] == "", "a rejected reply must never be written to reviews.db"
+    assert "publish_bridge:v1:r1" in store, "a rejected record stays visible, never silently deleted"
+    assert store["publish_bridge:v1:r1"]["moderationState"] == "rejected_by_google"
+
+
+def test_legacy_bridge_record_with_no_moderation_fields_reconciles_safely():
+    """A record written before this fix (no moderationState/reviewReplyState/
+    policyViolation fields at all) must still reconcile correctly once
+    Google reports an explicit APPROVED state -- no migration required."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    legacy_record = {  # exactly the pre-fix shape, nothing new added
+        "localReviewId": "r1", "gbpReviewName": "accounts/1/locations/2/reviews/abc",
+        "responseText": "Thank you!", "publishedAt": "2026-08-22T13:45:00Z",
+        "source": "future_insights", "status": "pending_google_reconciliation",
+        "locationName": "Casa Tequila Testtown", "reviewerName": "Jane Doe", "reviewDate": "2026-08-07",
+    }
+    deleted = []
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: legacy_record,
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thank you!", "reviewReplyState": "APPROVED", "updateTime": "2026-08-22T14:00:00Z"}},
+        delete_record=lambda k: deleted.append(k),
+    )
+    row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert counts["confirmed"] == 1, counts
+    assert row["owner_response"] == "Thank you!"
+    assert deleted == ["publish_bridge:v1:r1"]
+
+
+# === Full-sync + active-bridge integration (Google Reply Moderation State
+# fix, full-sync gap closure). Proves the ACTUAL end-to-end interaction: a
+# regular full sync (provider_gbp.py's _to_provider_review() ->
+# db.upsert_review(), simulated here exactly as gbp_sync.py would drive it)
+# happening independently while a PRYOR publish-bridge record is still
+# active must never corrupt or short-circuit reconciliation. ===============
+
+def _full_sync_upsert(conn, loc_id, api_review):
+    """Simulates exactly what gbp_sync.py does for one review: convert the
+    raw Google payload via the real GBPProvider._to_provider_review(), then
+    persist it via the real db.upsert_review() -- no shortcuts, no
+    reimplemented logic, so this test exercises the ACTUAL production path."""
+    provider_review = GBPProvider._to_provider_review(api_review)
+    return db.upsert_review(conn, loc_id, "Casa Tequila Testtown", provider_review.as_row(), "2026-09-20T12:00:00Z")
+
+
+def test_active_bridge_plus_pending_full_sync_never_clears_bridge_or_writes_db():
+    """Item 10: while a bridge is active, an UNRELATED full sync observing
+    a PENDING reply must leave owner_response empty -- reconciliation's own
+    'already answered locally' check must never short-circuit on it, and
+    must proceed to check Google directly (which also reports PENDING)."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+
+    _full_sync_upsert(conn, loc_id, {
+        "name": "accounts/1/locations/2/reviews/abc", "reviewer": {"displayName": "Jane Doe"},
+        "createTime": "2026-08-07T00:00:00Z", "starRating": "FIVE", "comment": "Great food",
+        "reviewReply": {"comment": "Thanks!", "reviewReplyState": "PENDING"},
+    })
+    conn.commit()
+
+    deleted = []
+    set_calls = []
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "PENDING"}},
+        delete_record=lambda k: deleted.append(k),
+        set_record=lambda k, v, ttl: set_calls.append((k, v, ttl)),
+    )
+    row = conn.execute("SELECT owner_response, gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == "", "an independent full sync must never populate owner_response for a PENDING reply"
+    assert row["gbp_reply_moderation_state"] == "pending_google_approval"
+    assert counts["pending_approval"] == 1, counts
+    assert deleted == [], "the bridge must not be cleared while the reply is still pending"
+
+
+def test_active_bridge_plus_approved_full_sync_lets_reconcile_confirm_on_next_run():
+    """Item 11: an independent full sync that observes an APPROVED,
+    matching reply correctly populates owner_response -- the NEXT
+    reconciliation pass then finds it already answered locally and clears
+    the bridge without needing its own extra Google call."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+
+    _full_sync_upsert(conn, loc_id, {
+        "name": "accounts/1/locations/2/reviews/abc", "reviewer": {"displayName": "Jane Doe"},
+        "createTime": "2026-08-07T00:00:00Z", "starRating": "FIVE", "comment": "Great food",
+        "reviewReply": {"comment": "Thanks!", "reviewReplyState": "APPROVED", "updateTime": "2026-08-22T14:00:00Z"},
+    })
+    conn.commit()
+
+    deleted = []
+    fetch_calls = []
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: fetch_calls.append(name) or {},
+        delete_record=lambda k: deleted.append(k),
+    )
+    row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == "Thanks!"
+    assert counts["confirmed"] == 1, counts
+    assert deleted == ["publish_bridge:v1:r1"]
+    assert fetch_calls == [], "reconciliation must trust the already-answered-locally signal, not re-check Google"
+
+
+def test_active_bridge_plus_rejected_full_sync_never_writes_db_bridge_stays_visible():
+    """Item 12: an independent full sync observing a REJECTED reply must
+    never populate owner_response -- reconciliation proceeds to check
+    Google directly, which also reports REJECTED, and the bridge remains a
+    visible terminal-rejection record rather than being cleared."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+
+    _full_sync_upsert(conn, loc_id, {
+        "name": "accounts/1/locations/2/reviews/abc", "reviewer": {"displayName": "Jane Doe"},
+        "createTime": "2026-08-07T00:00:00Z", "starRating": "FIVE", "comment": "Great food",
+        "reviewReply": {"comment": "Thanks!", "reviewReplyState": "REJECTED", "policyViolation": "SPAM"},
+    })
+    conn.commit()
+
+    deleted = []
+    set_calls = []
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "REJECTED", "policyViolation": "SPAM"}},
+        delete_record=lambda k: deleted.append(k),
+        set_record=lambda k, v, ttl: set_calls.append((k, v, ttl)),
+    )
+    row = conn.execute("SELECT owner_response, gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == "", "a rejected reply must never be persisted as a live owner_response"
+    assert row["gbp_reply_moderation_state"] == "rejected_by_google"
+    assert counts["rejected"] == 1, counts
+    assert deleted == [], "a rejected bridge record must stay visible, never silently deleted"
+    assert set_calls and set_calls[0][1]["moderationState"] == "rejected_by_google"
+
+
+def test_independent_external_reply_full_sync_populates_owner_response_no_bridge_needed():
+    """Item 13: an APPROVED, independently-discovered reply (no PRYOR
+    bridge ever existed for it) must still populate owner_response through
+    the ordinary full-sync path -- proving the fix does not regress
+    Externally Replied detection for the general case."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/xyz")
+
+    _full_sync_upsert(conn, loc_id, {
+        "name": "accounts/1/locations/2/reviews/xyz", "reviewer": {"displayName": "Jane Doe"},
+        "createTime": "2026-08-07T00:00:00Z", "starRating": "FIVE", "comment": "Great food",
+        "reviewReply": {"comment": "Glad you enjoyed it!", "reviewReplyState": "APPROVED"},
+    })
+    conn.commit()
+
+    row = conn.execute("SELECT owner_response, gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == "Glad you enjoyed it!"
+    assert row["gbp_reply_moderation_state"] == "approved_by_google"
+
+
+# === Production-readiness durability fix ===================================
+# Proves the state each of these branches captures SURVIVES the bridge
+# record disappearing entirely afterward (TTL expiry, an outage, or any
+# other reason it's gone) -- not just that the bridge itself is momentarily
+# correct while still present. Simulates "the bridge is now gone" by simply
+# calling reconcile.run_reconcile() a second time with an EMPTY keys list
+# (nothing left to process) and reading reviews.db directly.
+
+def test_rejected_state_persisted_durably_survives_bridge_disappearing():
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    store = {"publish_bridge:v1:r1": _bridge_record()}
+
+    reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: list(store.keys()),
+        get_record=lambda k: store.get(k),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "REJECTED", "policyViolation": "SPAM"}},
+        delete_record=lambda k: store.pop(k, None),
+        set_record=lambda k, v, ttl: store.__setitem__(k, v),
+    )
+    assert "publish_bridge:v1:r1" in store, "sanity check: bridge should still exist right after this pass"
+
+    # Now simulate the bridge disappearing entirely (TTL expiry/outage) --
+    # NOT deleted by reconcile itself, just gone from Redis by the time the
+    # next pass (or the frontend) looks for it.
+    store.clear()
+
+    row = conn.execute("SELECT owner_response, gbp_reply_moderation_state, gbp_reply_policy_violation FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == "", "a rejected reply must never appear as a live owner_response"
+    assert row["gbp_reply_moderation_state"] == "rejected_by_google", "REJECTED must survive the bridge disappearing -- this is the durability fix"
+    assert json.loads(row["gbp_reply_policy_violation"])["reasonCodes"] == ["SPAM"]
+
+    # A subsequent reconcile pass over the (now empty) bridge keyspace must
+    # not need this record at all -- reviews.db already has the answer.
+    counts = reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: list(store.keys()),
+        get_record=lambda k: store.get(k),
+        fetch_review=lambda name: (_ for _ in ()).throw(AssertionError("must not be called -- no bridge keys left")),
+        delete_record=lambda k: store.pop(k, None),
+        set_record=lambda k, v, ttl: store.__setitem__(k, v),
+    )
+    assert counts["confirmed"] == 0 and counts["rejected"] == 0, "nothing left to reconcile -- the durable record is the source of truth now"
+
+
+def test_pending_state_persisted_durably_survives_bridge_disappearing():
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    store = {"publish_bridge:v1:r1": _bridge_record()}
+
+    reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: list(store.keys()),
+        get_record=lambda k: store.get(k),
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "reviewReplyState": "PENDING"}},
+        delete_record=lambda k: store.pop(k, None),
+        set_record=lambda k, v, ttl: store.__setitem__(k, v),
+    )
+    store.clear()  # bridge disappears
+
+    row = conn.execute("SELECT owner_response, gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["owner_response"] == ""
+    assert row["gbp_reply_moderation_state"] == "pending_google_approval", "PENDING must survive the bridge disappearing"
+
+
+def test_rejected_bridge_persists_immediately_even_before_any_fresh_google_call():
+    """The core empirical finding from the Terry diagnostic: Google's own
+    GET essentially never independently re-confirms a moderation state, so
+    reconcile_one() must durably persist the BRIDGE's OWN already-known
+    REJECTED state up front -- not depend on a fresh GET to reveal it. This
+    test's fetch_review deliberately returns nothing new (no reviewReply at
+    all) to prove persistence happens anyway, from the bridge's own prior
+    state."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc")
+    already_rejected_bridge = {
+        **_bridge_record(),
+        "moderationState": "rejected_by_google",
+        "policyViolation": {"reasonCodes": ["SPAM"], "summary": "Rejected by Google -- flagged as spam."},
+    }
+
+    reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: already_rejected_bridge,
+        fetch_review=lambda name: {},  # Google's GET reveals nothing new -- the realistic case
+        delete_record=lambda k: (_ for _ in ()).throw(AssertionError("must not delete")),
+        set_record=lambda k, v, ttl: None,
+    )
+    row = conn.execute("SELECT gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["gbp_reply_moderation_state"] == "rejected_by_google", (
+        "the bridge's own already-known REJECTED state must be persisted immediately, "
+        "not deferred to a fresh GET that Google's real API essentially never populates"
+    )
+
+
+def test_approved_provenance_persisted_when_already_answered_locally_branch_fires():
+    """Item 6: when a bridge exists AND owner_response is already present
+    (the 'self-healed by an independent full sync' branch), the review is
+    durably stamped APPROVED -- this is what lets computeReplyState() later
+    keep attributing it to PRYOR instead of misclassifying it as an
+    unattributed 'Reply Recorded' once this bridge is gone."""
+    conn = _fresh_db()
+    loc_id = _add_location(conn)
+    review_id = _add_review(conn, loc_id, "accounts/1/locations/2/reviews/abc", owner_response="Already replied via full sync")
+    deleted = []
+
+    reconcile.run_reconcile(
+        conn, TEST_TENANT_ID, dry_run=False,
+        list_keys=lambda: ["publish_bridge:v1:r1"],
+        get_record=lambda k: _bridge_record(),
+        fetch_review=lambda name: (_ for _ in ()).throw(AssertionError("must not call Google -- already answered locally")),
+        delete_record=lambda k: deleted.append(k),
+    )
+    row = conn.execute("SELECT gbp_reply_moderation_state FROM reviews WHERE id = ?", (review_id,)).fetchone()
+    assert row["gbp_reply_moderation_state"] == "approved_by_google"
+    assert deleted == ["publish_bridge:v1:r1"]
 
 
 def test_already_answered_locally_clears_stale_bridge_without_google_call():
@@ -200,7 +679,7 @@ def test_dry_run_performs_zero_writes_or_deletes():
         conn, TEST_TENANT_ID, dry_run=True,
         list_keys=lambda: ["publish_bridge:v1:r1"],
         get_record=lambda k: _bridge_record(),
-        fetch_review=lambda name: {"reviewReply": {"comment": "Thank you!", "updateTime": "2026-08-22T13:50:00Z"}},
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thank you!", "updateTime": "2026-08-22T13:50:00Z", "reviewReplyState": "APPROVED"}},
         delete_record=lambda k: deleted.append(k),
     )
     row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
@@ -219,7 +698,7 @@ def test_only_the_matching_row_is_ever_touched():
         conn, TEST_TENANT_ID, dry_run=False,
         list_keys=lambda: ["publish_bridge:v1:r1"],
         get_record=lambda k: _bridge_record(gbp_review_name="accounts/1/locations/2/reviews/abc"),
-        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "updateTime": "2026-08-22T13:50:00Z"}},
+        fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "updateTime": "2026-08-22T13:50:00Z", "reviewReplyState": "APPROVED"}},
         delete_record=lambda k: None,
     )
     target = conn.execute("SELECT owner_response, review_text, star_rating FROM reviews WHERE id = ?", (target_id,)).fetchone()
@@ -389,7 +868,7 @@ def test_full_reconcile_round_trip_with_a_space_containing_key_never_crashes():
             conn, TEST_TENANT_ID, dry_run=False,
             list_keys=lambda: [key],
             get_record=reconcile.get_bridge_record,  # the REAL function, not a lambda fake
-            fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "updateTime": "2026-08-22T13:50:00Z"}},
+            fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "updateTime": "2026-08-22T13:50:00Z", "reviewReplyState": "APPROVED"}},
             delete_record=reconcile.delete_bridge_record,  # the REAL function, not a lambda fake
         )
         assert counts["confirmed"] == 1, counts
@@ -464,7 +943,7 @@ def test_full_reconcile_run_for_tenant_a_never_touches_tenant_bs_record():
     def run(fake):
         counts = reconcile.run_reconcile(
             conn, TEST_TENANT_ID, dry_run=False,
-            fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "updateTime": "2026-08-22T13:50:00Z"}},
+            fetch_review=lambda name: {"reviewReply": {"comment": "Thanks!", "updateTime": "2026-08-22T13:50:00Z", "reviewReplyState": "APPROVED"}},
         )
         assert counts["confirmed"] == 1, counts
         row = conn.execute("SELECT owner_response FROM reviews WHERE id = ?", (review_id,)).fetchone()
@@ -508,6 +987,23 @@ def main() -> int:
     tests = [
         ("confirmed reply reconciles reviews.db and clears the bridge", test_confirmed_reply_reconciles_db_and_clears_bridge),
         ("still-pending record leaves the row and bridge untouched", test_still_pending_leaves_row_and_bridge_untouched),
+        ("PENDING moderation state updates the bridge, never writes reviews.db", test_pending_approval_updates_bridge_never_writes_db),
+        ("REJECTED moderation state updates the bridge with policy reason, never writes DB, never deletes", test_rejected_reply_updates_bridge_with_policy_reason_never_writes_db_never_deletes),
+        ("comment present but no moderation state -> reply_recorded, never confirmed (the reported bug)", test_comment_present_but_no_moderation_state_is_reply_recorded_never_confirmed),
+        ("REVIEW_REPLY_STATE_UNSPECIFIED is treated as missing, never approved", test_unspecified_review_reply_state_is_treated_as_missing_not_approved),
+        ("an unrecognized future reviewReplyState is treated as missing, never approved", test_unknown_future_review_reply_state_is_treated_as_missing_not_approved),
+        ("a malformed/empty reviewReply response never crashes reconciliation", test_malformed_reviewreply_shape_never_crashes),
+        ("a pending reply later becomes approved across two reconcile runs", test_pending_reply_later_becomes_approved_across_two_runs),
+        ("a pending reply later becomes rejected across two reconcile runs", test_pending_reply_later_becomes_rejected_across_two_runs),
+        ("a legacy bridge record (no moderation fields) reconciles safely once approved", test_legacy_bridge_record_with_no_moderation_fields_reconciles_safely),
+        ("full-sync gap: active bridge + PENDING full sync never clears bridge or writes DB", test_active_bridge_plus_pending_full_sync_never_clears_bridge_or_writes_db),
+        ("full-sync gap: active bridge + APPROVED full sync lets the next reconcile confirm without a Google call", test_active_bridge_plus_approved_full_sync_lets_reconcile_confirm_on_next_run),
+        ("full-sync gap: active bridge + REJECTED full sync never writes DB, bridge stays visible", test_active_bridge_plus_rejected_full_sync_never_writes_db_bridge_stays_visible),
+        ("full-sync gap: an independent external APPROVED reply populates owner_response with no bridge needed", test_independent_external_reply_full_sync_populates_owner_response_no_bridge_needed),
+        ("durability: REJECTED state survives the bridge record disappearing entirely", test_rejected_state_persisted_durably_survives_bridge_disappearing),
+        ("durability: PENDING state survives the bridge record disappearing entirely", test_pending_state_persisted_durably_survives_bridge_disappearing),
+        ("durability: an already-REJECTED bridge persists immediately, without waiting on a fresh Google GET", test_rejected_bridge_persists_immediately_even_before_any_fresh_google_call),
+        ("durability: APPROVED provenance is stamped when the already-answered-locally branch fires", test_approved_provenance_persisted_when_already_answered_locally_branch_fires),
         ("already-answered locally clears a stale bridge without calling Google", test_already_answered_locally_clears_stale_bridge_without_google_call),
         ("a fetch failure leaves everything untouched", test_fetch_failure_leaves_everything_untouched),
         ("a record with no gbpReviewName is skipped, not crashed", test_no_gbp_review_name_is_skipped_not_crashed),

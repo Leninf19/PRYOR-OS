@@ -90,9 +90,10 @@ def test_provider_review_as_row_matches_db_upsert_review_expected_keys():
     """db.upsert_review()'s `row` dict is read via row.get(...) for exactly
     these keys (db.py: reviewer_name, review_date, star_rating, review_text,
     owner_response, review_url, gbp_review_name, gbp_update_time,
-    gbp_reply_update_time, gbp_language_code) -- as_row() must produce
-    precisely this shape so introducing a Provider never requires a
-    storage-layer change."""
+    gbp_reply_update_time, gbp_language_code, and -- since the Google Reply
+    Moderation State fix's full-sync gap closure -- gbp_reply_moderation_state/
+    gbp_reply_policy_violation) -- as_row() must produce precisely this
+    shape so introducing a Provider never requires a storage-layer change."""
     review = ProviderReview(
         reviewer_name="Jane Doe", review_date="2026-07-01", star_rating=5,
         review_text="Great food!", owner_response="Thank you!",
@@ -101,17 +102,21 @@ def test_provider_review_as_row_matches_db_upsert_review_expected_keys():
         gbp_update_time="2026-07-01T12:00:00Z",
         gbp_reply_update_time="2026-07-02T12:00:00Z",
         gbp_language_code="en",
+        gbp_reply_moderation_state="approved_by_google",
+        gbp_reply_policy_violation=None,
     )
     row = review.as_row()
     expected_keys = {
         "reviewer_name", "review_date", "star_rating", "review_text",
         "owner_response", "review_url", "gbp_review_name", "gbp_update_time",
         "gbp_reply_update_time", "gbp_language_code",
+        "gbp_reply_moderation_state", "gbp_reply_policy_violation",
     }
     assert set(row.keys()) == expected_keys, f"as_row() keys {set(row.keys())} must exactly match db.upsert_review()'s expected shape"
     assert row["reviewer_name"] == "Jane Doe"
     assert row["star_rating"] == 5
     assert row["gbp_review_name"] == "accounts/1/locations/2/reviews/3"
+    assert row["gbp_reply_moderation_state"] == "approved_by_google"
 
 
 def test_provider_review_defaults_for_scraper_sourced_row():

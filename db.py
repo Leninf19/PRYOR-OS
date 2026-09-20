@@ -8,6 +8,7 @@ migration script, and future pipeline stages (validate.py,
 refresh_analytics.py, export_chunks.py) all go through the same path
 instead of re-implementing dedup/diff logic per script.
 """
+import json
 import re
 import sqlite3
 from collections import Counter
@@ -299,7 +300,7 @@ def ensure_validation_flags_open_identity_index(conn: sqlite3.Connection) -> boo
 # doesn't control which migrations run. It just lets you tell at a glance,
 # from the DB file alone, whether it's seen the latest migration batch --
 # `sqlite3 reviews.db "PRAGMA user_version"` -- without reading this file.
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 
 def _column_level_unique_index_name(conn: sqlite3.Connection, table: str, column: str) -> str | None:
@@ -540,6 +541,21 @@ def _migrate_schema(conn: sqlite3.Connection):
         # new stuck run or re-alerted forever on the same permanently-open
         # one, depending on timing (the run #159 recurring-alert bug).
         "ALTER TABLE notifications_log ADD COLUMN related_run_id INTEGER REFERENCES scraper_runs(id)",
+        # Google Reply Moderation State fix (schema v20) -- persists
+        # Google's own reviewReplyState/policyViolation for a review's
+        # reply, independent of owner_response (see provider_gbp.py's
+        # _to_provider_review() for how these are populated, and
+        # upsert_review()'s own docstring below for how they're written).
+        # NULL for every pre-existing row and for any review Google gives
+        # no explicit signal for -- NULL never means "approved," only "no
+        # moderation signal recorded." gbp_reply_moderation_state is one of
+        # reply_moderation_state.py's outcome strings ('approved_by_google'
+        # | 'rejected_by_google' | 'pending_google_approval') or NULL.
+        # gbp_reply_policy_violation is a JSON-serialized
+        # {reasonCodes, summary} object (see normalize_policy_violation()),
+        # or NULL.
+        "ALTER TABLE reviews ADD COLUMN gbp_reply_moderation_state TEXT",
+        "ALTER TABLE reviews ADD COLUMN gbp_reply_policy_violation TEXT",
     ]
     for sql in migrations:
         try:
@@ -783,6 +799,16 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
     gbp_update_time = row.get("gbp_update_time")
     gbp_reply_update_time = row.get("gbp_reply_update_time")
     gbp_language_code = row.get("gbp_language_code")
+    # Google Reply Moderation State fix: gbp_reply_moderation_state is one
+    # of reply_moderation_state.py's outcome strings or None (never
+    # guessed); gbp_reply_policy_violation is JSON-serialized here (the
+    # column is TEXT) from whatever dict/None the caller supplied --
+    # json.dumps(None) is never called, since row.get() already returns
+    # None for "no violation," and this column is only ever meaningful
+    # alongside an explicit REJECTED moderation state.
+    gbp_reply_moderation_state = row.get("gbp_reply_moderation_state")
+    _policy_violation_raw = row.get("gbp_reply_policy_violation")
+    gbp_reply_policy_violation = json.dumps(_policy_violation_raw) if _policy_violation_raw is not None else None
 
     existing = None
     key = None
@@ -802,13 +828,15 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
                 """INSERT INTO reviews
                    (location_id, canonical_review_id, dedup_key, reviewer_name, review_date,
                     star_rating, review_text, owner_response, review_url, first_seen_at, last_seen_at,
-                    gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
+                    gbp_reply_moderation_state, gbp_reply_policy_violation)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (location_id, canonical_review_id(row.get("review_url", "")), key,
                  row.get("reviewer_name", ""), row.get("review_date", ""),
                  row.get("star_rating") or None, _normalize_text_field(row.get("review_text")) or "",
                  _normalize_text_field(row.get("owner_response")) or "", row.get("review_url", ""), now, now,
-                 gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code),
+                 gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
+                 gbp_reply_moderation_state, gbp_reply_policy_violation),
             )
         except sqlite3.IntegrityError as e:
             # Both lookups above missed, yet the database's own constraint still
@@ -882,7 +910,9 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
            dedup_key = COALESCE(?, dedup_key),
            gbp_update_time = COALESCE(?, gbp_update_time),
            gbp_reply_update_time = COALESCE(?, gbp_reply_update_time),
-           gbp_language_code = COALESCE(?, gbp_language_code)
+           gbp_language_code = COALESCE(?, gbp_language_code),
+           gbp_reply_moderation_state = COALESCE(?, gbp_reply_moderation_state),
+           gbp_reply_policy_violation = COALESCE(?, gbp_reply_policy_violation)
            WHERE id = ?""",
         (final_text, final_response,
          row.get("star_rating") or existing["star_rating"],
@@ -891,6 +921,15 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
          # COALESCE means a row without a gbp_review_name keeps its existing
          # dedup_key untouched, exactly as before.
          now, gbp_review_name, gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
+         # COALESCE here means: a resolved outcome (APPROVED/REJECTED/
+         # PENDING) always advances the stored state (e.g. pending ->
+         # rejected), while an unresolved read (None -- missing/unspecified/
+         # unknown reviewReplyState) never clobbers a PREVIOUSLY recorded
+         # resolved state. This is what "retained safely" means for an
+         # unknown future enum value too -- classify_moderation_outcome()
+         # already maps it to None, so it behaves exactly like "missing"
+         # here: never overwrites, never lost.
+         gbp_reply_moderation_state, gbp_reply_policy_violation,
          existing["id"]),
     )
     return "edited" if (changed_fields or gbp_edit_detected) else "unchanged"

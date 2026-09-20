@@ -55,6 +55,7 @@ import { discoverGoogleLocationIdsForReconciliation } from '../_lib/googleLocati
 import { resolveTenantEntitlements } from '../_lib/entitlements.js'
 import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
 import { classifyReviewRisk } from '../_lib/reviewRiskClassifier.js'
+import { ModerationState, parseGoogleReplyResponse, classifyModerationOutcome, replyTextMatches } from '../_lib/replyModerationState.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -1245,6 +1246,17 @@ function locationMatches(gbpName, ourName) {
   return a === b || a.includes(b) || b.includes(a)
 }
 
+// Google Reply Moderation State fix: previously this function only ever
+// checked replyRes.ok and discarded the response body entirely -- the
+// literal root cause of PRYOR showing "Confirmed" for a reply Google had
+// actually left pending/rejected in moderation (see the read-only audit for
+// Casa Tequila Brighton / reviewer "Terry", local review id 35738). Google's
+// updateReply, per its own current API reference, returns the full
+// ReviewReply object on success (comment/updateTime/reviewReplyState/
+// policyViolation) -- this now reads and normalizes it via
+// replyModerationState.js instead of throwing it away. Still throws on a
+// genuine HTTP failure exactly as before (that path is unchanged); only the
+// success path gains a return value.
 async function replyViaReviewName(reviewName, replyText, token) {
   const replyRes = await fetchWithRetry(`${GBP_BASE}/${reviewName}/reply`, {
     method:  'PUT',
@@ -1258,6 +1270,30 @@ async function replyViaReviewName(reviewName, replyText, token) {
     if (replyRes.status === 403) throw Object.assign(new Error(msg), { status: 403, code: 'missing_permission' })
     if (replyRes.status === 404) throw Object.assign(new Error(msg), { status: 404, code: 'review_gone' })
     throw Object.assign(new Error(msg), { status: 502, code: 'api_error' })
+  }
+
+  // Defensive parse -- an empty body, malformed JSON, or a body missing
+  // every field must never throw and must never be mistaken for a
+  // conclusive moderation outcome. parseGoogleReplyResponse() guarantees
+  // this by construction (see its own docstring).
+  let body = null
+  try {
+    body = await replyRes.json()
+  } catch {
+    body = null
+  }
+  const parsed = parseGoogleReplyResponse(body)
+  return {
+    // classifyModerationOutcome() returns null for anything unresolved
+    // (missing/unspecified/future/unknown reviewReplyState) -- the ONLY
+    // safe fallback for "HTTP 200, nothing conclusive yet" is
+    // SENT_TO_GOOGLE, never an assumed approval (PART 3's explicit
+    // requirement).
+    moderationState:          classifyModerationOutcome(parsed.reviewReplyState) ?? ModerationState.SENT_TO_GOOGLE,
+    reviewReplyState:         parsed.reviewReplyState,
+    policyViolation:          parsed.policyViolation,
+    googleUpdateTime:         parsed.updateTime,
+    replyTextMatchesSubmitted: replyTextMatches(parsed.comment, replyText),
   }
 }
 
@@ -1438,7 +1474,19 @@ async function publish(req, res) {
   // response is still 200 success:true, just with bridgeWarning:true so
   // the frontend can say "published, but local confirmation couldn't be
   // saved" instead of silently claiming full durability it doesn't have.
-  async function respondPublishSuccess(resolvedGbpReviewName) {
+  // `moderation` (Google Reply Moderation State fix): the object
+  // replyViaReviewName() now returns instead of void -- { moderationState,
+  // reviewReplyState, policyViolation, googleUpdateTime,
+  // replyTextMatchesSubmitted }. Threaded into both the JSON response (so
+  // the frontend can react immediately, without a second /publish-bridge
+  // round trip) and the durable bridge record (so it survives across
+  // browsers/devices and is what reconciliation later re-checks). Always
+  // present -- replyViaReviewName() never returns undefined on success --
+  // but defended with `?? ModerationState.SENT_TO_GOOGLE` anyway so a
+  // future caller of this function can never accidentally produce a
+  // missing/false-positive state.
+  async function respondPublishSuccess(resolvedGbpReviewName, moderation) {
+    const moderationState = moderation?.moderationState ?? ModerationState.SENT_TO_GOOGLE
     await recordConnectionCheckOutcome(tenantId, { success: true })
     // Notification Center Audit & Fix: a subsequent successful publish
     // resolves any previously-recorded "reply failed" notification for
@@ -1452,7 +1500,7 @@ async function publish(req, res) {
       // hitting this endpoint directly) -- Google still succeeded, there's
       // just nothing to key a bridge record by. Same partial-success shape,
       // not a hard failure.
-      return res.status(200).json({ success: true, bridgeWarning: true })
+      return res.status(200).json({ success: true, bridgeWarning: true, moderationState })
     }
     try {
       await writePublishBridge(tenantId, localReviewId, {
@@ -1461,14 +1509,20 @@ async function publish(req, res) {
         locationName: locationName ?? null,
         reviewerName: reviewerName ?? null,
         reviewDate: reviewDate ?? null,
+        moderationState,
+        reviewReplyState:   moderation?.reviewReplyState ?? null,
+        policyViolation:    moderation?.policyViolation ?? null,
+        googleUpdateTime:   moderation?.googleUpdateTime ?? null,
+        replyTextMatches:   moderation?.replyTextMatchesSubmitted ?? null,
+        moderationCheckedAt: new Date().toISOString(),
       })
-      return res.status(200).json({ success: true })
+      return res.status(200).json({ success: true, moderationState })
     } catch (err) {
       // PublishBridgeUnavailableError (not configured / Redis unreachable)
       // or any other write failure -- Google already has the reply, so this
       // is never reported as a publish failure.
       console.error(`[publish] bridge write failed after a successful Google publish (localReviewId=${localReviewId}): ${err instanceof PublishBridgeUnavailableError ? err.message : 'unexpected error'}`)
-      return res.status(200).json({ success: true, bridgeWarning: true })
+      return res.status(200).json({ success: true, bridgeWarning: true, moderationState })
     }
   }
 
@@ -1515,8 +1569,8 @@ async function publish(req, res) {
   try {
     // Preferred: direct resource path, already linked -- no lookup needed.
     if (reviewName) {
-      await replyViaReviewName(reviewName, replyText, token)
-      return respondPublishSuccess(reviewName)
+      const moderation = await replyViaReviewName(reviewName, replyText, token)
+      return respondPublishSuccess(reviewName, moderation)
     }
 
     // Fallback: fuzzy-match by location name, then by reviewer display name.
@@ -1618,8 +1672,8 @@ async function publish(req, res) {
       })
     }
 
-    await replyViaReviewName(review.name, replyText, token)
-    return respondPublishSuccess(review.name)
+    const moderation = await replyViaReviewName(review.name, replyText, token)
+    return respondPublishSuccess(review.name, moderation)
 
   } catch (err) {
     // err.status/err.code come from replyViaReviewName's own thrown errors

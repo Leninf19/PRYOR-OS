@@ -25,6 +25,7 @@ from provider_base import (
     CAP_READ_REVIEWS, CAP_REPLY,
 )
 import google_api as ga
+import reply_moderation_state as rms
 import tenant_keys
 
 # Moved here from gbp_sync.py (Phase 3 Milestone 1) along with the review
@@ -107,22 +108,67 @@ class GBPProvider(Provider):
 
     @staticmethod
     def _to_provider_review(api_review: dict) -> ProviderReview:
-        """Identical field-for-field to gbp_sync.py's previous
-        _review_to_row() -- moved, not rewritten."""
+        """Originally identical field-for-field to gbp_sync.py's previous
+        _review_to_row() -- moved, not rewritten. Since revised by the
+        Google Reply Moderation State fix's full-sync gap closure: this
+        used to set owner_response=reply.get("comment") unconditionally,
+        which is the exact root cause a regular full sync could confirm a
+        reply that Google's own moderation had actually left PENDING or
+        REJECTED (see reply_moderation_state.py's header for the full
+        story).
+
+        Fix, scoped narrowly: when reviewReplyState explicitly resolves to
+        REJECTED or PENDING, owner_response and gbp_reply_update_time are
+        WITHHELD from this payload (empty/None) rather than populated from
+        the comment -- db.upsert_review()'s existing "preserve existing
+        non-empty value when the new one is empty" behavior then keeps
+        whatever was already stored untouched, so this can never ERASE a
+        genuinely-approved prior reply, only refuse to treat a
+        pending/rejected one as if it were live.
+
+        Deliberately NOT withheld for a missing/unspecified/unrecognized
+        reviewReplyState (outcome is None): Google's ordinary reviews.list/
+        reviews.get read surface may never populate this field at all for
+        the overwhelming majority of reviews (its documented guarantee is
+        specifically about updateReply's own PUT response, not every
+        subsequent read) -- blocking on its absence here would silently
+        break the long-standing, comment-presence-based "externally
+        replied" detection for nearly every review this app has never
+        itself published, which predates and is orthogonal to this fix.
+        The place where "missing state must not be treated as approved"
+        actually matters -- a review this app JUST attempted to publish
+        through PRYOR, via an active publish-bridge record -- is enforced
+        in gbp_reply_bridge_reconcile.py, not here.
+
+        gbp_reply_moderation_state/gbp_reply_policy_violation are always
+        populated (or left None) so PRYOR can display Pending/Rejected
+        information for ANY review Google gives an explicit signal for,
+        independent of whether a PRYOR bridge is involved."""
         reviewer = api_review.get("reviewer", {}) or {}
         reply = api_review.get("reviewReply") or {}
         create_time = api_review.get("createTime", "") or ""
+        comment = reply.get("comment") or ""
+        review_reply_state = reply.get("reviewReplyState")
+        outcome = rms.classify_moderation_outcome(review_reply_state)
+
+        blocked = outcome in (rms.REJECTED, rms.PENDING_APPROVAL)
+        owner_response = "" if blocked else comment
+        gbp_reply_update_time = None if blocked else reply.get("updateTime")
+        policy_violation = rms.normalize_policy_violation(reply.get("policyViolation")) if outcome == rms.REJECTED else None
+
         return ProviderReview(
             reviewer_name=reviewer.get("displayName") or "A Google User",
             review_date=create_time[:10],
             star_rating=STAR_MAP.get(api_review.get("starRating")),
             review_text=api_review.get("comment") or "",
-            owner_response=reply.get("comment") or "",
+            owner_response=owner_response,
             review_url="",
             gbp_review_name=api_review.get("name"),
             gbp_update_time=api_review.get("updateTime"),
-            gbp_reply_update_time=reply.get("updateTime"),
+            gbp_reply_update_time=gbp_reply_update_time,
             gbp_language_code=api_review.get("languageCode"),
+            gbp_reply_moderation_state=outcome,
+            gbp_reply_policy_violation=policy_violation,
         )
 
     def reply_to_review(self, gbp_review_name: str, comment: str) -> None:
