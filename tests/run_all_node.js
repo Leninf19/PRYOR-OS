@@ -53,6 +53,8 @@ const TESTS = [
   'test_executive_intelligence_center_ui.js',
   'test_executive_intelligence_prefetch.js',
   'test_rewrite_policy.js',
+  'test_complaint_category_guide.js',
+  'test_response_playbook_v2.js',
   'test_executive_brief.js',
   'test_ai_tenant_limits.js',
   'test_gbp_location_authorization.js',

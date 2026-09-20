@@ -230,21 +230,116 @@ _CONTACT_EMAIL = "advertising@l3amigos.com"
 # all", 'ill' matches inside "the tacos were griILLed perfectly". Every entry
 # is now matched with \b...\b word boundaries via _SERIOUS_RE below, so a
 # keyword only fires when it appears as its own word.
-_SERIOUS_KEYWORDS = [
-    "sick", "ill", "vomit", "vomiting", "food poisoning", "diarrhea",
-    "hospital", "hospitalized", "doctor", "health department", "health code",
-    "cockroach", "roach", "rat", "rats", "mouse", "mice", "rodent", "rodents",
-    "insect", "insects", "pest", "pests",
-    "injury", "injured", "unsafe", "accident",
-    "discrimination", "discriminated", "racist", "racism", "harassment", "harassed",
-    "hostile", "threatening", "threatened",
-    "lawsuit", "lawyer", "attorney", "sue", "sued", "legal action",
-    "police", "assault", "assaulted", "stole", "stolen", "theft",
-    "never coming back", "health violation", "shut down",
+#
+# Review Response Playbook v2, PART 6: this is the Python-side mirror of
+# dashboard/api/_lib/reviewRiskClassifier.js's RISK_CATEGORIES -- same 10
+# categories, same keywords, same word-boundary matching -- kept as a
+# categorized dict (rather than one flat list) so this batch pipeline can
+# reason about WHICH kind of serious concern a review raises, exactly like
+# the JS on-demand path, instead of maintaining a second, differently-shaped
+# classifier. This is the established cross-language duplication convention
+# for this codebase (see reviewRiskClassifier.js's own header comment) --
+# there is no single module Python and JS can both import, so the two are
+# kept as clearly cross-referenced, kept-in-sync copies rather than a new,
+# competing scheme invented for Python alone.
+_RISK_CATEGORIES = {
+    "food_poisoning": [
+        "sick", "ill", "illness", "vomit", "vomiting", "threw up", "food poisoning",
+        "diarrhea", "nausea", "nauseous", "stomach ache", "upset stomach", "cramping",
+    ],
+    "allergic_reaction": [
+        "allergic", "allergy", "allergies", "anaphylaxis", "anaphylactic", "epipen",
+        "epi-pen", "throat closing", "throat swelling", "swelling", "hives",
+        "difficulty breathing", "trouble breathing", "can't breathe", "cant breathe",
+        "passed out", "unconscious", "lost consciousness",
+    ],
+    "injury": [
+        "injury", "injured", "cut myself", "burned", "burn", "choke", "choked",
+        "choking", "broken tooth", "chipped tooth", "fell", "fall", "accident",
+        "bleeding", "stitches", "hospital", "hospitalized", "doctor", "er visit",
+        "emergency room",
+    ],
+    "foreign_object": [
+        "glass", "metal", "plastic", "staple", "wire", "bug", "insect", "cockroach",
+        "roach", "fly in my", "hair in my food", "foreign object", "band-aid", "bandaid",
+    ],
+    "unsafe_food": [
+        "raw chicken", "undercooked", "undercooked chicken", "spoiled", "rotten",
+        "expired", "mold", "moldy", "rancid", "smelled off", "tasted off",
+    ],
+    "sanitation": [
+        "rat", "rats", "mouse", "mice", "rodent", "rodents", "pest", "pests",
+        "health department", "health code", "health violation", "dirty kitchen",
+        "unsanitary", "filthy", "shut down",
+    ],
+    "threat_violence": [
+        "threatened", "threatening", "assault", "assaulted", "violent", "violence",
+        "weapon", "gun", "knife pulled",
+    ],
+    "discrimination_harassment": [
+        "discrimination", "discriminated", "racist", "racism", "harassment",
+        "harassed", "hostile", "homophobic", "sexist",
+    ],
+    "legal_threat": [
+        "lawsuit", "lawyer", "attorney", "sue", "sued", "legal action", "police",
+        "subpoena", "file a complaint",
+    ],
+    "fraud_payment": [
+        "stole", "stolen", "theft", "fraud", "fraudulent", "overcharged", "scam", "scammed",
+    ],
+}
+_ACTIVE_EMERGENCY_KEYWORDS = [
+    "anaphylaxis", "anaphylactic", "difficulty breathing", "trouble breathing",
+    "can't breathe", "cant breathe", "passed out", "unconscious", "lost consciousness",
 ]
-_SERIOUS_RE = re.compile(
-    r"\b(" + "|".join(re.escape(kw) for kw in _SERIOUS_KEYWORDS) + r")\b", re.IGNORECASE
-)
+
+
+def _word_boundary_re(keywords: list[str]) -> re.Pattern:
+    return re.compile(r"\b(" + "|".join(re.escape(kw) for kw in keywords) + r")\b", re.IGNORECASE)
+
+
+_CATEGORY_PATTERNS = {category: _word_boundary_re(keywords) for category, keywords in _RISK_CATEGORIES.items()}
+_ACTIVE_EMERGENCY_RE = _word_boundary_re(_ACTIVE_EMERGENCY_KEYWORDS)
+
+# Kept for any external caller expecting a flat list (none currently exist in
+# this module) -- derived from _RISK_CATEGORIES rather than maintained twice.
+_SERIOUS_KEYWORDS = [kw for keywords in _RISK_CATEGORIES.values() for kw in keywords]
+_SERIOUS_RE = _word_boundary_re(_SERIOUS_KEYWORDS)
+
+
+def classify_review_risk(text: str) -> dict:
+    """Python mirror of reviewRiskClassifier.js's classifyReviewRisk().
+    Returns {"is_high_risk", "categories", "is_active_emergency"}. Never
+    raises; empty/missing text is always low risk."""
+    text = text or ""
+    if not text.strip():
+        return {"is_high_risk": False, "categories": [], "is_active_emergency": False}
+    categories = [category for category, pattern in _CATEGORY_PATTERNS.items() if pattern.search(text)]
+    return {
+        "is_high_risk": bool(categories),
+        "categories": categories,
+        "is_active_emergency": bool(_ACTIVE_EMERGENCY_RE.search(text)),
+    }
+
+
+# Python mirror of reviewRiskClassifier.js's CATEGORY_GUIDANCE -- see that
+# file's own header comment for the full PART 11-19 rationale (neutral
+# chronology for food-poisoning language, no unverified health-department/
+# inspection claims, protect-both-parties framing for staff/discrimination
+# allegations, etc.). Kept equivalent in intent so a manager regenerating a
+# batch-drafted response on-demand never sees the tone shift.
+_CATEGORY_GUIDANCE = {
+    "food_poisoning": "This review alleges the guest became ill after eating here. Use neutral chronology only -- say things like 'you became ill after your visit,' never 'our food made you sick' or 'we caused your illness.' You may calmly state standards, e.g. 'our restaurant follows established food-safety procedures and applicable health requirements,' but do not claim a perfect health inspection record, a specific inspection score, or 'this has never happened before' unless explicitly verified for this location. Do not diagnose the illness or admit fault.",
+    "allergic_reaction": "This review describes a possible allergic reaction. Express genuine concern without diagnosing, admitting causation, or asking for medical details publicly. Do not admit fault.",
+    "injury": "This review describes a physical injury. Express genuine concern for the guest's wellbeing and do not admit fault or dispute their account.",
+    "foreign_object": "This review alleges a foreign object was found in food. Acknowledge the seriousness without stating as fact that contamination occurred, and never say anything like 'that could not have come from our kitchen.'",
+    "unsafe_food": "This review alleges undercooked, raw, or spoiled food -- treat it as high-risk food safety. Do not confirm the item was actually undercooked/raw unless established, and do not call the guest dishonest.",
+    "sanitation": "This review raises a sanitation or pest concern. You may state that the restaurant maintains its own cleanliness standards while still acknowledging the complaint -- do not claim the review is false because 'we're always clean.' Avoid saying 'we follow all Health Department regulations' -- prefer 'established food-safety procedures and applicable health requirements.'",
+    "threat_violence": "This review describes a threat or confrontation. Keep the response neutral, serious, and non-inflammatory. Do not escalate or make accusations back.",
+    "discrimination_harassment": "This review alleges discrimination or harassment. Keep the response calm and neutral. Do not make legal conclusions, admit it occurred, automatically deny it, or attack the reviewer.",
+    "legal_threat": "This review references legal action or police involvement. Keep the response neutral. Do not make any legal conclusions or admissions.",
+    "fraud_payment": "This review alleges theft or a billing problem. Do not discuss payment details publicly, and do not admit an incorrect charge before it has been verified.",
+}
 
 # Phase 3 hard safety guard: language a NON-serious (positive/positive-with-
 # feedback/mixed/ordinary-negative) response must never contain. Matched
@@ -327,6 +422,93 @@ def classify_response_type(review: dict) -> str:
     return "positive"
 
 
+# Review Response Playbook v2, PART 6/7-10/17/18: Python-side mirror of
+# dashboard/api/_lib/complaintCategoryGuide.js's normal-severity, non-
+# high-risk complaint categories -- deliberately separate from
+# _RISK_CATEGORIES above (which gates the serious_escalation type and must
+# not be touched by this feature). Same word-boundary literal-phrase
+# convention as _RISK_CATEGORIES.
+_COMPLAINT_CATEGORIES = {
+    "slow_service": [
+        "slow service", "took forever", "waited forever", "waited an hour", "waited over an hour",
+        "long wait", "nobody came", "no one came", "ignored us", "took so long", "took too long",
+    ],
+    "rude_staff": [
+        "rude", "rude staff", "rude server", "rude waiter", "rude waitress", "attitude",
+        "dismissive", "unfriendly", "condescending", "yelled at", "snapped at", "disrespectful",
+    ],
+    "wrong_order": [
+        "wrong order", "wrong dish", "wrong item", "brought the wrong order", "not what I ordered",
+        "mixed up our order",
+    ],
+    "missing_items": [
+        "missing item", "forgot my", "forgot the", "didn't include", "left out of my order",
+        "was missing from", "never got my",
+    ],
+    "cold_food": ["cold food", "food was cold", "came out cold", "lukewarm", "arrived cold"],
+    "poor_food_quality": ["poor quality", "low quality", "not fresh", "tasted stale", "stale", "bad quality"],
+    "bland_food": ["bland", "flavorless", "no flavor", "tasteless", "under-seasoned", "needed more seasoning"],
+    "overcooked_food": ["overcooked", "over cooked", "dried out", "burnt", "burned", "too dry"],
+    "small_portions": ["small portion", "tiny portion", "portion size", "not enough food", "skimpy"],
+    "high_prices_or_value": [
+        "overpriced", "too expensive", "not worth the price", "not worth it", "pricey for",
+        "expensive for what", "wasn't worth",
+    ],
+    "long_takeout_wait": [
+        "takeout took forever", "pickup took forever", "took forever for pickup",
+        "order wasn't ready", "pickup wasn't ready",
+    ],
+    "reservation_or_seating_issue": [
+        "reservation", "reserved a table", "seated us", "wouldn't seat us", "lost our reservation",
+        "no table ready", "made us wait for a table",
+    ],
+    "cleanliness": [
+        "dirty table", "sticky table", "dirty floor", "dirty bathroom", "dirty restroom",
+        "not clean", "looked dirty", "grimy", "sticky floor",
+    ],
+    "billing_or_double_charge": [
+        "double charged", "charged twice", "overcharged", "wrong total", "billing error",
+        "charged the wrong", "bill was wrong", "incorrect charge",
+    ],
+    "delivery_problem": [
+        "delivery was late", "late delivery", "delivery driver", "arrived cold via delivery",
+        "never arrived", "delivery order", "doordash", "uber eats", "grubhub",
+    ],
+    "disputed_review": [
+        "never went there", "never even went there", "never ate there", "wrong location",
+        "not even the right restaurant", "this isn't us", "must be thinking of", "never been here",
+    ],
+}
+_COMPLAINT_PATTERNS = {category: _word_boundary_re(keywords) for category, keywords in _COMPLAINT_CATEGORIES.items()}
+
+_COMPLAINT_CATEGORY_GUIDANCE = {
+    "slow_service": "The complaint is about slow service or a long wait. Acknowledge the wait specifically without over-apologizing, arguing, or promising a refund or compensation.",
+    "rude_staff": "The complaint is about a staff member's behavior. Protect both the guest and the employee until the facts are known -- do not write that the employee \"would never do that,\" but also do not automatically agree the staff member's behavior was unacceptable or accuse them by name.",
+    "wrong_order": "The complaint is about receiving the wrong order or dish. Acknowledge the mistake plainly without blaming a specific employee or the guest.",
+    "missing_items": "The complaint is about missing item(s) from an order. Acknowledge it plainly without blaming a specific employee or promising a refund.",
+    "cold_food": "The complaint is about food arriving cold. Acknowledge the specific issue without debating it or claiming it doesn't usually happen.",
+    "poor_food_quality": "The complaint is about food quality. Acknowledge without debating personal taste or claiming \"most guests love this dish\" -- that reads as argumentative.",
+    "bland_food": "The complaint is that the food was bland or under-seasoned. Acknowledge without debating personal taste.",
+    "overcooked_food": "The complaint is that the food was overcooked or dried out. Acknowledge the specific issue without debating it.",
+    "small_portions": "The complaint is about portion size. Acknowledge briefly without debating it or explaining ingredient costs.",
+    "high_prices_or_value": "The complaint is about price or value. Do not argue about pricing, justify the price, or explain ingredient/food costs -- acknowledge briefly and keep it concise.",
+    "long_takeout_wait": "The complaint is about a long takeout or pickup wait. Acknowledge the specific issue without over-apologizing or promising compensation.",
+    "reservation_or_seating_issue": "The complaint is about a reservation or seating issue. Acknowledge it plainly without blaming a specific host or the guest.",
+    "cleanliness": "The complaint is about cleanliness. You may note that the restaurant maintains cleanliness standards while still acknowledging the guest's experience and willingness to look into it -- do not claim the restaurant is \"always clean\" in a way that dismisses the complaint as false.",
+    "billing_or_double_charge": "The complaint is about a billing or charge issue. Do not discuss specific card or payment details publicly, and do not admit an incorrect charge before it has been verified -- invite the guest to reach out so the charge can be looked into.",
+    "delivery_problem": "The complaint is about a delivery issue. Acknowledge the specific problem without blaming the delivery driver, platform, or the guest, and without promising a refund.",
+    "disputed_review": "This review may not match the restaurant's own records. Do not call the reviewer a liar, dishonest, or fraudulent -- acknowledge the discrepancy calmly and invite them to reach out with visit details.",
+}
+
+
+def classify_complaint_categories(text: str) -> list[str]:
+    """Python mirror of complaintCategoryGuide.js's classifyComplaintCategories()."""
+    text = text or ""
+    if not text.strip():
+        return []
+    return [category for category, pattern in _COMPLAINT_PATTERNS.items() if pattern.search(text)]
+
+
 def enforce_response_policy(draft_text: str, response_type: str) -> str:
     """The Phase 3 hard safety guard: deterministic, independent of the LLM.
     For any response_type other than 'serious_escalation', strips any
@@ -347,7 +529,7 @@ def enforce_response_policy(draft_text: str, response_type: str) -> str:
         if not any(p.search(s) for p in _FORBIDDEN_RECOVERY_PATTERNS)
     ]
     cleaned = " ".join(kept).strip()
-    return cleaned if cleaned else draft_text.split("—")[0].strip()  # never return empty; fall back to the pre-sign-off text
+    return cleaned if cleaned else draft_text.strip()  # never return empty; fall back to the whole draft
 
 
 def generate_response_draft(review: dict, restaurant_name: str) -> str | None:
@@ -369,15 +551,15 @@ def generate_response_draft(review: dict, restaurant_name: str) -> str | None:
 
     length_by_type = {
         "positive":               "1-2 sentences",
-        "positive_with_feedback": "2-3 sentences",
-        "mixed":                  "2-3 sentences",
-        "negative":               "2-3 sentences",
-        "serious_escalation":     "3-4 sentences",
+        "positive_with_feedback": "1-3 sentences",
+        "mixed":                  "1-3 sentences",
+        "negative":               "1-3 sentences",
+        "serious_escalation":     "2-4 sentences",
     }
     length = length_by_type[response_type]
 
     contact = (
-        f" At the end, before the sign-off, invite them to reach out: "
+        f" At the end, invite them to reach out: "
         f"'Please contact us at {_CONTACT_EMAIL} so we can make this right.'"
         if serious else ""
     )
@@ -387,21 +569,62 @@ def generate_response_draft(review: dict, restaurant_name: str) -> str | None:
         "that language is reserved for serious unresolved incidents only, which this is not."
     )
 
+    # Review Response Playbook v2, PART 1/PART 2: no automatic signature of
+    # any kind -- see responseStyleProfile.js's signatureEnabled field for
+    # the JS-side equivalent switch (default off). ai_engine.py has no
+    # per-tenant style-profile system of its own, so this is hardcoded off
+    # for now, matching PART 1's explicit instruction ("For now: NO
+    # AUTOMATIC SIGNATURE").
+    no_signoff_note = (
+        " Do not add a signature, name, or sign-off of any kind. Do not end with a dash and a "
+        "name, '— Restaurant Team', 'Sincerely,', 'Best,', 'Regards,', or 'Warmly,' -- these are "
+        "Google review replies, not letters. Simply end the response after its final sentence."
+    )
+
+    # PART 26: for a serious escalation, layer in the same category-specific
+    # guidance the JS on-demand path uses (reviewRiskClassifier.js's
+    # CATEGORY_GUIDANCE) -- acknowledge, express concern, state standards
+    # when useful, never admit unverified causation, never attack the
+    # reviewer, invite follow-up. For an ordinary negative/mixed review,
+    # layer in the matching complaint-category guidance instead (PARTS 7-10,
+    # 17-18) when a specific operational category was detected.
+    category_guidance = ""
+    if serious:
+        risk = classify_review_risk(text)
+        notes = [_CATEGORY_GUIDANCE[c] for c in risk["categories"] if c in _CATEGORY_GUIDANCE]
+        if risk["is_active_emergency"]:
+            notes.append(
+                "The review describes what sounds like an ACTIVE or severe medical reaction -- include "
+                "this exact guidance once: \"If you're currently experiencing difficulty breathing or "
+                "another severe reaction, please seek emergency medical care immediately.\""
+            )
+        if notes:
+            category_guidance = " " + " ".join(notes)
+    elif response_type in ("negative", "mixed"):
+        notes = [_COMPLAINT_CATEGORY_GUIDANCE[c] for c in classify_complaint_categories(text) if c in _COMPLAINT_CATEGORY_GUIDANCE]
+        if notes:
+            category_guidance = " " + " ".join(notes)
+
     if not text:
         prompt = (
             f"Write a {length} response from the owner of {restaurant_name} to a {stars}-star "
             f"Google review with no text from {reviewer}. Tone: {tone}. "
-            f"Do not mention any other restaurant or chain. No emojis. "
-            f"Sign off with '— The {restaurant_name} Team'."
+            f"Do not mention any other restaurant or chain. No emojis."
+            f"{no_signoff_note}"
         )
     else:
         prompt = (
             f"You are the manager of {restaurant_name}, a Mexican restaurant.\n\n"
-            f"Write a professional, genuine {length} response to this {stars}-star Google review. "
-            f"Tone: {tone}. Address {reviewer} by first name. "
+            f"Write a professional, genuine {length} response to this {stars}-star Google review, "
+            f"warm and conversational, never robotic, corporate, or obviously AI-generated. "
+            f"Vary how you open the response based on what this guest actually said -- never default to "
+            f"'Thank you for your review' or begin every response with 'Thank you for...'. "
+            f"Tone: {tone}. You may use {reviewer}'s first name occasionally if it feels natural, but do "
+            f"not force it into every response and never use a letter-style salutation like 'Dear {reviewer},'. "
             f"Respond only on behalf of {restaurant_name} — do not reference or name any other restaurant, brand, or chain. "
-            f"Do not offer discounts or freebies. No emojis.{contact}{no_recovery_note} "
-            f"Sign off with '— The {restaurant_name} Team'.\n\n"
+            f"Do not unnecessarily repeat '{restaurant_name}' in the reply itself. "
+            f"Do not offer discounts or freebies. No emojis.{contact}{no_recovery_note}{category_guidance}"
+            f"{no_signoff_note}\n\n"
             f"Review: {text[:400]}\n\nWrite the response now:"
         )
 

@@ -20,17 +20,35 @@ export const DEFAULT_STYLE_PROFILE = Object.freeze({
   // (an individual manager signing personally). Kept false by default,
   // matching the existing "— The {location} Team" sign-off exactly.
   managerSignsResponses: false,
+  // Review Response Playbook v2, PART 1/PART 25: public Google review
+  // replies must NOT carry an automatic signature by default -- a reply
+  // ending "— The {location} Team" reads as an obvious AI/template
+  // artifact, not something a real manager would type under a review.
+  // This flag is the one on/off switch: false means buildSignOff() below
+  // returns '' (the response simply ends after its final sentence, per
+  // PART 2 -- no dash/name/"Sincerely,"-style closing either). Kept here,
+  // not hardcoded in rewriteEngine.js, so a future tenant-level settings
+  // UI has exactly one field to flip once a tenant explicitly wants a
+  // signature back -- no prompt-building rewrite required for that.
+  signatureEnabled: false,
   signOff: '— The {location} Team',
   preferredLanguage: 'en',
   // Phrases the model should avoid unless the specific situation genuinely
-  // calls for very similar wording (PART 2 of this feature's spec).
+  // calls for very similar wording (PART 4 of this feature's spec) --
+  // generic corporate/AI-sounding formulations, not concepts that can
+  // never be expressed at all.
   phrasesToAvoid: [
+    'Thank you for your valuable feedback.',
+    'We sincerely apologize for any inconvenience.',
     'We sincerely apologize for any inconvenience caused.',
-    'We value your feedback.',
     'Your feedback is important to us.',
+    'We value your feedback.',
     'We strive to provide excellent service.',
-    'Please be assured',
     'We deeply regret',
+    'Please be assured',
+    'We appreciate you taking the time to share your experience.',
+    'We are committed to providing the highest level of service.',
+    'We take all feedback very seriously.',
   ],
 })
 
@@ -42,7 +60,10 @@ export function resolveStyleProfile(overrides = {}) {
   return { ...DEFAULT_STYLE_PROFILE, ...overrides }
 }
 
+// Returns '' (no sign-off at all) unless the style profile explicitly
+// opts in via signatureEnabled -- see that field's own comment above.
 export function buildSignOff(styleProfile, locationName) {
+  if (!styleProfile.signatureEnabled) return ''
   return styleProfile.signOff.replace('{location}', locationName)
 }
 
