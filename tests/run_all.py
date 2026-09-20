@@ -51,6 +51,7 @@ TESTS = [
     "test_reconcile_gbp_replies.py",
     "test_gbp_reply_bridge_reconcile.py",
     "test_prune_validation_flags.py",
+    "test_dedupe_review_revisions.py",
     "test_critical_alert_check.py",
     "test_nightly_digest.py",
     "test_negative_review_notifications.py",
