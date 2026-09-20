@@ -249,3 +249,105 @@ def is_tenant_onboarded(tenant_id: str) -> bool:
     if tenant_id in _TENANT_REVIEW_DB_REGISTRY:
         return True
     return _resolve_provisioned_path(tenant_id, "reviewDbPath") is not None
+
+
+# ---------------------------------------------------------------------------
+# All-Tenant Rollout -- legacy tenant_config bootstrap.
+# ---------------------------------------------------------------------------
+# Los Tres Amigos (and any future tenant onboarded the SAME way -- a
+# reviewed source-code registry edit, never self-service) predates the
+# Redis-backed tenant_config:v1 system entirely and, BY DESIGN, has no
+# record there: every reader of this tenant's data/credentials/
+# authorization (this module's own resolve_review_db_path()/
+# resolve_export_dir(), tenant_keys.py's static credential-migration maps,
+# and Node's mirrors -- credentialStore.js, tenantDualRead.js,
+# reviewDataPaths.js, tenants.js's BOOTSTRAP location-catalog mode) checks
+# ITS OWN static registry FIRST and returns before ever consulting
+# tenant_config_store -- see each one's own header comment. Confirmed by
+# direct audit (Review Media Feature all-tenant rollout, Phase 1): creating
+# a tenant_config record for a tenant in THIS static registry changes
+# NOTHING about any of those behaviors, because none of them will ever read
+# it. dashboard/api/_lib/tenantCreation.js's createNewTenant() separately,
+# deliberately refuses to create a *new tenant identity* (a fresh owner
+# user + tenant_config together) for Los Tres Amigos -- a DIFFERENT
+# operation than this one, which never touches any user/owner/identity
+# record at all, only ever writes the bare tenant_config shape.
+#
+# The ONLY thing a bootstrapped record is for: making a static-registry
+# tenant visible to tenant_config_store.list_tenant_ids() (an HKEYS scan),
+# so the SAME activate_media_capture() every self-service tenant uses can
+# activate prospective review-media capture for it too -- see
+# activate_review_media_rollout.py. activate_media_capture() itself is
+# UNCHANGED and still refuses to create anyone's first record; this is a
+# separate, narrowly-scoped, explicitly-named operation with its own
+# static-registry proof requirement.
+
+class NotInStaticRegistryError(ValueError):
+    """Raised by bootstrap_legacy_tenant_config() for any tenant_id not
+    present in _TENANT_REVIEW_DB_REGISTRY -- this operation never creates a
+    tenant_config record for an arbitrary or self-service tenant_id, only
+    for one already explicitly, reviewedly onboarded via a source-code
+    registry entry."""
+
+
+def list_static_registry_tenant_ids() -> list[str]:
+    """Every tenant_id explicitly onboarded via a reviewed source-code
+    registry edit (never self-service) -- today, exactly Los Tres Amigos.
+    Used by activate_review_media_rollout.py to compute the full,
+    deduplicated tenant union (this registry UNION
+    tenant_config_store.list_tenant_ids()) rather than relying on either
+    source alone."""
+    return list(_TENANT_REVIEW_DB_REGISTRY.keys())
+
+
+def bootstrap_legacy_tenant_config(tenant_id: str) -> dict:
+    """Creates tenant_config_store's bare tenant_config:v1 record for a
+    static-registry tenant that has never had one -- NEVER for any other
+    tenant_id (raises NotInStaticRegistryError), NEVER overwriting an
+    existing record (returns it unchanged if one already exists, before
+    ever attempting a write), and NEVER inventing provisioning/
+    entitlement/billing/OAuth/media-activation state -- every field this
+    function's patch does not explicitly set keeps
+    upsert_tenant_config()'s own ordinary, already-tested defaults (empty
+    approvedLocations, provisioning.status='none', mediaCapture inactive,
+    etc.), because none of those fields are ever consulted for a
+    BOOTSTRAP/static-registry tenant by anything in this codebase (see
+    this section's own header comment) -- they are simply harmless,
+    unused defaults, exactly like a legitimate self-service tenant that
+    has not yet been provisioned.
+
+    Only two fields are explicitly set, both reflecting Los Tres Amigos's
+    OWN REAL, already-true state (never invented): status='active' (this
+    tenant has always been genuinely, permanently operational -- there is
+    no other status a static-registry tenant could ever legitimately
+    have) and storageMode='LEGACY_REPO' (its own real, established
+    storage mode -- see this module's own resolve_review_db_path()).
+
+    Atomic create-if-absent: writes with expected_version=0, which
+    tenant_config_store's own CAS script only accepts for a genuinely
+    nonexistent record (a real record's configVersion is always >= 1
+    after its first write). If another process creates the record
+    concurrently (a ConfigVersionConflictError), this re-reads and
+    returns whatever now exists rather than retrying the write --
+    never a competing, overwriting create.
+
+    Safe to call repeatedly (idempotent): a second call for an
+    already-bootstrapped tenant simply returns the existing record
+    unchanged."""
+    if tenant_id not in _TENANT_REVIEW_DB_REGISTRY:
+        raise NotInStaticRegistryError(
+            f"bootstrap_legacy_tenant_config: {tenant_id!r} is not in the static legacy tenant registry -- "
+            f"refusing to create a tenant_config record for it"
+        )
+    existing = tenant_config_store.get_tenant_config(tenant_id)
+    if existing is not None:
+        return existing
+    try:
+        return tenant_config_store.upsert_tenant_config(
+            tenant_id, {"status": "active", "storageMode": "LEGACY_REPO"}, expected_version=0,
+        )
+    except tenant_config_store.ConfigVersionConflictError:
+        current = tenant_config_store.get_tenant_config(tenant_id)
+        if current is None:
+            raise
+        return current
