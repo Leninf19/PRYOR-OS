@@ -550,6 +550,23 @@ def initial_sync(tenant_id: str) -> dict:
                 "reviewCount": review_count, "locationCount": len(locations_by_id),
                 "lastError": None,
             },
+            # Review Media Feature -- All-Tenant Rollout: every tenant that
+            # reaches genuine, successful operational status (this exact
+            # write, and ONLY this write -- see this module's own header
+            # for why 'active' is otherwise never written anywhere but
+            # here) is automatically enrolled for prospective review-media
+            # capture at that same moment, computed via the ONE shared,
+            # server-side, preserve-if-already-set timestamp helper this
+            # tenant-config module also uses for the standalone admin
+            # rollout path (see its own docstring for the full contract --
+            # never duplicated, never a caller-supplied or backdated
+            # value). `config` here is this attempt's ORIGINAL read
+            # (line ~400, never reassigned), so a retried attempt correctly
+            # preserves whatever mediaCapture already held rather than
+            # resetting it, and a tenant that never reaches this success
+            # branch (any failure path below writes 'initial_sync_failed'
+            # instead) never has mediaCapture touched by this code at all.
+            "mediaCapture": tenant_config_store.compute_media_capture_activation_patch(config.get("mediaCapture")),
         }, expected_version=expected_version)
     except tenant_config_store.ConfigVersionConflictError as e:
         # The Blob uploads above (database AND artifact generation) are

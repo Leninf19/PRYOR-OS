@@ -1,0 +1,55 @@
+name: Rollout - Activate Review Media (All Tenants)
+
+# All-Tenant Rollout: runs activate_review_media_rollout.py, the smallest
+# safe administrative command to activate prospective review-media
+# capture for every EXISTING, legitimate, genuinely-active Production
+# tenant, through the SAME hardened, CAS-protected
+# tenant_config_store.activate_media_capture() function -- never a direct
+# Redis write.
+#
+# SAFE BY DEFAULT: the `apply` input defaults to false, which runs the
+# script WITHOUT --apply -- a pure dry run, zero writes. Only an explicit
+# apply=true dispatch passes --apply and performs real writes. Every
+# activation timestamp is computed server-side, inside the script, at
+# write time -- this workflow has no input through which a timestamp
+# could be supplied or backdated.
+#
+# This workflow NEVER calls Google, never triggers or dispatches a review
+# sync, never touches a media URL, never modifies reviews.db or any
+# exported artifact, and never touches billing/OAuth/reply/entitlement
+# settings -- activate_review_media_rollout.py's own script-level
+# guarantees (see its own header) are the enforcement point; this
+# workflow only supplies the two Redis secrets that script's tenant-config
+# reads/writes require.
+#
+# workflow_dispatch only -- no schedule, no push trigger.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'true = write activations for real. false (default) = dry run, zero writes.'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+
+jobs:
+  rollout:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Run review-media rollout
+        run: >
+          python activate_review_media_rollout.py
+          ${{ inputs.apply == 'true' && '--apply' || '' }}
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}

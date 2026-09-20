@@ -38,6 +38,7 @@ TESTS = [
     "test_tenant_config_store.py",
     "test_tenant_config_cross_language_consistency.py",
     "test_tenant_config_media_capture.py",
+    "test_activate_review_media_rollout.py",
     "test_tenant_blob_keys_cross_language_consistency.py",
     "test_tenant_blob_store.py",
     "test_provision_tenant.py",

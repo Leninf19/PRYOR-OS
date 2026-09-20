@@ -449,14 +449,70 @@ def activate_media_capture(tenant_id: str, expected_version: int) -> dict:
     if config is None:
         raise ValueError(f"activate_media_capture: tenant {tenant_id!r} has no tenant_config record yet")
 
-    existing_media_capture = config.get("mediaCapture") or {}
+    patch = compute_media_capture_activation_patch(config.get("mediaCapture"))
+    return upsert_tenant_config(tenant_id, {"mediaCapture": patch}, expected_version=expected_version)
+
+
+def compute_media_capture_activation_patch(existing_media_capture: dict | None) -> dict:
+    """All-Tenant Rollout: the ONE place that decides what mediaCapture
+    value an activation write should use -- a pure function, no I/O, no
+    Redis access. Both activate_media_capture() (above, for an EXISTING
+    tenant via the standalone CAS-protected admin path) and
+    initial_sync.py's own final success CAS write (for a BRAND-NEW tenant's
+    automatic activation at the moment it first becomes genuinely
+    operational) call this exact function, so the "preserve an
+    already-valid timestamp, otherwise compute a fresh server-side one"
+    logic is never duplicated or allowed to drift between the two callers.
+
+    Given the tenant's CURRENT mediaCapture sub-object (or None, for a
+    tenant with no record/field at all -- the common case for a brand-new
+    tenant's very first activation), returns the {'status': 'active',
+    'startedAt': ...} patch to write:
+      - If already status='active' with a genuinely valid startedAt, that
+        exact value is returned UNCHANGED -- calling this again (a retry,
+        a rerun of the admin rollout, a second initial_sync attempt after
+        a transient earlier failure) can never move an already-set
+        activation instant earlier or later.
+      - Otherwise, startedAt is computed HERE, from the server's own UTC
+        clock (_now_iso()) -- there is no parameter through which any
+        caller could supply or backdate a timestamp."""
+    existing_media_capture = existing_media_capture or {}
     existing_started_at = existing_media_capture.get("startedAt")
     if existing_media_capture.get("status") == "active" and _is_valid_iso_utc_timestamp(existing_started_at):
         started_at = existing_started_at  # preserved, never reset or backdated
     else:
         started_at = _now_iso()  # server-computed, never caller-supplied
+    return {"status": "active", "startedAt": started_at}
 
-    return upsert_tenant_config(
-        tenant_id, {"mediaCapture": {"status": "active", "startedAt": started_at}},
-        expected_version=expected_version,
-    )
+
+def list_tenant_ids() -> list[str]:
+    """All-Tenant Rollout: the ONE authoritative enumeration of every
+    tenant that has a record in tenant_config:v1 -- the SAME Redis hash
+    every read/write in this module already operates on (HGET/HSET/EVAL
+    against TENANT_CONFIG_KEY), just read via HKEYS instead of a per-tenant
+    HGET. This is a pure, read-only Redis call -- it can never write, and
+    it does not itself judge whether a discovered key is a "legitimate"
+    tenant (a valid tenant_id shape, a genuinely active/operational
+    status, etc.) -- callers (e.g. an admin rollout script) MUST apply
+    tenant_keys.is_valid_tenant_id() and their own status checks to
+    whatever this returns before treating an entry as eligible for any
+    action. Returns field names in whatever order Redis provides them --
+    never assumed to be creation order or otherwise meaningful -- so
+    callers that need a stable order must sort the result themselves.
+
+    Raises TenantConfigStoreUnavailableError on a genuine store outage,
+    exactly like every other read in this module -- never silently
+    returns an empty list for an outage, which a caller could otherwise
+    mistake for "there are genuinely zero tenants."""
+    config = _upstash_config()
+    if config is None:
+        raise TenantConfigStoreUnavailableError("tenant config store is not configured (missing UPSTASH_REDIS_REST_URL/TOKEN)")
+    url, token = config
+    try:
+        body = _upstash_generic_command(url, token, ["HKEYS", TENANT_CONFIG_KEY])
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        raise TenantConfigStoreUnavailableError(f"tenant config store unreachable: {e}") from e
+    result = body.get("result")
+    if not isinstance(result, list):
+        raise TenantConfigStoreUnavailableError(f"tenant config store returned a malformed HKEYS result: {result!r}")
+    return result

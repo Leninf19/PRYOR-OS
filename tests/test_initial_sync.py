@@ -507,6 +507,12 @@ class InitialSyncTestCase(unittest.TestCase):
         self.assertIsNotNone(config["initialSync"]["completedAt"])
         self.assertEqual(config["provisioning"]["reviewDbEtag"], outcome["reviewDbEtag"])
         self.assertEqual(config["provisioning"]["artifactGeneration"], outcome["artifactGeneration"])
+        # All-Tenant Rollout: a brand-new tenant's first successful Initial
+        # Sync automatically activates prospective review-media capture at
+        # that same moment -- server-computed timestamp, no caller input.
+        self.assertEqual(config["mediaCapture"]["status"], "active")
+        self.assertIsNotNone(config["mediaCapture"]["startedAt"])
+        self.assertTrue(tenant_config_store._is_valid_iso_utc_timestamp(config["mediaCapture"]["startedAt"]))
 
         db_path = self._download_db(tenant_blob_keys.review_db_blob_key(TENANT_A))
         self.assertEqual(self._review_count(db_path), 2)
@@ -530,6 +536,42 @@ class InitialSyncTestCase(unittest.TestCase):
         self.assertEqual(len(by_location), 2)
         for row in by_location:
             self.assertEqual(row["locationId"], 1, "generated artifacts must refer to the stable tenant-local location id")
+
+    def test_failed_initial_sync_never_activates_media_capture(self):
+        self._provision(TENANT_A, [("accounts/1/locations/1", "A", "")])
+        with mock.patch.object(google_api, "is_configured", return_value=True), \
+             mock.patch.object(google_api, "list_accounts", side_effect=google_api.GBPRateLimitError("rate limited", status=429)):
+            with self.assertRaises(isync.GoogleSyncFailedError):
+                isync.initial_sync(TENANT_A)
+        config = self.fake_store.get(TENANT_A)
+        self.assertEqual(config["status"], "initial_sync_failed")
+        self.assertNotIn("mediaCapture", config, (
+            "a tenant that never reaches genuine successful provisioning must never have mediaCapture "
+            "touched at all -- it must remain exactly whatever it was before this failed attempt"
+        ))
+
+    def test_initial_sync_preserves_an_already_active_media_capture_timestamp(self):
+        self._provision(TENANT_A, [("accounts/1/locations/1", "Casa Test", "")])
+        # Simulates a tenant whose mediaCapture was already, genuinely
+        # active (e.g. a hypothetical prior partial/recovered state) before
+        # this attempt's own final write -- the shared
+        # compute_media_capture_activation_patch() helper must preserve
+        # this exact timestamp, never reset it to "now."
+        preexisting_started_at = "2026-01-01T00:00:00+00:00"
+        self.fake_store.upsert(TENANT_A, {"mediaCapture": {"status": "active", "startedAt": preexisting_started_at}})
+
+        locations = [_gbp_location("accounts/1/locations/1", "Casa Test")]
+        reviews = {"accounts/1/locations/1": [_gbp_review("r1", "Great", "FIVE")]}
+        patches = self._mock_google(_account(), locations, reviews)
+        with patches[0], patches[1], patches[2], patches[3]:
+            outcome = isync.initial_sync(TENANT_A)
+        self.assertEqual(outcome["outcome"], "active")
+
+        config = self.fake_store.get(TENANT_A)
+        self.assertEqual(config["mediaCapture"]["status"], "active")
+        self.assertEqual(config["mediaCapture"]["startedAt"], preexisting_started_at, (
+            "an already-active mediaCapture timestamp must survive Initial Sync's own final write untouched"
+        ))
 
     def test_artifacts_never_contain_lta_brand_or_location_names(self):
         self._provision(TENANT_A, [("accounts/1/locations/1", "Tenant A's Own Restaurant", "")])
