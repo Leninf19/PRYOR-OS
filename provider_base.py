@@ -110,6 +110,17 @@ class ProviderReview:
     gbp_update_time: Optional[str] = None
     gbp_reply_update_time: Optional[str] = None
     gbp_language_code: Optional[str] = None
+    # Google Reply Moderation State fix (full-sync gap): one of
+    # reply_moderation_state.py's resolved outcomes (APPROVED/REJECTED/
+    # PENDING_APPROVAL) when the provider's payload carried an explicit,
+    # recognized reviewReplyState -- None when missing/unspecified/unknown
+    # (never guessed). gbp_reply_policy_violation is the sanitized
+    # {reasonCodes, summary} dict (see normalize_policy_violation()) when
+    # REJECTED, else None. Both optional so a Provider that has no concept
+    # of moderation state (the scraper, the mock provider) never has to
+    # supply them.
+    gbp_reply_moderation_state: Optional[str] = None
+    gbp_reply_policy_violation: Optional[dict] = None
 
     def as_row(self) -> dict:
         return {
@@ -123,6 +134,8 @@ class ProviderReview:
             "gbp_update_time": self.gbp_update_time,
             "gbp_reply_update_time": self.gbp_reply_update_time,
             "gbp_language_code": self.gbp_language_code,
+            "gbp_reply_moderation_state": self.gbp_reply_moderation_state,
+            "gbp_reply_policy_violation": self.gbp_reply_policy_violation,
         }
 
 

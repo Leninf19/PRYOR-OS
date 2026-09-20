@@ -278,8 +278,12 @@ async function testSuccessResponseShapeIsExactlySuccessTrue() {
     }
   )
   assert(res.statusCode === 200, `success must be HTTP 200, got ${res.statusCode}`)
-  assert(Object.keys(res.body).length === 1 && res.body.success === true,
-    `success body must be exactly { success: true }, got ${JSON.stringify(res.body)}`)
+  // Google Reply Moderation State fix: the success body now also carries
+  // `moderationState` (here 'sent_to_google', since the mocked Google PUT
+  // returned an empty body -- nothing conclusive yet, never an assumed
+  // approval). `success: true` alone is no longer the whole contract.
+  assert(Object.keys(res.body).length === 2 && res.body.success === true && res.body.moderationState === 'sent_to_google',
+    `success body must be exactly { success: true, moderationState: 'sent_to_google' }, got ${JSON.stringify(res.body)}`)
 }
 
 async function testEveryFailureResponseHasErrorAndMessageStrings() {

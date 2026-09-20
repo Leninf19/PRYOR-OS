@@ -116,8 +116,24 @@ function parseRecord(value) {
 // is the actual restaurant reply (legitimately needed so the frontend can
 // keep showing it before Google's own copy has synced back) -- callers
 // (Part 12) are responsible for never logging it.
+//
+// Google Reply Moderation State fix: `moderationState`/`reviewReplyState`/
+// `policyViolation`/`googleUpdateTime`/`replyTextMatches`/
+// `moderationCheckedAt` are new, OPTIONAL fields -- every caller today
+// ([action].js's publish()) always supplies them, but a record written by
+// code from before this fix (or a test that doesn't) simply omits them.
+// resolveBridgeModerationState() (replyModerationState.js) is the one place
+// that reads this field back and is REQUIRED to treat a missing
+// `moderationState` as ModerationState.SENT_TO_GOOGLE, never as approved --
+// that is what makes a pre-existing bridge record safe to keep reading
+// after this deploy without a migration. This module intentionally stores
+// whatever it's given without interpreting it -- interpretation lives only
+// in replyModerationState.js, so there is exactly one place that decides
+// what a record's fields mean.
 export async function writePublishBridge(tenantId, localReviewId, {
   gbpReviewName, responseText, locationName, reviewerName, reviewDate,
+  moderationState, reviewReplyState, policyViolation, googleUpdateTime,
+  replyTextMatches, moderationCheckedAt,
 }) {
   assertKnownTenantId(tenantId, 'writePublishBridge')
   const client = getClient()
@@ -133,6 +149,12 @@ export async function writePublishBridge(tenantId, localReviewId, {
     locationName: locationName ?? null,
     reviewerName: reviewerName ?? null,
     reviewDate: reviewDate ?? null,
+    moderationState: moderationState ?? null,
+    reviewReplyState: reviewReplyState ?? null,
+    policyViolation: policyViolation ?? null,
+    googleUpdateTime: googleUpdateTime ?? null,
+    replyTextMatches: replyTextMatches ?? null,
+    moderationCheckedAt: moderationCheckedAt ?? null,
   }
 
   try {

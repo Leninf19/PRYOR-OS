@@ -64,6 +64,22 @@ def write_json(rel_path: str, payload) -> None:
 
 
 def review_to_dict(r, loc) -> dict:
+    # Google Reply Moderation State fix (data-flow closure): exposes the
+    # two durable moderation columns to the frontend so a review's known
+    # REJECTED/PENDING/APPROVED outcome survives even after the ephemeral
+    # Redis publish-bridge record that originally carried it has expired or
+    # been cleared -- see gbp_reply_bridge_reconcile.py's own durable-persist
+    # step. gbp_reply_policy_violation is stored in reviews.db as a JSON
+    # string (TEXT column); parsed back into an object here so the frontend
+    # never has to double-decode it. Defensive against malformed/legacy
+    # content exactly like every other optional column below -- never lets
+    # a bad value break the whole export.
+    policy_violation_raw = r["gbp_reply_policy_violation"] if "gbp_reply_policy_violation" in r.keys() else None
+    try:
+        gbp_reply_policy_violation = json.loads(policy_violation_raw) if policy_violation_raw else None
+    except (TypeError, ValueError):
+        gbp_reply_policy_violation = None
+
     return {
         # Canonical, stable numeric location identifier -- the same
         # locations.id (dashboard/reviews.db) that account locationIds will
@@ -82,6 +98,8 @@ def review_to_dict(r, loc) -> dict:
         "ai_sentiment_reason": r["ai_sentiment_reason"] if "ai_sentiment_reason" in r.keys() else None,
         "ai_priority": r["ai_priority"] if "ai_priority" in r.keys() else None,
         "gbp_review_name": r["gbp_review_name"] if "gbp_review_name" in r.keys() else None,
+        "gbp_reply_moderation_state": r["gbp_reply_moderation_state"] if "gbp_reply_moderation_state" in r.keys() else None,
+        "gbp_reply_policy_violation": gbp_reply_policy_violation,
     }
 
 
