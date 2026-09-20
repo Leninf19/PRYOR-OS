@@ -738,6 +738,24 @@ def get_location_by_gbp_name(conn, gbp_location_name: str):
     ).fetchone()
 
 
+def _normalize_text_field(value) -> str | None:
+    """Strips incidental whitespace and normalizes an empty/whitespace-only
+    value to None -- a text field's IDENTITY for change-detection and
+    storage purposes must be its logical content only, never affected by a
+    provider's incidental leading/trailing whitespace. See upsert_review()'s
+    review_revisions growth-bug fix (recovery audit, 2026-09-19) for why this
+    matters: comparing an unnormalized incoming value against an
+    already-normalized stored value made a provider's unchanged-but-
+    whitespace-decorated reply text look "changed" on every single sync,
+    forever -- one spurious review_revisions row per run, per affected
+    review, confirmed via review_revisions.db against real (Google Business
+    Profile API) owner_response payloads."""
+    if not value:
+        return None
+    stripped = value.strip()
+    return stripped if stripped else None
+
+
 def upsert_review(conn, location_id: int, location_name: str, row: dict, now: str) -> str:
     """Insert a new review or update an existing one. Returns 'new', 'edited', or 'unchanged'.
 
@@ -788,8 +806,8 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (location_id, canonical_review_id(row.get("review_url", "")), key,
                  row.get("reviewer_name", ""), row.get("review_date", ""),
-                 row.get("star_rating") or None, row.get("review_text", ""),
-                 row.get("owner_response", ""), row.get("review_url", ""), now, now,
+                 row.get("star_rating") or None, _normalize_text_field(row.get("review_text")) or "",
+                 _normalize_text_field(row.get("owner_response")) or "", row.get("review_url", ""), now, now,
                  gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code),
             )
         except sqlite3.IntegrityError as e:
@@ -805,12 +823,26 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
             ) from e
         return "new"
 
+    # review_revisions growth-bug fix (recovery audit, 2026-09-19): review_text/
+    # owner_response are compared and recorded in their NORMALIZED (stripped)
+    # form -- the exact same form that ends up persisted below (final_text/
+    # final_response reuse these same values, rather than re-deriving them) --
+    # never the raw incoming provider value. Comparing a raw incoming value
+    # against `existing[field]` (which is always already-normalized once
+    # stored) meant a provider that returns the SAME reply text with
+    # incidental leading/trailing whitespace on every fetch looked "changed"
+    # on every single sync, forever. star_rating has no such whitespace
+    # concern and is compared exactly as before.
     changed_fields = []
     for field in ("review_text", "owner_response", "star_rating"):
         old_val = existing[field]
-        new_val = row.get(field) if field != "star_rating" else (row.get("star_rating") or None)
-        old_cmp = old_val if old_val not in ("", None) else None
-        new_cmp = new_val if new_val not in ("", None) else None
+        if field == "star_rating":
+            new_val = row.get("star_rating") or None
+            old_cmp = old_val
+        else:
+            new_val = _normalize_text_field(row.get(field))
+            old_cmp = _normalize_text_field(old_val)
+        new_cmp = new_val
         if old_cmp != new_cmp and new_cmp is not None:
             changed_fields.append((field, old_val, new_val))
 
@@ -832,10 +864,15 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
 
     # Preserve existing non-empty values when the source returns empty — this
     # prevents a missed CSS selector on re-scrape (or a partial API response)
-    # from clearing a response that was already captured and stored.
-    new_response = (row.get("owner_response") or "").strip()
+    # from clearing a response that was already captured and stored. Reuses
+    # _normalize_text_field() (the same normalization the comparison above
+    # just used) rather than a second, independent .strip() -- a single
+    # source of truth for "what does this field's stored value normalize
+    # to" is the actual fix for the growth bug; two normalization call sites
+    # that could ever disagree is exactly what caused it.
+    new_response = _normalize_text_field(row.get("owner_response"))
     final_response = new_response if new_response else (existing["owner_response"] or "")
-    new_text = (row.get("review_text") or "").strip()
+    new_text = _normalize_text_field(row.get("review_text"))
     final_text = new_text if new_text else (existing["review_text"] or "")
 
     conn.execute(

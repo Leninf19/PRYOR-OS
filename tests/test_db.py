@@ -683,6 +683,198 @@ def test_canonical_slug_handles_empty_slug_name():
     assert result == {7: "location-7"}, result
 
 
+# ---------------------------------------------------------------------------
+# review_revisions growth-bug regression tests (recovery audit, 2026-09-19).
+#
+# Reproduces the production incident: upsert_review()'s change-detection
+# compared the RAW incoming provider value against the ALREADY-NORMALIZED
+# (`.strip()`'d) stored value for review_text/owner_response. Since the
+# UPDATE statement runs unconditionally on every call, the stored value
+# converges to its stripped form after the first sync, while Google's
+# Business Profile API kept returning the SAME reply text with incidental
+# leading/trailing whitespace on every subsequent fetch -- a permanent
+# mismatch that inserted one spurious review_revisions row per sync, forever.
+# Confirmed against production data: 232,183 of 232,385 review_revisions rows
+# (99.9%) were `field_changed = 'owner_response'` across only 4,588 distinct
+# reviews, with sampled offending pairs differing from each other by exactly
+# one whitespace character (`old_value.strip() == new_value.strip()`).
+# ---------------------------------------------------------------------------
+
+def _revision_count(conn, review_id=None, field=None) -> int:
+    query = "SELECT COUNT(*) c FROM review_revisions WHERE 1=1"
+    params = []
+    if review_id is not None:
+        query += " AND review_id = ?"
+        params.append(review_id)
+    if field is not None:
+        query += " AND field_changed = ?"
+        params.append(field)
+    return conn.execute(query, params).fetchone()["c"]
+
+
+def _growth_row(**overrides):
+    row = {
+        "gbp_review_name": "reviews/GROWTH1",
+        "reviewer_name": "Pat Growth",
+        "review_date": "2026-09-01",
+        "star_rating": 5,
+        "review_text": "Great tacos",
+        "owner_response": "Thanks so much!",
+        "review_url": "",
+        "gbp_update_time": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_same_owner_response_synced_twice_no_extra_revision():
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-01T00:00:00Z"
+    row = _growth_row()
+    first = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row, now)
+    conn.commit()
+    assert first == "new"
+    assert _revision_count(conn) == 0, "a brand-new review must not itself produce a revision row"
+
+    second = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row, now)
+    conn.commit()
+    assert second == "unchanged", f"expected 'unchanged' for a byte-identical resync, got {second!r}"
+    assert _revision_count(conn) == 0, "re-syncing the identical response must never add a revision"
+
+
+def test_same_owner_response_synced_many_times_revision_count_stable():
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-01T00:00:00Z"
+    row = _growth_row()
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row, now)
+    conn.commit()
+
+    for _ in range(10):
+        db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row, now)
+        conn.commit()
+
+    assert _revision_count(conn, field="owner_response") == 0, (
+        "syncing the exact same owner_response 10 times must never accumulate revisions -- "
+        "this is the exact production growth bug (232,183 spurious rows)"
+    )
+
+
+def test_provider_incidental_whitespace_never_triggers_a_revision():
+    # The exact confirmed production defect: the provider returns the SAME
+    # logical reply with incidental leading/trailing whitespace that differs
+    # from the normalized form stored on a previous sync.
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-01T00:00:00Z"
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(owner_response="Thanks so much!"), now)
+    conn.commit()
+
+    for variant in ["Thanks so much!\n", " Thanks so much!", "Thanks so much!  ", "\tThanks so much!\t"]:
+        result = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(owner_response=variant), now)
+        conn.commit()
+        assert result == "unchanged", (
+            f"a whitespace-only difference must never be treated as a change, got {result!r} for {variant!r}"
+        )
+
+    assert _revision_count(conn, field="owner_response") == 0, (
+        "incidental provider whitespace must never produce a review_revisions row"
+    )
+    stored = conn.execute("SELECT owner_response FROM reviews WHERE gbp_review_name = 'reviews/GROWTH1'").fetchone()
+    assert stored["owner_response"] == "Thanks so much!", "the stored value must stay normalized, never accumulate whitespace"
+
+
+def test_none_vs_empty_equivalent_no_duplicate_revision():
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-01T00:00:00Z"
+    result = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(owner_response=""), now)
+    conn.commit()
+    assert result == "new"
+
+    # Re-sync with None instead of "" -- semantically identical absence.
+    result2 = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(owner_response=None), now)
+    conn.commit()
+    assert result2 == "unchanged"
+    assert _revision_count(conn, field="owner_response") == 0
+
+
+def test_genuine_owner_response_change_produces_exactly_one_revision():
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-01T00:00:00Z"
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(owner_response="Thanks!"), now)
+    conn.commit()
+
+    changed_row = _growth_row(owner_response="Thanks so much for visiting, we loved having you!")
+    result = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", changed_row, now)
+    conn.commit()
+    assert result == "edited"
+    assert _revision_count(conn, field="owner_response") == 1, "a genuine text change must produce exactly one revision"
+
+    # Re-syncing the NEW value repeatedly must never add further revisions.
+    for _ in range(5):
+        db.upsert_review(conn, loc_id, "Casa Tequila Testtown", changed_row, now)
+        conn.commit()
+    assert _revision_count(conn, field="owner_response") == 1, (
+        "re-syncing the already-recorded new value must never add more revisions"
+    )
+
+
+def test_owner_response_blank_incoming_preserves_existing_no_revision():
+    # This codebase's real, deliberate semantics (see upsert_review()'s own
+    # "blank-never-erases" comment): a blank/whitespace-only incoming value
+    # is treated as a missed scrape/partial API response, never a genuine
+    # removal -- the existing captured reply is preserved, and since the
+    # STORED value therefore never actually changes, no revision is recorded.
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-01T00:00:00Z"
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(owner_response="Thanks!"), now)
+    conn.commit()
+
+    result = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(owner_response=""), now)
+    conn.commit()
+    assert result == "unchanged"
+    assert _revision_count(conn, field="owner_response") == 0
+    stored = conn.execute("SELECT owner_response FROM reviews WHERE gbp_review_name = 'reviews/GROWTH1'").fetchone()
+    assert stored["owner_response"] == "Thanks!", "a blank incoming value must never erase an already-captured reply"
+
+
+def test_unrelated_field_change_does_not_create_owner_response_revision():
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-01T00:00:00Z"
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(star_rating=4), now)
+    conn.commit()
+
+    result = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(star_rating=5), now)
+    conn.commit()
+    assert result == "edited"
+    assert _revision_count(conn, field="star_rating") == 1
+    assert _revision_count(conn, field="owner_response") == 0, "changing star_rating must never create an owner_response revision"
+
+
+def test_multiple_reviews_revision_history_stays_isolated():
+    conn, loc_id = _fresh_conn()
+    now = "2026-09-01T00:00:00Z"
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(gbp_review_name="reviews/GROWTH-A", owner_response="Reply A"), now)
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", _growth_row(gbp_review_name="reviews/GROWTH-B", owner_response="Reply B"), now)
+    conn.commit()
+
+    # Genuinely change A's reply; resync B unchanged (with incidental whitespace) many times.
+    db.upsert_review(
+        conn, loc_id, "Casa Tequila Testtown",
+        _growth_row(gbp_review_name="reviews/GROWTH-A", owner_response="Reply A updated"), now,
+    )
+    conn.commit()
+    for _ in range(5):
+        db.upsert_review(
+            conn, loc_id, "Casa Tequila Testtown",
+            _growth_row(gbp_review_name="reviews/GROWTH-B", owner_response="Reply B\n"), now,
+        )
+        conn.commit()
+
+    review_a = conn.execute("SELECT id FROM reviews WHERE gbp_review_name = 'reviews/GROWTH-A'").fetchone()
+    review_b = conn.execute("SELECT id FROM reviews WHERE gbp_review_name = 'reviews/GROWTH-B'").fetchone()
+    assert _revision_count(conn, review_id=review_a["id"]) == 1, "review A must have exactly its one genuine change"
+    assert _revision_count(conn, review_id=review_b["id"]) == 0, "review B's whitespace-only resyncs must never produce revisions"
+
+
 def main():
     tests = [
         ("Case 1: historically linked row is updated, not duplicated", test_historically_linked_row_is_updated_not_duplicated),
@@ -705,6 +897,14 @@ def main():
         ("Phase 4P: canonical slugs disambiguate with stable locationId", test_canonical_slugs_disambiguate_duplicates_with_stable_location_id),
         ("Phase 4P: canonical slugs use no array position/random suffix", test_canonical_slugs_never_use_array_position_or_random_suffix),
         ("Phase 4P: canonical slug handles an empty-slug name", test_canonical_slug_handles_empty_slug_name),
+        ("growth-bug: same owner_response synced twice adds no extra revision", test_same_owner_response_synced_twice_no_extra_revision),
+        ("growth-bug: same owner_response synced 10x keeps revision count stable", test_same_owner_response_synced_many_times_revision_count_stable),
+        ("growth-bug: provider incidental whitespace never triggers a revision", test_provider_incidental_whitespace_never_triggers_a_revision),
+        ("growth-bug: None vs empty owner_response is not a duplicate revision", test_none_vs_empty_equivalent_no_duplicate_revision),
+        ("growth-bug: a genuine owner_response change produces exactly one revision", test_genuine_owner_response_change_produces_exactly_one_revision),
+        ("growth-bug: blank incoming owner_response preserves existing, no revision", test_owner_response_blank_incoming_preserves_existing_no_revision),
+        ("growth-bug: an unrelated field change never creates an owner_response revision", test_unrelated_field_change_does_not_create_owner_response_revision),
+        ("growth-bug: revision history stays isolated across multiple reviews", test_multiple_reviews_revision_history_stays_isolated),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()
