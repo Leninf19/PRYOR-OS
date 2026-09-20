@@ -55,6 +55,7 @@ TESTS = [
     "test_gbp_review_media_diagnostic.py",
     "test_media_sanitizer.py",
     "test_review_media_feature.py",
+    "test_review_media_scale.py",
     "test_prune_validation_flags.py",
     "test_dedupe_review_revisions.py",
     "test_critical_alert_check.py",

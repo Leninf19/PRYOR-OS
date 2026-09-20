@@ -444,6 +444,264 @@ def test_32_resolve_media_capture_started_at_never_writes():
     assert "activate_media_capture" not in source
 
 
+# ---------------------------------------------------------------------------
+# Pre-Integration Audit -- three-way write model (PRESERVE / REPLACE-empty /
+# REPLACE-media). These tests specifically target the bug found by direct
+# code review: an UNCONDITIONAL `gbp_review_media = ?` on every UPDATE meant
+# a review that was ONCE eligible with real stored media could have that
+# media silently ERASED to NULL by any later, merely-ineligible call --
+# including a purely transient tenant-config/Redis lookup failure. Every
+# "existing media ... preserved" test below reads the column's value BEFORE
+# and AFTER the second call and asserts byte-for-byte equality, not just
+# "still truthy."
+# ---------------------------------------------------------------------------
+
+def _media_column(conn, gbp_review_name):
+    return conn.execute("SELECT gbp_review_media FROM reviews WHERE gbp_review_name = ?", (gbp_review_name,)).fetchone()["gbp_review_media"]
+
+
+def test_pa_1_legacy_null_plus_inactive_remains_null():
+    conn, loc_id = _fresh_conn()
+    row = _base_row(gbp_create_time="2026-09-25T00:00:00Z")
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row, "2026-09-25T00:00:01Z", media_capture_started_at=None)
+    assert _stored_media(conn, row["gbp_review_name"]) is None
+
+
+def test_pa_2_legacy_null_plus_missing_config_remains_null():
+    conn, loc_id = _fresh_conn()
+    row = _base_row(gbp_create_time="2026-09-25T00:00:00Z")
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row, "2026-09-25T00:00:01Z", media_capture_started_at="")
+    assert _stored_media(conn, row["gbp_review_name"]) is None
+
+
+def test_pa_3_legacy_null_plus_invalid_config_remains_null():
+    conn, loc_id = _fresh_conn()
+    row = _base_row(gbp_create_time="2026-09-25T00:00:00Z")
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row, "2026-09-25T00:00:01Z", media_capture_started_at="garbage")
+    assert _stored_media(conn, row["gbp_review_name"]) is None
+
+
+def test_pa_4_legacy_null_plus_redis_lookup_failure_remains_null():
+    # At the db.py layer, a lookup failure is represented identically to
+    # "missing" -- media_capture_started_at=None -- since provider_sync.py
+    # collapses every non-active reason to None before ever calling
+    # upsert_review(). See test_28 for the orchestration-layer proof that
+    # a real TenantConfigStoreUnavailableError produces exactly this None.
+    conn, loc_id = _fresh_conn()
+    row = _base_row(gbp_create_time="2026-09-25T00:00:00Z")
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row, "2026-09-25T00:00:01Z", media_capture_started_at=None)
+    assert _stored_media(conn, row["gbp_review_name"]) is None
+
+
+def test_pa_5_legacy_null_plus_pre_activation_review_remains_null():
+    conn, loc_id = _fresh_conn()
+    row = _base_row(gbp_create_time="2026-08-01T00:00:00Z")
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    assert _stored_media(conn, row["gbp_review_name"]) is None
+
+
+def test_pa_6_existing_media_survives_config_lookup_failure():
+    conn, loc_id = _fresh_conn()
+    create_time = "2026-09-25T00:00:00Z"
+    row1 = _base_row(gbp_create_time=create_time, media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/real-photo"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    before = _media_column(conn, row1["gbp_review_name"])
+    assert json.loads(before)  # sanity: real media is genuinely stored
+
+    # A later sync where the tenant-config/Redis lookup failed -- represented,
+    # exactly like provider_sync.py represents it, as media_capture_started_at=None.
+    row2 = _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-26T00:00:00Z", media=None)
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row2, "2026-09-26T00:00:01Z", media_capture_started_at=None)
+    after = _media_column(conn, row1["gbp_review_name"])
+    assert after == before, (
+        "a config/Redis lookup failure must NEVER erase previously-stored eligible media -- "
+        f"before={before!r} after={after!r}"
+    )
+
+
+def test_pa_7_existing_media_survives_tenant_going_inactive():
+    conn, loc_id = _fresh_conn()
+    create_time = "2026-09-25T00:00:00Z"
+    row1 = _base_row(gbp_create_time=create_time, media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/real-photo"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    before = _media_column(conn, row1["gbp_review_name"])
+
+    row2 = _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-26T00:00:00Z", media=None)
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row2, "2026-09-26T00:00:01Z", media_capture_started_at=None)
+    after = _media_column(conn, row1["gbp_review_name"])
+    assert after == before, "media capture being (re-)reported inactive must never erase already-stored media"
+
+
+def test_pa_8_existing_media_survives_a_pre_activation_shaped_call():
+    conn, loc_id = _fresh_conn()
+    create_time = "2026-09-25T00:00:00Z"
+    row1 = _base_row(gbp_create_time=create_time, media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/real-photo"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    before = _media_column(conn, row1["gbp_review_name"])
+
+    # A subsequent call for the SAME review that this time carries no valid
+    # activation context at all (simulating a caller that hasn't resolved
+    # tenant config for this particular invocation).
+    row2 = _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-27T00:00:00Z", media=None)
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row2, "2026-09-27T00:00:01Z", media_capture_started_at="")
+    after = _media_column(conn, row1["gbp_review_name"])
+    assert after == before
+
+
+def test_pa_9_eligible_existing_media_google_removes_it_becomes_empty_array():
+    conn, loc_id = _fresh_conn()
+    create_time = "2026-09-25T00:00:00Z"
+    row1 = _base_row(gbp_create_time=create_time, media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/p1"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    assert json.loads(_media_column(conn, row1["gbp_review_name"]))
+
+    row2 = _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-26T00:00:00Z", media=[])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row2, "2026-09-26T00:00:01Z", media_capture_started_at=ACTIVE)
+    after = _media_column(conn, row1["gbp_review_name"])
+    assert after == "[]", f"an eligible review whose media Google removed must become '[]', got {after!r}"
+
+
+def test_pa_10_eligible_empty_then_new_media_becomes_array():
+    conn, loc_id = _fresh_conn()
+    create_time = "2026-09-25T00:00:00Z"
+    row1 = _base_row(gbp_create_time=create_time, media=[])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    assert _media_column(conn, row1["gbp_review_name"]) == "[]"
+
+    row2 = _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-26T00:00:00Z",
+                      media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/newly-added"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row2, "2026-09-26T00:00:01Z", media_capture_started_at=ACTIVE)
+    stored = json.loads(_media_column(conn, row1["gbp_review_name"]))
+    assert stored[0]["thumbnailUrl"] == "https://lh3.googleusercontent.com/newly-added"
+
+
+def test_pa_11_eligible_media_changed_url_replaced():
+    conn, loc_id = _fresh_conn()
+    create_time = "2026-09-25T00:00:00Z"
+    row1 = _base_row(gbp_create_time=create_time, media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/old-url"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+
+    row2 = _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-26T00:00:00Z",
+                      media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/rotated-url"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row2, "2026-09-26T00:00:01Z", media_capture_started_at=ACTIVE)
+    stored = json.loads(_media_column(conn, row1["gbp_review_name"]))
+    assert len(stored) == 1
+    assert stored[0]["thumbnailUrl"] == "https://lh3.googleusercontent.com/rotated-url"
+
+
+def test_pa_12_direct_upsert_without_activation_argument_preserves_existing():
+    conn, loc_id = _fresh_conn()
+    create_time = "2026-09-25T00:00:00Z"
+    row1 = _base_row(gbp_create_time=create_time, media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/p1"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    before = _media_column(conn, row1["gbp_review_name"])
+
+    # No media_capture_started_at kwarg AT ALL -- the classic import/repair
+    # call shape (5 positional args only).
+    row2 = _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-26T00:00:00Z", media=None)
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row2, "2026-09-26T00:00:01Z")
+    after = _media_column(conn, row1["gbp_review_name"])
+    assert after == before
+
+    # And the NULL variant: a legacy row that never had media, touched by
+    # an activation-omitting caller, must still end up NULL, not '[]'.
+    conn2, loc_id2 = _fresh_conn(prefix="test_review_media_null_")
+    row3 = _base_row(gbp_create_time=create_time, media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/irrelevant"}],
+                      gbp_review_name="accounts/1/locations/2/reviews/never-activated")
+    db.upsert_review(conn2, loc_id2, "Casa Tequila Testtown", row3, "2026-09-25T00:00:01Z")  # no kwarg at all
+    assert _media_column(conn2, row3["gbp_review_name"]) is None
+
+
+def test_pa_13_historical_malicious_media_cannot_bypass_gate_even_with_existing_media():
+    conn, loc_id = _fresh_conn()
+    create_time = "2026-09-25T00:00:00Z"
+    row1 = _base_row(gbp_create_time=create_time, media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/legit"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    before = _media_column(conn, row1["gbp_review_name"])
+
+    # A later, INELIGIBLE call (createTime now claims to be pre-activation --
+    # which can't legitimately happen for the same review, but proves the
+    # gate is driven by eligibility, not by whatever `media` merely contains)
+    # bearing an attacker-shaped payload must neither replace the existing
+    # real media NOR ever reach the sanitizer's output.
+    row2 = _base_row(gbp_create_time="2020-01-01T00:00:00Z", gbp_update_time="2026-09-26T00:00:00Z",
+                      media=[{"thumbnailUrl": "javascript:alert(1)"}, {"thumbnailUrl": "https://evil.example.com/p1"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row2, "2026-09-26T00:00:01Z", media_capture_started_at=ACTIVE)
+    after = _media_column(conn, row1["gbp_review_name"])
+    assert after == before, "an ineligible call's media payload must never replace existing eligible media, malicious or not"
+
+
+def test_pa_14_update_time_after_activation_cannot_qualify_an_old_review_with_no_existing_media():
+    conn, loc_id = _fresh_conn()
+    row1 = _base_row(gbp_create_time="2020-01-01T00:00:00Z", gbp_update_time="2026-09-26T00:00:00Z",
+                      media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/p1"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-26T00:00:01Z", media_capture_started_at=ACTIVE)
+    assert _media_column(conn, row1["gbp_review_name"]) is None
+
+
+def test_pa_15_create_time_equality_still_qualifies():
+    conn, loc_id = _fresh_conn()
+    row1 = _base_row(gbp_create_time=ACTIVE, media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/p1"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    assert json.loads(_media_column(conn, row1["gbp_review_name"]))
+
+
+def test_pa_16_no_owner_response_revision_from_any_media_transition():
+    conn, loc_id = _fresh_conn()
+    create_time = "2026-09-25T00:00:00Z"
+    row1 = _base_row(gbp_create_time=create_time, media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/p1"}])
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    review_id = conn.execute("SELECT id FROM reviews WHERE gbp_review_name = ?", (row1["gbp_review_name"],)).fetchone()["id"]
+
+    transitions = [
+        _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-26T00:00:00Z", media=[]),  # -> REPLACE_EMPTY
+        _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-27T00:00:00Z",
+                   media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/p2"}]),  # -> REPLACE_MEDIA
+    ]
+    now = "2026-09-28T00:00:01Z"
+    for i, row in enumerate(transitions):
+        db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row, f"2026-09-2{6+i}T00:00:01Z", media_capture_started_at=ACTIVE)
+    # Also a PRESERVE transition.
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown",
+                      _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-29T00:00:00Z", media=None),
+                      now, media_capture_started_at=None)
+
+    revisions = conn.execute("SELECT field_changed FROM review_revisions WHERE review_id = ?", (review_id,)).fetchall()
+    assert {r["field_changed"] for r in revisions} == set(), (
+        "no media transition (REPLACE_EMPTY, REPLACE_MEDIA, or PRESERVE) may ever create a review_revisions row"
+    )
+
+
+def test_pa_17_tenant_isolation_media_preservation():
+    conn_a, loc_a = _fresh_conn(prefix="test_pa_tenant_a_")
+    conn_b, loc_b = _fresh_conn(prefix="test_pa_tenant_b_")
+    row_a = _base_row(gbp_create_time="2026-09-25T00:00:00Z", gbp_review_name="accounts/1/locations/2/reviews/pa-tenant-a",
+                       media=[{"thumbnailUrl": "https://lh3.googleusercontent.com/tenant-a-photo"}])
+    db.upsert_review(conn_a, loc_a, "Casa Tequila Testtown", row_a, "2026-09-25T00:00:01Z", media_capture_started_at=ACTIVE)
+    # Tenant B's own database has no row at all for tenant A's review --
+    # a lookup for it must find nothing, not tenant A's stored media.
+    missing = conn_b.execute("SELECT gbp_review_media FROM reviews WHERE gbp_review_name = ?", (row_a["gbp_review_name"],)).fetchone()
+    assert missing is None
+
+
+def test_pa_18_normal_fields_still_update_while_media_is_preserved():
+    conn, loc_id = _fresh_conn()
+    create_time = "2026-08-01T00:00:00Z"  # permanently pre-activation
+    row1 = _base_row(gbp_create_time=create_time, review_text="Original text", star_rating=3)
+    db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row1, "2026-08-01T00:00:01Z", media_capture_started_at=ACTIVE)
+    assert _media_column(conn, row1["gbp_review_name"]) is None
+
+    row2 = _base_row(gbp_create_time=create_time, gbp_update_time="2026-09-26T00:00:00Z",
+                      review_text="Edited text after the fact", star_rating=1, media=None)
+    result = db.upsert_review(conn, loc_id, "Casa Tequila Testtown", row2, "2026-09-26T00:00:01Z", media_capture_started_at=ACTIVE)
+    assert result == "edited"
+    updated = conn.execute("SELECT review_text, star_rating, gbp_review_media FROM reviews WHERE gbp_review_name = ?",
+                            (row1["gbp_review_name"],)).fetchone()
+    assert updated["review_text"] == "Edited text after the fact"
+    assert updated["star_rating"] == 1
+    assert updated["gbp_review_media"] is None, "media stays PRESERVED (NULL) even though other fields updated normally"
+
+
 def main() -> int:
     tests = [
         ("1: missing tenant mediaCapture stores nothing", test_1_missing_tenant_media_capture_stores_nothing),
@@ -478,6 +736,25 @@ def main() -> int:
         ("30: no media URL fetch from media processing", test_30_no_media_url_fetch_from_media_processing),
         ("31: activation helper never called by deploy/onboarding/sync", test_31_activation_helper_never_called_by_deploy_onboarding_or_sync),
         ("32: resolve_media_capture_started_at() never writes", test_32_resolve_media_capture_started_at_never_writes),
+        # --- Pre-Integration Audit: three-way write model (PRESERVE fix) ---
+        ("PA-1: legacy NULL + inactive remains NULL", test_pa_1_legacy_null_plus_inactive_remains_null),
+        ("PA-2: legacy NULL + missing config remains NULL", test_pa_2_legacy_null_plus_missing_config_remains_null),
+        ("PA-3: legacy NULL + invalid config remains NULL", test_pa_3_legacy_null_plus_invalid_config_remains_null),
+        ("PA-4: legacy NULL + Redis lookup failure remains NULL", test_pa_4_legacy_null_plus_redis_lookup_failure_remains_null),
+        ("PA-5: legacy NULL + pre-activation review remains NULL", test_pa_5_legacy_null_plus_pre_activation_review_remains_null),
+        ("PA-6: existing media survives a config/Redis lookup failure", test_pa_6_existing_media_survives_config_lookup_failure),
+        ("PA-7: existing media survives the tenant going inactive", test_pa_7_existing_media_survives_tenant_going_inactive),
+        ("PA-8: existing media survives a pre-activation-shaped call", test_pa_8_existing_media_survives_a_pre_activation_shaped_call),
+        ("PA-9: eligible existing media -- Google removes it -> becomes []", test_pa_9_eligible_existing_media_google_removes_it_becomes_empty_array),
+        ("PA-10: eligible [] -> new media becomes an array", test_pa_10_eligible_empty_then_new_media_becomes_array),
+        ("PA-11: eligible media with a changed URL is replaced", test_pa_11_eligible_media_changed_url_replaced),
+        ("PA-12: direct upsert without the activation argument preserves existing/NULL", test_pa_12_direct_upsert_without_activation_argument_preserves_existing),
+        ("PA-13: historical malicious media cannot bypass the gate or erase existing media", test_pa_13_historical_malicious_media_cannot_bypass_gate_even_with_existing_media),
+        ("PA-14: updateTime after activation cannot qualify an old review", test_pa_14_update_time_after_activation_cannot_qualify_an_old_review_with_no_existing_media),
+        ("PA-15: createTime equality still qualifies", test_pa_15_create_time_equality_still_qualifies),
+        ("PA-16: no owner-response revision from any media transition (REPLACE_EMPTY/REPLACE_MEDIA/PRESERVE)", test_pa_16_no_owner_response_revision_from_any_media_transition),
+        ("PA-17: tenant isolation of preserved media", test_pa_17_tenant_isolation_media_preservation),
+        ("PA-18: normal review fields still update while media is preserved", test_pa_18_normal_fields_still_update_while_media_is_preserved),
     ]
     for name, fn in tests:
         run(name, fn)

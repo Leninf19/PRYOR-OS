@@ -558,24 +558,39 @@ def _migrate_schema(conn: sqlite3.Connection):
         # or NULL.
         "ALTER TABLE reviews ADD COLUMN gbp_reply_moderation_state TEXT",
         "ALTER TABLE reviews ADD COLUMN gbp_reply_policy_violation TEXT",
-        # Review Media Feature -- Scale & No-Backfill Audit (schema v21).
+        # Review Media Feature -- Scale & No-Backfill Audit (schema v21;
+        # NULL/'[]' semantics corrected by the Pre-Integration Audit fix).
         # A JSON-serialized array of ALREADY-SANITIZED media items (see
         # media_sanitizer.py) -- [{type, thumbnailUrl, thumbnailLabel,
-        # videoUrl, sortOrder}, ...] -- or NULL. NULL means "never
-        # evaluated for media at all" (every pre-existing row, and any
-        # review no sync has revisited since this column existed); '[]'
-        # means "evaluated, and either the review was ineligible or
-        # Google currently reports zero media items for it." Both are
-        # rendered identically by the frontend/export (no media shown),
-        # but they are NOT the same fact, and upsert_review()'s gate
-        # below is careful never to collapse the distinction in the
-        # direction that would matter (NULL never gets treated as [] in
-        # a way that would somehow permit a later implicit backfill --
-        # both are simply "nothing to show" today). Actual image/video
-        # bytes are NEVER stored here or anywhere else in this database --
-        # only sanitized Google-hosted URL strings and metadata (see
-        # db.upsert_review()'s own docstring for the full no-backfill
-        # gate this column is written through).
+        # videoUrl, sortOrder}, ...] -- or NULL. The authoritative meaning
+        # of each value, enforced by _resolve_review_media_write()'s
+        # PRESERVE/REPLACE gate below:
+        #   NULL      -- no eligible media snapshot has EVER been stored
+        #                for this review. Covers every pre-existing row,
+        #                every row belonging to an inactive/unconfigured
+        #                tenant, every pre-activation review, and every
+        #                row a config/Redis lookup failure was in effect
+        #                for. An ineligible review is NEVER described as
+        #                "evaluated" by writing '[]' -- that would require
+        #                a write this column's gate deliberately never
+        #                makes for an ineligible row.
+        #   '[]'      -- the tenant was active and THIS SPECIFIC review
+        #                was checked successfully (createTime >= startedAt)
+        #                but currently has no valid media -- either Google
+        #                reports none, or every item failed sanitization.
+        #                This is a real, positive fact about an eligible
+        #                review, distinct from "never evaluated."
+        #   non-empty -- the tenant was active, this review was eligible,
+        #   array        and sanitized media was stored.
+        # Once written, an eligible review's own PRIOR value (real media
+        # or '[]') is NEVER silently reverted to NULL by a later,
+        # merely-ineligible call (e.g. a transient config outage) --
+        # upsert_review()'s UPDATE omits this column entirely in that
+        # case (PRESERVE mode), rather than overwriting it. Actual
+        # image/video bytes are NEVER stored here or anywhere else in
+        # this database -- only sanitized Google-hosted URL strings and
+        # metadata (see db.upsert_review()'s own docstring for the full
+        # no-backfill gate this column is written through).
         "ALTER TABLE reviews ADD COLUMN gbp_review_media TEXT",
     ]
     for sql in migrations:
@@ -820,7 +835,38 @@ def _parse_iso_utc_timestamp(value: str) -> datetime:
     return dt
 
 
-def _resolve_review_media_json(row: dict, media_capture_started_at) -> str | None:
+MEDIA_WRITE_PRESERVE = "preserve"
+MEDIA_WRITE_REPLACE = "replace"
+
+# Pre-Integration Audit -- three-way media write model. The gate below
+# (_resolve_review_media_write) returns exactly one of these two modes,
+# never a bare value a SQL layer could confuse with "set the column to
+# NULL." PRESERVE means upsert_review() must not include gbp_review_media
+# in its UPDATE's SET clause AT ALL -- the column's existing value
+# (whatever it is, including real stored media, including NULL) survives
+# byte-for-byte untouched. REPLACE means the column is wholesale
+# overwritten with the accompanying JSON string, which may legitimately be
+# '[]' (an eligible review currently has no media) or a real array.
+#
+# THE BUG THIS REPLACES (Pre-Integration Audit, found by direct code
+# review of the ORIGINAL _resolve_review_media_json()/UPDATE pair): the
+# prior design had exactly one non-eligible outcome -- return None, bound
+# as SQL NULL via an UNCONDITIONAL `gbp_review_media = ?` in the UPDATE.
+# For a BRAND-NEW or PERMANENTLY-INELIGIBLE row this was harmless (NULL
+# staying NULL). But for a review that was PREVIOUSLY eligible and had
+# real media stored, any LATER sync call that resolved to "ineligible" --
+# including a purely TRANSIENT tenant-config/Redis lookup failure, which
+# provider_sync.py deliberately maps to media_capture_started_at=None so
+# the underlying review sync can continue -- unconditionally overwrote
+# that real, previously-captured media back to NULL. A momentary Redis
+# outage could silently erase already-stored eligible media. PRESERVE
+# mode exists specifically to make that structurally impossible: "we have
+# no current basis to decide" (inactive, missing/invalid config, a lookup
+# failure, a pre-activation review, or an omitted argument) now means
+# "leave whatever is already there alone," never "set it to NULL."
+
+
+def _resolve_review_media_write(row: dict, media_capture_started_at) -> tuple[str, str | None]:
     """THE authoritative no-backfill gate for review media -- see
     upsert_review()'s own docstring (media_capture_started_at parameter)
     for the full contract. This is the ONE place in the entire codebase
@@ -829,13 +875,16 @@ def _resolve_review_media_json(row: dict, media_capture_started_at) -> str | Non
     upsert, unconditionally -- independent of whether any other field
     changed this sync, so an updateTime-only edit can never bypass it.
 
-    Returns None (meaning: store NULL, never touch `media`) unless ALL of
-    the following independently validate:
+    Returns (MEDIA_WRITE_PRESERVE, None) -- meaning the caller must leave
+    gbp_review_media completely untouched, never write NULL, never write
+    '[]' -- unless ALL of the following independently validate:
       1. media_capture_started_at is itself a genuinely valid ISO/RFC3339
          timestamp (a caller passing None, an empty string, or a malformed
-         value -- an inactive tenant, or simply omitting the keyword
-         argument entirely, which is the default -- always fails closed
-         here, never treated as "no restriction").
+         value -- an inactive tenant, a missing/invalid tenant_config, a
+         transient config/Redis lookup failure, or simply omitting the
+         keyword argument entirely (the default) -- always fails closed
+         to PRESERVE here, never treated as "no restriction" and never
+         treated as "clear it").
       2. row['gbp_create_time'] (the FULL, untruncated Google createTime --
          never row['review_date'], which is date-only and would make an
          exact-day activation ambiguous) is itself a genuinely valid
@@ -848,19 +897,23 @@ def _resolve_review_media_json(row: dict, media_capture_started_at) -> str | Non
     Only once all three hold does this re-sanitize row.get('media') through
     media_sanitizer.sanitize_review_media_items() -- NEVER trusting a
     caller's claim that a value is "already sanitized," regardless of
-    which Provider or import/repair path produced it -- and return the
-    JSON-serialized result (which may legitimately be '[]' if Google
-    currently reports zero qualifying media items for an eligible review).
+    which Provider or import/repair path produced it -- and return
+    (MEDIA_WRITE_REPLACE, json_string), where json_string may legitimately
+    be '[]' if Google currently reports zero qualifying media items for an
+    otherwise-eligible review (this IS an intentional, wholesale removal
+    of any previously-stored media for that specific review -- Google
+    genuinely no longer has media for it -- never confused with PRESERVE).
 
     A pre-activation (or otherwise ineligible) review's `media` payload,
     however large or well-formed, is discarded here in full -- it is
     never partially stored, truncated, or queued for a "later" write.
     Historical media is never preserved merely because it was present in
-    an incoming row."""
+    an incoming row -- and, symmetrically, historically-stored real media
+    is never erased merely because THIS call happens to be ineligible."""
     if not review_qualifies_for_media(row, media_capture_started_at):
-        return None
+        return MEDIA_WRITE_PRESERVE, None
     sanitized = media_sanitizer.sanitize_review_media_items(row.get("media"))
-    return json.dumps(sanitized, separators=(",", ":"))
+    return MEDIA_WRITE_REPLACE, json.dumps(sanitized, separators=(",", ":"))
 
 
 def review_qualifies_for_media(row: dict, media_capture_started_at) -> bool:
@@ -892,13 +945,16 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
     mediaCapture.startedAt (an ISO/RFC3339 string), or None. Defaults to
     None -- a SAFE default, deliberately, so every existing and future
     caller that omits this keyword argument (every current call site,
-    plus any future import/repair script) fails closed and stores no
-    media, without needing to individually opt in. See
-    _resolve_review_media_json() above for the full no-backfill gate this
-    drives; this function itself never inspects row['media'] or
-    row['gbp_create_time'] directly -- it only threads them and this
-    argument through to that one gate function, on every insert AND
-    update, unconditionally.
+    plus any future import/repair script) fails closed to PRESERVE mode
+    (see MEDIA_WRITE_PRESERVE/_resolve_review_media_write() above) without
+    needing to individually opt in. "Fails closed" here means "leaves
+    gbp_review_media exactly as it already is" -- NULL stays NULL, and any
+    real media already stored for a review stays stored -- NEVER "sets it
+    to NULL," which would erase previously-captured eligible media on
+    something as ordinary as a transient tenant-config/Redis outage. This
+    function itself never inspects row['media'] or row['gbp_create_time']
+    directly -- it only threads them and this argument through to that one
+    gate function, on every insert AND update, unconditionally.
     When present, gbp_review_name is the canonical identity (see link_review_to_gbp()'s
     docstring for the invariant this upholds) and gbp_update_time becomes an authoritative
     edit signal straight from Google, on top of the existing text/rating/response
@@ -930,10 +986,12 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
     gbp_reply_moderation_state = row.get("gbp_reply_moderation_state")
     _policy_violation_raw = row.get("gbp_reply_policy_violation")
     gbp_reply_policy_violation = json.dumps(_policy_violation_raw) if _policy_violation_raw is not None else None
-    # Review Media Feature -- Scale & No-Backfill Audit: evaluated ONCE per
-    # call, unconditionally, on both the insert and update paths below --
-    # see _resolve_review_media_json()'s own docstring for the full gate.
-    gbp_review_media = _resolve_review_media_json(row, media_capture_started_at)
+    # Review Media Feature -- Scale & No-Backfill Audit (Pre-Integration
+    # Audit fix): evaluated ONCE per call, unconditionally, on both the
+    # insert and update paths below -- see
+    # _resolve_review_media_write()'s own docstring for the full
+    # three-way (PRESERVE / REPLACE-with-'[]' / REPLACE-with-array) gate.
+    media_write_mode, media_write_value = _resolve_review_media_write(row, media_capture_started_at)
 
     existing = None
     key = None
@@ -961,7 +1019,11 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
                  row.get("star_rating") or None, _normalize_text_field(row.get("review_text")) or "",
                  _normalize_text_field(row.get("owner_response")) or "", row.get("review_url", ""), now, now,
                  gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
-                 gbp_reply_moderation_state, gbp_reply_policy_violation, gbp_review_media),
+                 gbp_reply_moderation_state, gbp_reply_policy_violation,
+                 # A brand-new row has no prior value to preserve -- PRESERVE
+                 # trivially means NULL here (media_write_value is already
+                 # None in that mode); REPLACE inserts the JSON string.
+                 media_write_value),
             )
         except sqlite3.IntegrityError as e:
             # Both lookups above missed, yet the database's own constraint still
@@ -1028,49 +1090,65 @@ def upsert_review(conn, location_id: int, location_name: str, row: dict, now: st
     new_text = _normalize_text_field(row.get("review_text"))
     final_text = new_text if new_text else (existing["review_text"] or "")
 
-    conn.execute(
-        """UPDATE reviews SET review_text = ?, owner_response = ?, star_rating = ?,
-           last_seen_at = ?, missing_since = NULL, is_deleted = 0, deleted_detected_at = NULL,
-           gbp_review_name = COALESCE(?, gbp_review_name),
-           dedup_key = COALESCE(?, dedup_key),
-           gbp_update_time = COALESCE(?, gbp_update_time),
-           gbp_reply_update_time = COALESCE(?, gbp_reply_update_time),
-           gbp_language_code = COALESCE(?, gbp_language_code),
-           gbp_reply_moderation_state = COALESCE(?, gbp_reply_moderation_state),
-           gbp_reply_policy_violation = COALESCE(?, gbp_reply_policy_violation),
-           gbp_review_media = ?
-           WHERE id = ?""",
-        (final_text, final_response,
-         row.get("star_rating") or existing["star_rating"],
-         # dedup_key is normalized to gbp_review_name whenever this row has (or is
-         # newly gaining) one -- the same invariant link_review_to_gbp() upholds.
-         # COALESCE means a row without a gbp_review_name keeps its existing
-         # dedup_key untouched, exactly as before.
-         now, gbp_review_name, gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
-         # COALESCE here means: a resolved outcome (APPROVED/REJECTED/
-         # PENDING) always advances the stored state (e.g. pending ->
-         # rejected), while an unresolved read (None -- missing/unspecified/
-         # unknown reviewReplyState) never clobbers a PREVIOUSLY recorded
-         # resolved state. This is what "retained safely" means for an
-         # unknown future enum value too -- classify_moderation_outcome()
-         # already maps it to None, so it behaves exactly like "missing"
-         # here: never overwrites, never lost.
-         gbp_reply_moderation_state, gbp_reply_policy_violation,
-         # UNCONDITIONAL overwrite -- deliberately NOT a COALESCE, unlike
-         # every field above. gbp_review_media is purely a function of
-         # (row, media_capture_started_at), recomputed by
-         # _resolve_review_media_json() on every single call, so it must
-         # replace whatever was stored before wholesale: an ineligible
-         # review is written back to NULL every time (never "sticky" from
-         # a moment the gate was accidentally satisfied), and an eligible
-         # review's media array is replaced in full, including collapsing
-         # to '[]' the moment Google reports zero qualifying items --
-         # never merged with the previous array, and never bypassed by an
-         # updateTime-only change (this SET runs whether or not
-         # gbp_edit_detected or changed_fields is empty).
-         gbp_review_media,
-         existing["id"]),
-    )
+    # Pre-Integration Audit fix: gbp_review_media's SET clause is included
+    # in this UPDATE ONLY in REPLACE mode -- built as a genuinely separate
+    # SQL branch (a static, hardcoded clause list; nothing data-derived
+    # ever feeds into the SQL text itself), never a COALESCE and never an
+    # unconditional `= ?`. In PRESERVE mode the column is entirely absent
+    # from the statement, so SQLite leaves its current value -- real
+    # stored media, or a legacy NULL -- byte-for-byte untouched. This is
+    # what makes "do not update this column" structurally distinct from
+    # "set this column to SQL NULL": the former never appears in the
+    # generated SQL at all for this call. Every field ABOVE this comment
+    # keeps its own prior COALESCE/unconditional-overwrite semantics,
+    # unchanged.
+    set_clauses = [
+        "review_text = ?", "owner_response = ?", "star_rating = ?",
+        "last_seen_at = ?", "missing_since = NULL", "is_deleted = 0", "deleted_detected_at = NULL",
+        "gbp_review_name = COALESCE(?, gbp_review_name)",
+        "dedup_key = COALESCE(?, dedup_key)",
+        "gbp_update_time = COALESCE(?, gbp_update_time)",
+        "gbp_reply_update_time = COALESCE(?, gbp_reply_update_time)",
+        "gbp_language_code = COALESCE(?, gbp_language_code)",
+        "gbp_reply_moderation_state = COALESCE(?, gbp_reply_moderation_state)",
+        "gbp_reply_policy_violation = COALESCE(?, gbp_reply_policy_violation)",
+    ]
+    params = [
+        final_text, final_response,
+        row.get("star_rating") or existing["star_rating"],
+        # dedup_key is normalized to gbp_review_name whenever this row has (or is
+        # newly gaining) one -- the same invariant link_review_to_gbp() upholds.
+        # COALESCE means a row without a gbp_review_name keeps its existing
+        # dedup_key untouched, exactly as before.
+        now, gbp_review_name, gbp_review_name, gbp_update_time, gbp_reply_update_time, gbp_language_code,
+        # COALESCE here means: a resolved outcome (APPROVED/REJECTED/
+        # PENDING) always advances the stored state (e.g. pending ->
+        # rejected), while an unresolved read (None -- missing/unspecified/
+        # unknown reviewReplyState) never clobbers a PREVIOUSLY recorded
+        # resolved state. This is what "retained safely" means for an
+        # unknown future enum value too -- classify_moderation_outcome()
+        # already maps it to None, so it behaves exactly like "missing"
+        # here: never overwrites, never lost.
+        gbp_reply_moderation_state, gbp_reply_policy_violation,
+    ]
+    if media_write_mode == MEDIA_WRITE_REPLACE:
+        # An eligible review's media array is replaced in full -- including
+        # collapsing to '[]' the moment Google reports zero qualifying
+        # items for it -- never merged with the previous array, and never
+        # bypassed by an updateTime-only change (this branch is chosen
+        # purely from media_write_mode, independent of changed_fields/
+        # gbp_edit_detected).
+        set_clauses.append("gbp_review_media = ?")
+        params.append(media_write_value)
+    # else: MEDIA_WRITE_PRESERVE -- gbp_review_media is simply never
+    # mentioned in this UPDATE; its existing value (real media, or a
+    # legacy/never-evaluated NULL) survives this call completely
+    # unchanged, including when this call's ineligibility came from a
+    # transient tenant-config/Redis lookup failure rather than a genuine,
+    # durable "this tenant/review will never qualify" fact.
+    params.append(existing["id"])
+
+    conn.execute(f"UPDATE reviews SET {', '.join(set_clauses)} WHERE id = ?", params)
     return "edited" if (changed_fields or gbp_edit_detected) else "unchanged"
 
 
