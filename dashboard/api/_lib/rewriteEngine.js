@@ -16,6 +16,7 @@ import { resolveTenantEntitlements } from './entitlements.js'
 import { getAiUsage, recordAiUsage, currentUsagePeriod, AiUsageStoreUnavailableError } from './aiUsageStore.js'
 import { calculateAiUsageUnits, resolveTokenCounts } from './aiUsageUnits.js'
 import { classifyReviewRisk, CATEGORY_GUIDANCE } from './reviewRiskClassifier.js'
+import { classifyComplaintCategories, COMPLAINT_CATEGORY_GUIDANCE } from './complaintCategoryGuide.js'
 import { resolveStyleProfile, buildSignOff, buildPhrasesToAvoidNote } from './responseStyleProfile.js'
 
 const REWRITE_MODEL = 'claude-haiku-4-5-20251001'
@@ -59,8 +60,15 @@ export function enforceResponsePolicy(draftText, serious) {
   const sentences = draftText.trim().split(/(?<=[.!?])\s+/)
   const kept = sentences.filter(s => !FORBIDDEN_RECOVERY_PATTERNS.some(p => p.test(s)))
   const cleaned = kept.join(' ').trim()
-  return cleaned || draftText.split('—')[0].trim() // never return empty; fall back to the pre-sign-off text
+  return cleaned || draftText.trim() // never return empty; fall back to the whole draft
 }
+
+// PART 23 -- a lightweight, deliberately approximate signal that the review
+// text itself is written in Spanish: Spanish-only diacritics/punctuation, or
+// a handful of very common Spanish words that essentially never appear in an
+// English review. False negatives just fall back to English (safe); this is
+// not meant to be a general-purpose language detector.
+const SPANISH_HINT_RE = /[ñáéíóúü¿¡]|\b(gracias|comida|excelente|servicio|deliciosa|delicioso|atenci[oó]n|volveremos|recomendado|mesero|camarero|muy buena|buenísimo)\b/i
 
 const TONE_GUIDES = {
   friendly:     'Warm, conversational, and approachable. Like a friendly local business owner who genuinely cares.',
@@ -224,32 +232,53 @@ export async function generateRewrite(body, usage = {}) {
   const toneGuide    = TONE_GUIDES[tone] ?? TONE_GUIDES.friendly
   const locationName = location || 'our restaurant'
   const styleProfile = resolveStyleProfile()
-  const { isHighRisk: serious, categories: riskCategories } = classifyReviewRisk(reviewText)
+  const { isHighRisk: serious, categories: riskCategories, isActiveEmergency } = classifyReviewRisk(reviewText)
 
-  const langNote = tone === 'spanish'
-    ? 'Language: Write entirely in Spanish. Do not include any English.'
-    : 'Language: Write in English, regardless of the language of the current draft or the original review.'
+  // PART 23 -- language follows the REVIEW's own language, not just the
+  // manager's tone selection: a review clearly written in Spanish gets a
+  // natural Spanish reply (never an awkward literal translation) unless the
+  // manager explicitly picked the 'spanish' tone (which forces it either
+  // way) or picked 'seo' (English keyword copy, kept English on purpose --
+  // "Mexican food", the city name, etc. are meant to stay in English).
+  const detectedSpanish = tone !== 'seo' && SPANISH_HINT_RE.test(reviewText || '')
+  const langNote = tone === 'spanish' || detectedSpanish
+    ? 'Language: This review is in Spanish (or the manager requested a Spanish reply). Respond entirely and naturally in Spanish, the way a native speaker actually writes -- never a stiff, literal translation. Do not include any English.'
+    : 'Language: Write in English, regardless of the language of the current draft.'
 
+  // PART 21 -- length targets by star tier / severity.
   const lengthGuide = tone === 'short'
     ? 'Length: 2 sentences maximum.'
     : numStars >= 4
       ? 'Length: 1–2 sentences. Brief and grateful.'
       : numStars === 3
-        ? 'Length: 2–3 sentences. Appreciative but acknowledge room to improve.'
+        ? 'Length: 1–2 sentences. Neutral and brief.'
         : serious
-          ? 'Length: 3–4 sentences. Sincere and specific — this is a serious concern.'
-          : 'Length: 2–3 sentences. Sincere and to the point.'
+          ? 'Length: 2–4 sentences. Sincere and specific — this is a serious concern. Only longer than 4 sentences if genuinely necessary.'
+          : 'Length: 1–3 sentences. Sincere and to the point.'
 
   const contactNote = serious
-    ? `At the end (before the sign-off), invite them to reach out directly: "Please contact us at ${CONTACT_EMAIL} so we can make this right." Do not add anything after the sign-off.`
+    ? `At the end, invite them to reach out directly: "Please contact us at ${CONTACT_EMAIL} so we can make this right." Do not add anything after that.`
     : `Do not include any contact email, phone number, or "contact us" invitation — that language is reserved for serious unresolved incidents only, which this is not.`
 
-  // PARTS 9-12 -- category-specific policy guidance, only present when a
+  const emergencyNote = serious && isActiveEmergency
+    ? ' The review describes what sounds like an ACTIVE or severe medical reaction (difficulty breathing, anaphylaxis, loss of consciousness) -- include this exact guidance once: "If you\'re currently experiencing difficulty breathing or another severe reaction, please seek emergency medical care immediately." Do not include this emergency language otherwise.'
+    : ''
+
+  // PARTS 9-19 -- category-specific policy guidance, only present when a
   // matching category was actually detected. Never a fixed template (see
-  // reviewRiskClassifier.js's own header) -- the model still writes
-  // naturally, constrained by this guidance.
+  // reviewRiskClassifier.js's/complaintCategoryGuide.js's own headers) --
+  // the model still writes naturally, constrained by this guidance.
+  // High-risk categories (reviewRiskClassifier.js) and ordinary operational
+  // complaint categories (complaintCategoryGuide.js) are mutually exclusive
+  // by construction (PART 6) -- a review is only run through the second
+  // classifier's guidance when it isn't already high-risk.
   const categoryGuidance = riskCategories
     .map(category => CATEGORY_GUIDANCE[category])
+    .filter(Boolean)
+    .join(' ')
+  const complaintCategories = serious ? [] : classifyComplaintCategories(reviewText)
+  const complaintGuidance = complaintCategories
+    .map(category => COMPLAINT_CATEGORY_GUIDANCE[category])
     .filter(Boolean)
     .join(' ')
 
@@ -258,19 +287,27 @@ export async function generateRewrite(body, usage = {}) {
   // Google review" opener with explicit anti-cliché/anti-repetition
   // guidance -- the actual behavior change this feature exists to make,
   // not just more prompt text piled onto the same weak instruction.
-  const openingVarietyNote = 'Vary how you open the response naturally based on what THIS guest actually said -- never default to "Thank you for your review" (or any other fixed opening) every time. Open the way a real, attentive manager would actually start.'
-  const voiceNote = 'Sound like a real, attentive restaurant owner or manager texting a genuine reply -- professional, warm, concise, and specific to this review. Never robotic, never defensive, never over-apologetic, and never obviously AI-generated.'
+  const openingVarietyNote = 'Vary how you open the response naturally based on what THIS guest actually said -- never default to "Thank you for your review" or begin every response with "Thank you for..." Tone examples only, not a fixed list to choose from verbatim: positive openings like "Really glad you enjoyed everything" / "Thanks for coming in!" / "Love hearing this."; negative openings like "We\'re sorry this visit missed the mark." / "That\'s definitely not the experience we want for our guests."; serious openings like "We\'re concerned to hear about your experience." / "We take a report like this seriously." Open the way a real, attentive manager would actually start, based on what this specific guest wrote.'
+  const voiceNote = 'Sound like a real, attentive restaurant owner or manager texting a genuine reply -- warm, professional, conversational, concise, confident, respectful, and specific to this review. Never robotic, never corporate, never legalistic, never defensive, never over-apologetic, and never obviously AI-generated.'
   const phrasesToAvoidNote = buildPhrasesToAvoidNote(styleProfile)
+  const nameNote = reviewerName
+    ? `You may use the guest's first name (${reviewerName.split(' ')[0]}) occasionally if it feels natural (e.g. "Thanks for coming in, ${reviewerName.split(' ')[0]}."), but do not force it into every response, and never use a letter-style salutation like "Dear ${reviewerName.split(' ')[0]},".`
+    : ''
+  const noRepeatNameNote = `Do not unnecessarily repeat "${locationName}" in the reply itself -- the public review page already shows which restaurant is responding.`
+  const signOffLine = buildSignOff(styleProfile, locationName)
+  const closingNote = signOffLine
+    ? `End the response by signing off as '${signOffLine}'.`
+    : 'Do not add a signature, name, or sign-off of any kind. Do not end with a dash and a name, "— Restaurant Team", "Sincerely,", "Best,", "Regards,", or "Warmly," -- these are Google review replies, not letters. Simply end the response after its final sentence.'
 
   const prompt = `You are writing on behalf of ${locationName}, a ${styleProfile.cuisineType} ${styleProfile.businessType}. ${voiceNote} ${openingVarietyNote} ${phrasesToAvoidNote}
 
-Write on behalf of ${locationName} only — do not reference or name any other restaurant or chain.
+Write on behalf of ${locationName} only — do not reference or name any other restaurant or chain. ${noRepeatNameNote}${nameNote ? ` ${nameNote}` : ''}
 
 TONE: ${toneGuide}
 ${langNote}
 ${lengthGuide}
-${contactNote}
-${categoryGuidance ? `\nIMPORTANT — this review may involve a serious concern: ${categoryGuidance}\n` : ''}
+${contactNote}${emergencyNote}
+${categoryGuidance ? `\nIMPORTANT — this review may involve a serious concern: ${categoryGuidance}\n` : ''}${complaintGuidance ? `\n${complaintGuidance}\n` : ''}
 REVIEWER: ${reviewerName || 'A guest'}
 STAR RATING: ${numStars} out of 5
 REVIEW TEXT: ${reviewText}
@@ -278,7 +315,7 @@ REVIEW TEXT: ${reviewText}
 CURRENT DRAFT (improve it to match the guidance above):
 ${currentDraft || '(No draft — write from scratch)'}
 
-Write ONLY the response text. No quotes, no labels, no preamble. Sign off as '${buildSignOff(styleProfile, locationName)}'.`
+Write ONLY the response text. No quotes, no labels, no preamble. ${closingNote}`
 
   try {
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {

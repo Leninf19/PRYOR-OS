@@ -189,6 +189,76 @@ def test_generated_draft_for_casa_tequila_prime_never_contains_forbidden_cta():
     assert "make this right" not in cleaned.lower()
 
 
+# --- Review Response Playbook v2 (PART 27/28): generate_response_draft() --
+# prompt-content regression tests. _call() is monkeypatched to capture the
+# exact prompt sent to Anthropic instead of making a real call -- these
+# assert on POLICY (what the model was told), mirroring
+# tests/test_response_playbook_v2.js's JS-side coverage of rewriteEngine.js.
+
+def _capture_prompt(review, restaurant_name="Casa Tequila Prime"):
+    captured = {}
+    original_call = ai_engine._call
+    ai_engine._call = lambda prompt, **kwargs: captured.setdefault("prompt", prompt) or "A generated reply."
+    try:
+        ai_engine.generate_response_draft(review, restaurant_name)
+    finally:
+        ai_engine._call = original_call
+    return captured["prompt"]
+
+
+def test_no_text_review_prompt_has_no_signature_instruction():
+    prompt = _capture_prompt({"star_rating": 5, "review_text": "", "reviewer_name": "Alex"})
+    assert "Sign off with" not in prompt
+    assert "The Casa Tequila Prime Team" not in prompt
+    assert "Do not add a signature" in prompt
+
+
+def test_has_text_review_prompt_has_no_signature_instruction():
+    prompt = _capture_prompt({"star_rating": 5, "review_text": "Great food and service!", "reviewer_name": "Alex"})
+    assert "Sign off with" not in prompt
+    assert "The Casa Tequila Prime Team" not in prompt
+    assert "Do not add a signature" in prompt
+
+
+def test_serious_review_prompt_has_no_signature_instruction():
+    review = {"star_rating": 1, "review_text": "I got food poisoning after eating here last night.", "reviewer_name": "Alex"}
+    prompt = _capture_prompt(review)
+    assert "Sign off with" not in prompt
+    assert "The Casa Tequila Prime Team" not in prompt
+
+
+def test_food_poisoning_prompt_uses_neutral_chronology_language():
+    review = {"star_rating": 1, "review_text": "I got food poisoning after eating here last night.", "reviewer_name": "Alex"}
+    prompt = _capture_prompt(review)
+    assert "neutral chronology" in prompt.lower()
+    assert "our food made you sick" in prompt.lower()
+    assert "established food-safety procedures and applicable health requirements" in prompt.lower()
+
+
+def test_rude_staff_prompt_protects_both_parties():
+    review = {"star_rating": 1, "review_text": "Our server was so rude and dismissive to us the entire meal.", "reviewer_name": "Alex"}
+    prompt = _capture_prompt(review)
+    assert "protect both the guest and the employee" in prompt.lower()
+
+
+def test_price_complaint_prompt_forbids_arguing_pricing():
+    review = {"star_rating": 2, "review_text": "Way too expensive for what you get, not worth it.", "reviewer_name": "Alex"}
+    prompt = _capture_prompt(review)
+    assert "do not argue about pricing" in prompt.lower()
+
+
+def test_ordinary_negative_review_prompt_has_no_category_guidance():
+    review = {"star_rating": 1, "review_text": "Just not a great visit overall, wouldn't recommend.", "reviewer_name": "Alex"}
+    prompt = _capture_prompt(review)
+    assert ai_engine.classify_response_type(review) != "serious_escalation"
+
+
+def test_prompt_discourages_thank_you_for_your_review_default_opening():
+    review = {"star_rating": 1, "review_text": "Service was slow and food was cold.", "reviewer_name": "Alex"}
+    prompt = _capture_prompt(review)
+    assert "never default to" in prompt.lower()
+
+
 def main():
     tests = [
         ("Casa Tequila Prime regression review classifies positive_with_feedback", test_casa_tequila_prime_classifies_positive_with_feedback),
@@ -209,6 +279,14 @@ def main():
         ("guard leaves serious_escalation responses untouched", test_guard_leaves_serious_escalation_untouched),
         ("guard never returns an empty string", test_guard_never_returns_empty_string),
         ("end-to-end: worst-case model output is still sanitized for the regression case", test_generated_draft_for_casa_tequila_prime_never_contains_forbidden_cta),
+        ("PART 1/28: no-text review prompt has no signature instruction", test_no_text_review_prompt_has_no_signature_instruction),
+        ("PART 1/28: has-text review prompt has no signature instruction", test_has_text_review_prompt_has_no_signature_instruction),
+        ("PART 1/28: serious review prompt has no signature instruction", test_serious_review_prompt_has_no_signature_instruction),
+        ("PART 11: food-poisoning prompt uses neutral chronology, never causation language", test_food_poisoning_prompt_uses_neutral_chronology_language),
+        ("PART 8: rude-staff prompt protects both guest and employee", test_rude_staff_prompt_protects_both_parties),
+        ("PART 10: price complaint prompt forbids arguing pricing", test_price_complaint_prompt_forbids_arguing_pricing),
+        ("an ordinary negative review is never classified serious_escalation", test_ordinary_negative_review_prompt_has_no_category_guidance),
+        ("PART 4/5: prompt discourages the default 'Thank you for your review' opening", test_prompt_discourages_thank_you_for_your_review_default_opening),
     ]
     for name, fn in tests:
         run(name, fn)
