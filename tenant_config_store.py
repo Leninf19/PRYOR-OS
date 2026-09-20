@@ -58,6 +58,16 @@ from datetime import datetime, timezone
 
 import tenant_keys
 
+# Review Media Feature -- Scale & No-Backfill Audit: the ONLY two states
+# mediaCapture.status may ever be. 'active' with a valid startedAt is the
+# ONLY condition under which any caller (db.upsert_review()'s gate) may
+# ever store review media -- see that function's own docstring. Neither
+# value here is ever written by any deploy/onboarding/initial-sync/normal-
+# sync code path in this codebase; activate_media_capture() below (never
+# called anywhere in this implementation) is the sole intended writer of
+# 'active', reserved for a future, separately-reviewed operator action.
+_VALID_MEDIA_CAPTURE_STATUSES = {"inactive", "active"}
+
 TENANT_CONFIG_KEY = "tenant_config:v1"
 
 # Multi-Tenant Phase 4F closure: 'provisioned' inserted between
@@ -275,6 +285,16 @@ def upsert_tenant_config(tenant_id: str, patch: dict, expected_version: int | No
         # record today, so this is always None here unless `existing`
         # already carries a real value written by Node's createNewTenant().
         "creation": None,
+        # Review Media Feature -- Scale & No-Backfill Audit: a sibling of
+        # provisioning/initialSync/entitlementChange on this SAME record,
+        # per that audit's Audit 3 recommendation (no second tenant-config
+        # store invented). Defaults to 'inactive'/None for EVERY tenant,
+        # including one getting its first record via this function --
+        # missing mediaCapture, or a missing/malformed startedAt, both mean
+        # "inactive" to every reader (see db.upsert_review()'s gate) and
+        # this default is what makes that true from a tenant's very first
+        # write onward, with no special-casing required anywhere else.
+        "mediaCapture": {"status": "inactive", "startedAt": None},
         **(existing or {}),
         "createdAt": (existing or {}).get("createdAt", now),
         **patch,
@@ -291,6 +311,9 @@ def upsert_tenant_config(tenant_id: str, patch: dict, expected_version: int | No
         raise ValueError(f"upsert_tenant_config: invalid storageMode {next_record['storageMode']!r}")
     if not isinstance(next_record["locationCatalogEnabled"], bool):
         raise ValueError("upsert_tenant_config: locationCatalogEnabled must be a boolean")
+    media_capture = next_record.get("mediaCapture")
+    if not isinstance(media_capture, dict) or media_capture.get("status") not in _VALID_MEDIA_CAPTURE_STATUSES:
+        raise ValueError(f"upsert_tenant_config: invalid mediaCapture {media_capture!r}")
 
     if expected_version is not None:
         if current_version != expected_version:
@@ -328,3 +351,112 @@ def upsert_tenant_config(tenant_id: str, patch: dict, expected_version: int | No
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         raise TenantConfigStoreUnavailableError(f"tenant config store unreachable: {e}") from e
     return next_record
+
+
+# ---------------------------------------------------------------------------
+# Review Media Feature -- Scale & No-Backfill Audit (Phase 2)
+# ---------------------------------------------------------------------------
+# The two functions below are the ONLY code in this codebase that ever
+# reads or writes mediaCapture with real intent to affect the storage gate.
+# Neither is called anywhere in this implementation:
+#   - resolve_media_capture_started_at() is wired into sync orchestration
+#     in a LATER phase (see provider_sync.py), but as a pure READ that can
+#     only ever produce None or an already-active tenant's own startedAt --
+#     it cannot activate anything.
+#   - activate_media_capture() is the sole intended WRITER of
+#     mediaCapture.status='active', and is deliberately never called by
+#     any deploy, onboarding, initial-sync, or normal-sync code path in
+#     this implementation. Tenant activation is a separate, explicit,
+#     later operation performed by a human-triggered call to this
+#     function specifically -- see tests/test_tenant_config_media_capture.py
+#     for its isolated coverage.
+
+def _is_valid_iso_utc_timestamp(value) -> bool:
+    """Strict, defensive ISO/RFC3339 validity check -- a malformed or
+    non-string startedAt must NEVER be treated as a valid activation
+    instant by any reader. Mirrors gbp_review_media_diagnostic.py's own
+    _parse_iso_utc() normalization ('Z' -> '+00:00') without importing that
+    diagnostic module (this store must not depend on diagnostic tooling)."""
+    if not isinstance(value, str) or not value:
+        return False
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return True
+
+
+def resolve_media_capture_started_at(tenant_id: str) -> str | None:
+    """The ONE safe read for 'what activation timestamp (if any) should
+    gate this tenant's review media storage.' Returns the tenant's own
+    validated startedAt ONLY when mediaCapture.status == 'active' AND
+    startedAt is a genuinely valid ISO/RFC3339 timestamp -- every other
+    case (no tenant_config record at all, missing mediaCapture, status
+    'inactive', a missing/malformed startedAt) returns None, never a
+    guessed or inherited value from another tenant or a fallback default.
+
+    Raises TenantConfigStoreUnavailableError on a genuine store outage,
+    exactly like every other read in this module -- it is the CALLER's
+    responsibility (sync orchestration) to catch that and continue the
+    review sync with media capture disabled, per this feature's explicit
+    'config lookup failure fails closed, never blocks the sync' contract.
+    This function itself never swallows that distinction, so a genuine
+    outage can never be silently confused with a tenant that is simply
+    not activated."""
+    tenant_keys.assert_valid_tenant_id(tenant_id, "resolve_media_capture_started_at")
+    config = get_tenant_config(tenant_id)
+    if config is None:
+        return None
+    media_capture = config.get("mediaCapture")
+    if not isinstance(media_capture, dict) or media_capture.get("status") != "active":
+        return None
+    started_at = media_capture.get("startedAt")
+    if not _is_valid_iso_utc_timestamp(started_at):
+        return None
+    return started_at
+
+
+def activate_media_capture(tenant_id: str, expected_version: int) -> dict:
+    """Server-only, CAS-protected helper for a FUTURE, separately-reviewed
+    explicit activation action. NEVER called anywhere in this
+    implementation -- no deploy step, onboarding flow, initial_sync.py run,
+    or normal gbp_sync.py/provider_sync.py sync ever calls this function.
+    There is no browser-reachable endpoint that reaches it either.
+
+    Idempotent and backdate-proof by construction:
+      - startedAt is computed here, server-side, from the CURRENT UTC
+        clock (_now_iso()) -- this function takes NO timestamp parameter
+        at all, so a caller has no way to supply, backdate, or reset one.
+      - If the tenant is ALREADY status='active' with an already-valid
+        startedAt, that existing startedAt is preserved UNCHANGED -- this
+        call becomes a safe no-op for the timestamp itself (still goes
+        through the normal CAS write path so configVersion/updatedAt
+        advance consistently, but startedAt's value never moves). Calling
+        this function a second time (or a tenth time) can never move an
+        already-set activation instant earlier OR later.
+      - A tenant with no tenant_config record at all raises ValueError --
+        this function never creates a tenant's first record; activation is
+        only ever meaningful for a tenant that already exists.
+
+    `expected_version` is REQUIRED (positional, no default) -- exactly like
+    every other write in this module after an initial read, binding this
+    activation attempt to the exact generation the caller last observed."""
+    tenant_keys.assert_valid_tenant_id(tenant_id, "activate_media_capture")
+    config = get_tenant_config(tenant_id)
+    if config is None:
+        raise ValueError(f"activate_media_capture: tenant {tenant_id!r} has no tenant_config record yet")
+
+    existing_media_capture = config.get("mediaCapture") or {}
+    existing_started_at = existing_media_capture.get("startedAt")
+    if existing_media_capture.get("status") == "active" and _is_valid_iso_utc_timestamp(existing_started_at):
+        started_at = existing_started_at  # preserved, never reset or backdated
+    else:
+        started_at = _now_iso()  # server-computed, never caller-supplied
+
+    return upsert_tenant_config(
+        tenant_id, {"mediaCapture": {"status": "active", "startedAt": started_at}},
+        expected_version=expected_version,
+    )

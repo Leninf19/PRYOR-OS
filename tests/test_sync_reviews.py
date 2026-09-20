@@ -155,14 +155,16 @@ def test_main_returns_one_on_failed_status():
 def test_main_passes_fast_flag_through_to_sync_all():
     captured = {}
 
-    async def fake_sync_all(provider, *, fast=False):
+    async def fake_sync_all(provider, *, fast=False, tenant_id=None):
         captured["fast"] = fast
+        captured["tenant_id"] = tenant_id
         return {"status": "ok", "locations_succeeded": 0, "locations_failed": 0, "new": 0}
 
     with _argv("--provider", "mock", "--fast", "--tenant-id", TEST_TENANT_ID), \
          mock.patch("sync_reviews.provider_sync.sync_all", new=fake_sync_all):
         sync_reviews.main()
     assert captured["fast"] is True
+    assert captured["tenant_id"] == TEST_TENANT_ID
 
 
 # --- GitHub Actions output compatibility --------------------------------------

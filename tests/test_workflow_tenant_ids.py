@@ -56,6 +56,17 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # tenant, unlike every script in that list (which must NEVER accept a
     # dispatch-supplied tenant id). See that workflow's own header comment.
     "tenant-lifecycle.yml",
+    # Review Media Feature -- Scale & No-Backfill Audit diagnostic
+    # infrastructure: invokes gbp_review_media_diagnostic.py, which is
+    # NOT in TENANT_AWARE_SCRIPTS above and is deliberately dispatch-driven
+    # (an explicit, required tenant_id workflow_dispatch input, per that
+    # audit's own design), exactly like tenant-lifecycle.yml's
+    # provision_tenant.py/initial_sync.py -- both are built to run for an
+    # operator-chosen tenant across the whole multi-tenant fleet, unlike
+    # every script in TENANT_AWARE_SCRIPTS (which must NEVER accept a
+    # dispatch-supplied tenant id, since those all operate specifically on
+    # Los Tres Amigos's own fixed production pipeline).
+    "diagnostic-gbp-review-media.yml",
 }
 
 results = []

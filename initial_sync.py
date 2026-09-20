@@ -300,7 +300,13 @@ def _run_integrity_check(db_path: Path) -> None:
 def _run_google_sync(tenant_id: str, approved_locations: list[dict]) -> dict:
     approved_google_location_ids = {loc["googleLocationId"] for loc in approved_locations}
     provider = approved_provider.ApprovedLocationsOnlyGBPProvider(tenant_id, approved_google_location_ids)
-    result = asyncio.run(provider_sync.sync_all(provider, fast=False))
+    # Review Media Feature -- Scale & No-Backfill Audit: threaded through
+    # for consistency with every other sync entry point, but a brand-new
+    # tenant always defaults to mediaCapture.status='inactive' (see
+    # tenant_config_store.py's upsert_tenant_config()) -- this NEVER
+    # activates media capture during Initial Sync, it only lets the SAME
+    # no-op-when-inactive gate run uniformly everywhere.
+    result = asyncio.run(provider_sync.sync_all(provider, fast=False, tenant_id=tenant_id))
     if result.get("status") != "ok":
         raise GoogleSyncFailedError(
             f"tenant {tenant_id!r}: Google sync did not complete cleanly for every approved location -- "

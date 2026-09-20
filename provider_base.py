@@ -121,6 +121,22 @@ class ProviderReview:
     # supply them.
     gbp_reply_moderation_state: Optional[str] = None
     gbp_reply_policy_violation: Optional[dict] = None
+    # Review Media Feature -- Scale & No-Backfill Audit (Phase 4). `media`
+    # is the ALREADY-SANITIZED candidate list (see media_sanitizer.py) --
+    # never raw Google reviewMediaItems. `gbp_create_time` is the FULL,
+    # untruncated Google createTime string (unlike review_date, which
+    # stays date-only, unchanged, for backward compatibility with every
+    # existing reader of that field). Both are optional so a Provider with
+    # no media concept (the scraper, the mock provider) never has to
+    # supply them, and both are TRANSIENT: as_row() forwards them so
+    # db.upsert_review()'s gate can see them, but neither is a database
+    # column, and gbp_create_time is NEVER itself persisted anywhere --
+    # only used, in-memory, for the one eligibility comparison the gate
+    # performs. Providing `media` here is NOT itself an eligibility
+    # decision -- see db.upsert_review()'s own docstring for why that
+    # decision is deliberately made there, not in any Provider."""
+    media: Optional[list] = None
+    gbp_create_time: Optional[str] = None
 
     def as_row(self) -> dict:
         return {
@@ -136,6 +152,12 @@ class ProviderReview:
             "gbp_language_code": self.gbp_language_code,
             "gbp_reply_moderation_state": self.gbp_reply_moderation_state,
             "gbp_reply_policy_violation": self.gbp_reply_policy_violation,
+            # Transient -- see the field comment above. Neither key is a
+            # database column; db.upsert_review() reads both only to
+            # decide whether `media` may be stored at all, then discards
+            # gbp_create_time entirely.
+            "media": self.media,
+            "gbp_create_time": self.gbp_create_time,
         }
 
 

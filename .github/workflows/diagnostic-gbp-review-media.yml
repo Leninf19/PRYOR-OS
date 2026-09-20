@@ -1,0 +1,75 @@
+name: Diagnostic - GBP Review Media
+
+# DIAGNOSTIC INFRASTRUCTURE ONLY (Review Media Feature, Scale & No-Backfill
+# Audit). Runs gbp_review_media_diagnostic.py, which calls ONLY
+# google_api.get_review() -- a single, read-only GET for one exact review
+# resource. It never calls list_reviews(), never runs any provider's
+# fetch_reviews(), never runs provider_sync.sync_all(), never calls
+# reply_to_review()/updateReply/deleteReply, never writes to Redis or
+# reviews.db, never generates export artifacts, and never downloads an
+# image or video byte (thumbnailUrl/videoUrl strings are only ever parsed
+# with urllib.parse.urlparse() for a sanitized hostname/scheme report).
+#
+# --hypothetical-activation-time is a diagnostic-only comparison. This
+# workflow never activates media capture for any tenant -- it has no write
+# path to tenant_config at all.
+#
+# workflow_dispatch only -- no schedule, no push trigger. Both tenant_id and
+# gbp_review_name are explicit, required dispatch inputs; there is no
+# unsafe default review or tenant baked into this workflow or the script it
+# runs (the script itself also requires both via argparse and refuses to
+# run without them).
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_id:
+        description: 'Explicit tenant whose credential to use (e.g. t_los-tres-amigos). REQUIRED -- no default.'
+        required: true
+      gbp_review_name:
+        description: 'Exact Google review resource name (accounts/*/locations/*/reviews/*). REQUIRED -- no default.'
+        required: true
+      hypothetical_activation_time:
+        description: 'Optional ISO/RFC3339 UTC timestamp for a diagnostic-only eligibility comparison. Never written anywhere; does not activate media capture for any tenant.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        # Uses the dispatched ref by default (whatever ref this workflow_dispatch
+        # run was triggered against) -- no explicit `ref:` override here, so a
+        # dispatch against feature/review-media checks out that branch's own
+        # copy of the diagnostic script, never main's.
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      # cryptography is required for google_api.py's AESGCM decrypt of the
+      # Redis-stored refresh token (see google_api.py's
+      # _fetch_refresh_token_from_redis()) -- the same dependency every
+      # other GBP-calling workflow installs. google_api.py's own HTTP calls
+      # use urllib.request (stdlib), so nothing else is needed.
+      - name: Install Python dependencies
+        run: pip install cryptography
+
+      - name: Run GBP review media diagnostic (read-only)
+        run: >
+          python gbp_review_media_diagnostic.py
+          --tenant-id "${{ inputs.tenant_id }}"
+          --gbp-review-name "${{ inputs.gbp_review_name }}"
+          --hypothetical-activation-time "${{ inputs.hypothetical_activation_time }}"
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}

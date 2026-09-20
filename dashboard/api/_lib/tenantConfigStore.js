@@ -441,6 +441,19 @@ export async function upsertTenantConfig(tenantId, patch, { expectedVersion, all
       status: 'none', requestedAt: null, completedAt: null, failedAt: null,
       addedLocationIds: [], removedLocationIds: [], lastError: null,
     },
+    // Review Media Feature -- Scale & No-Backfill Audit: a sibling of
+    // provisioning/initialSync/entitlementChange on this SAME record (no
+    // second tenant-config store invented -- see that audit's Audit 3).
+    // Defaults to 'inactive'/null for EVERY tenant, including one getting
+    // its first record via this function. Missing mediaCapture, or a
+    // missing/malformed startedAt, both mean "inactive" to every reader
+    // (Python's db.upsert_review() gate) -- this default is what makes
+    // that true from a tenant's very first write onward. Nothing in this
+    // file ever activates it -- see tenant_config_store.py's (Python)
+    // activate_media_capture(), the sole intended writer of
+    // mediaCapture's own active status, never called by any
+    // deploy/onboarding/sync path in this implementation.
+    mediaCapture: { status: 'inactive', startedAt: null },
     ...existing,
     createdAt: existing?.createdAt ?? now,
     ...patch,
@@ -477,6 +490,12 @@ export async function upsertTenantConfig(tenantId, patch, { expectedVersion, all
   }
   if (!Number.isInteger(next.nextLocationId) || next.nextLocationId < 1) {
     throw new Error('upsertTenantConfig: nextLocationId must be a positive integer')
+  }
+  if (
+    typeof next.mediaCapture !== 'object' || next.mediaCapture === null ||
+    (next.mediaCapture.status !== 'inactive' && next.mediaCapture.status !== 'active')
+  ) {
+    throw new Error(`upsertTenantConfig: invalid mediaCapture ${JSON.stringify(next.mediaCapture)}`)
   }
 
   if (expectedVersion !== undefined) {

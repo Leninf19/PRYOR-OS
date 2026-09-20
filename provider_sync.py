@@ -23,6 +23,8 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 import db
+import media_sanitizer
+import tenant_config_store
 import validate
 from provider_base import Provider, ProviderError
 
@@ -296,12 +298,24 @@ def _record_early_failure(conn, now: str, reason: str, provider_name: str, mode:
     conn.commit()
 
 
-async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
+async def sync_all(provider: Provider, *, fast: bool = False, tenant_id: str | None = None) -> dict:
     """Runs one full sync pass for any Provider. Returns run stats
     (new/edited/deleted counts) in the same shape auto_update.py's own run
     stats and gbp_sync.py's previous sync_all() already used, so any caller
     (a workflow, a notification script, a test) can treat any provider's
     result identically.
+
+    Review Media Feature -- Scale & No-Backfill Audit (Phase 6): `tenant_id`
+    is optional (None for a caller with no tenant concept, e.g. a bare
+    MockProvider smoke test) and is used for EXACTLY ONE thing -- resolving
+    this tenant's mediaCapture.startedAt ONCE, here, before the per-location
+    loop begins, never once per review and never once per location. This is
+    a single Redis read (tenant_config_store.resolve_media_capture_started_at()),
+    NOT a new Google API call, and adds no new pagination of any kind. If
+    that lookup fails (a genuine store outage), this sync CONTINUES with
+    media capture disabled for this run -- a config-store outage must never
+    block the underlying review sync itself, only disable the media gate
+    for this one pass.
 
     Moved and generalized from gbp_sync.py's original sync_all() (Phase 3
     Milestone 1). The only behavioral differences from that original: the
@@ -324,6 +338,20 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
     db.init_schema(conn)
     now = datetime.now(timezone.utc).isoformat()
     mode = _mode_for(provider)
+
+    # Review Media Feature -- Scale & No-Backfill Audit (Phase 6): resolved
+    # ONCE per sync_all() call, never per location, never per review. See
+    # this function's own docstring above for the full "config lookup
+    # failure fails closed, sync continues" contract.
+    media_capture_started_at = None
+    if tenant_id is not None:
+        try:
+            media_capture_started_at = tenant_config_store.resolve_media_capture_started_at(tenant_id)
+        except tenant_config_store.TenantConfigStoreUnavailableError as e:
+            print(f"provider_sync.py: mediaCapture lookup failed for tenant ({type(e).__name__}) -- "
+                  f"continuing this sync with media capture disabled")
+            media_capture_started_at = None
+    media_capture_active = media_capture_started_at is not None
 
     if not provider.is_configured():
         return {"status": "skipped", "reason": f"{provider.display_name} not configured"}
@@ -398,6 +426,11 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
             scraped_keys = set()
             window_min_date = None
             loc_new = loc_edited = 0
+            # Review Media Feature -- Scale & No-Backfill Audit (Phase 6):
+            # safe observability only -- counts, never URLs/labels/secrets,
+            # and never itself a storage decision (db.upsert_review()'s own
+            # gate remains the sole authority on what is actually written).
+            loc_media_qualifying = loc_media_stored_items = loc_media_dropped_items = loc_media_pre_activation = 0
 
             for preview in provider_reviews:
                 row = preview.as_row()
@@ -405,7 +438,20 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
                 scraped_keys.add(key)
                 if row["review_date"] and (window_min_date is None or row["review_date"] < window_min_date):
                     window_min_date = row["review_date"]
-                result = db.upsert_review(conn, loc["id"], loc["name"], row, now)
+
+                if media_capture_active:
+                    if db.review_qualifies_for_media(row, media_capture_started_at):
+                        loc_media_qualifying += 1
+                        sanitized_preview = media_sanitizer.sanitize_review_media_items(row.get("media"))
+                        loc_media_stored_items += len(sanitized_preview)
+                        loc_media_dropped_items += max(len(row.get("media") or []) - len(sanitized_preview), 0)
+                    elif row.get("gbp_create_time"):
+                        loc_media_pre_activation += 1
+
+                result = db.upsert_review(
+                    conn, loc["id"], loc["name"], row, now,
+                    media_capture_started_at=media_capture_started_at,
+                )
                 if result == "new":
                     loc_new += 1
                     new_reviews_detail.append({
@@ -414,6 +460,14 @@ async def sync_all(provider: Provider, *, fast: bool = False) -> dict:
                     })
                 elif result == "edited":
                     loc_edited += 1
+
+            # One summary line per LOCATION, never per review -- counts
+            # only, never a URL, a label, or review text.
+            print(
+                f"provider_sync.py: location={loc['name']!r} media_capture_active={media_capture_active} "
+                f"qualifying_reviews={loc_media_qualifying} stored_media_items={loc_media_stored_items} "
+                f"dropped_items={loc_media_dropped_items} pre_activation_reviews={loc_media_pre_activation}"
+            )
 
             # Skipped on the fast/partial path -- a one-page fetch doesn't cover
             # enough of the review window for detect_deletions to judge absence

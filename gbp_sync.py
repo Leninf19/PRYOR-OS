@@ -60,7 +60,7 @@ def sync_all(*, tenant_id: str, fast: bool = False) -> dict:
     value back) without requiring every caller to remember to do it first."""
     tenant_keys.assert_valid_tenant_id(tenant_id, "gbp_sync.sync_all")
     db.DB_PATH = tenant_paths.resolve_review_db_path(tenant_id)
-    return asyncio.run(provider_sync.sync_all(GBPProvider(tenant_id=tenant_id), fast=fast))
+    return asyncio.run(provider_sync.sync_all(GBPProvider(tenant_id=tenant_id), fast=fast, tenant_id=tenant_id))
 
 
 def _build_email_html(negative_reviews: list) -> str:

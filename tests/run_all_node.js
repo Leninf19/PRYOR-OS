@@ -116,6 +116,7 @@ const TESTS = [
   'test_tenant_location_ownership.js',
   'test_tenant_location_catalog_concurrency.js',
   'test_tenant_config_cross_language_consistency.js',
+  'test_review_media_gallery.js',
   'test_tenant_blob_keys_cross_language_consistency.js',
   'test_review_data_paths_provisioning.js',
   'test_provisioned_not_active.js',

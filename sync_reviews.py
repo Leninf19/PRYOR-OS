@@ -149,7 +149,7 @@ def main() -> int:
         print(f"::error::sync_reviews.py: {e}")
         return 1
 
-    result = asyncio.run(provider_sync.sync_all(provider, fast=args.fast))
+    result = asyncio.run(provider_sync.sync_all(provider, fast=args.fast, tenant_id=args.tenant_id))
     print(result)
     print(f"[sync_reviews] stage=sync_complete status={result.get('status')} "
           f"new={result.get('new', 0)} edited={result.get('edited', 0)} deleted={result.get('deleted', 0)}")

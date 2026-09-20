@@ -93,7 +93,14 @@ def test_provider_review_as_row_matches_db_upsert_review_expected_keys():
     gbp_reply_update_time, gbp_language_code, and -- since the Google Reply
     Moderation State fix's full-sync gap closure -- gbp_reply_moderation_state/
     gbp_reply_policy_violation) -- as_row() must produce precisely this
-    shape so introducing a Provider never requires a storage-layer change."""
+    shape so introducing a Provider never requires a storage-layer change.
+
+    Review Media Feature -- Scale & No-Backfill Audit (Phase 4): `media`
+    and `gbp_create_time` were deliberately, reviewedly added here -- both
+    TRANSIENT (never database columns; db.upsert_review()'s gate reads them
+    only to decide whether `media` may ever reach gbp_review_media, then
+    discards gbp_create_time entirely). This update to the expected-keys
+    set is that review."""
     review = ProviderReview(
         reviewer_name="Jane Doe", review_date="2026-07-01", star_rating=5,
         review_text="Great food!", owner_response="Thank you!",
@@ -111,6 +118,7 @@ def test_provider_review_as_row_matches_db_upsert_review_expected_keys():
         "owner_response", "review_url", "gbp_review_name", "gbp_update_time",
         "gbp_reply_update_time", "gbp_language_code",
         "gbp_reply_moderation_state", "gbp_reply_policy_violation",
+        "media", "gbp_create_time",
     }
     assert set(row.keys()) == expected_keys, f"as_row() keys {set(row.keys())} must exactly match db.upsert_review()'s expected shape"
     assert row["reviewer_name"] == "Jane Doe"
