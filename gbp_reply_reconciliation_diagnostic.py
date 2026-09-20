@@ -33,6 +33,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import google_api as ga
+import reply_moderation_state as rms
 import tenant_keys
 import tenant_paths
 
@@ -66,9 +67,17 @@ def abbreviate(gbp_review_name: str | None) -> str:
     return "..." + gbp_review_name[-24:]
 
 
-def check_google_state(tenant_id: str, gbp_review_name: str) -> dict:
+def check_google_state(tenant_id: str, gbp_review_name: str, local_reply_text: str | None = None) -> dict:
     """Single read-only GET. Never writes, never replies. Returns a dict
-    describing what Google currently reports for this exact review."""
+    describing what Google currently reports for this exact review.
+
+    Google Reply Moderation State fix (Phase 6): now also reports
+    reviewReplyState/policyViolation and a normalized reply-text match
+    result -- the exact fields the original version of this script never
+    looked at, which is how a rejected/pending reply with an echoed-back
+    comment could look identical to a genuinely approved one. A missing or
+    unrecognized reviewReplyState is reported as "unresolved", never
+    guessed as approval or rejection (see reply_moderation_state.py)."""
     try:
         api_review = ga.get_review(tenant_id, gbp_review_name)
     except Exception as e:
@@ -76,6 +85,24 @@ def check_google_state(tenant_id: str, gbp_review_name: str) -> dict:
 
     reply = api_review.get("reviewReply") or {}
     comment = (reply.get("comment") or "").strip()
+    review_reply_state = reply.get("reviewReplyState")
+    normalized_state = rms.normalize_review_reply_state(review_reply_state)
+    outcome_state = rms.classify_moderation_outcome(review_reply_state)
+    policy_violation = rms.normalize_policy_violation(reply.get("policyViolation"))
+    text_matches = rms.reply_text_matches(comment, local_reply_text) if local_reply_text else None
+
+    if outcome_state == rms.APPROVED:
+        interpretation = "APPROVED by Google -- this reply should be treated as resolved."
+    elif outcome_state == rms.REJECTED:
+        reason = policy_violation["summary"] if policy_violation else "no reason given"
+        interpretation = f"REJECTED by Google ({reason}) -- must NOT be treated as answered; needs a new reply."
+    elif outcome_state == rms.PENDING_APPROVAL:
+        interpretation = "PENDING Google approval -- not yet resolved, do not treat as answered."
+    elif comment:
+        interpretation = "Reply text present but reviewReplyState is missing/unspecified/unrecognized -- UNRESOLVED, do not treat as answered."
+    else:
+        interpretation = "No reply present on Google at all -- genuinely unanswered."
+
     return {
         "verifiable": True,
         "has_reply": bool(comment),
@@ -84,6 +111,12 @@ def check_google_state(tenant_id: str, gbp_review_name: str) -> dict:
         "reviewer_display_name": (api_review.get("reviewer") or {}).get("displayName"),
         "create_time": api_review.get("createTime"),
         "review_comment": api_review.get("comment") or "",
+        "review_reply_state_raw": review_reply_state,
+        "review_reply_state_normalized": normalized_state,
+        "moderation_outcome": outcome_state,
+        "policy_violation": policy_violation,
+        "reply_text_matches_local": text_matches,
+        "interpretation": interpretation,
     }
 
 
@@ -166,17 +199,23 @@ def main() -> int:
             row["identity_check"] = "unverifiable"
         else:
             row["identity_check"] = identity_sanity_check(r, google_state)
-            row["recommended_state"] = (
-                "already answered on Google -- should NOT be Needs Reply"
-                if google_state["has_reply"] else
-                "genuinely unanswered on Google -- Needs Reply is correct"
-            )
+            outcome = google_state.get("moderation_outcome")
+            if outcome == rms.APPROVED:
+                row["recommended_state"] = "already answered on Google (APPROVED) -- should NOT be Needs Reply"
+            elif outcome == rms.REJECTED:
+                row["recommended_state"] = "REJECTED by Google -- must NOT be treated as answered"
+            elif outcome == rms.PENDING_APPROVAL:
+                row["recommended_state"] = "PENDING Google approval -- not yet resolved"
+            elif google_state["has_reply"]:
+                row["recommended_state"] = "reply text present, moderation state UNRESOLVED -- do not treat as answered"
+            else:
+                row["recommended_state"] = "genuinely unanswered on Google -- Needs Reply is correct"
         results.append(row)
 
     # --- Per-review table ---
-    print("=" * 150)
-    print(f"{'ID':7} | {'Reviewer':28} | {'Date':10} | {'GBP review id':27} | {'Local reply?':13} | {'Google reply?':14} | {'Identity':22} | Recommended state")
-    print("=" * 150)
+    print("=" * 175)
+    print(f"{'ID':7} | {'Reviewer':22} | {'Date':10} | {'GBP review id':27} | {'Local reply?':13} | {'Google reply?':14} | {'ReplyState':10} | {'Identity':16} | Recommended state")
+    print("=" * 175)
     for row in results:
         google = row.get("google") or {}
         google_reply_disp = (
@@ -184,26 +223,31 @@ def main() -> int:
             "ERROR" if not google.get("verifiable") else
             ("YES" if google["has_reply"] else "no")
         )
+        reply_state_disp = (google.get("review_reply_state_normalized") or "(none)") if google.get("verifiable") else "n/a"
         print(
-            f"{row['id']:<7} | {row['reviewer_name'][:28]:28} | {row['review_date'] or '':10} | "
+            f"{row['id']:<7} | {row['reviewer_name'][:22]:22} | {row['review_date'] or '':10} | "
             f"{abbreviate(row['gbp_review_name']):27} | {'yes' if row['local_owner_response_present'] else 'no':13} | "
-            f"{google_reply_disp:14} | {row.get('identity_check', 'n/a'):22} | {row['recommended_state']}"
+            f"{google_reply_disp:14} | {reply_state_disp:10} | {row.get('identity_check', 'n/a'):16} | {row['recommended_state']}"
         )
-    print("=" * 150)
+    print("=" * 175)
     print()
 
-    # --- Detail for anything Google says IS answered (the interesting case) ---
-    answered_on_google = [r for r in results if r.get("google", {}).get("has_reply")]
-    if answered_on_google:
-        print("--- Reviews Google reports as ALREADY ANSWERED (local state is stale) ---")
-        for row in answered_on_google:
+    # --- Detail for anything Google reports a reply for (the interesting case) ---
+    has_any_reply = [r for r in results if r.get("google", {}).get("has_reply")]
+    if has_any_reply:
+        print("--- Reviews Google reports a reply for (local state is stale either way) ---")
+        for row in has_any_reply:
             g = row["google"]
             print(f"  id={row['id']} reviewer={row['reviewer_name']!r} date={row['review_date']} "
                   f"gbp_review_name={abbreviate(row['gbp_review_name'])}")
-            print(f"    Google reply timestamp: {g['reply_timestamp']}")
+            print(f"    reviewReplyState (raw / normalized): {g['review_reply_state_raw']!r} / {g['review_reply_state_normalized']!r}")
+            print(f"    policyViolation: {g['policy_violation']}")
+            print(f"    Google reply updateTime: {g['reply_timestamp']}")
             print(f"    Google reply text: {g['reply_text'][:300]!r}")
+            print(f"    Reply text matches local record (only meaningful if a local reply text was supplied): {g['reply_text_matches_local']}")
             print(f"    Local gbp_reply_update_time (before this run): {row['local_gbp_reply_update_time']}")
             print(f"    Identity sanity check: {row['identity_check']}")
+            print(f"    Final diagnostic interpretation: {g['interpretation']}")
         print()
 
     unverifiable = [r for r in results if r["recommended_state"] == "unable to verify"]
@@ -216,26 +260,31 @@ def main() -> int:
 
     # --- Summary totals ---
     total = len(results)
-    answered = len(answered_on_google)
+    approved = len([r for r in results if r.get("google", {}).get("moderation_outcome") == rms.APPROVED])
+    rejected = len([r for r in results if r.get("google", {}).get("moderation_outcome") == rms.REJECTED])
+    pending = len([r for r in results if r.get("google", {}).get("moderation_outcome") == rms.PENDING_APPROVAL])
+    unresolved_with_text = len([r for r in results if r.get("google", {}).get("has_reply") and r.get("google", {}).get("moderation_outcome") is None])
     unanswered = len([r for r in results if r["recommended_state"] == "genuinely unanswered on Google -- Needs Reply is correct"])
     unable = len(unverifiable)
 
     default_results = [r for r in results if r["in_default_window"]]
-    default_answered = len([r for r in default_results if r.get("google", {}).get("has_reply")])
-    default_unanswered = len([r for r in default_results if r["recommended_state"] == "genuinely unanswered on Google -- Needs Reply is correct"])
-    default_unable = len([r for r in default_results if r["recommended_state"] == "unable to verify"])
 
     print("=" * 60)
     print("SUMMARY -- all actionable reviews at this location")
     print(f"  Current Needs Reply (actionable, local):   {total}")
-    print(f"  Already answered on Google:                {answered}")
-    print(f"  Genuinely unanswered on Google:             {unanswered}")
-    print(f"  Unable to verify:                           {unable}")
+    print(f"  Approved by Google:                         {approved}")
+    print(f"  Rejected by Google:                         {rejected}")
+    print(f"  Pending Google approval:                    {pending}")
+    print(f"  Reply text present, moderation UNRESOLVED:  {unresolved_with_text}")
+    print(f"  Genuinely unanswered on Google:              {unanswered}")
+    print(f"  Unable to verify:                            {unable}")
     print()
     print(f"SUMMARY -- default dashboard window only (last {args.window_days} days, {len(default_results)} reviews)")
-    print(f"  Already answered on Google:                {default_answered}")
-    print(f"  Genuinely unanswered on Google:             {default_unanswered}")
-    print(f"  Unable to verify:                           {default_unable}")
+    print(f"  Approved by Google:                          {len([r for r in default_results if r.get('google', {}).get('moderation_outcome') == rms.APPROVED])}")
+    print(f"  Rejected by Google:                          {len([r for r in default_results if r.get('google', {}).get('moderation_outcome') == rms.REJECTED])}")
+    print(f"  Pending Google approval:                     {len([r for r in default_results if r.get('google', {}).get('moderation_outcome') == rms.PENDING_APPROVAL])}")
+    print(f"  Genuinely unanswered on Google:               {len([r for r in default_results if r['recommended_state'] == 'genuinely unanswered on Google -- Needs Reply is correct'])}")
+    print(f"  Unable to verify:                             {len([r for r in default_results if r['recommended_state'] == 'unable to verify'])}")
     print("=" * 60)
     print("\n=== END gbp_reply_reconciliation_diagnostic.py -- nothing was written anywhere ===")
     return 0

@@ -18,7 +18,10 @@ import { useRestaurantContacts } from '../hooks/useRestaurantContacts.js'
 import ContactEditorModal from './settings/ContactEditorModal.jsx'
 import { useAccount } from '../components/AuthGate.jsx'
 import { EMAIL_STATUS_META, DUPLICATE_EMAIL_STATUSES } from '../utils/actionWorkspaceUtils.js'
-import { REPLY_STATE_META, computeReplyState, isActionableReplyState, isAnsweredReplyState, classifyReviewRiskClient, CATEGORY_UI_LABELS, computeReplyStateCounts } from '../utils/replyState.js'
+import {
+  REPLY_STATE_META, computeReplyState, isActionableReplyState, isAnsweredReplyState, classifyReviewRiskClient,
+  CATEGORY_UI_LABELS, computeReplyStateCounts, ModerationState, MODERATION_STATE_DESCRIPTIONS, resolveBridgeModerationState,
+} from '../utils/replyState.js'
 
 const PAGE_SIZE = 40
 
@@ -333,14 +336,67 @@ function ReplyStateBadge({ r, wsEntry, bridgeEntry }) {
   return <Badge variant={meta.variant}>{meta.label}</Badge>
 }
 
+// Google Reply Moderation State fix -- replaces the old, unconditional
+// "Published via Pryor OS ... awaiting the next sync" box. Shows exactly
+// what's known (the bridge record's own moderationState, never just
+// "it exists") plus short supporting text -- for a rejection, the actual
+// (sanitized) policy reason when available, never a raw API payload. A
+// REJECTED reply re-opens the normal compose workspace underneath so a
+// manager can write and submit a genuinely new reply -- this is never an
+// automatic republish of the same text.
+function ModerationStatusBox({ bridgeEntry, r, draft, wsEntry, onUpdate, onPublishSuccess, nextReviewId }) {
+  const state = resolveBridgeModerationState(bridgeEntry)
+  const meta = REPLY_STATE_META[state] ?? REPLY_STATE_META[ModerationState.SENT_TO_GOOGLE]
+  const description = state === ModerationState.REJECTED
+    ? (bridgeEntry.policyViolation?.summary || MODERATION_STATE_DESCRIPTIONS[ModerationState.REJECTED])
+    : MODERATION_STATE_DESCRIPTIONS[state]
+  return (
+    <>
+      <div>
+        <div className="flex items-center gap-2 mb-1.5">
+          <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>
+            Reply Sent via Pryor OS
+          </p>
+          <Badge variant={meta.variant}>{meta.label}</Badge>
+        </div>
+        <div className="p-3 rounded-xl text-xs leading-relaxed italic"
+             style={{ background: 'var(--color-accent-lt)', border: '1px solid var(--color-accent-md)', color: 'var(--color-text-2)' }}>
+          {bridgeEntry.responseText}
+        </div>
+        {description && (
+          <p className="text-[10px] mt-1.5" style={{ color: 'var(--color-text-3)' }}>
+            {description}
+          </p>
+        )}
+      </div>
+      {state === ModerationState.REJECTED && (
+        <div className="pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>
+          <ResponseWorkspace r={r} draft={draft} wsEntry={wsEntry} onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} nextReviewId={nextReviewId} />
+        </div>
+      )}
+    </>
+  )
+}
+
 // ─── Filter bar ───────────────────────────────────────────────────────────────
 // M5.3: reply-state quick filters (pills) per the frozen wireframe (Needs
 // reply / Draft / Confirmed / Failed / Externally replied), replacing the
 // old single "No reply only" checkbox with the same underlying predicate
 // reachable through the new state vocabulary -- filtering behavior is
 // identical for every non-pending review; only the control surface changed.
+//
+// Google Reply Moderation State fix: the single 'confirmed' pill is
+// replaced by the granular states a manager actually needs to filter on --
+// most importantly Rejected by Google (which needs a brand-new reply, so it
+// belongs next to Needs Reply/Failed, not hidden inside a generic
+// "Confirmed" bucket).
 
-const REPLY_STATE_FILTERS = ['needs_reply', 'draft', 'confirmed', 'failed', 'externally_replied']
+const REPLY_STATE_FILTERS = [
+  'needs_reply', 'draft',
+  ModerationState.SENT_TO_GOOGLE, ModerationState.PENDING_APPROVAL, ModerationState.APPROVED,
+  ModerationState.REJECTED, ModerationState.VERIFICATION_DELAYED,
+  'failed', ModerationState.EXTERNALLY_REPLIED,
+]
 
 // Filtering UX Cleanup: `counts` (optional) shows, per state, how many
 // reviews in the CURRENT GLOBAL scope (App.jsx's date/location/brand/star
@@ -1238,13 +1294,21 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpd
         {reviewLength(r.review_text) && ` · ${(r.review_text || '').trim().length} characters`}
       </p>
 
-      {/* Owner response (already replied on Google) -- or, Recovery
-          Milestone 6B Part 4: a durable publish-bridge record, proof this
-          app's own Confirm & Publish already reached Google even though
-          the next GBP sync hasn't written owner_response back into
-          reviews.db yet. Showing the actual bridge text here (not just an
-          empty gap) is what makes the review read as done immediately,
-          cross-browser/cross-device, without waiting on that sync. */}
+      {/* Owner response (already replied on Google) -- or, Google Reply
+          Moderation State fix (originally Recovery Milestone 6B Part 4): a
+          durable publish-bridge record. Its OWN moderationState is what's
+          shown now -- NEVER just "Published, awaiting sync" for every
+          bridge regardless of what Google actually said (the literal defect
+          the read-only audit found: Casa Tequila Brighton / reviewer
+          "Terry", local review id 35738, showed "Confirmed" while the
+          reply was absent from Google's public listing). A REJECTED reply
+          re-opens the normal compose workspace below the status box -- a
+          rejected reply is genuinely unanswered and needs a brand-new
+          reply, never an automatic republish of the same text. Every other
+          bridge state (sent/pending/approved/verification-delayed) hides
+          the compose workspace so a manager can't accidentally trigger a
+          duplicate publish attempt while the outcome is still in flight or
+          unresolved. */}
       {r.owner_response ? (
         <div>
           <p className="text-[10px] font-bold uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-3)' }}>
@@ -1256,18 +1320,10 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpd
           </div>
         </div>
       ) : bridgeEntry ? (
-        <div>
-          <p className="text-[10px] font-bold uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-3)' }}>
-            Published via Pryor OS
-          </p>
-          <div className="p-3 rounded-xl text-xs leading-relaxed italic"
-               style={{ background: 'var(--color-accent-lt)', border: '1px solid var(--color-accent-md)', color: 'var(--color-text-2)' }}>
-            {bridgeEntry.responseText}
-          </div>
-          <p className="text-[10px] mt-1.5" style={{ color: 'var(--color-text-3)' }}>
-            Published to Google · awaiting the next sync to confirm it here. No action needed.
-          </p>
-        </div>
+        <ModerationStatusBox
+          bridgeEntry={bridgeEntry} r={r} draft={draft} wsEntry={wsEntry}
+          onUpdate={onUpdate} onPublishSuccess={onPublishSuccess} nextReviewId={nextReviewId}
+        />
       ) : (
         /* Not yet replied -- full response workspace (draft/edit/rewrite/publish) */
         <div className="pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>

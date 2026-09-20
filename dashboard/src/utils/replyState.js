@@ -1,33 +1,72 @@
 import { reviewId } from './dataUtils.js'
 
+// Google Reply Moderation State fix -- mirrors dashboard/api/_lib/
+// replyModerationState.js's ModerationState/resolveBridgeModerationState
+// exactly, by comment reference (kept in sync, not imported: a browser
+// bundle cannot import a server-only _lib module -- see this file's own
+// RISK_CATEGORIES copy further below for the SAME established
+// frontend/backend duplication convention this project already uses).
+//
+// Root cause this fix addresses (full audit: Casa Tequila Brighton /
+// reviewer "Terry", local review id 35738): this file used to collapse
+// "a publish-bridge record merely exists" OR "the browser's own
+// localStorage says published" into a single 'confirmed' state -- which is
+// exactly what let PRYOR show "Confirmed" for a reply Google had actually
+// left pending or rejected in moderation. Bridge existence alone, and
+// localStorage alone, must NEVER produce an approved/confirmed state again.
+export const ModerationState = Object.freeze({
+  SENT_TO_GOOGLE:       'sent_to_google',
+  PENDING_APPROVAL:     'pending_google_approval',
+  APPROVED:             'approved_by_google',
+  REJECTED:             'rejected_by_google',
+  VERIFICATION_DELAYED: 'verification_delayed',
+  EXTERNALLY_REPLIED:   'externally_replied',
+})
+
+const KNOWN_MODERATION_STATES = new Set(Object.values(ModerationState))
+
+// Reads a publish-bridge record's OWN moderationState field instead of
+// treating mere existence as confirmation. A record written before this fix
+// (or carrying any unrecognized future value) has no usable moderationState
+// and falls back to SENT_TO_GOOGLE -- the honest, weakest state, never an
+// assumed approval. This is what makes a pre-existing bridge record safe to
+// keep reading after this deploy with no migration.
+export function resolveBridgeModerationState(bridgeEntry) {
+  if (!bridgeEntry) return null
+  if (typeof bridgeEntry.moderationState === 'string' && KNOWN_MODERATION_STATES.has(bridgeEntry.moderationState)) {
+    return bridgeEntry.moderationState
+  }
+  return ModerationState.SENT_TO_GOOGLE
+}
+
 // M5's reply-state model (Navigation/Design System/Execution Master Plan
 // v1.0) -- a presentation-layer mapping over the existing workspace `status`
-// + `owner_response` fields, NOT a new data source or a change to how those
-// fields get set. Five states, four backed by real, already-existing data:
+// + `owner_response` fields, extended by the Google Reply Moderation State
+// fix to replace the old single, misleading 'confirmed' state with the
+// granular states above:
 //
-//  - draft:               status is draft_ready or edited (an AI or edited
-//                          draft exists, not yet sent) -- real field.
-//  - confirmed:            status === 'published' (this app recorded a
-//                          successful publish). There is no independent
-//                          backend confirmation signal beyond our own
-//                          optimistic marking -- this IS the real field.
-//  - failed:               status === 'failed' -- real field, unchanged.
-//  - externally_replied:   owner_response is populated but this app's
-//                          workspace never recorded publishing it -- a
-//                          reply exists on Google that didn't come from
-//                          here. Computed from two already-real fields.
-//  - pending:              INERT STUB. No code path in this app ever sets
-//                          status to 'pending_confirmation' -- the real
-//                          backend signal for "published, awaiting Google
-//                          sync confirmation" doesn't exist yet (Execution
-//                          Master Plan v1.0's M5 risk note). This branch
-//                          exists only so the 5-state badge model is
-//                          complete in the UI now, without fabricating a
-//                          confirmation this app can't actually verify.
-//                          Never reachable in production today.
+//  - draft:                status is draft_ready or edited (an AI or edited
+//                           draft exists, not yet sent) -- real field.
+//  - sent_to_google:        Google accepted the reply at the HTTP layer, but
+//                           no conclusive moderation state is known yet --
+//                           this is what localStorage alone, or a bridge
+//                           record with no/legacy moderationState, means.
+//  - pending_google_approval / approved_by_google / rejected_by_google:
+//                           Google's own reviewReplyState, read from the
+//                           publish-bridge record (see replyModerationState.js).
+//  - verification_delayed: a check was attempted but stayed inconclusive
+//                           (timeout, unreadable state, delayed reconciliation).
+//  - failed:                status === 'failed' -- real field, unchanged.
+//  - externally_replied:    owner_response is populated but this app's
+//                           workspace/bridge never recorded publishing it --
+//                           a reply exists on Google that didn't come from
+//                           here. Computed from already-real fields.
+//  - pending:               INERT STUB, unchanged from before this fix --
+//                           no code path in this app ever sets
+//                           wsEntry.status to 'pending_confirmation'.
 //
-// `taken_care_of` (an existing 6th, unrelated operational status -- "handled,
-// no reply needed") is intentionally NOT one of the 5 reply states; callers
+// `taken_care_of` (an existing, unrelated operational status -- "handled,
+// no reply needed") is intentionally NOT one of these reply states; callers
 // keep it on its own existing "Done" badge.
 //
 // M6: extracted from Reviews.jsx (where this was first built) into this
@@ -35,86 +74,113 @@ import { reviewId } from './dataUtils.js'
 // the Execution Master Plan v1.0 explicitly says needs this exact model)
 // reuses it instead of duplicating the mapping.
 export const REPLY_STATE_META = {
-  needs_reply:         { label: 'Needs Reply',         variant: 'danger'  },
-  draft:               { label: 'Draft',               variant: 'accent'  },
-  confirmed:           { label: 'Confirmed',           variant: 'success' },
-  failed:              { label: 'Failed',              variant: 'danger'  },
-  externally_replied:  { label: 'Externally Replied',  variant: 'info'    },
-  pending:             { label: 'Pending',             variant: 'warning' },
+  needs_reply:                            { label: 'Needs Reply',             variant: 'danger'  },
+  draft:                                   { label: 'Draft',                   variant: 'accent'  },
+  [ModerationState.SENT_TO_GOOGLE]:        { label: 'Sent to Google',          variant: 'accent'  },
+  [ModerationState.PENDING_APPROVAL]:      { label: 'Pending Google Approval', variant: 'warning' },
+  [ModerationState.APPROVED]:              { label: 'Approved by Google',      variant: 'success' },
+  [ModerationState.REJECTED]:              { label: 'Rejected by Google',      variant: 'danger'  },
+  [ModerationState.VERIFICATION_DELAYED]:  { label: 'Verification Delayed',    variant: 'warning' },
+  failed:                                  { label: 'Failed',                  variant: 'danger'  },
+  [ModerationState.EXTERNALLY_REPLIED]:    { label: 'Externally Replied',      variant: 'info'    },
+  pending:                                 { label: 'Pending',                 variant: 'warning' },
 }
 
-// Recovery Milestone 6B, Part 3: reply-state priority, updated after
-// Milestone 6A's production diagnostic proved successfully-published
-// replies were reappearing as Needs Reply -- the ONLY record of "this app
-// published this" was wsEntry (browser localStorage), invisible to any
-// other browser/device and to the app itself once cleared. Priority order
-// now:
-//   1. Google owner_response -- always authoritative. Combined with a live
-//      bridge record, it's this app's own publish that's now confirmed
-//      (state 'confirmed'); alone, it's a reply this app never recorded
-//      making ('externally_replied') -- same distinction the previous
-//      version drew from wsEntry alone, now drawn from the durable bridge
-//      instead, so it survives a reload/new browser/new device.
+// Short, manager-facing supporting text for each state (PART 5's explicit
+// requirement: "include short supporting text explaining the state").
+// A rejected review's reason comes from the bridge record's own
+// policyViolation.summary (never a raw API payload) when available.
+export const MODERATION_STATE_DESCRIPTIONS = Object.freeze({
+  [ModerationState.SENT_TO_GOOGLE]:       'Google accepted the reply. Approval has not been confirmed yet.',
+  [ModerationState.PENDING_APPROVAL]:     'Google is still reviewing this reply before it can appear publicly.',
+  [ModerationState.APPROVED]:             'Google has approved this reply. It may take additional time to appear on every public surface.',
+  [ModerationState.REJECTED]:             'Google rejected this reply and it will not appear publicly. Write a new reply below.',
+  [ModerationState.VERIFICATION_DELAYED]: "We couldn't confirm this reply's status with Google yet. It will keep checking automatically.",
+})
+
+// Recovery Milestone 6B, Part 3 reply-state priority, revised by the Google
+// Reply Moderation State fix. Priority order:
+//   1. Google owner_response -- always authoritative (an independent sync
+//      actually saw Google serving this comment back). Combined with a
+//      live bridge record, this app's own publish produced it -- treated
+//      as APPROVED (the strongest signal this system has, though still not
+//      literal proof of every public surface having propagated it); alone,
+//      it's a reply this app never recorded making (EXTERNALLY_REPLIED).
 //   2. The durable Redis bridge (see dashboard/api/_lib/publishBridgeStore.js)
-//      -- proof Google already accepted the reply, even before the next
-//      GBP sync writes owner_response locally. Cross-browser/cross-device,
-//      unlike wsEntry.
+//      -- its OWN moderationState field is now what's actually inspected
+//      (resolveBridgeModerationState() above), never just its existence.
+//      This is the literal fix for the "Confirmed but missing on Google"
+//      defect: a bridge record can now resolve to SENT_TO_GOOGLE, PENDING,
+//      APPROVED, REJECTED, or VERIFICATION_DELAYED, never a blanket
+//      'confirmed'.
 //   3. wsEntry.status === 'published' -- kept as a same-browser fallback
 //      for when the bridge itself couldn't be read (Redis unreachable,
-//      pre-6B client) rather than removed outright.
-//   4/5. failed / draft -- unchanged, but now correctly ONLY reachable when
-//      neither of the two authoritative-or-durable signals above says
-//      otherwise, so a stale 'failed' or 'draft' workspace entry can never
-//      override an actual Google reply or a durable publish record (the
-//      exact scenario Milestone 6B Part 11 requires tests for).
+//      pre-fix client), but PART 5's explicit requirement: localStorage
+//      alone may support temporary UI continuity, never canonical
+//      confirmation -- so this resolves to SENT_TO_GOOGLE, never APPROVED.
+//   4/5. failed / draft -- unchanged, only reachable when neither signal
+//      above says otherwise.
 //
 // `bridgeEntry` is optional (undefined for any caller not yet passing
-// bridge data) so every existing call site keeps working unchanged until
-// it's updated to pass one.
+// bridge data) so every existing call site keeps working unchanged.
 export function computeReplyState(r, wsEntry, bridgeEntry) {
   const hasBridge = Boolean(bridgeEntry)
-  if (r.owner_response) return hasBridge ? 'confirmed' : 'externally_replied'
-  if (hasBridge) return 'confirmed'
+  if (r.owner_response) return hasBridge ? ModerationState.APPROVED : ModerationState.EXTERNALLY_REPLIED
+  if (hasBridge) return resolveBridgeModerationState(bridgeEntry)
   if (wsEntry?.status === 'pending_confirmation') return 'pending' // see comment above -- never set
   if (wsEntry?.status === 'failed') return 'failed'
-  if (wsEntry?.status === 'published') return 'confirmed'
+  if (wsEntry?.status === 'published') return ModerationState.SENT_TO_GOOGLE
   if (wsEntry?.status === 'draft_ready' || wsEntry?.status === 'edited') return 'draft'
   return 'needs_reply'
 }
 
-// Recovery Milestone 6B, Part 9: true once a review is answered by ANY of
-// the three durable-or-authoritative signals (Google's own owner_response,
-// the Redis publish bridge, or a same-browser 'published' workspace
-// record) -- never by a draft/edited/failed workspace status alone. Used
-// to gate AI draft generation (on-demand, prewarm, and -- where technically
-// reachable -- batch) so a review that's already answered by any of these
-// paths never consumes Anthropic credits preparing another response.
+// Recovery Milestone 6B, Part 9, revised by the Google Reply Moderation
+// State fix: true once a review is answered by a signal strong enough that
+// generating another AI draft / showing the compose workspace would risk a
+// duplicate publish attempt. A REJECTED bridge is the one deliberate
+// exception -- Google will never make that reply public, so the review is
+// NOT actually answered and must re-open for a genuinely new reply (PART 4/
+// 8's "never automatically republish" requirement is about not retrying the
+// SAME rejected text automatically; a manager writing and submitting a new
+// one through the normal compose flow is exactly the intended recovery
+// path). SENT_TO_GOOGLE/PENDING_APPROVAL/APPROVED/VERIFICATION_DELAYED all
+// still count as "answered" here to prevent inviting a duplicate publish
+// while the outcome is in flight or unresolved.
 export function isAnsweredReplyState(r, wsEntry, bridgeEntry) {
-  return Boolean(r.owner_response) || Boolean(bridgeEntry) || wsEntry?.status === 'published'
+  if (r.owner_response) return true
+  if (bridgeEntry) return resolveBridgeModerationState(bridgeEntry) !== ModerationState.REJECTED
+  return wsEntry?.status === 'published'
 }
 
-// Recovery Milestone 4 (Review Reply Inbox + AI Response Quality): the
-// Reviews inbox's default queue. "Actionable" = still needs a manager's
-// attention -- unanswered (needs_reply), has a prepared-but-not-yet-sent
-// draft (draft), or previously failed to publish and needs a retry
-// (failed). confirmed/externally_replied are already resolved and belong
-// in history/search, not the default working queue.
-const ACTIONABLE_STATES = new Set(['needs_reply', 'draft', 'failed'])
+// Recovery Milestone 4 (Review Reply Inbox + AI Response Quality), revised
+// by the Google Reply Moderation State fix: the Reviews inbox's default
+// queue. "Actionable" = still needs a manager's attention -- unanswered
+// (needs_reply), has a prepared-but-not-yet-sent draft (draft), previously
+// failed to publish and needs a retry (failed), or was REJECTED by Google's
+// moderation and genuinely needs a brand-new reply. Every other resolved/
+// in-flight state belongs in history/search, not the default working queue.
+const ACTIONABLE_STATES = new Set(['needs_reply', 'draft', 'failed', ModerationState.REJECTED])
 export function isActionableReplyState(state) {
   return ACTIONABLE_STATES.has(state)
 }
 
-// Filtering UX Cleanup: per-state counts (Needs Reply/Draft/Confirmed/
-// Failed/Externally Replied) for Reviews.jsx's status pill row. Takes
-// `reviews` as whatever the caller considers "in scope" -- Reviews.jsx
-// passes the GLOBALLY-filtered dataset (App.jsx's date/location/brand/star
-// filters already applied), never its own further-narrowed local view, so
-// these counts answer "how many of each status exist in the current global
-// scope," independent of which status pill(s) happen to be selected right
-// now. Extracted as a pure function (no React) so it's directly
-// unit-testable, mirroring dataUtils.js's computeNextReviewId().
+// Filtering UX Cleanup: per-state counts for Reviews.jsx's status pill row,
+// extended by the Google Reply Moderation State fix to the full granular
+// state set. Takes `reviews` as whatever the caller considers "in scope" --
+// Reviews.jsx passes the GLOBALLY-filtered dataset (App.jsx's date/
+// location/brand/star filters already applied), never its own
+// further-narrowed local view, so these counts answer "how many of each
+// state exist in the current global scope," independent of which status
+// pill(s) happen to be selected right now. Extracted as a pure function (no
+// React) so it's directly unit-testable, mirroring dataUtils.js's
+// computeNextReviewId().
 export function computeReplyStateCounts(reviews, ws, bridges) {
-  const counts = { needs_reply: 0, draft: 0, confirmed: 0, failed: 0, externally_replied: 0 }
+  const counts = {
+    needs_reply: 0, draft: 0, failed: 0,
+    [ModerationState.SENT_TO_GOOGLE]: 0, [ModerationState.PENDING_APPROVAL]: 0,
+    [ModerationState.APPROVED]: 0, [ModerationState.REJECTED]: 0,
+    [ModerationState.VERIFICATION_DELAYED]: 0, [ModerationState.EXTERNALLY_REPLIED]: 0,
+  }
   reviews.forEach(r => {
     const id = reviewId(r)
     const state = computeReplyState(r, ws?.[id], bridges?.[id])

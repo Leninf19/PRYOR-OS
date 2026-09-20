@@ -22,7 +22,7 @@ import { readFileSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { filterReviews } from '../dashboard/src/utils/dataUtils.js'
-import { computeReplyStateCounts, isActionableReplyState, computeReplyState } from '../dashboard/src/utils/replyState.js'
+import { computeReplyStateCounts, isActionableReplyState, computeReplyState, ModerationState } from '../dashboard/src/utils/replyState.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REVIEWS_JSX = path.resolve(__dirname, '..', 'dashboard', 'src', 'pages', 'Reviews.jsx')
@@ -122,10 +122,14 @@ function testCountsReflectRealReplyStatesAcrossTheGlobalScope() {
   const withAnswered = scoped.map(r => r.reviewer_name === 'Echo' ? { ...r, owner_response: 'Thanks!' } : r)
   const counts = computeReplyStateCounts(withAnswered, ws, {})
   assert(counts.draft === 1, `Bravo has a draft_ready workspace entry, got ${counts.draft}`)
-  assert(counts.confirmed === 1, `Delta was marked published, got ${counts.confirmed}`)
+  // Google Reply Moderation State fix: a same-browser wsEntry.status ===
+  // 'published' with no durable bridge record resolves to SENT_TO_GOOGLE,
+  // never the old blanket 'confirmed' -- localStorage alone must never
+  // establish canonical confirmation.
+  assert(counts[ModerationState.SENT_TO_GOOGLE] === 1, `Delta was marked published, got ${counts[ModerationState.SENT_TO_GOOGLE]}`)
   assert(counts.externally_replied === 1, `Echo has an owner_response with no bridge/published record, got ${counts.externally_replied}`)
   assert(counts.needs_reply === 3, `the remaining 3 (Alpha, Charlie, Foxtrot) are plain needs_reply, got ${counts.needs_reply}`)
-  const total = counts.needs_reply + counts.draft + counts.confirmed + counts.failed + counts.externally_replied
+  const total = Object.values(counts).reduce((sum, n) => sum + n, 0)
   assert(total === CORPUS.length, `counts must never lose or duplicate a review -- expected ${CORPUS.length}, got ${total}`)
 }
 

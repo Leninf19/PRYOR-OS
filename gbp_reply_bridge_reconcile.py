@@ -64,10 +64,19 @@ from datetime import datetime, timezone
 
 import db
 import google_api as ga
+import reply_moderation_state as rms
 import tenant_keys
 import tenant_paths
 
 REQUEST_TIMEOUT_SECONDS = 10
+
+# Google Reply Moderation State fix: matches
+# dashboard/api/_lib/publishBridgeStore.js's BRIDGE_TTL_SECONDS exactly --
+# used only when this script itself re-writes a bridge record (PENDING/
+# REJECTED/VERIFICATION_DELAYED updates via set_bridge_record()) so an
+# actively-rechecked record's TTL is refreshed the same way the original
+# write's TTL was set, rather than drifting to a different lifetime policy.
+BRIDGE_TTL_SECONDS = 60 * 60 * 48
 
 
 class BridgeStoreUnavailableError(Exception):
@@ -152,6 +161,30 @@ def delete_bridge_record(key: str) -> None:
     _redis_get(f"{base_url}/del/{_quote_key(key)}", token)
 
 
+# Google Reply Moderation State fix: reconciliation now needs to UPDATE a
+# bridge record in place (advance PENDING -> a resolved state, or record a
+# REJECTED outcome with its policy reason) without deleting it -- unlike
+# every other Redis call in this module (a GET/DEL against one exact key),
+# Upstash's REST SET command takes the value in the POST body rather than
+# the URL path, since a JSON-serialized record can be arbitrarily large and
+# contain characters that would make an already-long URL fragile. TTL is
+# reset to the full BRIDGE_TTL_SECONDS on every update -- simpler and safe
+# (the record's write-then-read window only matters within its lifetime;
+# there is no requirement to preserve the exact remaining TTL across an
+# update), and keeps a record a manager is actively re-checking from
+# expiring mid-investigation.
+def set_bridge_record(key: str, record: dict, ttl_seconds: int) -> None:
+    base_url, token = _redis_base_url()
+    url = f"{base_url}/set/{_quote_key(key)}?EX={ttl_seconds}"
+    body = json.dumps(record).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+        json.loads(resp.read())
+
+
 def find_local_review(conn, gbp_review_name: str):
     return conn.execute(
         """SELECT r.id, r.location_id, l.name AS location_name, r.owner_response
@@ -162,19 +195,46 @@ def find_local_review(conn, gbp_review_name: str):
 
 
 def reconcile_one(conn, key: str, record: dict, dry_run: bool, tenant_id: str,
-                   fetch_review=None, delete_record=None) -> str:
-    """Returns one of: 'confirmed', 'still_pending', 'skipped_no_gbp_id',
+                   fetch_review=None, delete_record=None, set_record=None) -> str:
+    """Returns one of: 'confirmed', 'rejected', 'pending_approval',
+    'still_pending', 'verification_delayed', 'skipped_no_gbp_id',
     'skipped_not_found_locally', 'fetch_failed'.
 
-    fetch_review/delete_record default to the real google_api.get_review()
-    (bound to tenant_id)/delete_bridge_record() -- overridable so tests can
-    inject deterministic stand-ins, the same seam reconcile_gbp_replies.py's
-    fetch_review parameter already uses. When overridden, tenant_id is
-    unused (the injected callable is called directly)."""
+    Google Reply Moderation State fix: this used to treat ANY non-empty
+    `reviewReply.comment` as proof the reply was live and write it straight
+    to reviews.db -- the exact root cause of PRYOR showing a reply as
+    resolved when Google's own moderation had actually left it pending or
+    rejected (see the read-only audit for Casa Tequila Brighton / reviewer
+    "Terry", local review id 35738). Now `reviewReply.reviewReplyState` is
+    read and trusted FIRST:
+      - APPROVED (+ a non-empty comment) -> write reviews.db, clear bridge.
+      - REJECTED -> update the bridge record in place with the rejection +
+        policy reason, NEVER write reviews.db, NEVER delete the bridge
+        (PART 4/8's "never automatically republish" -- the bridge record's
+        terminal REJECTED state is what the UI shows; a genuinely new reply
+        goes through the normal publish flow, which writes a fresh bridge
+        record with its own new key/outcome, not a mutation of this one).
+      - PENDING -> update the bridge in place, keep waiting.
+      - missing/unspecified/unrecognized reviewReplyState:
+          - no comment at all yet -> 'still_pending' (the original,
+            benign, overwhelmingly common case: nothing to evaluate yet).
+          - a comment IS present but Google gave no resolvable moderation
+            state -> 'verification_delayed', NEVER 'confirmed'. This is
+            PART 2's explicit requirement ("missing/unspecified moderation
+            state must not be interpreted as approval or rejection") and
+            the literal fix for the reported bug.
+
+    fetch_review/delete_record/set_record default to the real
+    google_api.get_review() (bound to tenant_id)/delete_bridge_record()/
+    set_bridge_record() -- overridable so tests can inject deterministic
+    stand-ins, the same seam reconcile_gbp_replies.py's fetch_review
+    parameter already uses. When overridden, tenant_id is unused (the
+    injected callable is called directly)."""
     if fetch_review is None:
         tenant_keys.assert_valid_tenant_id(tenant_id, "reconcile_one")
         fetch_review = lambda review_name: ga.get_review(tenant_id, review_name)  # noqa: E731
     delete_record = delete_record or delete_bridge_record
+    set_record = set_record or set_bridge_record
 
     gbp_review_name = record.get("gbpReviewName")
     if not gbp_review_name:
@@ -207,32 +267,102 @@ def reconcile_one(conn, key: str, record: dict, dry_run: bool, tenant_id: str,
 
     reply = api_review.get("reviewReply") or {}
     comment = (reply.get("comment") or "").strip()
+    review_reply_state = reply.get("reviewReplyState")
+    outcome_state = rms.classify_moderation_outcome(review_reply_state)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Phase 7 observability (Google Reply Moderation State fix): this
+    # workflow's cron is configured for every 15 minutes, but the actual
+    # run history has been observed to have gaps of 2-5 hours -- a
+    # documented characteristic of GitHub Actions' `schedule` trigger under
+    # platform load, not a bug this repo's configuration can fully control
+    # (see PART 7 of this fix's own report for the full investigation).
+    # Logging a record's real age here -- every time reconciliation
+    # actually gets to check it -- makes that gap's real-world impact
+    # directly visible in existing logs, with no new infrastructure and no
+    # change to the workflow's own schedule/concurrency configuration.
+    published_at = record.get("publishedAt")
+    if published_at:
+        try:
+            age_seconds = (datetime.now(timezone.utc) - datetime.fromisoformat(published_at.replace("Z", "+00:00"))).total_seconds()
+            if age_seconds > 900:  # more than the intended 15-minute cadence
+                print(f"[reconcile] {key}: record is {age_seconds / 60:.0f} minutes old at first/latest check -- "
+                      f"longer than the intended 15-minute reconciliation cadence (see PART 7 findings)")
+        except (ValueError, TypeError):
+            pass  # malformed timestamp -- never let observability logging break reconciliation itself
+
+    if outcome_state == rms.APPROVED and comment:
+        print(f"[reconcile] {key}: Google approved the reply -- writing owner_response to reviews.db (review id={local_row['id']})")
+        if not dry_run:
+            db.upsert_review(
+                conn, local_row["location_id"], local_row["location_name"],
+                {
+                    "gbp_review_name": gbp_review_name,
+                    "owner_response": comment,
+                    "gbp_reply_update_time": reply.get("updateTime"),
+                },
+                now_iso,
+            )
+            conn.commit()
+            delete_record(key)
+        return "confirmed"
+
+    if outcome_state == rms.REJECTED:
+        policy = rms.normalize_policy_violation(reply.get("policyViolation"))
+        print(f"[reconcile] {key}: Google rejected this reply ({policy['summary'] if policy else 'no reason given'}) -- "
+              f"marking the bridge record rejected, never auto-republishing")
+        if not dry_run:
+            updated = {
+                **record,
+                "moderationState": rms.REJECTED,
+                "reviewReplyState": review_reply_state,
+                "policyViolation": policy,
+                "googleUpdateTime": reply.get("updateTime"),
+                "moderationCheckedAt": now_iso,
+            }
+            set_record(key, updated, BRIDGE_TTL_SECONDS)
+        return "rejected"
+
+    if outcome_state == rms.PENDING_APPROVAL:
+        print(f"[reconcile] {key}: Google reports this reply as still pending approval")
+        if not dry_run:
+            updated = {
+                **record,
+                "moderationState": rms.PENDING_APPROVAL,
+                "reviewReplyState": review_reply_state,
+                "googleUpdateTime": reply.get("updateTime"),
+                "moderationCheckedAt": now_iso,
+            }
+            set_record(key, updated, BRIDGE_TTL_SECONDS)
+        return "pending_approval"
+
     if not comment:
         print(f"[reconcile] {key}: Google still shows no reply for this review -- still pending")
         return "still_pending"
 
-    print(f"[reconcile] {key}: Google confirms the reply -- writing owner_response to reviews.db (review id={local_row['id']})")
+    # A comment IS present, but reviewReplyState was missing/unspecified/
+    # unrecognized -- exactly the gap the audit found. Never silently
+    # confirm; mark inconclusive and keep checking.
+    print(f"[reconcile] {key}: Google shows reply text but no resolvable moderation state -- verification delayed, not confirmed")
     if not dry_run:
-        db.upsert_review(
-            conn, local_row["location_id"], local_row["location_name"],
-            {
-                "gbp_review_name": gbp_review_name,
-                "owner_response": comment,
-                "gbp_reply_update_time": reply.get("updateTime"),
-            },
-            datetime.now(timezone.utc).isoformat(),
-        )
-        conn.commit()
-        delete_record(key)
-    return "confirmed"
+        updated = {
+            **record,
+            "moderationState": rms.VERIFICATION_DELAYED,
+            "reviewReplyState": review_reply_state,
+            "googleUpdateTime": reply.get("updateTime"),
+            "replyTextMatches": rms.reply_text_matches(comment, record.get("responseText")),
+            "moderationCheckedAt": now_iso,
+        }
+        set_record(key, updated, BRIDGE_TTL_SECONDS)
+    return "verification_delayed"
 
 
 def run_reconcile(conn, tenant_id: str, dry_run: bool = False, *,
-                   list_keys=None, get_record=None, fetch_review=None, delete_record=None) -> dict:
+                   list_keys=None, get_record=None, fetch_review=None, delete_record=None, set_record=None) -> dict:
     """Orchestrates one reconciliation pass -- separated from main() so
     tests can drive it directly against a temporary DB with every external
-    seam (Redis list/get/delete, Google fetch) injected, without touching
-    argparse/sys.exit or any real network/Redis/DB.
+    seam (Redis list/get/delete/set, Google fetch) injected, without
+    touching argparse/sys.exit or any real network/Redis/DB.
 
     Multi-Tenant Phase 4C revision: tenant_id is REQUIRED, with no default,
     and is validated up front regardless of whether list_keys/fetch_review
@@ -248,16 +378,20 @@ def run_reconcile(conn, tenant_id: str, dry_run: bool = False, *,
     list_keys = list_keys or (lambda: list_bridge_keys(tenant_id))
     get_record = get_record or get_bridge_record
     delete_record = delete_record or delete_bridge_record
+    set_record = set_record or set_bridge_record
 
     keys = list_keys()
     print(f"[reconcile] tenant={tenant_id} {len(keys)} active publish-bridge record(s) found")
 
-    counts = {"confirmed": 0, "still_pending": 0, "skipped_no_gbp_id": 0, "skipped_not_found_locally": 0, "fetch_failed": 0}
+    counts = {
+        "confirmed": 0, "rejected": 0, "pending_approval": 0, "still_pending": 0,
+        "verification_delayed": 0, "skipped_no_gbp_id": 0, "skipped_not_found_locally": 0, "fetch_failed": 0,
+    }
     for key in keys:
         record = get_record(key)
         if not record:
             continue  # expired between list and get, or was concurrently cleared -- not an error
-        outcome = reconcile_one(conn, key, record, dry_run, tenant_id, fetch_review=fetch_review, delete_record=delete_record)
+        outcome = reconcile_one(conn, key, record, dry_run, tenant_id, fetch_review=fetch_review, delete_record=delete_record, set_record=set_record)
         counts[outcome] = counts.get(outcome, 0) + 1
     return counts
 
