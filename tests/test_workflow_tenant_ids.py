@@ -67,6 +67,13 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # dispatch-supplied tenant id, since those all operate specifically on
     # Los Tres Amigos's own fixed production pipeline).
     "diagnostic-gbp-review-media.yml",
+    # PRYOR OS Google Cloud project migration, Phase 8A: invokes
+    # credential_migration_status.py, which is NOT in TENANT_AWARE_SCRIPTS
+    # above and takes no --tenant-id at all -- it enumerates every tenant
+    # in both registries itself (the deduplicated union), unlike every
+    # script in that list (which each operate on exactly one fixed,
+    # reviewed tenant).
+    "diagnostic-credential-migration-status.yml",
 }
 
 results = []
