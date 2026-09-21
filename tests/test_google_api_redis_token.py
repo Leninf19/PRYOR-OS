@@ -11,6 +11,12 @@ key = SHA-256 of the encryption key string) -- not just Python encrypting
 and decrypting its own data -- so this genuinely proves the two
 implementations are byte-compatible, not merely self-consistent.
 
+Dual-client migration (Phase 5): _fetch_refresh_token_from_redis() now
+returns (refresh_token, client_key) instead of a bare token string -- see
+test_google_oauth_clients.py for the dedicated client-provenance/dual-client
+test coverage; this file's own assertions were updated only where the
+return shape changed, everything else is unchanged.
+
 Run directly: python tests/test_google_api_redis_token.py
 """
 import json
@@ -94,7 +100,13 @@ class TestGoogleApiRedisToken(unittest.TestCase):
         }
         with patch("urllib.request.urlopen", return_value=fake_upstash_response(record)):
             result = ga._fetch_refresh_token_from_redis(TEST_TENANT_ID)
-            self.assertEqual(result, FIXTURE_PLAINTEXT, "must decrypt to the exact plaintext Node encrypted")
+            # Dual-client migration (Phase 5): the function now returns
+            # (refresh_token, client_key). This record predates client
+            # provenance tracking entirely (no clientKey field), so it must
+            # normalize to 'legacy-lta' -- correct by construction, not a
+            # guess: every credential stored before this migration was, in
+            # fact, issued by the legacy client.
+            self.assertEqual(result, (FIXTURE_PLAINTEXT, "legacy-lta"), "must decrypt to the exact plaintext Node encrypted, with clientKey defaulted to legacy-lta")
 
     def test_wrong_encryption_key_falls_back_to_none_not_crash(self):
         self._configure_redis_env()
@@ -273,7 +285,7 @@ class TestGoogleApiCredentialTenantIsolation(unittest.TestCase):
         }
         with patch("urllib.request.urlopen", return_value=fake_upstash_response(record)):
             result = ga._fetch_refresh_token_from_redis(TEST_TENANT_ID)
-        self.assertEqual(result, FIXTURE_PLAINTEXT)
+        self.assertEqual(result, (FIXTURE_PLAINTEXT, "legacy-lta"))
 
 
 if __name__ == "__main__":

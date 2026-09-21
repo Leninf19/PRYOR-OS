@@ -235,9 +235,15 @@ def test_diagnose_google_status_step_env_mapping_is_exact():
     env = diagnose_steps[0].get("env", {})
 
     assert env.get("TENANT_ID") == "${{ inputs.tenant_id }}", "diagnose step must source TENANT_ID from inputs.tenant_id"
+    # Dual-client migration (Phase 5): the new suffixed secret names are
+    # wired additively alongside the bare pair (google_oauth_clients.py's
+    # compatibility bridge falls back to the bare pair until both suffixed
+    # vars are configured) -- reviewed and expected here, not an oversight.
     expected_secret_env = {
         "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN", "CREDENTIAL_ENCRYPTION_KEY",
         "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_CLIENT_ID_LEGACY", "GOOGLE_CLIENT_SECRET_LEGACY",
+        "GOOGLE_CLIENT_ID_PRYOR", "GOOGLE_CLIENT_SECRET_PRYOR",
     }
     actual_secret_env = {k for k in env if k != "TENANT_ID"}
     assert actual_secret_env == expected_secret_env, (

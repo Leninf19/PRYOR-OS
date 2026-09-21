@@ -35,6 +35,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import retry as retry_lib
 import tenant_keys
+import google_oauth_clients
 from provider_base import ProviderError
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -129,7 +130,24 @@ def _env(name: str) -> str:
 # ciphertext; Python's high-level AESGCM.decrypt() wants them concatenated
 # -- ciphertext + tag -- so that concatenation happens here, not a format
 # difference between the two implementations).
-def _fetch_refresh_token_from_redis(tenant_id: str) -> str | None:
+def _fetch_refresh_token_from_redis(tenant_id: str) -> tuple[str, str] | None:
+    """Returns (refresh_token, client_key) for this tenant's Redis-stored
+    credential, or None if unavailable for any reason (caller falls back
+    to GOOGLE_REFRESH_TOKEN).
+
+    Dual-client migration (Phase 5): client_key is the record's own
+    'clientKey' field ('legacy-lta' or 'pryor-2026'), identifying which
+    Google OAuth client issued this specific token -- REQUIRED because the
+    refresh grant only works with the exact client that issued the token.
+    A record written before this migration has no such field at all;
+    those are normalized to 'legacy-lta' HERE, at this one read site
+    (mirroring credentialStore.js's identical default on the Node side),
+    which is correct by construction: every credential stored before this
+    migration was, in fact, issued by the legacy LTA client. An explicit
+    but unrecognized value is NOT normalized -- it is returned as-is so
+    get_access_token() below can fail closed via
+    google_oauth_clients.resolve_google_oauth_client_credentials(), never
+    silently treated as legacy."""
     tenant_keys.assert_valid_tenant_id(tenant_id, "_fetch_refresh_token_from_redis")
     url = os.environ.get("UPSTASH_REDIS_REST_URL")
     rest_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
@@ -155,7 +173,8 @@ def _fetch_refresh_token_from_redis(tenant_id: str) -> str | None:
         ciphertext = base64.b64decode(record["refreshTokenCiphertext"])
         auth_tag = base64.b64decode(record["refreshTokenAuthTag"])
         plaintext = AESGCM(key).decrypt(iv, ciphertext + auth_tag, None)
-        return plaintext.decode("utf-8")
+        client_key = record.get("clientKey") or google_oauth_clients.GOOGLE_OAUTH_CLIENT_KEY_LEGACY
+        return plaintext.decode("utf-8"), client_key
     except Exception as e:  # noqa: BLE001 -- any failure here must fall back, never crash the pipeline
         print(f"[google_api] Redis-stored credential unavailable for tenant {tenant_id!r}, "
               f"falling back to GOOGLE_REFRESH_TOKEN: {e}")
@@ -178,9 +197,28 @@ def get_access_token(tenant_id: str, force_refresh: bool = False) -> str:
     if not force_refresh and cache["token"] and now < cache["expires_at"]:
         return cache["token"]
 
-    client_id = _env("GOOGLE_CLIENT_ID")
-    client_secret = _env("GOOGLE_CLIENT_SECRET")
-    refresh_token = _fetch_refresh_token_from_redis(tenant_id) or _env("GOOGLE_REFRESH_TOKEN")
+    redis_result = _fetch_refresh_token_from_redis(tenant_id)
+    if redis_result is not None:
+        refresh_token, client_key = redis_result
+    else:
+        # GOOGLE_REFRESH_TOKEN fallback: permanently and exclusively LTA's
+        # legacy token, hardcoded to the legacy client pair here in code --
+        # NEVER selected by any runtime flag or data field. This is the
+        # one deliberate resolution to the fallback-token-provenance
+        # question worked through in this migration's design phase: the
+        # fallback's lifecycle is bound 1:1 to the legacy client's
+        # lifecycle (retired together, in the same reviewed change, once
+        # LTA has a proven Redis credential under the PRYOR client) rather
+        # than ever being repointed at a PRYOR-issued value.
+        refresh_token = _env("GOOGLE_REFRESH_TOKEN")
+        client_key = google_oauth_clients.GOOGLE_OAUTH_CLIENT_KEY_LEGACY
+
+    try:
+        _, client_id, client_secret = google_oauth_clients.resolve_google_oauth_client_credentials(client_key)
+    except google_oauth_clients.UnrecognizedClientKeyError as e:
+        raise GBPAuthError(str(e)) from e
+    except google_oauth_clients.GoogleOAuthClientNotConfiguredError as e:
+        raise GBPAuthError(str(e)) from e
 
     body = urllib.parse.urlencode({
         "client_id": client_id,
@@ -388,7 +426,7 @@ def is_configured() -> bool:
     pure env-var presence check (no network call, preserving the existing
     contract), so the Redis path is represented by checking its own three
     required env vars are present, not by actually reaching Upstash."""
-    has_client_creds = bool(os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET"))
+    has_client_creds = google_oauth_clients.has_any_google_oauth_client_configured()
     has_env_refresh_token = bool(os.environ.get("GOOGLE_REFRESH_TOKEN"))
     has_redis_config = bool(
         os.environ.get("UPSTASH_REDIS_REST_URL")

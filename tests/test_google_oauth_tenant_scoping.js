@@ -244,10 +244,15 @@ async function testMissingOrWrongPurposeStateFails() {
 async function mockSuccessfulGoogleFetch({ accountName = 'Los Tres Amigos' } = {}) {
   globalThis.fetch = async (url) => {
     if (url === 'https://oauth2.googleapis.com/token') {
-      return { ok: true, json: async () => ({ access_token: 'fake-access-token', refresh_token: FAKE_REFRESH_TOKEN, expires_in: 3600 }) }
+      return { ok: true, status: 200, json: async () => ({ access_token: 'fake-access-token', refresh_token: FAKE_REFRESH_TOKEN, expires_in: 3600 }) }
     }
     if (url.includes('mybusinessaccountmanagement.googleapis.com')) {
-      return { ok: true, json: async () => ({ accounts: [{ accountName, name: 'accounts/123' }] }) }
+      // Dual-client migration (Phase 5) promoted this accounts.list call
+      // from a best-effort, non-fatal fetch to a hard gate -- it now goes
+      // through fetchWithRetry() (google/_lib/http.js), which reads
+      // res.status (and, on a would-be-retried response, res.headers.get())
+      // -- both fields are required on this mock now, not just `ok`.
+      return { ok: true, status: 200, json: async () => ({ accounts: [{ accountName, name: 'accounts/123' }] }) }
     }
     throw new Error(`unexpected fetch during callback test: ${url}`)
   }

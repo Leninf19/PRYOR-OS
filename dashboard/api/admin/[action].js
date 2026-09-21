@@ -347,7 +347,7 @@ async function discoverForTenant(tenantId) {
   }
   let token
   try {
-    token = await getAccessToken(credential.refreshToken)
+    token = await getAccessToken(credential.refreshToken, credential.clientKey)
   } catch (err) {
     return { errorResponse: { status: 503, body: { error: 'not_connected', message: err.description || err.message || 'Could not obtain a Google access token for this tenant.' } } }
   }

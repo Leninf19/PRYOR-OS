@@ -23,6 +23,13 @@
 //
 // No real Upstash, no real Redis, no production data.
 //
+// Dual-client migration (Phase 5): setStoredCredentialIfVersion() now
+// requires an explicit clientKey (no default -- see credentialStore.js's
+// own comment on that function) since it's the real production
+// Connect/Reconnect write path; every call in this file passes
+// clientKey: 'legacy-lta', which is orthogonal to what this file actually
+// tests (CAS/concurrency behavior, not client provenance).
+//
 // Run directly: node tests/test_credential_cas_concurrency.js
 
 process.env.CREDENTIAL_ENCRYPTION_KEY = 'test-encryption-key-not-a-real-secret'
@@ -97,7 +104,7 @@ async function testOlderCandidateCannotOverwriteNewerAfterConcurrentCasWrites() 
   assert(before.credentialVersion === 1, `sanity: expected version 1 after the first connect, got ${before.credentialVersion}`)
 
   // Candidate B reads version 1 and wins the race, installing first.
-  const bResult = await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'candidate-b-token', connectedAccountName: 'B' }, 1)
+  const bResult = await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'candidate-b-token', connectedAccountName: 'B', clientKey: 'legacy-lta' }, 1)
   assert(bResult.credentialVersion === 2, `expected candidate B to become version 2, got ${bResult.credentialVersion}`)
 
   // Candidate A ALSO captured expectedVersion=1 (the same starting point B
@@ -105,7 +112,7 @@ async function testOlderCandidateCannotOverwriteNewerAfterConcurrentCasWrites() 
   // fail, since the stored version has already moved on to 2.
   let threw = null
   try {
-    await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'candidate-a-token', connectedAccountName: 'A' }, 1)
+    await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'candidate-a-token', connectedAccountName: 'A', clientKey: 'legacy-lta' }, 1)
   } catch (e) {
     threw = e
   }
@@ -122,7 +129,7 @@ async function testConflictErrorCarriesCurrentRecordWithoutLeakingPlaintextToken
   await setStoredCredential(TENANT_A, { refreshToken: 'super-secret-refresh-token', connectedAccountName: 'A' })
   let caught = null
   try {
-    await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'attempted-replacement', connectedAccountName: 'X' }, 0) // wrong -- actual is 1
+    await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'attempted-replacement', connectedAccountName: 'X', clientKey: 'legacy-lta' }, 0) // wrong -- actual is 1
   } catch (e) {
     caught = e
   }
@@ -152,7 +159,7 @@ async function testStaleTokenRefreshCannotOverwriteNewerReconnect() {
     const value = await originalGet(key)
     if (!injected) {
       injected = true
-      await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'reconnected-token', connectedAccountName: 'Reconnected' }, 1)
+      await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'reconnected-token', connectedAccountName: 'Reconnected', clientKey: 'legacy-lta' }, 1)
     }
     return value
   }
@@ -175,7 +182,7 @@ async function testStaleSyncOutcomeCannotOverwriteNewerReconnect() {
     const value = await originalGet(key)
     if (!injected) {
       injected = true
-      await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'reconnected-token', connectedAccountName: 'Reconnected' }, 1)
+      await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'reconnected-token', connectedAccountName: 'Reconnected', clientKey: 'legacy-lta' }, 1)
     }
     return value
   }
@@ -195,7 +202,7 @@ async function testDisconnectAfterCompletedReconnectAlwaysResultsInDisconnected(
   const client = fakeCredentialRedis()
   setCredentialRedis(() => client)
   await setStoredCredential(TENANT_A, { refreshToken: 'v1', connectedAccountName: 'A' })
-  await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'v2', connectedAccountName: 'A' }, 1)
+  await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'v2', connectedAccountName: 'A', clientKey: 'legacy-lta' }, 1)
   await clearStoredCredential(TENANT_A)
   const cred = await getStoredCredential(TENANT_A)
   assert(cred === null, 'Disconnect must always win outright against whatever credential currently exists, regardless of how recently a reconnect completed')
@@ -211,7 +218,7 @@ async function testReconnectCapturedBeforeADisconnectFailsClosedRatherThanReinst
 
   let threw = null
   try {
-    await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'stale-reconnect-attempt', connectedAccountName: 'Stale' }, capturedVersion)
+    await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'stale-reconnect-attempt', connectedAccountName: 'Stale', clientKey: 'legacy-lta' }, capturedVersion)
   } catch (e) {
     threw = e
   }
@@ -231,7 +238,7 @@ async function testFreshReconnectAfterDisconnectSucceedsNormally() {
   // like any genuine first-time connect.
   const freshExpectedVersion = (await getStoredCredential(TENANT_A))?.credentialVersion ?? 0
   assert(freshExpectedVersion === 0, 'sanity: a disconnected tenant reads back as version 0')
-  const result = await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'fresh-after-disconnect', connectedAccountName: 'Fresh' }, 0)
+  const result = await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'fresh-after-disconnect', connectedAccountName: 'Fresh', clientKey: 'legacy-lta' }, 0)
   assert(result.credentialVersion === 1, `expected the fresh connect to become version 1, got ${result.credentialVersion}`)
   const cred = await getStoredCredential(TENANT_A)
   assert(cred.refreshToken === 'fresh-after-disconnect', 'the fresh connect must succeed and be indistinguishable from a genuine first-time connection')
@@ -245,7 +252,7 @@ async function testCrossTenantCredentialVersionsAreIsolated() {
   const client = fakeCredentialRedis()
   setCredentialRedis(() => client)
   await setStoredCredential(TENANT_A, { refreshToken: 'a-v1', connectedAccountName: 'A' })
-  await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'a-v2', connectedAccountName: 'A' }, 1)
+  await setStoredCredentialIfVersion(TENANT_A, { refreshToken: 'a-v2', connectedAccountName: 'A', clientKey: 'legacy-lta' }, 1)
   await setStoredCredential(TENANT_B, { refreshToken: 'b-v1', connectedAccountName: 'B' })
 
   const credA = await getStoredCredential(TENANT_A)
@@ -257,7 +264,7 @@ async function testCrossTenantCredentialVersionsAreIsolated() {
   // for Tenant A must be evaluated purely against Tenant B's OWN state.
   let threw = false
   try {
-    await setStoredCredentialIfVersion(TENANT_B, { refreshToken: 'wrong-tenant-version-attempt', connectedAccountName: 'X' }, 2)
+    await setStoredCredentialIfVersion(TENANT_B, { refreshToken: 'wrong-tenant-version-attempt', connectedAccountName: 'X', clientKey: 'legacy-lta' }, 2)
   } catch (e) {
     threw = e instanceof CredentialVersionConflictError
   }

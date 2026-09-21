@@ -23,6 +23,7 @@ TESTS = [
     "test_location_analytics.py",
     "test_google_api_endpoints.py",
     "test_google_api_redis_token.py",
+    "test_google_oauth_clients.py",
     "test_tenant_keys.py",
     "test_workflow_tenant_ids.py",
     "test_vercel_deploy_workflow_paths.py",
