@@ -26,6 +26,10 @@ import { setCookie, parseCookies, clearCookie } from './_lib/cookies.js'
 import { fetchWithRetry, FetchBudgetExceededError } from './_lib/http.js'
 import { exchangeRefreshToken, getAccessToken } from './_lib/googleAuth.js'
 import { signOAuthState, verifyOAuthState } from './_lib/oauthState.js'
+import {
+  resolveGoogleOAuthClientCredentials, resolveAuthClientKeyFromFlag, hasAnyGoogleOAuthClientConfigured,
+  UnrecognizedClientKeyError, GoogleOAuthClientNotConfiguredError,
+} from './_lib/googleOAuthClients.js'
 import { requireAuth, requireScopedAuth, requireLocationAccess, isWildcardGrant, evaluateSession, statusForAuthFailure } from '../_lib/auth.js'
 import { Permission, roleHasPermission } from '../_lib/permissions.js'
 import { resolveLocationIdForReview, resolveLocationIdForReviewOrDeny } from '../_lib/reviewLocationIndex.js'
@@ -134,15 +138,41 @@ async function auth(req, res) {
     `)
   }
 
-  const clientId = process.env.GOOGLE_CLIENT_ID
-  if (!clientId) {
-    return res.status(503).send(`
-      <html><body style="font-family:system-ui;max-width:520px;margin:60px auto;padding:0 20px">
-        <h2>Setup incomplete</h2>
-        <p>Add <code>GOOGLE_CLIENT_ID</code> to Vercel environment variables first, then try again.</p>
-        <a href="/settings">← Back to Settings</a>
-      </body></html>
-    `)
+  // Dual-client migration (Phase 5): which client THIS brand-new flow uses
+  // is decided ONLY by the server-side GOOGLE_GBP_AUTH_CLIENT_KEY flag --
+  // never by anything the browser sends. An invalid flag value fails
+  // closed (never silently falls back to legacy) so a typo'd/garbled
+  // Production config value is loud, not a silent wrong-client mistake.
+  let authClientKey
+  try {
+    authClientKey = resolveAuthClientKeyFromFlag()
+  } catch (err) {
+    if (err instanceof UnrecognizedClientKeyError) {
+      return res.status(503).send(`
+        <html><body style="font-family:system-ui;max-width:520px;margin:60px auto;padding:0 20px">
+          <h2>Setup incomplete</h2>
+          <p>GOOGLE_GBP_AUTH_CLIENT_KEY is set to an unrecognized value. Fix the Vercel environment variable and try again.</p>
+          <a href="/settings">← Back to Settings</a>
+        </body></html>
+      `)
+    }
+    throw err
+  }
+
+  let clientId
+  try {
+    ;({ clientId } = resolveGoogleOAuthClientCredentials(authClientKey))
+  } catch (err) {
+    if (err instanceof GoogleOAuthClientNotConfiguredError) {
+      return res.status(503).send(`
+        <html><body style="font-family:system-ui;max-width:520px;margin:60px auto;padding:0 20px">
+          <h2>Setup incomplete</h2>
+          <p>Add <code>GOOGLE_CLIENT_ID</code> to Vercel environment variables first, then try again.</p>
+          <a href="/settings">← Back to Settings</a>
+        </body></html>
+      `)
+    }
+    throw err
   }
 
   const proto      = req.headers['x-forwarded-proto'] || 'https'
@@ -197,7 +227,7 @@ async function auth(req, res) {
   const nonce = randomBytes(32).toString('hex')
   let state
   try {
-    state = await signOAuthState({ nonce, tenantId, userId: account.userId }, { expiresInSeconds: 600 })
+    state = await signOAuthState({ nonce, tenantId, userId: account.userId, clientKey: authClientKey }, { expiresInSeconds: 600 })
   } catch (err) {
     console.error(`[google/auth] could not sign OAuth state: ${err.message}`)
     return res.status(503).send(`
@@ -310,13 +340,25 @@ async function callback(req, res) {
     `))
   }
 
-  const clientId     = process.env.GOOGLE_CLIENT_ID
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET
-
-  if (!clientId || !clientSecret) {
-    return res.status(503).send(page('Missing credentials', `
-      <p>GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET is not set in Vercel environment variables.</p>
-    `))
+  // Dual-client migration (Phase 5): the client used for this EXCHANGE is
+  // selected ONLY from the verified, HMAC-signed state claim
+  // (decodedState.clientKey, already defaulted to 'legacy-lta' by
+  // verifyOAuthState() if this state predates the migration) -- never from
+  // an unsigned query param, header, or any other browser-controlled
+  // input. This is what makes it structurally impossible to exchange an
+  // authorization code (bound, at Google's end, to whichever client_id
+  // requested it) against the WRONG client.
+  const oauthClientKey = decodedState.clientKey
+  let clientId, clientSecret
+  try {
+    ;({ clientId, clientSecret } = resolveGoogleOAuthClientCredentials(oauthClientKey))
+  } catch (err) {
+    if (err instanceof GoogleOAuthClientNotConfiguredError || err instanceof UnrecognizedClientKeyError) {
+      return res.status(503).send(page('Missing credentials', `
+        <p>GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET is not set in Vercel environment variables.</p>
+      `))
+    }
+    throw err
   }
 
   const proto       = req.headers['x-forwarded-proto'] || 'https'
@@ -386,26 +428,89 @@ async function callback(req, res) {
     `))
   }
 
-  // Phase 8, Milestone 8.7: the refresh token is written straight to the
-  // live credential store (Redis, encrypted) -- no Vercel env var, no
-  // redeploy, no ~60s propagation window. Fetch the connected account's
-  // display name once, right now, using the access token this same
-  // authorization_code exchange already returned (no extra refresh-token
-  // round trip needed) so "Connected Google Account" is accurate from the
-  // moment of connection.
+  // --- VALIDATE BEFORE PROMOTION (Phase 5) ----------------------------------
+  // Everything from here to setStoredCredentialIfVersion() below is
+  // read-only against Google -- no publish/reply/edit/sync/import/write
+  // endpoint is ever called on this path. Any failure below returns
+  // WITHOUT calling setStoredCredentialIfVersion() at all, so the
+  // previously stored credential (if any) is left byte-for-byte
+  // unchanged -- exactly the same "your previous connection remains
+  // active" contract the existing committed-tenant reconciliation check
+  // below already established; this extends it uniformly rather than
+  // introducing a new pattern.
+
+  const REQUIRED_GBP_SCOPE = 'https://www.googleapis.com/auth/business.manage'
+  // Google's token endpoint MAY legitimately omit `scope` in the
+  // authorization_code response when the granted scope exactly matches
+  // what was requested -- this is not something to guess at: this exact
+  // codebase's own status()/testConnection() code already relies on that
+  // same convention for a REFRESH exchange response
+  // (`tokenData.scope || REQUIRED_GBP_SCOPE`, further down this file), so
+  // treating absence here as "granted exactly what was requested" matches
+  // an already-proven, already-shipped assumption about this API, not a
+  // new one. Only an EXPLICIT, wrong scope list is grounds for rejection.
+  if (typeof tokens.scope === 'string' && tokens.scope) {
+    const grantedScopes = new Set(tokens.scope.split(' ').filter(Boolean))
+    const unexpected = [...grantedScopes].filter(s => s !== REQUIRED_GBP_SCOPE)
+    if (!grantedScopes.has(REQUIRED_GBP_SCOPE) || unexpected.length > 0) {
+      return res.status(400).send(page('Unexpected permissions granted', `
+        <p>Google granted a different set of permissions than requested.</p>
+        <p style="color:#16a34a">Your previous Google connection, if any, remains active and unchanged.</p>
+        <p><a href="/settings/google">← Back to Settings</a></p>
+      `))
+    }
+  }
+
+  // Prove the freshly-issued refresh token actually works for the refresh
+  // grant (not merely that the authorization_code exchange returned a
+  // string that looks like one) -- using the SAME resolved client this
+  // whole exchange is using. A failure here is exceedingly unlikely
+  // immediately after a successful code exchange, but "the token Google
+  // just issued cannot itself be refreshed" is exactly the kind of defect
+  // this gate exists to catch before it becomes a stored, broken credential.
+  let refreshProof
+  try {
+    refreshProof = await exchangeRefreshToken(tokens.refresh_token, oauthClientKey)
+  } catch (err) {
+    return res.status(502).send(page('Could not verify the new connection', `
+      <p>Could not verify the newly issued Google credential: <strong>${err.message}</strong></p>
+      <p style="color:#16a34a">Your previous Google connection, if any, remains active and unchanged.</p>
+      <p><a href="/settings/google">← Back to Settings</a></p>
+    `))
+  }
+  if (!refreshProof.access_token) {
+    return res.status(400).send(page('Could not verify the new connection', `
+      <p>The newly issued Google credential could not be refreshed: <strong>${refreshProof.error_description || refreshProof.error || 'unknown error'}</strong></p>
+      <p style="color:#16a34a">Your previous Google connection, if any, remains active and unchanged.</p>
+      <p><a href="/settings/google">← Back to Settings</a></p>
+    `))
+  }
+
+  // accounts.list -- PROMOTED from a best-effort, non-fatal fetch to a
+  // hard gate for every tenant (previously this only blocked promotion
+  // for already-committed tenants via the location-reconciliation check
+  // below; a pre-commit tenant's failure here used to be silently
+  // swallowed). Read-only; never a write endpoint.
   let connectedAccountName = null
   try {
     const r = await fetchWithRetry('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
       headers: { Authorization: `Bearer ${tokens.access_token}` },
     })
-    if (r.ok) {
-      const data = await r.json()
-      connectedAccountName = (data.accounts || [])[0]?.accountName || null
+    if (!r.ok) {
+      return res.status(502).send(page('Could not verify the new connection', `
+        <p>Could not list Google Business Profile accounts for the newly authorized credential (HTTP ${r.status}).</p>
+        <p style="color:#16a34a">Your previous Google connection, if any, remains active and unchanged.</p>
+        <p><a href="/settings/google">← Back to Settings</a></p>
+      `))
     }
-  } catch {
-    // Non-fatal -- the connection still succeeds; the account name is
-    // cosmetic and will populate on the next status check if this
-    // best-effort fetch fails.
+    const data = await r.json()
+    connectedAccountName = (data.accounts || [])[0]?.accountName || null
+  } catch (err) {
+    return res.status(502).send(page('Could not verify the new connection', `
+      <p>Could not reach Google to verify the newly authorized credential: ${err.message}</p>
+      <p style="color:#16a34a">Your previous Google connection, if any, remains active and unchanged.</p>
+      <p><a href="/settings/google">← Back to Settings</a></p>
+    `))
   }
 
   // Multi-Tenant Phase 4I.2 -- ENTITLEMENT RECONCILIATION. The candidate
@@ -497,7 +602,7 @@ async function callback(req, res) {
     // writing anything, and this function does NOT retry -- a stale
     // candidate is discarded outright, never automatically re-attempted;
     // the user explicitly reconnects again if they still want to.
-    await setStoredCredentialIfVersion(verifiedTenantId, { refreshToken: tokens.refresh_token, connectedAccountName }, expectedCredentialVersion)
+    await setStoredCredentialIfVersion(verifiedTenantId, { refreshToken: tokens.refresh_token, connectedAccountName, clientKey: oauthClientKey }, expectedCredentialVersion)
   } catch (err) {
     if (err instanceof CredentialVersionConflictError) {
       await appendAuditEntry(verifiedTenantId, {
@@ -652,9 +757,12 @@ async function status(req, res) {
 
   const summaryFields = await buildIntegrationSummaryFields(tenantId, account)
 
-  const hasId     = !!process.env.GOOGLE_CLIENT_ID
-  const hasSecret = !!process.env.GOOGLE_CLIENT_SECRET
-  if (!hasId || !hasSecret) {
+  // Dual-client migration (Phase 5): this is a coarse "is GBP integration
+  // configured AT ALL in this deployment" check, run before any specific
+  // tenant's credential (and therefore its own clientKey) is read -- it
+  // does not and cannot know yet which client this tenant's credential
+  // needs, so it accepts either family being configured.
+  if (!hasAnyGoogleOAuthClientConfigured()) {
     return res.status(200).json({ connected: false, state: 'not_configured', ...summaryFields })
   }
 
@@ -679,7 +787,7 @@ async function status(req, res) {
   }
 
   try {
-    const tokenData = await exchangeRefreshToken(credential.refreshToken)
+    const tokenData = await exchangeRefreshToken(credential.refreshToken, credential.clientKey)
     if (!tokenData.access_token) {
       await recordConnectionCheckOutcome(tenantId, { success: false, reason: tokenData.error || 'unknown', errorDescription: tokenData.error_description })
       const updated = await getStoredCredential(tenantId)
@@ -807,17 +915,18 @@ async function testConnection(req, res) {
   if (!allowed) return
 
   const checks = []
-  const clientId     = process.env.GOOGLE_CLIENT_ID
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET
 
-  // 1. OAuth credentials configured
-  if (!clientId || !clientSecret) {
+  // 1. OAuth credentials configured -- same coarse "is GBP integration
+  // configured at all" check as status() above; which SPECIFIC client
+  // this tenant's own credential needs is checked implicitly by the
+  // refresh-token exchange below, via credential.clientKey.
+  if (!hasAnyGoogleOAuthClientConfigured()) {
     checks.push(check('credentials', 'OAuth credentials configured', 'fail',
-      `Missing ${!clientId ? 'GOOGLE_CLIENT_ID' : 'GOOGLE_CLIENT_SECRET'} in Vercel environment variables.`))
+      'Neither the legacy nor the PRYOR Google OAuth client is configured in Vercel environment variables.'))
     return res.status(200).json({ overallStatus: 'fail', checks })
   }
   checks.push(check('credentials', 'OAuth credentials configured', 'pass',
-    'GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are set.'))
+    'A Google OAuth client is configured.'))
 
   let credential
   try {
@@ -835,7 +944,7 @@ async function testConnection(req, res) {
   checks.push(check('refresh_token', 'Refresh token present', 'pass', 'A Google account is connected.'))
 
   // 2. Refresh token exchange
-  const tokenData = await exchangeRefreshToken(credential.refreshToken).catch(err => ({ __networkError: err }))
+  const tokenData = await exchangeRefreshToken(credential.refreshToken, credential.clientKey).catch(err => ({ __networkError: err }))
   if (tokenData.__networkError) {
     checks.push(check('token_exchange', 'Exchange refresh token for access token', 'fail',
       `Network error reaching Google's token endpoint: ${tokenData.__networkError.message}`))
@@ -1349,7 +1458,7 @@ async function publish(req, res) {
     return res.status(status).json(body)
   }
 
-  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+  if (!hasAnyGoogleOAuthClientConfigured()) {
     return res.status(503).json({
       error:   'not_connected',
       message: 'Google Business Profile is not connected. Complete setup in Settings → Google Business Profile.',
@@ -1554,7 +1663,7 @@ async function publish(req, res) {
   // must never be mistaken for the whole connection being broken.
   let token
   try {
-    token = await getAccessToken(credential.refreshToken)
+    token = await getAccessToken(credential.refreshToken, credential.clientKey)
     await recordOAuthRefresh(tenantId)
   } catch (err) {
     if (err.code === 'invalid_grant') {
@@ -1909,7 +2018,7 @@ async function discoverLocations(req, res) {
 
   let token
   try {
-    token = await getAccessToken(credential.refreshToken)
+    token = await getAccessToken(credential.refreshToken, credential.clientKey)
   } catch (err) {
     return res.status(503).json({ error: 'not_connected', message: err.description || err.message || 'Could not obtain a Google access token.' })
   }

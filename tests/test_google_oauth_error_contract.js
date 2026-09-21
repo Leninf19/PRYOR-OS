@@ -147,13 +147,20 @@ async function testAuthOwnerReachesExistingSuccessPath() {
   const fixtures = await setDirectory()
   const token = await tokenFor(fixtures.owner)
   const prevClientId = process.env.GOOGLE_CLIENT_ID
+  const prevClientSecret = process.env.GOOGLE_CLIENT_SECRET
   process.env.GOOGLE_CLIENT_ID = 'fake-client-id-for-test'
+  // Dual-client migration (Phase 5): auth() now resolves a FULL client
+  // pair (via the legacy compatibility bridge) before building the
+  // redirect, not just GOOGLE_CLIENT_ID alone -- a real Production
+  // configuration always has both set together, so this fixture must too.
+  process.env.GOOGLE_CLIENT_SECRET = 'fake-client-secret-for-test'
   try {
     const res = fakeRes()
     await authHandler(reqWithCookie(token), res)
     assert(res.statusCode === 302, `a valid Owner must reach the unchanged redirect-to-Google path (302), got ${res.statusCode}`)
   } finally {
     process.env.GOOGLE_CLIENT_ID = prevClientId
+    process.env.GOOGLE_CLIENT_SECRET = prevClientSecret
   }
 }
 

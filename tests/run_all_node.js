@@ -27,6 +27,8 @@ const TESTS = [
   'test_oauth_safety.js',
   'test_google_oauth_error_contract.js',
   'test_google_oauth_tenant_scoping.js',
+  'test_google_oauth_dual_client.js',
+  'test_google_oauth_workflow_wiring.js',
   'test_phase4b_cross_tenant_adversarial.js',
   'test_http_methods.js',
   'test_workflow_concurrency.js',

@@ -379,7 +379,7 @@ export async function getStoredCredential(tenantId) {
       // caller -- surface it as an auth failure the dashboard can display
       // and recover from via reconnect, not an unhandled exception.
       console.error(`[credentialStore] failed to decrypt stored refresh token: ${err.message}`)
-      return { ...record, refreshToken: null, health: GoogleHealth.AUTH_FAILED, lastFailureReason: 'decryption_failed', credentialVersion }
+      return { ...record, refreshToken: null, health: GoogleHealth.AUTH_FAILED, lastFailureReason: 'decryption_failed', credentialVersion, clientKey: record.clientKey ?? 'legacy-lta' }
     }
   }
 
@@ -399,10 +399,28 @@ export async function getStoredCredential(tenantId) {
     lastConnectionCheckStatus: record.lastConnectionCheckStatus ?? null,
     health: record.health ?? GoogleHealth.CONNECTED,
     credentialVersion,
+    // Dual-client migration (Phase 5): which Google OAuth client issued
+    // this refresh token -- 'legacy-lta' or 'pryor-2026'. EVERY record
+    // written before this migration has no such field at all (this
+    // module predates the concept entirely); those default to
+    // 'legacy-lta' here, at the ONE read site, rather than requiring a
+    // Production backfill write -- which is correct by construction,
+    // not just a convenient default: every credential ever stored before
+    // this migration was, in fact, issued by the legacy LTA client.
+    // google_api.py's Python-side reader applies the identical default.
+    // Recognizing/rejecting an EXPLICIT-but-unknown value is deliberately
+    // NOT this store's job -- that belongs to googleOAuthClients.js's
+    // resolveGoogleOAuthClientCredentials(), the single source of truth
+    // for which values are recognized, so this file never has its own,
+    // possibly-drifting copy of that list.
+    clientKey: record.clientKey ?? 'legacy-lta',
   }
 }
 
-function buildFreshRecord({ refreshToken, connectedAccountName }, credentialVersion) {
+function buildFreshRecord({ refreshToken, connectedAccountName, clientKey }, credentialVersion) {
+  if (typeof clientKey !== 'string' || !clientKey) {
+    throw new TypeError('buildFreshRecord: clientKey is required and must be a non-empty string')
+  }
   const { ciphertext, iv, authTag } = encrypt(refreshToken)
   const now = new Date().toISOString()
   return {
@@ -419,6 +437,7 @@ function buildFreshRecord({ refreshToken, connectedAccountName }, credentialVers
     lastConnectionCheckStatus: null,
     health: GoogleHealth.CONNECTED,
     credentialVersion,
+    clientKey,
   }
 }
 
@@ -435,14 +454,14 @@ function buildFreshRecord({ refreshToken, connectedAccountName }, credentialVers
 // stamps credentialVersion, incrementing from whatever was there, so a
 // record it creates is fully compatible with a subsequent CAS call against
 // it) but production code no longer calls it as of this phase.
-export async function setStoredCredential(tenantId, { refreshToken, connectedAccountName }) {
+export async function setStoredCredential(tenantId, { refreshToken, connectedAccountName, clientKey = 'legacy-lta' }) {
   assertValidTenantId(tenantId, 'setStoredCredential')
   const client = getClient()
   if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
 
   const existing = await readRaw(client, tenantId)
   const nextVersion = (Number.isInteger(existing?.credentialVersion) ? existing.credentialVersion : 0) + 1
-  await writeRaw(client, tenantId, buildFreshRecord({ refreshToken, connectedAccountName }, nextVersion))
+  await writeRaw(client, tenantId, buildFreshRecord({ refreshToken, connectedAccountName, clientKey }, nextVersion))
 }
 
 // THE production Connect/Reconnect write path (Multi-Tenant Phase 4I.2).
@@ -462,7 +481,7 @@ export async function setStoredCredential(tenantId, { refreshToken, connectedAcc
 // missing/legacy record, so a first-ever connect (captured expectedVersion
 // via getStoredCredential() returning null, i.e. version 0) and a genuine
 // version-0 record behave identically.
-export async function setStoredCredentialIfVersion(tenantId, { refreshToken, connectedAccountName }, expectedVersion) {
+export async function setStoredCredentialIfVersion(tenantId, { refreshToken, connectedAccountName, clientKey }, expectedVersion) {
   assertValidTenantId(tenantId, 'setStoredCredentialIfVersion')
   if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
     throw new TypeError('setStoredCredentialIfVersion: expectedVersion must be a non-negative integer')
@@ -470,7 +489,12 @@ export async function setStoredCredentialIfVersion(tenantId, { refreshToken, con
   const client = getClient()
   if (!client) throw new CredentialStoreUnavailableError('credential store is not configured')
 
-  const next = buildFreshRecord({ refreshToken, connectedAccountName }, expectedVersion + 1)
+  // clientKey is REQUIRED here (no default) -- this is the real production
+  // Connect/Reconnect write path (google/[action].js's callback()), and
+  // every new write must state, explicitly, which client the candidate
+  // credential was actually validated against. buildFreshRecord()'s own
+  // check enforces this.
+  const next = buildFreshRecord({ refreshToken, connectedAccountName, clientKey }, expectedVersion + 1)
 
   let evalResult
   try {

@@ -54,6 +54,15 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          # Dual-client migration (Phase 5): new suffixed secret names,
+          # additive alongside the bare pair above. Missing until
+          # Production configuration -- google_oauth_clients.py's
+          # compatibility bridge keeps using the bare pair above until
+          # both of these are set, never a partial mix of the two.
+          GOOGLE_CLIENT_ID_LEGACY: ${{ secrets.GOOGLE_CLIENT_ID_LEGACY }}
+          GOOGLE_CLIENT_SECRET_LEGACY: ${{ secrets.GOOGLE_CLIENT_SECRET_LEGACY }}
+          GOOGLE_CLIENT_ID_PRYOR: ${{ secrets.GOOGLE_CLIENT_ID_PRYOR }}
+          GOOGLE_CLIENT_SECRET_PRYOR: ${{ secrets.GOOGLE_CLIENT_SECRET_PRYOR }}
           # Phase 8, Milestone 8.8: tries the same live Redis-backed
           # credential store Settings -> Google Business Profile writes to
           # first, falling back to GOOGLE_REFRESH_TOKEN above if any of
@@ -84,6 +93,15 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          # Dual-client migration (Phase 5): new suffixed secret names,
+          # additive alongside the bare pair above. Missing until
+          # Production configuration -- google_oauth_clients.py's
+          # compatibility bridge keeps using the bare pair above until
+          # both of these are set, never a partial mix of the two.
+          GOOGLE_CLIENT_ID_LEGACY: ${{ secrets.GOOGLE_CLIENT_ID_LEGACY }}
+          GOOGLE_CLIENT_SECRET_LEGACY: ${{ secrets.GOOGLE_CLIENT_SECRET_LEGACY }}
+          GOOGLE_CLIENT_ID_PRYOR: ${{ secrets.GOOGLE_CLIENT_ID_PRYOR }}
+          GOOGLE_CLIENT_SECRET_PRYOR: ${{ secrets.GOOGLE_CLIENT_SECRET_PRYOR }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
           CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}

@@ -19,6 +19,15 @@
 
 process.env.SESSION_SIGNING_SECRET = 'test-secret-at-least-32-characters-long-xyz'
 process.env.CREDENTIAL_ENCRYPTION_KEY = 'test-encryption-key-not-a-real-secret'
+// Dual-client migration (Phase 5): getAccessToken() now resolves a real
+// client pair (via the legacy compatibility bridge) before any token
+// exchange -- previously an unset pair silently sent client_id: undefined
+// to the (mocked) fetch below, which the mock never validated; now it
+// fails closed before reaching fetch at all, so a complete pair must be
+// configured for this file's discoverForTenant() coverage to exercise the
+// path it's actually testing.
+process.env.GOOGLE_CLIENT_ID = 'fake-client-id'
+process.env.GOOGLE_CLIENT_SECRET = 'fake-client-secret'
 
 import bcrypt from 'bcryptjs'
 import handler from '../dashboard/api/admin/[action].js'
