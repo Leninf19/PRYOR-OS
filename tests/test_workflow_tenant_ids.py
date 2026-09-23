@@ -93,6 +93,9 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # One-off cleanup: invokes clear_blue_seafood_stale_claim.mjs (Node),
     # hardcoded to a single specific email, no --tenant-id.
     "clear-blue-seafood-stale-claim.yml",
+    # One-off diagnostic: invokes diagnose_blue_seafood_provisioning.mjs
+    # (Node), hardcoded to a single specific email, no --tenant-id.
+    "diagnostic-blue-seafood-provisioning.yml",
 }
 
 results = []

@@ -1,0 +1,39 @@
+name: Diagnostic - Blue Seafood Provisioning Status
+
+# Read-only diagnostic: finds the real tenant now created for
+# lenin@futuremark.studio and reports its provisioning-dispatch state,
+# including provisioning.lastError -- needed to diagnose a
+# 'provisioning_dispatch_failed' status ("Setup couldn't start" in the
+# Onboarding UI) precisely instead of guessing. Makes no writes.
+#
+# workflow_dispatch only. Meant to be deleted once this investigation
+# concludes -- not reusable operator tooling (hardcoded to this one email).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Run provisioning diagnostic
+        working-directory: dashboard
+        run: node diagnose_blue_seafood_provisioning.mjs
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
