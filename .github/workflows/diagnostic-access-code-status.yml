@@ -32,6 +32,15 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v6
 
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+
       - name: Run access code diagnostic
         run: node access_code_diagnostic.mjs --email "$EMAIL" --label "$LABEL"
         env:
