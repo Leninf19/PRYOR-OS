@@ -1,0 +1,53 @@
+name: Create Blue Seafood Replacement Access Code
+
+# One-off remediation: creates EXACTLY ONE replacement registration access
+# code for lenin@futuremark.studio (identical settings to the original,
+# now-consumed code), now that accessCodeStore.js's REDEEM_SCRIPT
+# null-encoding bug and the burn-before-validate ordering are both fixed
+# and verified against the real backend.
+#
+# Aborts without creating anything if an account or tenant already exists
+# for that email. The raw code is NEVER printed to the log -- it is written
+# to a local file and uploaded as a short-lived (1 day), access-controlled
+# workflow artifact, downloadable only by someone with read access to this
+# repository's Actions runs. Delete the artifact once retrieved.
+#
+# workflow_dispatch only. Meant to be deleted once the replacement code has
+# been delivered -- not reusable operator tooling (settings are hardcoded
+# to this one specific remediation).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-code:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Create replacement code
+        working-directory: dashboard
+        run: node create_blue_seafood_replacement_code.mjs
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+
+      - name: Upload replacement code as a private artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blue-seafood-replacement-code
+          path: dashboard/replacement-code.txt
+          retention-days: 1
