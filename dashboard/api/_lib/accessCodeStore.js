@@ -249,6 +249,20 @@ export async function revokeAccessCode(codeHash) {
 // exists (or vice versa) -- both happen atomically, or neither does. See
 // getAccessCodeRedemptionClaim()'s own header for why this claim outlives
 // the pending-registration record's own (shorter, activity-refreshed) TTL.
+// Phase B.8 post-incident correction -- this backend's Lua cjson.encode()
+// silently DROPS any object field whose value is null when re-encoding a
+// whole table (confirmed empirically: cjson.decode('{"b":null}') then
+// cjson.encode() of that table omits "b" entirely, even after explicitly
+// re-asserting cjson.null on the field immediately before encoding). A
+// naive `cjson.encode(code)` of the whole record therefore silently
+// corrupted discountPercent/discountFixedCents/trialDays/expiresAt/
+// revokedAt (each nullable) on every redemption, both in the value
+// returned to the caller AND in what got persisted back to storage via
+// HSET -- this is what produced the "This access code could not be
+// processed" failure. Fields are now emitted individually via explicit
+// helpers that never rely on this backend's null-in-table encode behavior.
+// redemptions entries never contain a null field, so cjson.encode is safe
+// for that array alone.
 const REDEEM_SCRIPT = `
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then return false end
@@ -262,9 +276,43 @@ if code.redemptionCount >= code.maxRedemptions then return false end
 code.redemptionCount = code.redemptionCount + 1
 if not code.redemptions or code.redemptions == cjson.null then code.redemptions = {} end
 table.insert(code.redemptions, { tenantId = ARGV[2], userId = ARGV[3], redeemedAt = ARGV[4] })
-redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(code))
+
+local function jstr(v)
+  if v == nil or v == cjson.null then return 'null' end
+  return cjson.encode(v)
+end
+local function jnum(v)
+  if v == nil or v == cjson.null then return 'null' end
+  return tostring(v)
+end
+local function jbool(v)
+  if v then return 'true' else return 'false' end
+end
+
+local encoded = '{'
+  .. '"codeHash":' .. jstr(code.codeHash) .. ','
+  .. '"prefix":' .. jstr(code.prefix) .. ','
+  .. '"plan":' .. jstr(code.plan) .. ','
+  .. '"discountPercent":' .. jnum(code.discountPercent) .. ','
+  .. '"discountFixedCents":' .. jnum(code.discountFixedCents) .. ','
+  .. '"trialDays":' .. jnum(code.trialDays) .. ','
+  .. '"paymentRequired":' .. jbool(code.paymentRequired) .. ','
+  .. '"expiresAt":' .. jstr(code.expiresAt) .. ','
+  .. '"maxRedemptions":' .. jnum(code.maxRedemptions) .. ','
+  .. '"redemptionCount":' .. jnum(code.redemptionCount) .. ','
+  .. '"allowedEmail":' .. jstr(code.allowedEmail) .. ','
+  .. '"allowedEmailDomain":' .. jstr(code.allowedEmailDomain) .. ','
+  .. '"clientLabel":' .. jstr(code.clientLabel) .. ','
+  .. '"createdBy":' .. jstr(code.createdBy) .. ','
+  .. '"createdAt":' .. jstr(code.createdAt) .. ','
+  .. '"revokedAt":' .. jstr(code.revokedAt) .. ','
+  .. '"status":' .. jstr(code.status) .. ','
+  .. '"redemptions":' .. cjson.encode(code.redemptions)
+  .. '}'
+
+redis.call('HSET', KEYS[1], ARGV[1], encoded)
 redis.call('SET', KEYS[2], ARGV[5], 'EX', ARGV[6])
-return cjson.encode(code)
+return encoded
 `
 
 export class AccessCodeInvalidError extends Error {}

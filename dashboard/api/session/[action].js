@@ -2100,6 +2100,30 @@ async function redeemAccessCodeAction(req, res) {
       return res.status(400).json({ error: 'payment_not_yet_supported', message: 'This access code requires payment, which is not yet supported. Please contact support.' })
     }
 
+    // Post-incident correction -- buildAccessCodeCommercialWrite() was only
+    // ever called AFTER redeemAccessCode() below, so a code whose stored
+    // trialDays/discountPercent/discountFixedCents/plan failed that
+    // validation still had its one-time redemption atomically consumed
+    // before the failure was ever detected. Run the SAME validation here,
+    // on the pre-redemption preview, so a malformed code is rejected
+    // without ever being consumed. This mirrors the paymentRequired check
+    // just above (already checked pre-consume) and matches
+    // accessCodeCommercial.js's own documented intent (see that module's
+    // header). The post-redemption check below is kept as defense in
+    // depth; it should no longer be reachable for a fresh redemption.
+    try {
+      buildAccessCodeCommercialWrite(preview)
+    } catch (err) {
+      if (err instanceof PaymentRequiredNotSupportedError) {
+        return res.status(400).json({ error: 'payment_not_yet_supported', message: err.message })
+      }
+      if (err instanceof InvalidAccessCodeGrantError) {
+        console.error(`[session/redeem-access-code] ${err.message}`)
+        return res.status(503).json({ error: 'service_unavailable', message: 'This access code could not be processed. Please contact support.' })
+      }
+      throw err
+    }
+
     try {
       // redeemAccessCode() itself atomically writes the durable claim
       // (accessCodeStore.js's REDEEM_SCRIPT) in the SAME operation that
