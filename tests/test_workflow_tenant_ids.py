@@ -87,6 +87,9 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # access_code_fix_verification.mjs (Node), touches only a disposable
     # test code with a fake .invalid email, no --tenant-id.
     "diagnostic-access-code-fix-verification.yml",
+    # One-off remediation: invokes create_blue_seafood_replacement_code.mjs
+    # (Node), hardcoded to a single specific email, no --tenant-id.
+    "create-blue-seafood-replacement-code.yml",
 }
 
 results = []
