@@ -79,6 +79,10 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # that list is Python entrypoints only), takes an email/label lookup,
     # never a --tenant-id.
     "diagnostic-access-code-status.yml",
+    # One-off Lua/cjson null round-trip investigation: invokes
+    # access_code_null_roundtrip_probe.mjs (Node), touches only a synthetic
+    # payload and a disposable test key, no --tenant-id.
+    "diagnostic-access-code-null-roundtrip-probe.yml",
 }
 
 results = []
