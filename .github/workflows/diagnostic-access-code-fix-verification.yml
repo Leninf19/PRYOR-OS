@@ -1,0 +1,42 @@
+name: Diagnostic - Access Code Fix Verification
+
+# One-off verification: exercises the REAL create -> preview -> redeem ->
+# read -> (failed re-redeem) -> revoke sequence through accessCodeStore.js's
+# actual exported functions against a disposable, clearly-fake test code
+# (an .invalid-TLD email, a distinct DIAGTEST prefix/clientLabel) to confirm
+# the REDEEM_SCRIPT null-preservation fix and the new pre-redemption
+# validation check both work against the real backend. Revokes the test
+# code at the end. Never touches any other record. Prints only sanitized
+# booleans/types, never the raw code.
+#
+# workflow_dispatch only. Meant to be deleted once this investigation
+# concludes -- not reusable operator tooling.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Run fix verification
+        working-directory: dashboard
+        run: node access_code_fix_verification.mjs
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}

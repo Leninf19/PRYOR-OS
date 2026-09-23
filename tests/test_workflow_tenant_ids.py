@@ -83,6 +83,10 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # access_code_null_roundtrip_probe.mjs (Node), touches only a synthetic
     # payload and a disposable test key, no --tenant-id.
     "diagnostic-access-code-null-roundtrip-probe.yml",
+    # One-off end-to-end fix verification: invokes
+    # access_code_fix_verification.mjs (Node), touches only a disposable
+    # test code with a fake .invalid email, no --tenant-id.
+    "diagnostic-access-code-fix-verification.yml",
 }
 
 results = []

@@ -536,6 +536,28 @@ async function testInvalidTrialDaysCannotBeUsedToRedeem() {
   assert(threw instanceof TypeError, 'an absurd trialDays value must be rejected at code-creation time, never able to grant a multi-year trial')
 }
 
+// Real-incident regression (2026-09-23): a code whose STORED record has
+// trialDays missing entirely (not null -- the exact shape a whole-object
+// JSON round trip that drops null-valued keys produces, and also the
+// exact shape createAccessCode() itself would never write, matching
+// accessCodeCommercial.js's own documented "a pre-B.8 code could have been
+// created before validation existed" rationale) must be rejected BEFORE
+// redeemAccessCode() ever runs -- not after, which would burn the code's
+// one redemption slot on every single attempt with nothing to show for it.
+async function testMalformedStoredTrialDaysRejectedWithoutBurningIt() {
+  const client = installFakeRedis(); installWorkingEmailTransport()
+  const { cookie } = await registerAndVerify({ email: 'malformed-trial@example.com' })
+  const { rawCode, record } = await makeAccessCode({ prefix: 'LTA-MALF', plan: 'growth', maxRedemptions: 1 })
+  // Simulate the real corrupted-on-disk shape directly -- JSON.stringify of
+  // an object with an `undefined`-valued key omits that key entirely, the
+  // same shape confirmed against the real backend.
+  await client.hset('access_codes:v1', { [record.codeHash]: JSON.stringify({ ...record, trialDays: undefined }) })
+  const res = await invoke('redeem-access-code', { code: rawCode }, { cookie })
+  assert(res.statusCode === 503 && res.body.error === 'service_unavailable', `expected a stable service_unavailable error, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  const stored = await getAccessCodeByHash(record.codeHash)
+  assert(stored.redemptionCount === 0, 'a code rejected for malformed commercial fields must NEVER be burned -- redemptionCount must stay 0')
+}
+
 async function testExpiredCodeCreatesNoTenantOrCommercialState() {
   installFakeRedis(); installWorkingEmailTransport()
   const { cookie, pending } = await registerAndVerify({ email: 'expired-owner@example.com' })
@@ -1004,6 +1026,7 @@ const tests = [
   ['discount metadata preserved through real redemption', testDiscountMetadataPreservedThroughRedemption],
   ['invalid plan cannot be used to create a code at all', testInvalidPlanCannotBeUsedToRedeem],
   ['invalid trialDays cannot be used to create a code at all', testInvalidTrialDaysCannotBeUsedToRedeem],
+  ['malformed stored trialDays rejected WITHOUT burning it', testMalformedStoredTrialDaysRejectedWithoutBurningIt],
   ['expired code creates no tenant/commercial state', testExpiredCodeCreatesNoTenantOrCommercialState],
   ['max-redemption-reached code creates no tenant/commercial state', testMaxRedemptionReachedCreatesNoTenantOrCommercialState],
   ['email-mismatch code creates no tenant/commercial state', testEmailMismatchCreatesNoTenantOrCommercialState],
