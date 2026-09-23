@@ -1,0 +1,43 @@
+name: Diagnostic - Access Code Null Round-Trip Probe
+
+# One-off investigation: proves or disproves whether this Redis-compatible
+# backend's Lua `cjson` library round-trips JSON `null` correctly through
+# cjson.decode -> cjson.encode -- the exact operation accessCodeStore.js's
+# REDEEM_SCRIPT performs on a whole access-code record during redemption.
+#
+# Runs dashboard/access_code_null_roundtrip_probe.mjs, which touches ONLY a
+# synthetic hardcoded payload and a disposable, clearly-namespaced test key
+# (diagnostic_test:access_code_null_roundtrip:v1) that it deletes before and
+# after use. Never reads or writes access_codes:v1 or any other real key.
+#
+# workflow_dispatch only. Meant to be deleted once the investigation
+# concludes -- not reusable operator tooling.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Run null round-trip probe
+        working-directory: dashboard
+        run: node access_code_null_roundtrip_probe.mjs
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
