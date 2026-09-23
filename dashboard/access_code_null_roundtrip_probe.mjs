@@ -29,6 +29,16 @@ function getClient() {
   return new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
 }
 
+// @upstash/redis auto-deserializes values that look like JSON, so a GET or
+// EVAL result may already be an object, not the raw string -- mirrors
+// accessCodeStore.js's own parseRecord() helper, which defends against
+// exactly this.
+function toRecord(value) {
+  if (value == null) return null
+  if (typeof value === 'object') return value
+  return JSON.parse(value)
+}
+
 // Mirrors REDEEM_SCRIPT's own decode -> encode shape exactly, minus the
 // Redis reads/writes -- pure computation, touches no keys.
 const NAIVE_ROUNDTRIP_SCRIPT = `
@@ -80,9 +90,9 @@ async function main() {
   console.log('=== Probe 1: naive decode->encode round trip (mirrors REDEEM_SCRIPT today) ===')
   try {
     const naive = await client.eval(NAIVE_ROUNDTRIP_SCRIPT, [], [payload])
-    console.log(`Output: ${naive}`)
-    const parsed = JSON.parse(naive)
-    console.log(`null fields preserved: b=${parsed.b === null}, d=${parsed.d === null}`)
+    const parsed = toRecord(naive)
+    console.log(`Output: ${JSON.stringify(parsed)}`)
+    console.log(`b key present: ${'b' in parsed}, value: ${JSON.stringify(parsed.b)} -- d key present: ${'d' in parsed}, value: ${JSON.stringify(parsed.d)}`)
   } catch (err) {
     console.log(`Probe 1 failed: ${err.message}`)
   }
@@ -90,9 +100,9 @@ async function main() {
   console.log('\n=== Probe 2: round trip WITH candidate fix (re-assert cjson.null before encode) ===')
   try {
     const fixed = await client.eval(FIXED_ROUNDTRIP_SCRIPT, [], [payload])
-    console.log(`Output: ${fixed}`)
-    const parsed = JSON.parse(fixed)
-    console.log(`null fields preserved: b=${parsed.b === null}, d=${parsed.d === null}`)
+    const parsed = toRecord(fixed)
+    console.log(`Output: ${JSON.stringify(parsed)}`)
+    console.log(`b key present: ${'b' in parsed}, value: ${JSON.stringify(parsed.b)} -- d key present: ${'d' in parsed}, value: ${JSON.stringify(parsed.d)}`)
   } catch (err) {
     console.log(`Probe 2 failed: ${err.message}`)
   }
@@ -109,20 +119,20 @@ async function main() {
     await client.set(TEST_KEY, JSON.stringify(testRecord))
 
     const beforeRaw = await client.get(TEST_KEY)
-    const before = typeof beforeRaw === 'string' ? JSON.parse(beforeRaw) : beforeRaw
-    console.log(`Before redemption -- trialDays present: ${typeof before.trialDays !== 'undefined'}, value: ${JSON.stringify(before.trialDays)}`)
+    const before = toRecord(beforeRaw)
+    console.log(`Before redemption -- trialDays present: ${'trialDays' in before}, value: ${JSON.stringify(before.trialDays)}`)
 
     const redeemResult = await client.eval(
       FIXED_REDEEM_SCRIPT,
       [TEST_KEY, TEST_CLAIM_KEY],
       ['test-tenant', 'test-user', new Date().toISOString()]
     )
-    const after = JSON.parse(redeemResult)
-    console.log(`After simulated redemption -- redemptionCount: ${after.redemptionCount}, trialDays present: ${typeof after.trialDays !== 'undefined'}, value: ${JSON.stringify(after.trialDays)}, discountPercent value: ${JSON.stringify(after.discountPercent)}, discountFixedCents value: ${JSON.stringify(after.discountFixedCents)}`)
+    const after = toRecord(redeemResult)
+    console.log(`After simulated redemption -- redemptionCount: ${after.redemptionCount}, trialDays present: ${'trialDays' in after}, value: ${JSON.stringify(after.trialDays)}, discountPercent present: ${'discountPercent' in after}, value: ${JSON.stringify(after.discountPercent)}, discountFixedCents present: ${'discountFixedCents' in after}, value: ${JSON.stringify(after.discountFixedCents)}`)
 
     const afterStoredRaw = await client.get(TEST_KEY)
-    const afterStored = typeof afterStoredRaw === 'string' ? JSON.parse(afterStoredRaw) : afterStoredRaw
-    console.log(`Re-read from storage (not the script's return value) -- trialDays present: ${typeof afterStored.trialDays !== 'undefined'}, value: ${JSON.stringify(afterStored.trialDays)}`)
+    const afterStored = toRecord(afterStoredRaw)
+    console.log(`Re-read from storage (not the script's return value) -- trialDays present: ${'trialDays' in afterStored}, value: ${JSON.stringify(afterStored.trialDays)}`)
   } catch (err) {
     console.log(`Probe 3 failed: ${err.message}`)
   } finally {
