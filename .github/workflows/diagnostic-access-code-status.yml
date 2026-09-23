@@ -1,0 +1,41 @@
+name: Diagnostic - Access Code Redemption Status
+
+# Read-only diagnostic for a specific registration access-code redemption
+# failure -- runs access_code_diagnostic.mjs, which only ever calls
+# existing, already-exported read functions (accessCodeStore.js's
+# listAccessCodes()/getAccessCodeRedemptionClaim(), pendingRegistrationStore.js's
+# getPendingRegistration(), accountStore.js's getAccountByEmail()). No
+# write, no revoke, no redemption, no raw access code ever printed
+# (codeHash is a one-way hash, safe to display).
+#
+# workflow_dispatch only -- no schedule. Requires the email (and optionally
+# the code's clientLabel) as inputs so this stays a targeted lookup, never
+# a full dump of every code in the store.
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: 'Email to investigate (redemption claim / pending registration / account)'
+        required: true
+      label:
+        description: 'Access code clientLabel to match, if known'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Run access code diagnostic
+        run: node access_code_diagnostic.mjs --email "$EMAIL" --label "$LABEL"
+        env:
+          EMAIL: ${{ inputs.email }}
+          LABEL: ${{ inputs.label }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}

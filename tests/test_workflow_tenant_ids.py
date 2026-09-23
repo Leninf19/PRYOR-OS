@@ -74,6 +74,11 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # script in that list (which each operate on exactly one fixed,
     # reviewed tenant).
     "diagnostic-credential-migration-status.yml",
+    # Access-code redemption-failure diagnostic: invokes
+    # access_code_diagnostic.mjs (Node, not in TENANT_AWARE_SCRIPTS at all --
+    # that list is Python entrypoints only), takes an email/label lookup,
+    # never a --tenant-id.
+    "diagnostic-access-code-status.yml",
 }
 
 results = []
