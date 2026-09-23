@@ -1,0 +1,46 @@
+name: Clear Blue Seafood Stale Redemption Claim
+
+# One-off, narrowly-scoped cleanup: removes ONLY the stale access-code
+# redemption claim for lenin@futuremark.studio, which blocks
+# redeemAccessCodeAction() from ever looking at a newly-submitted code
+# (session/[action].js:2012-2021 resumes from any existing claim for the
+# email, before reading the request body at all).
+#
+# Runs clear_blue_seafood_stale_claim.mjs, which re-verifies every fact
+# this cleanup depends on immediately before writing and aborts without
+# writing anything if any of them changed. The only write is
+# clearAccessCodeRedemptionClaim(email) -- a single string key delete.
+# Never touches access_codes:v1, never resets a redemption count, never
+# redeems anything, never logs the raw code.
+#
+# workflow_dispatch only. Meant to be deleted once this one-time cleanup
+# concludes -- not reusable operator tooling.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clear-claim:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Verify and clear the stale claim
+        working-directory: dashboard
+        run: node clear_blue_seafood_stale_claim.mjs
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}

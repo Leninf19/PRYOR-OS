@@ -90,6 +90,9 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # One-off remediation: invokes create_blue_seafood_replacement_code.mjs
     # (Node), hardcoded to a single specific email, no --tenant-id.
     "create-blue-seafood-replacement-code.yml",
+    # One-off cleanup: invokes clear_blue_seafood_stale_claim.mjs (Node),
+    # hardcoded to a single specific email, no --tenant-id.
+    "clear-blue-seafood-stale-claim.yml",
 }
 
 results = []
