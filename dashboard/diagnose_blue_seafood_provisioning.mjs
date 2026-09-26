@@ -38,18 +38,42 @@ async function main() {
 
   const approved = config.approvedLocations || []
   const provisioning = config.provisioning || {}
+  const initialSync = config.initialSync || {}
+  const commercial = config.commercial || {}
   console.log(JSON.stringify({
     status: config.status,
     storageMode: config.storageMode,
-    locationCount: approved.length,
-    locationNames: approved.map(l => l.title),
+    approvedLocationCount: approved.length,
+    approvedLocationNames: approved.map(l => l.title),
     createdAt: config.createdAt,
+    activatedAt: config.activatedAt ?? null,
     provisioning: {
       status: provisioning.status,
       dispatchAttemptId: provisioning.dispatchAttemptId ?? null,
       dispatchedAt: provisioning.dispatchedAt ?? null,
       lastAttemptAt: provisioning.lastAttemptAt ?? null,
       lastError: provisioning.lastError ?? null,
+      provisionedLocationIds: provisioning.provisionedLocationIds ?? [],
+    },
+    initialSync: {
+      status: initialSync.status ?? null,
+      startedAt: initialSync.startedAt ?? null,
+      completedAt: initialSync.completedAt ?? null,
+      failedAt: initialSync.failedAt ?? null,
+      reviewCount: initialSync.reviewCount ?? null,
+      locationCount: initialSync.locationCount ?? null,
+      lastError: initialSync.lastError ?? null,
+    },
+    commercial: {
+      commercialStatus: commercial.commercialStatus ?? null,
+      plan: commercial.plan ?? null,
+      planSource: commercial.planSource ?? null,
+      paymentRequired: commercial.paymentRequired ?? null,
+      trial: commercial.trial ?? null,
+      discountPercent: commercial.discountPercent ?? null,
+      discountFixedCents: commercial.discountFixedCents ?? null,
+      suspension: commercial.suspension ?? null,
+      cancellation: commercial.cancellation ?? null,
     },
   }, null, 2))
 }
