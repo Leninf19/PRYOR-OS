@@ -74,6 +74,13 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # script in that list (which each operate on exactly one fixed,
     # reviewed tenant).
     "diagnostic-credential-migration-status.yml",
+    # Recurring review sync for BLOB-mode tenants: invokes recurring_sync.py,
+    # which is NOT in TENANT_AWARE_SCRIPTS above and enumerates every
+    # eligible tenant itself by default (like credential_migration_status.py),
+    # or takes an OPTIONAL --tenant-id for operator-chosen single-tenant
+    # dispatch (like diagnostic-gbp-review-media.yml's own precedent) --
+    # never a REQUIRED --tenant-id sourced from a fixed, reviewed env value.
+    "recurring-review-sync.yml",
     # Access-code redemption-failure diagnostic: invokes
     # access_code_diagnostic.mjs (Node, not in TENANT_AWARE_SCRIPTS at all --
     # that list is Python entrypoints only), takes an email/label lookup,
