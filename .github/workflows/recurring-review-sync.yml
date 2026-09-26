@@ -1,0 +1,70 @@
+name: Recurring Review Sync (BLOB-Mode Tenants)
+
+# Ongoing Google Business Profile review sync for every BLOB-mode tenant
+# that has already completed Initial Sync -- see recurring_sync.py's own
+# header for the full design rationale. Los Tres Amigos (LEGACY_REPO) is
+# structurally excluded and untouched; its own update-reviews.yml cadence
+# is completely separate and unaffected by this workflow.
+#
+# DELIBERATELY workflow_dispatch-only for now -- NO cron trigger. Proposed
+# cadence, to be added as its own reviewed one-line change once this has
+# been observed running cleanly via manual dispatch (see the PR that
+# introduced this file for the specific proposal and rollout plan):
+#
+#   schedule:
+#     - cron: '30 */6 * * *'   # every 6h, offset 30min from update-reviews.yml's own :00 schedule
+#
+# The `tenant_id` input lets an operator dispatch a sync for exactly one
+# tenant (e.g. to verify a single tenant cleanly before the schedule is
+# ever enabled) -- mirrors diagnostic-gbp-review-media.yml's own precedent
+# for a script that is deliberately built to run for an operator-chosen
+# tenant, never a --tenant-id sourced from a fixed, reviewed env value the
+# way every LTA-only pipeline script requires.
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_id:
+        description: 'Sync only this tenant (optional -- omit to process every eligible tenant)'
+        required: false
+
+concurrency:
+  group: blob-tenant-review-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      # recurring_sync.py imports initial_sync.py, which imports google_api.py
+      # -- credential decryption needs `cryptography`, matching every other
+      # workflow that invokes Google-sync code.
+      - name: Install Python dependencies
+        run: pip install cryptography
+
+      - name: Run recurring sync
+        run: |
+          if [ -n "$TENANT_ID_INPUT" ]; then
+            python recurring_sync.py --tenant-id "$TENANT_ID_INPUT"
+          else
+            python recurring_sync.py
+          fi
+        env:
+          TENANT_ID_INPUT: ${{ inputs.tenant_id }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_CLIENT_ID_LEGACY: ${{ secrets.GOOGLE_CLIENT_ID_LEGACY }}
+          GOOGLE_CLIENT_SECRET_LEGACY: ${{ secrets.GOOGLE_CLIENT_SECRET_LEGACY }}
+          GOOGLE_CLIENT_ID_PRYOR: ${{ secrets.GOOGLE_CLIENT_ID_PRYOR }}
+          GOOGLE_CLIENT_SECRET_PRYOR: ${{ secrets.GOOGLE_CLIENT_SECRET_PRYOR }}
