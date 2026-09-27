@@ -219,7 +219,7 @@ def test_global_429_preserves_data_and_correct_alert():
     assert run_row["locations_succeeded"] == 0
     assert run_row["locations_failed"] == 0
 
-    alert_html = notify.check_scraper_failure(conn)
+    alert_html, _log_calls = notify.check_scraper_failure(conn)
     conn.close()
 
     assert "0 of 0" not in alert_html, "must never say '0 of 0 locations encountered an error'"

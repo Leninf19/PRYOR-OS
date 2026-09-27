@@ -48,7 +48,12 @@ import provider_sync
 import tenant_keys
 import tenant_paths
 
-TO_ADDR = "advertising@l3amigos.com"
+# Platform-operational alerts only (scraper stuck-run / stale-pipeline
+# liveness) -- never tenant/review content, so this always goes to the
+# platform operator regardless of which tenant this script runs for. See
+# notify.py's own routing split for the reasoning and the business-content
+# boundary this file never crosses.
+TO_ADDR = "lenin@futuremark.studio"
 FROM_ADDR = os.environ.get("GMAIL_USER", "")
 APP_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
 

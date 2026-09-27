@@ -147,6 +147,15 @@ def test_check_stuck_run_reports_every_simultaneously_stuck_run_not_just_the_lat
     assert f"run #{run_b}" in html
 
 
+# --- Recipient routing --------------------------------------------------------
+
+def test_to_addr_is_the_platform_operator_not_a_tenant_business_address():
+    """health_check.py content is pipeline/infra health only (stuck runs,
+    stale cron) -- never tenant/review content -- so it must always go to
+    the platform operator, never advertising@l3amigos.com."""
+    assert health_check.TO_ADDR == "lenin@futuremark.studio"
+
+
 # --- Watchdog reconciliation wired into main()'s flow -------------------------
 
 def test_reconciled_run_stops_matching_check_stuck_run_entirely():
@@ -180,6 +189,7 @@ def main():
         ("check_stuck_run alerts independently on a second, distinct stuck run", test_check_stuck_run_alerts_independently_on_a_second_distinct_run),
         ("check_stuck_run reports every simultaneously-stuck run, not just the latest", test_check_stuck_run_reports_every_simultaneously_stuck_run_not_just_the_latest),
         ("a reconciled ('timed_out') run stops matching check_stuck_run entirely", test_reconciled_run_stops_matching_check_stuck_run_entirely),
+        ("TO_ADDR is the platform operator, not a tenant business address", test_to_addr_is_the_platform_operator_not_a_tenant_business_address),
     ]
     for name, fn in tests:
         run(name, fn)
