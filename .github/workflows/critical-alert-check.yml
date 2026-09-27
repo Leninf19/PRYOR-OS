@@ -9,7 +9,10 @@ name: Critical Review Alert Check
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * *'
+    # GitHub-account migration: quote-style-only touch (same schedule) to
+    # reassign this workflow's SCHEDULED-run "actor" from LosTresAmigos1 to
+    # Leninf19 -- see update-reviews.yml's identical comment.
+    - cron: "*/15 * * * *"
 
 # Shared with every other workflow that commits to dashboard/reviews.db --
 # see update-reviews.yml for the full rationale.

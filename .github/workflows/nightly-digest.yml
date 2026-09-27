@@ -8,8 +8,12 @@ name: Nightly Review Digest
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 2 * * *'
-    - cron: '0 3 * * *'
+    # GitHub-account migration: quote-style-only touch (same schedules) to
+    # reassign this workflow's SCHEDULED-run "actor" from LosTresAmigos1 to
+    # Leninf19 -- see update-reviews.yml's identical comment. Both entries
+    # touched since each fires as its own distinct scheduled event.
+    - cron: "0 2 * * *"
+    - cron: "0 3 * * *"
 
 # Shared with every other workflow that commits to dashboard/reviews.db --
 # see update-reviews.yml for the full rationale.

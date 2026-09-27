@@ -3,7 +3,12 @@ name: Update Reviews
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'    # ~every 6h; GitHub may delay scheduled runs under load
+    # GitHub-account migration: this cron line is deliberately touched
+    # (quote style only, same schedule) to reassign this workflow's
+    # SCHEDULED-run "actor" attribution from LosTresAmigos1 to Leninf19 --
+    # GitHub's documented mechanism attributes a scheduled run's actor to
+    # whoever last modified the cron syntax line itself.
+    - cron: "0 */6 * * *"    # ~every 6h; GitHub may delay scheduled runs under load
 
 # Every workflow that commits to dashboard/reviews.db shares this same
 # group, serializing them so two writers can never race to commit/push at
