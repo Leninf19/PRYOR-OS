@@ -2,7 +2,10 @@ name: Weekly Review Report
 
 on:
   schedule:
-    - cron: '0 13 * * 1'   # Every Monday at 8am EST (13:00 UTC)
+    # GitHub-account migration: quote-style-only touch (same schedule) to
+    # reassign this workflow's SCHEDULED-run "actor" from LosTresAmigos1 to
+    # Leninf19 -- see update-reviews.yml's identical comment.
+    - cron: "0 13 * * 1"   # Every Monday at 8am EST (13:00 UTC)
   workflow_dispatch:         # manual trigger
 
 jobs:

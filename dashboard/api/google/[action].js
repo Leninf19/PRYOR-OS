@@ -1058,8 +1058,16 @@ async function testConnection(req, res) {
 // Returns { success: true } or { error, message }
 // ---------------------------------------------------------------------------
 
-const REPO_OWNER = 'LosTresAmigos1'
-const REPO_NAME  = 'lta-review-dashboard'
+// GitHub-account migration: this used to point at LosTresAmigos1/
+// lta-review-dashboard, the pre-migration repo path. That repo was
+// renamed/transferred to Leninf19/PRYOR-OS (a transfer redirect, not a
+// duplicate) -- GITHUB_SYNC_PAT already authenticates as Leninf19
+// regardless (confirmed via the Actions API's own `actor` field on past
+// workflow_dispatch runs, not assumed from the old path), so this is a
+// pure string update removing reliance on GitHub's redirect, not a
+// credential change.
+const REPO_OWNER = 'Leninf19'
+const REPO_NAME  = 'PRYOR-OS'
 
 async function triggerSync(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
@@ -2108,10 +2116,12 @@ async function discoverLocations(req, res) {
 // dispatchTenantLifecycleWorkflow() calls THIS repo's own pinned dispatcher
 // (.github/workflows/tenant-lifecycle-dispatch.yml) -- the exact same
 // trusted, pinned-application-commit execution engine every manual
-// operator dispatch has used throughout this project. Deliberately a
-// SEPARATE repo and token from triggerSync()/triggerImport() above, which
-// target Los Tres Amigos's own legacy repo with GITHUB_SYNC_PAT -- that
-// token has no relationship to this one and is never used here.
+// operator dispatch has used throughout this project. Post-GitHub-migration,
+// this now resolves to the SAME repo as triggerSync()/triggerImport() above
+// (both Leninf19/PRYOR-OS) -- it was a separate repo (Los Tres Amigos's own
+// legacy lta-review-dashboard) before that migration. Still a genuinely
+// SEPARATE credential: this uses TENANT_PROVISIONING_DISPATCH_PAT, never
+// GITHUB_SYNC_PAT, and the two remain unrelated.
 //
 // Preview Infrastructure Isolation (blocker-fix revision) -- for
 // 'production', the dispatch's own `ref` is 'main', exactly as always:
