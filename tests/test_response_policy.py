@@ -21,9 +21,11 @@ Run directly: py tests/test_response_policy.py
 """
 import sys
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ai_engine
+import tenant_config_store
 
 results = []
 
@@ -162,9 +164,32 @@ def test_guard_strips_phone_number():
 
 
 def test_guard_leaves_serious_escalation_untouched():
+    # Tenant-Isolated Review Contact: a serious response is only trusted
+    # verbatim when a REAL, resolved contact was actually offered -- the
+    # third arg simulates what resolve_review_response_contact() would have
+    # returned for the tenant this draft was generated for.
     draft = "We are very sorry to hear this. Please contact us at advertising@l3amigos.com so we can make this right."
-    cleaned = ai_engine.enforce_response_policy(draft, "serious_escalation")
-    assert cleaned == draft, "serious_escalation is the one class allowed to keep the contact CTA"
+    cleaned = ai_engine.enforce_response_policy(draft, "serious_escalation", "advertising@l3amigos.com")
+    assert cleaned == draft, "a serious response with a real, configured contact keeps the contact CTA"
+
+
+def test_guard_strips_hallucinated_contact_when_none_configured():
+    draft = "We are very sorry to hear this. Please contact us at advertising@l3amigos.com so we can make this right."
+    cleaned = ai_engine.enforce_response_policy(draft, "serious_escalation", None)
+    assert "advertising@l3amigos.com" not in cleaned, "an unconfigured contact must never leak into a reply, even a serious one"
+    assert "sorry" in cleaned.lower(), "the sincere recovery language must survive -- only the contact-shaped text is stripped"
+
+
+def test_guard_keeps_generic_reach_out_language_when_none_configured():
+    draft = "We take this seriously. Please reach out to us directly so we can make this right."
+    cleaned = ai_engine.enforce_response_policy(draft, "serious_escalation", None)
+    assert cleaned == draft, "generic, contact-method-free recovery language must survive untouched when no contact is configured"
+
+
+def test_guard_never_leaks_a_different_tenants_contact():
+    draft = "So sorry about this. Please contact us at advertising@l3amigos.com so we can make this right."
+    cleaned = ai_engine.enforce_response_policy(draft, "serious_escalation", "owner@blueseafoodgrill.example")
+    assert "advertising@l3amigos.com" not in cleaned, "another tenant's address must never survive into this tenant's reply"
 
 
 def test_guard_never_returns_empty_string():
@@ -195,12 +220,18 @@ def test_generated_draft_for_casa_tequila_prime_never_contains_forbidden_cta():
 # assert on POLICY (what the model was told), mirroring
 # tests/test_response_playbook_v2.js's JS-side coverage of rewriteEngine.js.
 
-def _capture_prompt(review, restaurant_name="Casa Tequila Prime"):
+def _capture_prompt(review, restaurant_name="Casa Tequila Prime", tenant_id=None):
+    # Mirrors batch_generate_drafts()'s own pattern: resolve the tenant's
+    # contact once, then pass the resolved value into
+    # generate_response_draft() -- that function no longer looks tenant_id
+    # up itself (see its docstring for why).
+    contact = ai_engine.resolve_review_response_contact(tenant_id)
+    contact_value = contact.get("email") or contact.get("phone")
     captured = {}
     original_call = ai_engine._call
     ai_engine._call = lambda prompt, **kwargs: captured.setdefault("prompt", prompt) or "A generated reply."
     try:
-        ai_engine.generate_response_draft(review, restaurant_name)
+        ai_engine.generate_response_draft(review, restaurant_name, contact_value=contact_value)
     finally:
         ai_engine._call = original_call
     return captured["prompt"]
@@ -259,6 +290,65 @@ def test_prompt_discourages_thank_you_for_your_review_default_opening():
     assert "never default to" in prompt.lower()
 
 
+# --- Tenant-Isolated Review Contact: resolve_review_response_contact() --------
+
+_LTA_TENANT_ID = "t_los-tres-amigos"
+_OTHER_TENANT_ID = "t_blue-seafood-grill-dldh5k"
+
+
+def _with_fake_tenant_config(records, fn):
+    with mock.patch.object(tenant_config_store, "get_tenant_config", side_effect=lambda tid: records.get(tid)):
+        return fn()
+
+
+def test_lta_gets_its_own_address_when_unconfigured():
+    contact = _with_fake_tenant_config({}, lambda: ai_engine.resolve_review_response_contact(_LTA_TENANT_ID))
+    assert contact["email"] == "advertising@l3amigos.com", f"LTA must default to its own historical address, got {contact}"
+
+
+def test_other_tenant_never_inherits_ltas_address_when_unconfigured():
+    contact = _with_fake_tenant_config({}, lambda: ai_engine.resolve_review_response_contact(_OTHER_TENANT_ID))
+    assert contact["email"] is None and contact["phone"] is None, \
+        f"an unconfigured non-LTA tenant must get no contact at all, never LTA's address, got {contact}"
+
+
+def test_other_tenant_gets_its_own_configured_contact():
+    records = {_OTHER_TENANT_ID: {"reviewContact": {"email": "owner@blueseafoodgrill.example", "phone": None}}}
+    contact = _with_fake_tenant_config(records, lambda: ai_engine.resolve_review_response_contact(_OTHER_TENANT_ID))
+    assert contact["email"] == "owner@blueseafoodgrill.example", f"expected the tenant's own configured contact, got {contact}"
+
+
+def test_configured_contact_overrides_ltas_default_too():
+    records = {_LTA_TENANT_ID: {"reviewContact": {"email": "newcontact@example.com", "phone": None}}}
+    contact = _with_fake_tenant_config(records, lambda: ai_engine.resolve_review_response_contact(_LTA_TENANT_ID))
+    assert contact["email"] == "newcontact@example.com", "an explicitly configured contact must win even for LTA itself"
+
+
+# --- End-to-end: generate_response_draft()'s prompt reflects the resolved contact --
+
+_SERIOUS_REVIEW = {"star_rating": 1, "review_text": "I got food poisoning and ended up in the hospital.", "reviewer_name": "Alex"}
+
+
+def test_serious_prompt_for_lta_offers_ltas_address():
+    prompt = _with_fake_tenant_config({}, lambda: _capture_prompt(_SERIOUS_REVIEW, tenant_id=_LTA_TENANT_ID))
+    assert "advertising@l3amigos.com" in prompt, "LTA's serious-reply prompt must offer its own historical address"
+
+
+def test_serious_prompt_for_another_tenant_offers_its_own_contact_never_ltas():
+    records = {_OTHER_TENANT_ID: {"reviewContact": {"email": "owner@blueseafoodgrill.example", "phone": None}}}
+    prompt = _with_fake_tenant_config(records, lambda: _capture_prompt(_SERIOUS_REVIEW, tenant_id=_OTHER_TENANT_ID))
+    assert "owner@blueseafoodgrill.example" in prompt, "this tenant's own configured contact must appear in its prompt"
+    assert "advertising@l3amigos.com" not in prompt, "LTA's address must never appear in another tenant's prompt"
+
+
+def test_serious_prompt_for_tenant_with_no_configured_contact_never_invents_one():
+    records = {_OTHER_TENANT_ID: {}}  # a real record exists, just no reviewContact configured yet
+    prompt = _with_fake_tenant_config(records, lambda: _capture_prompt(_SERIOUS_REVIEW, tenant_id=_OTHER_TENANT_ID))
+    assert "advertising@l3amigos.com" not in prompt, "an unconfigured tenant must never see LTA's address in its own prompt"
+    assert "do not state or invent any specific email" in prompt.lower(), \
+        "the model must be explicitly told not to invent a contact method when none is configured"
+
+
 def main():
     tests = [
         ("Casa Tequila Prime regression review classifies positive_with_feedback", test_casa_tequila_prime_classifies_positive_with_feedback),
@@ -276,8 +366,18 @@ def main():
         ("guard strips forbidden CTA from a non-serious response", test_guard_strips_forbidden_cta_from_non_serious_response),
         ("guard strips a bare email even without a known phrase", test_guard_strips_bare_email_even_without_known_phrase),
         ("guard strips a phone number", test_guard_strips_phone_number),
-        ("guard leaves serious_escalation responses untouched", test_guard_leaves_serious_escalation_untouched),
+        ("guard leaves serious_escalation responses untouched when a real contact was offered", test_guard_leaves_serious_escalation_untouched),
+        ("guard strips a hallucinated/leaked contact when none is configured", test_guard_strips_hallucinated_contact_when_none_configured),
+        ("guard keeps generic reach-out language when none is configured", test_guard_keeps_generic_reach_out_language_when_none_configured),
+        ("guard never leaks a different tenant's contact", test_guard_never_leaks_a_different_tenants_contact),
         ("guard never returns an empty string", test_guard_never_returns_empty_string),
+        ("Tenant-Isolated Review Contact: LTA gets its own address when unconfigured", test_lta_gets_its_own_address_when_unconfigured),
+        ("Tenant-Isolated Review Contact: another tenant never inherits LTA's address when unconfigured", test_other_tenant_never_inherits_ltas_address_when_unconfigured),
+        ("Tenant-Isolated Review Contact: another tenant gets its own configured contact", test_other_tenant_gets_its_own_configured_contact),
+        ("Tenant-Isolated Review Contact: an explicit configured contact overrides LTA's own default too", test_configured_contact_overrides_ltas_default_too),
+        ("Tenant-Isolated Review Contact: LTA's serious-reply prompt offers its own address", test_serious_prompt_for_lta_offers_ltas_address),
+        ("Tenant-Isolated Review Contact: another tenant's serious-reply prompt offers its own contact, never LTA's", test_serious_prompt_for_another_tenant_offers_its_own_contact_never_ltas),
+        ("Tenant-Isolated Review Contact: a tenant with no configured contact never has one invented", test_serious_prompt_for_tenant_with_no_configured_contact_never_invents_one),
         ("end-to-end: worst-case model output is still sanitized for the regression case", test_generated_draft_for_casa_tequila_prime_never_contains_forbidden_cta),
         ("PART 1/28: no-text review prompt has no signature instruction", test_no_text_review_prompt_has_no_signature_instruction),
         ("PART 1/28: has-text review prompt has no signature instruction", test_has_text_review_prompt_has_no_signature_instruction),

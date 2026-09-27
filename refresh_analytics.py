@@ -2301,7 +2301,7 @@ def main():
         ).fetchall()
     }
     loc_map = {loc_id: dict(loc) for loc_id, loc in locations.items()}
-    new_drafts = ai_engine.batch_generate_drafts(reviews, loc_map, existing_draft_keys)
+    new_drafts = ai_engine.batch_generate_drafts(reviews, loc_map, existing_draft_keys, tenant_id=args.tenant_id)
     for key, draft in new_drafts.items():
         set_cache(conn, key, draft)
     if new_drafts:

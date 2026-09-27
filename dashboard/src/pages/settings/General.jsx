@@ -1,6 +1,8 @@
+import { useEffect, useState } from 'react'
 import ThemeToggle from '../../components/ui/ThemeToggle.jsx'
 import Badge from '../../components/ui/Badge.jsx'
 import { useCompanyGoals } from '../../hooks/useCompanyGoals.js'
+import { getReviewContact, upsertReviewContact } from '../../services/reviewContactService.js'
 
 // Appearance + Company Goals + AI Rewrite, moved verbatim out of the old
 // flat Settings.jsx (Phase 8, Milestone 8.1) -- a pure reorganization, zero
@@ -96,6 +98,105 @@ function GoalsSection() {
   )
 }
 
+// Tenant-Isolated Review Contact (multi-tenant readiness): this tenant's
+// OWN public, customer-facing contact -- offered in AI-generated replies to
+// serious/escalated reviews (see rewriteEngine.js's
+// resolveReviewResponseContact()). Deliberately a DIFFERENT setting than
+// Restaurant Contacts (the internal manager/escalation directory, never
+// shown to a customer) -- never pre-filled from the signed-in account's own
+// email, and never another tenant's value.
+function ReviewContactSection() {
+  const [loading, setLoading] = useState(true)
+  const [forbidden, setForbidden] = useState(false)
+  const [email, setEmail] = useState('')
+  const [phone, setPhone] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState(null)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    getReviewContact()
+      .then(contact => {
+        if (cancelled) return
+        setEmail(contact.email ?? '')
+        setPhone(contact.phone ?? '')
+      })
+      .catch(err => { if (!cancelled && err.message?.includes('403')) setForbidden(true) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [])
+
+  async function handleSave() {
+    setSaving(true)
+    setError(null)
+    setSaved(false)
+    try {
+      const result = await upsertReviewContact({ email, phone })
+      setEmail(result.email ?? '')
+      setPhone(result.phone ?? '')
+      setSaved(true)
+      setTimeout(() => setSaved(false), 3000)
+    } catch (err) {
+      setError(err.message || 'Could not save the review-response contact.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading) return null
+  if (forbidden) return null // Owner/Admin only -- silently absent for any other role, matching this section's own auth scope
+
+  return (
+    <div className="rounded-2xl border overflow-hidden"
+         style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <div className="px-6 py-5">
+        <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Review Response Contact</p>
+        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
+          The email or phone number an AI-generated reply may offer a guest for a serious, unresolved
+          issue. Never shown unless you set one — a reply never invents a contact method on its own.
+        </p>
+      </div>
+      <div className="px-6 pb-6 space-y-3 border-t pt-4" style={{ borderColor: 'var(--color-border)' }}>
+        <div className="flex items-center justify-between gap-4">
+          <label className="text-xs" style={{ color: 'var(--color-text-2)' }}>Email</label>
+          <input
+            type="email"
+            value={email}
+            onChange={e => setEmail(e.target.value)}
+            placeholder="e.g. support@yourrestaurant.com"
+            className="w-64 text-sm px-3 py-1.5 rounded-lg border focus:outline-none"
+            style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-4">
+          <label className="text-xs" style={{ color: 'var(--color-text-2)' }}>Phone</label>
+          <input
+            type="tel"
+            value={phone}
+            onChange={e => setPhone(e.target.value)}
+            placeholder="optional"
+            className="w-64 text-sm px-3 py-1.5 rounded-lg border focus:outline-none"
+            style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
+          />
+        </div>
+        {error && <p className="text-xs" style={{ color: 'var(--color-danger, #dc2626)' }}>{error}</p>}
+        <div className="flex items-center gap-3 pt-1">
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="text-xs font-semibold px-3 py-1.5 rounded-lg border"
+            style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-1)' }}
+          >
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+          {saved && <span className="text-xs" style={{ color: 'var(--color-text-3)' }}>Saved</span>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 const PLANNED = [
   { title: 'Notification Preferences', desc: 'Choose which alerts to receive and how often.' },
   { title: 'Alert Thresholds',         desc: 'Set the rating drop or backlog size that triggers an alert.' },
@@ -139,6 +240,7 @@ export default function General() {
           AI Features
         </p>
         <AIRewriteSection />
+        <ReviewContactSection />
       </section>
 
       <section className="space-y-3">

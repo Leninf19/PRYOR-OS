@@ -22,6 +22,8 @@ import json
 import os
 import re
 
+import tenant_config_store
+
 _client = None
 
 
@@ -222,7 +224,38 @@ def classify_reviews_batch(reviews: list) -> dict:
 # Response drafts
 # ---------------------------------------------------------------------------
 
-_CONTACT_EMAIL = "advertising@l3amigos.com"
+_LTA_TENANT_ID = "t_los-tres-amigos"
+_LTA_DEFAULT_REVIEW_CONTACT_EMAIL = "advertising@l3amigos.com"
+
+
+def resolve_review_response_contact(tenant_id: str | None) -> dict:
+    """Tenant-Isolated Review Contact (multi-tenant readiness): returns
+    {"email": str|None, "phone": str|None} -- this tenant's OWN configured
+    public review-response contact, never another tenant's. Los Tres
+    Amigos's own historical address is preserved as a hardcoded fallback
+    for that ONE tenant specifically (mirrors dashboard/api/_lib/
+    rewriteEngine.js's own JS-side resolveReviewResponseContact() exactly --
+    the two run in separate languages/runtimes and cannot share code, but
+    must never diverge in behavior). A tenant's own configured
+    tenant_config.reviewContact always wins when present, including for
+    LTA itself if ever explicitly set through the same settings path.
+    Every other tenant with no configured contact gets no contact at all --
+    never LTA's address, never a guessed/derived one. A tenant_config store
+    outage degrades to "no contact" rather than raising, since this is a
+    best-effort prompt-shaping input, never a hard dependency of draft
+    generation itself."""
+    if tenant_id:
+        config = None
+        try:
+            config = tenant_config_store.get_tenant_config(tenant_id)
+        except tenant_config_store.TenantConfigStoreUnavailableError as e:
+            print(f"::warning::ai_engine.py: tenant config store unavailable while resolving review contact: {e}")
+        contact = (config or {}).get("reviewContact") or {}
+        if contact.get("email") or contact.get("phone"):
+            return {"email": contact.get("email"), "phone": contact.get("phone")}
+    if tenant_id == _LTA_TENANT_ID:
+        return {"email": _LTA_DEFAULT_REVIEW_CONTACT_EMAIL, "phone": None}
+    return {"email": None, "phone": None}
 
 # Recovery Milestone 4 (Review Reply Inbox + AI Response Quality): the
 # previous list matched as a naive substring (`kw in lower`), which fires on
@@ -348,19 +381,25 @@ _CATEGORY_GUIDANCE = {
 # backstop, not dependent on the classifier or the LLM having gotten it
 # right. Sentence-level: enforce_response_policy() below removes only the
 # offending sentence(s), not the whole response.
-_FORBIDDEN_RECOVERY_PATTERNS = [
+#
+# Tenant-Isolated Review Contact: split into "recovery language" (generic
+# phrases, never leak anything by themselves) and "contact leak" (email/
+# phone-shaped text, the actual thing that must never be another tenant's
+# or invented) -- mirrors rewriteEngine.js's identical split exactly.
+_RECOVERY_LANGUAGE_PATTERNS = [
     re.compile(r"contact us[^.!?]*so we can make this right", re.IGNORECASE),
     re.compile(r"make this right", re.IGNORECASE),
     re.compile(r"please contact us", re.IGNORECASE),
     re.compile(r"reach out to us", re.IGNORECASE),
     re.compile(r"reach out directly", re.IGNORECASE),
     re.compile(r"contact us at", re.IGNORECASE),
-    re.compile(re.escape(_CONTACT_EMAIL), re.IGNORECASE),
-    re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),  # any email address
-    re.compile(r"\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b"),  # any US-style phone number
     re.compile(r"sincerely apologi[sz]e", re.IGNORECASE),
     re.compile(r"deeply apologi[sz]e", re.IGNORECASE),
     re.compile(r"give us another chance", re.IGNORECASE),
+]
+_CONTACT_LEAK_PATTERNS = [
+    re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),  # any email address
+    re.compile(r"\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b"),  # any US-style phone number
 ]
 
 RESPONSE_TYPES = ("positive", "positive_with_feedback", "mixed", "negative", "serious_escalation")
@@ -509,31 +548,50 @@ def classify_complaint_categories(text: str) -> list[str]:
     return [category for category, pattern in _COMPLAINT_PATTERNS.items() if pattern.search(text)]
 
 
-def enforce_response_policy(draft_text: str, response_type: str) -> str:
+def enforce_response_policy(draft_text: str, response_type: str, contact_value: str | None = None) -> str:
     """The Phase 3 hard safety guard: deterministic, independent of the LLM.
     For any response_type other than 'serious_escalation', strips any
     sentence containing forbidden recovery/escalation language (a contact
     CTA, an email address, a phone number, excessive apology) rather than
-    trusting the model not to have generated it. serious_escalation
-    responses are returned unmodified -- that's the one class allowed to
-    contain a contact CTA, and Reviews.jsx additionally gates those behind
-    a "Needs Management Review" human-review step rather than auto-allowing
-    one-click publish."""
-    if response_type == "serious_escalation" or not draft_text:
+    trusting the model not to have generated it. Reviews.jsx additionally
+    gates serious_escalation responses behind a "Needs Management Review"
+    human-review step rather than auto-allowing one-click publish.
+
+    Tenant-Isolated Review Contact: `contact_value` is the resolved email/
+    phone THIS draft was actually permitted to offer (from
+    resolve_review_response_contact()). A serious_escalation response keeps
+    a contact-shaped sentence ONLY when it contains EXACTLY that value --
+    never merely "some email/phone was mentioned." This defends against
+    both the model inventing a contact when none was configured, and the
+    model surfacing a DIFFERENT (wrong, stale, or another tenant's leaked)
+    contact even when a real one WAS configured."""
+    if not draft_text:
         return draft_text
+    serious = response_type == "serious_escalation"
+
+    def keep(sentence: str) -> bool:
+        if not serious and any(p.search(sentence) for p in _RECOVERY_LANGUAGE_PATTERNS):
+            return False
+        if any(p.search(sentence) for p in _CONTACT_LEAK_PATTERNS):
+            return bool(contact_value) and contact_value in sentence
+        return True
 
     # Split on sentence boundaries, keeping the punctuation with each sentence.
     sentences = re.split(r"(?<=[.!?])\s+", draft_text.strip())
-    kept = [
-        s for s in sentences
-        if not any(p.search(s) for p in _FORBIDDEN_RECOVERY_PATTERNS)
-    ]
+    kept = [s for s in sentences if keep(s)]
     cleaned = " ".join(kept).strip()
     return cleaned if cleaned else draft_text.strip()  # never return empty; fall back to the whole draft
 
 
-def generate_response_draft(review: dict, restaurant_name: str) -> str | None:
-    """Generate a professional owner-response draft for a single review."""
+def generate_response_draft(review: dict, restaurant_name: str, contact_value: str | None = None) -> str | None:
+    """Generate a professional owner-response draft for a single review.
+
+    `contact_value` (nullable): this tenant's OWN already-resolved public
+    review-response contact (email or phone), from
+    resolve_review_response_contact() -- resolved ONCE by the caller
+    (batch_generate_drafts() resolves it once per batch run, not once per
+    review; a single on-demand caller resolves it once per call), never
+    re-looked-up per review here."""
     stars    = review.get("star_rating") or 3
     reviewer = (review.get("reviewer_name") or "Guest").split()[0]
     text     = (review.get("review_text") or "").strip()
@@ -558,11 +616,18 @@ def generate_response_draft(review: dict, restaurant_name: str) -> str | None:
     }
     length = length_by_type[response_type]
 
-    contact = (
-        f" At the end, invite them to reach out: "
-        f"'Please contact us at {_CONTACT_EMAIL} so we can make this right.'"
-        if serious else ""
-    )
+    if serious:
+        contact = (
+            f" At the end, invite them to reach out: "
+            f"'Please contact us at {contact_value} so we can make this right.'"
+            if contact_value else
+            " At the end, invite them to reach out to us directly so we can make this right "
+            "(e.g. 'Please reach out to us directly so we can make this right.'). Do not state "
+            "or invent any specific email address, phone number, or other contact method -- "
+            "none has been provided."
+        )
+    else:
+        contact = ""
     no_recovery_note = (
         "" if serious else
         " Do not include any contact email, phone number, or 'contact us' invitation -- "
@@ -631,7 +696,7 @@ def generate_response_draft(review: dict, restaurant_name: str) -> str | None:
     draft = _call(prompt, model="claude-haiku-4-5-20251001", max_tokens=200)
     if draft is None:
         return None
-    return enforce_response_policy(draft, response_type)
+    return enforce_response_policy(draft, response_type, contact_value)
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +704,7 @@ def generate_response_draft(review: dict, restaurant_name: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def batch_generate_drafts(
-    reviews: list, location_map: dict, existing_hashes: set, limit: int = 100
+    reviews: list, location_map: dict, existing_hashes: set, limit: int = 100, tenant_id: str | None = None
 ) -> dict:
     """
     Generate response drafts for every unresponded review that doesn't
@@ -669,6 +734,12 @@ def batch_generate_drafts(
     candidates.sort(key=lambda r: r.get("review_date") or "", reverse=True)
     candidates = candidates[:limit]
 
+    # Tenant-Isolated Review Contact: resolved ONCE for this whole batch
+    # (every candidate below belongs to the same tenant_id), never once per
+    # review -- see generate_response_draft()'s own docstring for why.
+    review_contact = resolve_review_response_contact(tenant_id)
+    contact_value = review_contact.get("email") or review_contact.get("phone")
+
     results = {}
     for r in candidates:
         rid = r.get("review_id") or r.get("review_url") or ""
@@ -680,7 +751,7 @@ def batch_generate_drafts(
             continue
         loc = location_map.get(r.get("location_id"), {})
         restaurant_name = loc.get("name") or r.get("location_name") or "this location"
-        draft = generate_response_draft(r, restaurant_name)
+        draft = generate_response_draft(r, restaurant_name, contact_value=contact_value)
         if draft:
             results[cache_key] = {
                 "review_id": rid,

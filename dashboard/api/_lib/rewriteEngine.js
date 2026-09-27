@@ -18,11 +18,50 @@ import { calculateAiUsageUnits, resolveTokenCounts } from './aiUsageUnits.js'
 import { classifyReviewRisk, CATEGORY_GUIDANCE } from './reviewRiskClassifier.js'
 import { classifyComplaintCategories, COMPLAINT_CATEGORY_GUIDANCE } from './complaintCategoryGuide.js'
 import { resolveStyleProfile, buildSignOff, buildPhrasesToAvoidNote } from './responseStyleProfile.js'
+import { getTenantConfig, TenantConfigStoreUnavailableError } from './tenantConfigStore.js'
+import { DEFAULT_TENANT_ID } from './tenants.js'
 
 const REWRITE_MODEL = 'claude-haiku-4-5-20251001'
 const REWRITE_MAX_TOKENS = 300
 
-const CONTACT_EMAIL = 'advertising@l3amigos.com'
+// Tenant-Isolated Review Contact (multi-tenant readiness): a customer-
+// facing reply must only ever offer ITS OWN tenant's contact, never
+// another tenant's. Los Tres Amigos's own historical address is preserved
+// as a hardcoded fallback for that ONE tenant specifically (never invented
+// for, or leaked to, any other tenant) -- a tenant's own configured
+// tenant_config.reviewContact always wins when present, including for LTA
+// itself if it's ever explicitly set through the same settings path.
+// Every other tenant with no configured contact gets no contact at all --
+// never LTA's address, never a guessed/derived one (e.g. never the
+// account owner's own login email, which may be private or unsuitable for
+// customer complaints).
+const LTA_DEFAULT_REVIEW_CONTACT_EMAIL = 'advertising@l3amigos.com'
+
+// Returns { email, phone } (each string|null) -- this tenant's OWN
+// configured public review-response contact, resolved fresh on every call
+// (tenant_config can change at any time; never cached across requests).
+// A store outage degrades to "no contact" rather than throwing, matching
+// this function's role as a best-effort prompt-shaping input, never a
+// hard dependency of reply generation itself.
+export async function resolveReviewResponseContact(tenantId) {
+  if (tenantId) {
+    let config = null
+    try {
+      config = await getTenantConfig(tenantId)
+    } catch (err) {
+      if (!(err instanceof TenantConfigStoreUnavailableError)) throw err
+      console.error(`[rewrite] tenant config store unavailable while resolving review contact: ${err.message}`)
+    }
+    const configured = config?.reviewContact
+    if (configured?.email || configured?.phone) {
+      return { email: configured.email ?? null, phone: configured.phone ?? null }
+    }
+  }
+  if (tenantId === DEFAULT_TENANT_ID) {
+    return { email: LTA_DEFAULT_REVIEW_CONTACT_EMAIL, phone: null }
+  }
+  return { email: null, phone: null }
+}
 
 // Recovery Milestone 4 (Review Reply Inbox + AI Response Quality) --
 // re-exported for existing callers (replyState.js's frontend copy is
@@ -40,25 +79,47 @@ export function isSeriousIssue(reviewText) {
 // forbidden recovery/escalation language rather than trusting the model not
 // to have generated it. Applied to EVERY rewrite response before it's
 // returned, regardless of tone requested.
-const FORBIDDEN_RECOVERY_PATTERNS = [
+//
+// Tenant-Isolated Review Contact: split into two groups so a SERIOUS
+// response with NO configured contact (see resolveReviewResponseContact())
+// can still keep its sincere "please reach out to us" language while
+// having any hallucinated email/phone stripped -- the one thing that must
+// NEVER appear is a contact method nobody actually configured, whether
+// that's another tenant's leaked address or one the model invented.
+const RECOVERY_LANGUAGE_PATTERNS = [
   /contact us[^.!?]*so we can make this right/i,
   /make this right/i,
   /please contact us/i,
   /reach out to us/i,
   /reach out directly/i,
   /contact us at/i,
-  new RegExp(CONTACT_EMAIL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'),
-  /\b[\w.+-]+@[\w-]+\.[\w.-]+\b/,      // any email address
-  /\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b/, // any US-style phone number
   /sincerely apologi[sz]e/i,
   /deeply apologi[sz]e/i,
   /give us another chance/i,
 ]
+const CONTACT_LEAK_PATTERNS = [
+  /\b[\w.+-]+@[\w-]+\.[\w.-]+\b/,      // any email address
+  /\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b/, // any US-style phone number
+]
 
-export function enforceResponsePolicy(draftText, serious) {
-  if (serious || !draftText) return draftText
+// `contactValue` (nullable): the resolved email/phone this specific reply
+// was actually permitted to offer (from resolveReviewResponseContact()).
+// A serious response keeps a contact-shaped sentence ONLY when it contains
+// EXACTLY this tenant's own resolved contact value -- never merely "some
+// email/phone was mentioned." This defends against two distinct failure
+// modes with the same check: the model inventing a contact when none was
+// configured, AND the model surfacing a DIFFERENT (wrong, stale, or
+// another tenant's leaked) contact even when a real one WAS configured.
+// A non-serious response is always fully scrubbed of all recovery/contact
+// language, exactly as before.
+export function enforceResponsePolicy(draftText, serious, contactValue = null) {
+  if (!draftText) return draftText
   const sentences = draftText.trim().split(/(?<=[.!?])\s+/)
-  const kept = sentences.filter(s => !FORBIDDEN_RECOVERY_PATTERNS.some(p => p.test(s)))
+  const kept = sentences.filter(s => {
+    if (!serious && RECOVERY_LANGUAGE_PATTERNS.some(p => p.test(s))) return false
+    if (CONTACT_LEAK_PATTERNS.some(p => p.test(s))) return Boolean(contactValue) && s.includes(contactValue)
+    return true
+  })
   const cleaned = kept.join(' ').trim()
   return cleaned || draftText.trim() // never return empty; fall back to the whole draft
 }
@@ -256,8 +317,16 @@ export async function generateRewrite(body, usage = {}) {
           ? 'Length: 2–4 sentences. Sincere and specific — this is a serious concern. Only longer than 4 sentences if genuinely necessary.'
           : 'Length: 1–3 sentences. Sincere and to the point.'
 
+  // Tenant-Isolated Review Contact: resolved fresh per request, from THIS
+  // tenant's own tenant_config only -- see resolveReviewResponseContact()'s
+  // own header for the full fallback/isolation contract.
+  const reviewContact = await resolveReviewResponseContact(tenantId)
+  const contactValue = reviewContact.email || reviewContact.phone
+
   const contactNote = serious
-    ? `At the end, invite them to reach out directly: "Please contact us at ${CONTACT_EMAIL} so we can make this right." Do not add anything after that.`
+    ? (contactValue
+        ? `At the end, invite them to reach out directly: "Please contact us at ${contactValue} so we can make this right." Do not add anything after that.`
+        : `At the end, invite them to reach out to us directly so we can make this right (e.g. "Please reach out to us directly so we can make this right."). Do not state or invent any specific email address, phone number, or other contact method — none has been provided.`)
     : `Do not include any contact email, phone number, or "contact us" invitation — that language is reserved for serious unresolved incidents only, which this is not.`
 
   const emergencyNote = serious && isActiveEmergency
@@ -372,7 +441,7 @@ Write ONLY the response text. No quotes, no labels, no preamble. ${closingNote}`
 
     // Phase 3 hard safety guard -- applied regardless of what the model
     // actually returned, not just relied on via the prompt above.
-    const finalRewrite = enforceResponsePolicy(rewritten, serious)
+    const finalRewrite = enforceResponsePolicy(rewritten, serious, contactValue)
     logAiUsage({ ...usage, endpoint: 'rewrite', inputChars: prompt.length, outputChars: finalRewrite.length })
     return { ok: true, rewritten: finalRewrite, riskLevel: serious ? 'high_risk' : 'normal', riskCategories }
   } catch (err) {

@@ -40,6 +40,7 @@ import {
 } from '../_lib/contactStore.js'
 import { appendAuditEntry, listAuditEntries, clientIp, AuditLogUnavailableError } from '../_lib/auditLog.js'
 import { resolveTenantId } from '../_lib/tenants.js'
+import { getTenantConfig, upsertTenantConfig, ConfigVersionConflictError, TenantConfigStoreUnavailableError } from '../_lib/tenantConfigStore.js'
 import { readPrivateDataFile } from '../_lib/reviewDataPaths.js'
 import { hasSmtpConfig, sendReviewEmail, EmailSenderUnavailableError } from '../_lib/emailSender.js'
 import { buildTestEmailSubject, buildTestEmail } from '../_lib/testEmailTemplate.js'
@@ -447,6 +448,89 @@ async function backfillContactsFromLegacyAction(req, res) {
     if (err instanceof ContactStoreUnavailableError) {
       console.error(`[settings/contacts-backfill-from-legacy] ${err.message}`)
       return res.status(503).json({ error: 'service_unavailable', message: 'Restaurant contacts are temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// Tenant-Isolated Review Contact (multi-tenant readiness): this tenant's
+// OWN public, customer-facing review-response contact (email and/or
+// phone) -- surfaced in AI-generated review replies for serious/escalated
+// reviews (see rewriteEngine.js's resolveReviewResponseContact()). A
+// DIFFERENT, deliberately separate concept from Restaurant Contacts above
+// (contactStore.js's per-location managerName/primaryEmail/ccEmails),
+// which is the INTERNAL directory used for the bad-review escalation
+// email workflow, never shown to a customer. Never auto-derived from the
+// account owner's own login email (may be private/unsuitable for
+// customer complaints) and never inherited from another tenant.
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+function normalizeContactField(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed ? trimmed : null
+}
+
+// GET /api/settings/review-contact -- the raw configured value (may be
+// entirely unset), never the resolved-with-fallback value
+// resolveReviewResponseContact() computes for actual reply generation.
+async function reviewContactAction(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, ['owner', 'admin'])
+  if (!account) return
+
+  const tenantId = resolveTenantId(account)
+  try {
+    const config = await getTenantConfig(tenantId)
+    const contact = config?.reviewContact || { email: null, phone: null }
+    return res.status(200).json({ email: contact.email ?? null, phone: contact.phone ?? null })
+  } catch (err) {
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[settings/review-contact] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// POST /api/settings/review-contact-upsert { email, phone } -- either or
+// both may be omitted/empty to clear that field; both empty clears the
+// tenant back to "no configured contact" (never re-deriving LTA's
+// address or the caller's own login email as a substitute).
+async function reviewContactUpsertAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, ['owner', 'admin'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `settings:review-contact-upsert:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
+
+  const email = normalizeContactField(req.body?.email)
+  const phone = normalizeContactField(req.body?.phone)
+  if (email && !EMAIL_PATTERN.test(email)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'That does not look like a valid email address.' })
+  }
+
+  const tenantId = resolveTenantId(account)
+  try {
+    const config = await getTenantConfig(tenantId)
+    if (!config) return res.status(404).json({ error: 'not_found' })
+    const updated = await upsertTenantConfig(tenantId, { reviewContact: { email, phone } }, { expectedVersion: config.configVersion })
+    await appendAuditEntry(tenantId, {
+      actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+      entity: 'tenant_review_contact', entityId: tenantId, action: 'review_contact.updated', changes: null, result: 'success',
+      message: (email || phone) ? 'Updated the tenant\'s public review-response contact.' : 'Cleared the tenant\'s public review-response contact.',
+    })
+    return res.status(200).json({ email: updated.reviewContact?.email ?? null, phone: updated.reviewContact?.phone ?? null })
+  } catch (err) {
+    if (err instanceof ConfigVersionConflictError) {
+      return res.status(409).json({ error: 'concurrent_update', message: 'Your changes could not be saved because this tenant\'s configuration changed at the same time. Please refresh and try again.' })
+    }
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[settings/review-contact-upsert] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
     }
     throw err
   }
@@ -1424,6 +1508,8 @@ export default async function handler(req, res) {
     case 'contacts-toggle-active':          return toggleContactActiveAction(req, res)
     case 'contacts-backfill-from-legacy':   return backfillContactsFromLegacyAction(req, res)
     case 'contacts-send-test-email':        return sendTestEmailAction(req, res)
+    case 'review-contact':                   return reviewContactAction(req, res)
+    case 'review-contact-upsert':            return reviewContactUpsertAction(req, res)
     case 'audit-log':                       return auditLogAction(req, res)
     case 'email-status':                    return emailStatusAction(req, res)
     case 'invite-user':                     return inviteUserAction(req, res)
