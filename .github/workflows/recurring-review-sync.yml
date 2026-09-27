@@ -68,3 +68,13 @@ jobs:
           GOOGLE_CLIENT_SECRET_LEGACY: ${{ secrets.GOOGLE_CLIENT_SECRET_LEGACY }}
           GOOGLE_CLIENT_ID_PRYOR: ${{ secrets.GOOGLE_CLIENT_ID_PRYOR }}
           GOOGLE_CLIENT_SECRET_PRYOR: ${{ secrets.GOOGLE_CLIENT_SECRET_PRYOR }}
+          # Dashboard-parity revision: recurring_sync.py now calls
+          # refresh_analytics.run_analytics_refresh() (via
+          # tenant_artifact_export.generate_tenant_artifacts()), which uses
+          # this to classify review sentiment/priority and generate AI
+          # summaries/drafts -- exactly like update-reviews.yml/
+          # critical-alert-check.yml already do for LTA. Without it,
+          # ai_engine.is_available() is False and the sync still completes
+          # (every AI field gracefully degrades to null), but no
+          # AI-derived content is ever produced for a BLOB-mode tenant.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
