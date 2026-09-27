@@ -45,9 +45,17 @@ jobs:
 
       # recurring_sync.py imports initial_sync.py, which imports google_api.py
       # -- credential decryption needs `cryptography`, matching every other
-      # workflow that invokes Google-sync code.
+      # workflow that invokes Google-sync code. Dashboard-parity revision:
+      # recurring_sync.py now also runs refresh_analytics.run_analytics_refresh(),
+      # which imports ai_engine -- needs `anthropic` too, same as
+      # update-reviews.yml/critical-alert-check.yml. Without this,
+      # ANTHROPIC_API_KEY alone is not enough: ai_engine.is_available()
+      # checks that the package itself imports, not just that the key is
+      # set (confirmed live: a dispatch with the key set but not this
+      # package printed "[ai] anthropic package not installed" and still
+      # completed with AI=off, rather than erroring).
       - name: Install Python dependencies
-        run: pip install cryptography
+        run: pip install anthropic cryptography
 
       - name: Run recurring sync
         run: |
