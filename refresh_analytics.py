@@ -2237,7 +2237,15 @@ def main():
         loc_cur    = by_loc_30[loc_id]
         loc_prev   = by_loc_prev[loc_id]
         loc_recent = by_loc_recent_90[loc_id]
-        for alert_fn, args in (
+        # Loop variable deliberately named `alert_args`, never `args` -- a
+        # `for` loop's target leaks into this function's own scope (unlike a
+        # comprehension), and `args` is already this function's own
+        # argparse.Namespace from `parser.parse_args()` near the top. Reusing
+        # that name here permanently shadowed it for everything below this
+        # loop -- exactly what broke ai_engine.batch_generate_drafts()'s
+        # tenant_id=args.tenant_id a few dozen lines down, since nothing
+        # before this fix ever read args.tenant_id again after this point.
+        for alert_fn, alert_args in (
             (rating_trend_alert,     (loc_all, loc["name"])),
             (negative_spike_alert,   (loc_recent, loc["name"])),  # recent window -- an old spike isn't "actionable today"
             (volume_drop_alert,      (loc_cur, loc_prev, loc["name"])),
@@ -2245,7 +2253,7 @@ def main():
             (sentiment_shift_alert,  (loc_cur, loc_prev, loc["name"])),
             (critical_review_alert,  (loc_recent, loc["name"])),  # recent window, same reasoning as negative_spike_alert
         ):
-            alert = alert_fn(*args)
+            alert = alert_fn(*alert_args)
             if alert:
                 alerts.append(alert)
     set_cache(conn, "predictive_alerts", alerts)
