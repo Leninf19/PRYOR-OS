@@ -167,12 +167,16 @@ def check_critical_alert_pipeline_stale(conn, now: datetime) -> str:
     """Independent watchdog for the 15-minute critical-review-alert pipeline
     (critical-alert-check.yml): queries the GitHub Actions API directly
     (ambient GITHUB_TOKEN, actions:read permission) for that workflow's most
-    recent COMPLETED run of any event type -- the native GitHub schedule
+    recent SUCCESSFUL run of any event type -- the native GitHub schedule
     trigger (left enabled) OR the new Vercel-cron-driven workflow_dispatch --
-    and alerts if none exists within CRITICAL_ALERT_STALE_THRESHOLD. A
-    resend-window dedup (like check_stale_pipeline above, not per-run-id
-    like check_stuck_run) since "no run in N hours" is a condition, not a
-    specific row identity."""
+    and alerts if none exists within CRITICAL_ALERT_STALE_THRESHOLD.
+    Deliberately `status=success`, never merely `status=completed`: a
+    completed-but-FAILED run (e.g. a genuine GBPAuthError, or any other bug)
+    means the alert check did NOT actually run successfully -- exactly the
+    condition this watchdog exists to catch, so it must never be mistaken
+    for evidence of health. A resend-window dedup (like check_stale_pipeline
+    above, not per-run-id like check_stuck_run) since "no successful run in
+    N hours" is a condition, not a specific row identity."""
     resend_cutoff = (now - RESEND_WINDOW).isoformat()
     if already_notified(conn, "critical_alert_pipeline_stale", resend_cutoff):
         return ""
@@ -185,7 +189,7 @@ def check_critical_alert_pipeline_stale(conn, now: datetime) -> str:
     try:
         resp = requests.get(
             f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/workflows/{CRITICAL_ALERT_WORKFLOW_FILE}/runs",
-            params={"status": "completed", "per_page": 1},
+            params={"status": "success", "per_page": 1},
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
@@ -211,14 +215,14 @@ def check_critical_alert_pipeline_stale(conn, now: datetime) -> str:
         return ""
 
     if last_run_at is None:
-        detail = "No completed run found at all."
+        detail = "No successful run found at all."
     else:
-        detail = f"Last completed run finished {last_run_at.isoformat()} ({now - last_run_at} ago)."
+        detail = f"Last successful run finished {last_run_at.isoformat()} ({now - last_run_at} ago)."
 
     log_notification(conn, "critical_alert_pipeline_stale", detail)
     return (
         f"<h2 style='color:#b91c1c'>Critical-review-alert pipeline looks stale</h2>"
-        f"<p>{detail} Expected a completed run at least every ~15 minutes (via the Vercel "
+        f"<p>{detail} Expected a successful run at least every ~15 minutes (via the Vercel "
         f"cron dispatch) or, at minimum, within ~{CRITICAL_ALERT_STALE_THRESHOLD}. Check the "
         f"Vercel cron job (dashboard/api/google/[action].js's cron-critical-alert-check "
         f"action) and confirm GitHub's own schedule trigger for critical-alert-check.yml is "

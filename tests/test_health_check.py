@@ -213,7 +213,7 @@ def test_critical_alert_watchdog_alerts_when_no_run_exists_at_all():
         with mock.patch.object(health_check.requests, "get", return_value=_fake_github_runs_response([])):
             html = health_check.check_critical_alert_pipeline_stale(conn, now)
     conn.close()
-    assert "No completed run found at all" in html
+    assert "No successful run found at all" in html
 
 
 def test_critical_alert_watchdog_fails_open_on_a_github_api_error():
@@ -225,6 +225,34 @@ def test_critical_alert_watchdog_fails_open_on_a_github_api_error():
             html = health_check.check_critical_alert_pipeline_stale(conn, now)
     conn.close()
     assert html == "", "a GitHub API failure during the probe itself must never be reported as pipeline staleness"
+
+
+def test_critical_alert_watchdog_queries_success_not_merely_completed():
+    """Regression lock-in: a run that is completed-but-FAILED (a genuine
+    GBPAuthError, or any other bug in critical-alert-check.yml itself) must
+    NEVER be mistaken for evidence the pipeline is healthy. The prior draft
+    of this function queried status='completed' (which GitHub's API treats
+    as ANY terminal state, success or failure); this locks in the fix to
+    status='success' by inspecting the actual request, not just the
+    fixture's contents (a mocked response can't itself prove the real query
+    excludes failures)."""
+    _fresh_db()
+    conn = db.get_connection()
+    now = datetime.now(timezone.utc)
+    captured_params = {}
+
+    def _capture(url, params=None, **kwargs):
+        captured_params.update(params or {})
+        return _fake_github_runs_response([{"created_at": (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")}])
+
+    with mock.patch.dict("os.environ", {"GITHUB_TOKEN": "fake-token"}):
+        with mock.patch.object(health_check.requests, "get", side_effect=_capture):
+            health_check.check_critical_alert_pipeline_stale(conn, now)
+    conn.close()
+    assert captured_params.get("status") == "success", (
+        f"must query status='success', never merely 'completed' (which includes failed runs), "
+        f"got {captured_params.get('status')!r}"
+    )
 
 
 def test_critical_alert_watchdog_respects_the_resend_window():
@@ -281,6 +309,7 @@ def main():
         ("critical-alert watchdog alerts when no run exists within the threshold window", test_critical_alert_watchdog_alerts_when_no_run_in_the_threshold_window),
         ("critical-alert watchdog alerts when no run exists at all", test_critical_alert_watchdog_alerts_when_no_run_exists_at_all),
         ("critical-alert watchdog fails open on a GitHub API error", test_critical_alert_watchdog_fails_open_on_a_github_api_error),
+        ("critical-alert watchdog queries status=success, never merely completed", test_critical_alert_watchdog_queries_success_not_merely_completed),
         ("critical-alert watchdog respects its resend window", test_critical_alert_watchdog_respects_the_resend_window),
     ]
     for name, fn in tests:
