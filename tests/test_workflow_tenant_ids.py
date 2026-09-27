@@ -81,6 +81,9 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # dispatch (like diagnostic-gbp-review-media.yml's own precedent) --
     # never a REQUIRED --tenant-id sourced from a fixed, reviewed env value.
     "recurring-review-sync.yml",
+    # One-off verification: invokes test scripts directly (Python test
+    # files), no --tenant-id at all.
+    "diagnostic-run-python-tests.yml",
     # Access-code redemption-failure diagnostic: invokes
     # access_code_diagnostic.mjs (Node, not in TENANT_AWARE_SCRIPTS at all --
     # that list is Python entrypoints only), takes an email/label lookup,

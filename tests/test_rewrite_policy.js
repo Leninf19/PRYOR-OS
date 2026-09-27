@@ -14,8 +14,9 @@
 //
 // Run directly: node tests/test_rewrite_policy.js
 
-import { isSeriousIssue, enforceResponsePolicy, generateRewrite } from '../dashboard/api/_lib/rewriteEngine.js'
+import { isSeriousIssue, enforceResponsePolicy, generateRewrite, resolveReviewResponseContact } from '../dashboard/api/_lib/rewriteEngine.js'
 import { DEFAULT_TENANT_ID } from '../dashboard/api/_lib/tenants.js'
+import { _setRedisClientForTests, _resetRedisClientForTests } from '../dashboard/api/_lib/tenantConfigStore.js'
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg)
@@ -84,9 +85,40 @@ function testGuardStripsPhoneNumber() {
 }
 
 function testGuardLeavesSeriousUntouched() {
+  // Tenant-Isolated Review Contact: a serious response is only trusted
+  // verbatim when a REAL, resolved contact was actually offered -- the
+  // third arg simulates what resolveReviewResponseContact() would have
+  // returned for the tenant this draft was generated for.
   const draft = 'We are very sorry to hear this. Please contact us at advertising@l3amigos.com so we can make this right.'
-  const cleaned = enforceResponsePolicy(draft, true)
-  assert(cleaned === draft, 'serious responses are the one class allowed to keep the contact CTA')
+  const cleaned = enforceResponsePolicy(draft, true, 'advertising@l3amigos.com')
+  assert(cleaned === draft, 'a serious response with a real, configured contact keeps the contact CTA')
+}
+
+function testGuardStripsHallucinatedContactFromSeriousResponseWithNoConfiguredContact() {
+  // The tenant has NO configured review contact (resolveReviewResponseContact()
+  // returned no email/phone) -- even a serious response must never surface
+  // a contact method nobody configured, whether hallucinated by the model
+  // or (worse) leaked from another tenant's own address.
+  const draft = 'We are very sorry to hear this. Please contact us at advertising@l3amigos.com so we can make this right.'
+  const cleaned = enforceResponsePolicy(draft, true, null)
+  assert(!cleaned.includes('advertising@l3amigos.com'), 'an unconfigured contact must never leak into a reply, even a serious one')
+  assert(cleaned.toLowerCase().includes('sorry'), 'the sincere recovery language must survive -- only the contact-shaped text is stripped')
+}
+
+function testGuardKeepsGenericReachOutLanguageForSeriousResponseWithNoConfiguredContact() {
+  const draft = 'We take this seriously. Please reach out to us directly so we can make this right.'
+  const cleaned = enforceResponsePolicy(draft, true, null)
+  assert(cleaned === draft, 'generic, contact-method-free recovery language must survive untouched when no contact is configured')
+}
+
+function testGuardNeverLeaksADifferentTenantsContactIntoASeriousResponse() {
+  // Simulates the exact cross-tenant leak this feature exists to prevent:
+  // the model (or a stale prompt) produced Los Tres Amigos's address for a
+  // reply that was actually generated for a DIFFERENT tenant, whose own
+  // resolved contact is something else entirely.
+  const draft = 'So sorry about this. Please contact us at advertising@l3amigos.com so we can make this right.'
+  const cleaned = enforceResponsePolicy(draft, true, 'owner@blueseafoodgrill.example')
+  assert(!cleaned.includes('advertising@l3amigos.com'), "another tenant's address must never survive into this tenant's reply")
 }
 
 function testGuardNeverReturnsEmpty() {
@@ -106,6 +138,128 @@ function installSuccessFetch() {
   let calls = 0
   globalThis.fetch = async () => { calls++; return { ok: true, json: async () => ({ content: [{ text: 'A generated reply.' }] }) } }
   return () => calls
+}
+function installCapturingSuccessFetch() {
+  let lastPrompt = null
+  globalThis.fetch = async (url, opts) => {
+    lastPrompt = JSON.parse(opts.body).messages[0].content
+    return { ok: true, json: async () => ({ content: [{ text: 'A generated reply.' }] }) }
+  }
+  return () => lastPrompt
+}
+
+// --- Tenant-Isolated Review Contact: resolveReviewResponseContact() --------
+
+const OTHER_TENANT_ID = 't_blue-seafood-grill-dldh5k'
+
+function fakeTenantConfigRedis(records) {
+  return {
+    hget: async (_key, tenantId) => (records[tenantId] ? JSON.stringify(records[tenantId]) : null),
+    hset: async () => {},
+  }
+}
+
+async function testLtaGetsItsOwnAddressWhenUnconfigured() {
+  _setRedisClientForTests(() => fakeTenantConfigRedis({}))
+  try {
+    const contact = await resolveReviewResponseContact(DEFAULT_TENANT_ID)
+    assert(contact.email === 'advertising@l3amigos.com', `LTA must default to its own historical address, got ${JSON.stringify(contact)}`)
+  } finally {
+    _resetRedisClientForTests()
+  }
+}
+
+async function testOtherTenantNeverInheritsLtasAddressWhenUnconfigured() {
+  _setRedisClientForTests(() => fakeTenantConfigRedis({}))
+  try {
+    const contact = await resolveReviewResponseContact(OTHER_TENANT_ID)
+    assert(contact.email === null && contact.phone === null,
+      `an unconfigured non-LTA tenant must get no contact at all, never LTA's address, got ${JSON.stringify(contact)}`)
+  } finally {
+    _resetRedisClientForTests()
+  }
+}
+
+async function testOtherTenantGetsItsOwnConfiguredContact() {
+  _setRedisClientForTests(() => fakeTenantConfigRedis({
+    [OTHER_TENANT_ID]: { reviewContact: { email: 'owner@blueseafoodgrill.example', phone: null } },
+  }))
+  try {
+    const contact = await resolveReviewResponseContact(OTHER_TENANT_ID)
+    assert(contact.email === 'owner@blueseafoodgrill.example', `expected the tenant's own configured contact, got ${JSON.stringify(contact)}`)
+  } finally {
+    _resetRedisClientForTests()
+  }
+}
+
+async function testConfiguredContactOverridesLtasDefaultToo() {
+  _setRedisClientForTests(() => fakeTenantConfigRedis({
+    [DEFAULT_TENANT_ID]: { reviewContact: { email: 'newcontact@example.com', phone: null } },
+  }))
+  try {
+    const contact = await resolveReviewResponseContact(DEFAULT_TENANT_ID)
+    assert(contact.email === 'newcontact@example.com', 'an explicitly configured contact must win even for LTA itself')
+  } finally {
+    _resetRedisClientForTests()
+  }
+}
+
+// --- End-to-end: generateRewrite() prompt reflects the resolved contact ---
+
+async function testSeriousReplyForLtaPromptOffersLtasAddress() {
+  _setRedisClientForTests(() => fakeTenantConfigRedis({}))
+  try {
+    const getPrompt = installCapturingSuccessFetch()
+    const result = await generateRewrite(
+      { tone: 'friendly', reviewText: 'I got food poisoning and ended up in the hospital.', stars: 1 },
+      { tenantId: DEFAULT_TENANT_ID },
+    )
+    assert(result.ok === true)
+    assert(getPrompt().includes('advertising@l3amigos.com'), 'LTA\'s serious-reply prompt must offer its own historical address')
+  } finally {
+    _resetRedisClientForTests()
+  }
+}
+
+async function testSeriousReplyForAnotherTenantPromptOffersItsOwnContactNeverLtas() {
+  _setRedisClientForTests(() => fakeTenantConfigRedis({
+    [OTHER_TENANT_ID]: { reviewContact: { email: 'owner@blueseafoodgrill.example', phone: null } },
+  }))
+  try {
+    const getPrompt = installCapturingSuccessFetch()
+    const result = await generateRewrite(
+      { tone: 'friendly', reviewText: 'I got food poisoning and ended up in the hospital.', stars: 1 },
+      { tenantId: OTHER_TENANT_ID },
+    )
+    assert(result.ok === true)
+    const prompt = getPrompt()
+    assert(prompt.includes('owner@blueseafoodgrill.example'), "this tenant's own configured contact must appear in its prompt")
+    assert(!prompt.includes('advertising@l3amigos.com'), "LTA's address must never appear in another tenant's prompt")
+  } finally {
+    _resetRedisClientForTests()
+  }
+}
+
+async function testSeriousReplyForTenantWithNoConfiguredContactNeverInventsOne() {
+  // A real tenant_config record exists (so entitlement resolution treats
+  // this as a genuine, known tenant rather than failing closed on an
+  // unknown one) -- it simply has no reviewContact set yet, the ordinary
+  // "hasn't configured one" case this test is actually about.
+  _setRedisClientForTests(() => fakeTenantConfigRedis({ [OTHER_TENANT_ID]: {} }))
+  try {
+    const getPrompt = installCapturingSuccessFetch()
+    const result = await generateRewrite(
+      { tone: 'friendly', reviewText: 'I got food poisoning and ended up in the hospital.', stars: 1 },
+      { tenantId: OTHER_TENANT_ID },
+    )
+    assert(result.ok === true)
+    const prompt = getPrompt()
+    assert(!prompt.includes('advertising@l3amigos.com'), 'an unconfigured tenant must never see LTA\'s address in its own prompt')
+    assert(prompt.toLowerCase().includes('do not state or invent any specific email'),
+      'the model must be explicitly told not to invent a contact method when none is configured')
+  } finally {
+    _resetRedisClientForTests()
+  }
 }
 
 async function testOversizedReviewTextRejectedNoFetch() {
@@ -237,8 +391,18 @@ const tests = [
   ['guard strips forbidden CTA from a non-serious response', testGuardStripsForbiddenCtaFromNonSeriousResponse],
   ['guard strips a bare email even without a known phrase', testGuardStripsBareEmail],
   ['guard strips a phone number', testGuardStripsPhoneNumber],
-  ['guard leaves serious responses untouched', testGuardLeavesSeriousUntouched],
+  ['guard leaves serious responses untouched when a real contact was offered', testGuardLeavesSeriousUntouched],
+  ['guard strips a hallucinated/leaked contact from a serious response with no configured contact', testGuardStripsHallucinatedContactFromSeriousResponseWithNoConfiguredContact],
+  ['guard keeps generic reach-out language for a serious response with no configured contact', testGuardKeepsGenericReachOutLanguageForSeriousResponseWithNoConfiguredContact],
+  ["guard never lets a different tenant's contact leak into a serious response", testGuardNeverLeaksADifferentTenantsContactIntoASeriousResponse],
   ['guard never returns an empty string', testGuardNeverReturnsEmpty],
+  ['Tenant-Isolated Review Contact: LTA gets its own address when unconfigured', testLtaGetsItsOwnAddressWhenUnconfigured],
+  ["Tenant-Isolated Review Contact: another tenant never inherits LTA's address when unconfigured", testOtherTenantNeverInheritsLtasAddressWhenUnconfigured],
+  ['Tenant-Isolated Review Contact: another tenant gets its own configured contact', testOtherTenantGetsItsOwnConfiguredContact],
+  ["Tenant-Isolated Review Contact: an explicit configured contact overrides LTA's own default too", testConfiguredContactOverridesLtasDefaultToo],
+  ["Tenant-Isolated Review Contact: LTA's serious-reply prompt offers its own address", testSeriousReplyForLtaPromptOffersLtasAddress],
+  ["Tenant-Isolated Review Contact: another tenant's serious-reply prompt offers its own contact, never LTA's", testSeriousReplyForAnotherTenantPromptOffersItsOwnContactNeverLtas],
+  ['Tenant-Isolated Review Contact: a tenant with no configured contact never has one invented', testSeriousReplyForTenantWithNoConfiguredContactNeverInventsOne],
   ['PHASE A4: oversized reviewText rejected (400), zero Anthropic calls', testOversizedReviewTextRejectedNoFetch],
   ['PHASE A4: oversized currentDraft rejected (400), zero Anthropic calls', testOversizedCurrentDraftRejectedNoFetch],
   ['PHASE A4: oversized reviewerName rejected (400), zero Anthropic calls', testOversizedReviewerNameRejectedNoFetch],
