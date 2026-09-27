@@ -60,6 +60,7 @@ import { resolveTenantEntitlements } from '../_lib/entitlements.js'
 import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
 import { classifyReviewRisk } from '../_lib/reviewRiskClassifier.js'
 import { ModerationState, parseGoogleReplyResponse, classifyModerationOutcome, replyTextMatches } from '../_lib/replyModerationState.js'
+import { sendReviewEmail, hasSmtpConfig } from '../_lib/emailSender.js'
 
 const STATE_COOKIE = 'gbp_oauth_state'
 
@@ -1239,6 +1240,127 @@ async function triggerImport(req, res) {
   } catch (err) {
     return res.status(502).json({ error: 'network_error', message: err.message })
   }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/google/cron-critical-alert-check -- Vercel-Cron-invoked dispatch
+// of critical-alert-check.yml. NOT session-authenticated (no human is signed
+// in when Vercel's own cron infrastructure calls this) -- gated instead by
+// Vercel's own documented CRON_SECRET bearer-token convention
+// (https://vercel.com/docs/cron-jobs: every cron invocation carries
+// `Authorization: Bearer $CRON_SECRET`).
+//
+// Why this exists: a 2026-09-27 scheduling-reliability audit measured
+// critical-alert-check.yml's native GitHub `schedule:` trigger firing at
+// only ~7% of its nominal 15-minute cadence over 14 days (93 of ~1,327
+// expected firings) -- a well-documented GitHub Actions platform limitation
+// on sub-hourly cron, NOT a configuration defect: queue delay was 0/93,
+// reviews-db-writer concurrency-group overlap was 0/93, and every run that
+// DID fire completed successfully. Every longer-interval workflow in this
+// same repo (6h/daily/weekly) fires close to its expected schedule,
+// confirming the throttling is frequency-specific, not repo- or
+// account-specific.
+//
+// This endpoint is a DIFFERENT, more reliable trigger for the EXACT SAME
+// existing workflow_dispatch path -- critical_alert_check.py itself, its
+// tenant scope (t_los-tres-amigos), its per-review dedup
+// (digest_filters.already_notified, keyed by review id, never by
+// invocation), and its 30-day catch-up lookback (CRITICAL_LOOKBACK_DAYS in
+// digest_filters.py) are completely unchanged and untouched by this file.
+// Overlap between this dispatch and GitHub's own native schedule trigger
+// (left enabled, not replaced) is already made safe by
+// critical-alert-check.yml's existing `concurrency: group: reviews-db-writer,
+// cancel-in-progress: false` -- any two overlapping runs queue, never run in
+// parallel, so no new overlap-protection code is needed here.
+//
+// NOT LIVE until CRON_SECRET is set in Vercel AND vercel.json's `crons`
+// array includes this path -- see this change's PR description for the
+// exact activation snippet. Shipping this endpoint alone does not add a
+// second live scheduler.
+//
+// Deliberately no dedup/cooldown on the failure-alert email below: a
+// sustained GitHub API outage produces one alert per 15-minute tick until
+// it recovers. Accepted as the simplest honest option for now -- a cooldown
+// (e.g. an Upstash-backed "already alerted in the last hour" key) can be
+// added later if this proves noisy in practice; it is not required for
+// correctness, since duplicate alerts are harmless, just repetitive.
+async function cronCriticalAlertCheck(req, res) {
+  if (req.method !== 'POST' && req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const secret = process.env.CRON_SECRET
+  if (!secret) {
+    console.error('[cron-critical-alert-check] CRON_SECRET is not configured -- refusing to dispatch')
+    return res.status(503).json({ error: 'not_configured' })
+  }
+  const authHeader = req.headers?.authorization || req.headers?.Authorization
+  if (authHeader !== `Bearer ${secret}`) {
+    return res.status(401).json({ error: 'unauthorized' })
+  }
+
+  const pat = process.env.GITHUB_SYNC_PAT
+  if (!pat) {
+    console.error('[cron-critical-alert-check] GITHUB_SYNC_PAT is not configured -- refusing to dispatch')
+    return res.status(503).json({ error: 'not_configured' })
+  }
+
+  try {
+    const r = await fetch(
+      `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/workflows/critical-alert-check.yml/dispatches`,
+      {
+        method:  'POST',
+        headers: {
+          Authorization:          `Bearer ${pat}`,
+          Accept:                 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'Content-Type':         'application/json',
+        },
+        body: JSON.stringify({ ref: 'main' }),
+      }
+    )
+
+    if (r.status === 204) {
+      return res.status(200).json({ success: true })
+    }
+
+    const body = await r.json().catch(() => ({}))
+    const message = body.message || `GitHub API returned status ${r.status}.`
+    await alertPlatformDispatchFailure(message).catch(alertErr => {
+      console.error('[cron-critical-alert-check] platform failure-alert email ALSO failed:', alertErr.message)
+    })
+    return res.status(502).json({ error: 'github_error', message })
+  } catch (err) {
+    await alertPlatformDispatchFailure(err.message).catch(alertErr => {
+      console.error('[cron-critical-alert-check] platform failure-alert email ALSO failed:', alertErr.message)
+    })
+    return res.status(502).json({ error: 'network_error', message: err.message })
+  }
+}
+
+// Platform-operational failure alert -- same destination the notification-
+// routing revision established for platform health/failure notifications
+// (lenin@futuremark.studio), deliberately NEVER advertising@l3amigos.com
+// (this is infrastructure, never tenant/review content) and NEVER the
+// tenant's own reviewContact setting (an unrelated, customer-facing address
+// this file never reads).
+async function alertPlatformDispatchFailure(errorMessage) {
+  if (!hasSmtpConfig()) {
+    console.error('[cron-critical-alert-check] SMTP not configured -- cannot send platform failure alert')
+    return
+  }
+  const safeMessage = String(errorMessage || 'unknown error').slice(0, 500)
+  const escaped = safeMessage.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  await sendReviewEmail({
+    to:      'lenin@futuremark.studio',
+    subject: 'PRYOR Platform Alert -- critical-alert-check dispatch failed',
+    text:    `The 15-minute critical-review-alert cron dispatch failed: ${safeMessage}\n\n` +
+             'GitHub\'s own schedule trigger remains enabled as a fallback, and the 30-day ' +
+             'lookback in digest_filters.py means no review is permanently missed once a ' +
+             'check does successfully run -- but this dispatch path is not currently working.',
+    html:    `<p>The 15-minute critical-review-alert cron dispatch failed:</p><pre>${escaped}</pre>` +
+             '<p>GitHub\'s own schedule trigger remains enabled as a fallback, and the 30-day ' +
+             'lookback in <code>digest_filters.py</code> means no review is permanently missed ' +
+             'once a check does successfully run -- but this dispatch path is not currently working.</p>',
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -2611,6 +2733,7 @@ export default async function handler(req, res) {
     case 'discover-locations': return discoverLocations(req, res)
     case 'approve-locations':  return approveLocations(req, res)
     case 'retry-provisioning': return retryProvisioning(req, res)
+    case 'cron-critical-alert-check': return cronCriticalAlertCheck(req, res)
     default:                   return res.status(404).json({ error: 'not_found' })
   }
 }

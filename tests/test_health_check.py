@@ -23,10 +23,12 @@ Root causes fixed:
 
 Run directly: py tests/test_health_check.py
 """
+import os
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
@@ -156,6 +158,90 @@ def test_to_addr_is_the_platform_operator_not_a_tenant_business_address():
     assert health_check.TO_ADDR == "lenin@futuremark.studio"
 
 
+# --- check_critical_alert_pipeline_stale: independent 15-min-pipeline watchdog -
+
+def _fake_github_runs_response(runs):
+    resp = mock.Mock()
+    resp.raise_for_status = mock.Mock()
+    resp.json = mock.Mock(return_value={"workflow_runs": runs})
+    return resp
+
+
+def test_critical_alert_watchdog_skips_silently_without_a_github_token():
+    _fresh_db()
+    conn = db.get_connection()
+    with mock.patch.dict("os.environ", {}, clear=False):
+        for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+            os.environ.pop(var, None)
+        with mock.patch.object(health_check.requests, "get") as mock_get:
+            html = health_check.check_critical_alert_pipeline_stale(conn, datetime.now(timezone.utc))
+    conn.close()
+    assert html == ""
+    assert not mock_get.called, "must never call the GitHub API without a token configured"
+
+
+def test_critical_alert_watchdog_silent_when_a_recent_run_exists():
+    _fresh_db()
+    conn = db.get_connection()
+    now = datetime.now(timezone.utc)
+    recent_run = [{"created_at": (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")}]
+    with mock.patch.dict("os.environ", {"GITHUB_TOKEN": "fake-token"}):
+        with mock.patch.object(health_check.requests, "get", return_value=_fake_github_runs_response(recent_run)):
+            html = health_check.check_critical_alert_pipeline_stale(conn, now)
+    conn.close()
+    assert html == "", "a run within the stale threshold must never alert"
+
+
+def test_critical_alert_watchdog_alerts_when_no_run_in_the_threshold_window():
+    _fresh_db()
+    conn = db.get_connection()
+    now = datetime.now(timezone.utc)
+    stale_run = [{"created_at": (now - timedelta(hours=3)).isoformat().replace("+00:00", "Z")}]
+    with mock.patch.dict("os.environ", {"GITHUB_TOKEN": "fake-token"}):
+        with mock.patch.object(health_check.requests, "get", return_value=_fake_github_runs_response(stale_run)):
+            html = health_check.check_critical_alert_pipeline_stale(conn, now)
+    conn.close()
+    assert "stale" in html.lower()
+    assert "3:00:00" in html or "3 " in html or "ago" in html
+
+
+def test_critical_alert_watchdog_alerts_when_no_run_exists_at_all():
+    _fresh_db()
+    conn = db.get_connection()
+    now = datetime.now(timezone.utc)
+    with mock.patch.dict("os.environ", {"GITHUB_TOKEN": "fake-token"}):
+        with mock.patch.object(health_check.requests, "get", return_value=_fake_github_runs_response([])):
+            html = health_check.check_critical_alert_pipeline_stale(conn, now)
+    conn.close()
+    assert "No completed run found at all" in html
+
+
+def test_critical_alert_watchdog_fails_open_on_a_github_api_error():
+    _fresh_db()
+    conn = db.get_connection()
+    now = datetime.now(timezone.utc)
+    with mock.patch.dict("os.environ", {"GITHUB_TOKEN": "fake-token"}):
+        with mock.patch.object(health_check.requests, "get", side_effect=Exception("simulated network failure")):
+            html = health_check.check_critical_alert_pipeline_stale(conn, now)
+    conn.close()
+    assert html == "", "a GitHub API failure during the probe itself must never be reported as pipeline staleness"
+
+
+def test_critical_alert_watchdog_respects_the_resend_window():
+    _fresh_db()
+    conn = db.get_connection()
+    now = datetime.now(timezone.utc)
+    stale_run = [{"created_at": (now - timedelta(hours=5)).isoformat().replace("+00:00", "Z")}]
+    with mock.patch.dict("os.environ", {"GITHUB_TOKEN": "fake-token"}):
+        with mock.patch.object(health_check.requests, "get", return_value=_fake_github_runs_response(stale_run)):
+            first = health_check.check_critical_alert_pipeline_stale(conn, now)
+            conn.commit()
+            second = health_check.check_critical_alert_pipeline_stale(conn, now + timedelta(minutes=5))
+    conn.close()
+    assert first != "", "the first stale detection must alert"
+    assert second == "", "a re-check shortly after must not re-alert within the resend window"
+
+
 # --- Watchdog reconciliation wired into main()'s flow -------------------------
 
 def test_reconciled_run_stops_matching_check_stuck_run_entirely():
@@ -190,6 +276,12 @@ def main():
         ("check_stuck_run reports every simultaneously-stuck run, not just the latest", test_check_stuck_run_reports_every_simultaneously_stuck_run_not_just_the_latest),
         ("a reconciled ('timed_out') run stops matching check_stuck_run entirely", test_reconciled_run_stops_matching_check_stuck_run_entirely),
         ("TO_ADDR is the platform operator, not a tenant business address", test_to_addr_is_the_platform_operator_not_a_tenant_business_address),
+        ("critical-alert watchdog skips silently without a GITHUB_TOKEN", test_critical_alert_watchdog_skips_silently_without_a_github_token),
+        ("critical-alert watchdog is silent when a recent run exists", test_critical_alert_watchdog_silent_when_a_recent_run_exists),
+        ("critical-alert watchdog alerts when no run exists within the threshold window", test_critical_alert_watchdog_alerts_when_no_run_in_the_threshold_window),
+        ("critical-alert watchdog alerts when no run exists at all", test_critical_alert_watchdog_alerts_when_no_run_exists_at_all),
+        ("critical-alert watchdog fails open on a GitHub API error", test_critical_alert_watchdog_fails_open_on_a_github_api_error),
+        ("critical-alert watchdog respects its resend window", test_critical_alert_watchdog_respects_the_resend_window),
     ]
     for name, fn in tests:
         run(name, fn)

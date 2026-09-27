@@ -43,6 +43,8 @@ from email.mime.text import MIMEText
 import argparse
 import sys
 
+import requests
+
 import db
 import provider_sync
 import tenant_keys
@@ -60,6 +62,24 @@ APP_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
 STUCK_RUN_THRESHOLD = timedelta(hours=2)       # a scrape cycle should never take this long
 STALE_PIPELINE_THRESHOLD = timedelta(hours=14)  # ~2x the 6h cron interval
 RESEND_WINDOW = timedelta(hours=20)             # re-alert daily, not every health-check run
+
+# Scheduling-reliability audit (2026-09-27): critical-alert-check.yml's own
+# native GitHub `schedule:` trigger was measured firing at only ~7% of its
+# nominal 15-minute cadence -- a GitHub Actions platform limitation on
+# sub-hourly cron, not a defect in that workflow's own code. The fix is a
+# Vercel Cron Job dispatching it independently (dashboard/api/google/
+# [action].js's cronCriticalAlertCheck()), but nothing INSIDE that 15-minute
+# pipeline can ever notice its own silence if its trigger mechanism itself
+# goes dark (a dead Vercel cron, a misconfigured secret, etc.) -- that
+# requires an INDEPENDENT watchdog. health_check.py's own daily schedule was
+# separately measured firing reliably (~108% of nominal over the same
+# 14-day window), so it is reused here as that watchdog rather than
+# inventing a new, separately-scheduled check with its own reliability
+# question mark.
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_REPO = "Leninf19/PRYOR-OS"
+CRITICAL_ALERT_WORKFLOW_FILE = "critical-alert-check.yml"
+CRITICAL_ALERT_STALE_THRESHOLD = timedelta(hours=2)  # generous vs. the intended 15-min cadence -- avoids false alarms from ordinary jitter
 
 
 def already_notified(conn, notification_type, since: str) -> bool:
@@ -143,6 +163,69 @@ def check_stale_pipeline(conn, now: datetime) -> str:
     )
 
 
+def check_critical_alert_pipeline_stale(conn, now: datetime) -> str:
+    """Independent watchdog for the 15-minute critical-review-alert pipeline
+    (critical-alert-check.yml): queries the GitHub Actions API directly
+    (ambient GITHUB_TOKEN, actions:read permission) for that workflow's most
+    recent COMPLETED run of any event type -- the native GitHub schedule
+    trigger (left enabled) OR the new Vercel-cron-driven workflow_dispatch --
+    and alerts if none exists within CRITICAL_ALERT_STALE_THRESHOLD. A
+    resend-window dedup (like check_stale_pipeline above, not per-run-id
+    like check_stuck_run) since "no run in N hours" is a condition, not a
+    specific row identity."""
+    resend_cutoff = (now - RESEND_WINDOW).isoformat()
+    if already_notified(conn, "critical_alert_pipeline_stale", resend_cutoff):
+        return ""
+
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        print("health_check.py: GITHUB_TOKEN not set -- skipping critical-alert-pipeline staleness check")
+        return ""
+
+    try:
+        resp = requests.get(
+            f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/workflows/{CRITICAL_ALERT_WORKFLOW_FILE}/runs",
+            params={"status": "completed", "per_page": 1},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        runs = resp.json().get("workflow_runs", [])
+    except Exception as e:
+        # Fails open (never alerts, never crashes health_check.py's other
+        # checks) -- a GitHub API hiccup during THIS specific probe is not
+        # itself evidence the pipeline is stale, and every other check in
+        # this file must still run and be able to send its own email.
+        print(f"health_check.py: critical-alert-pipeline staleness check failed to query GitHub API: {e}")
+        return ""
+
+    last_run_at = (
+        datetime.fromisoformat(runs[0]["created_at"].replace("Z", "+00:00"))
+        if runs else None
+    )
+    if last_run_at is not None and now - last_run_at < CRITICAL_ALERT_STALE_THRESHOLD:
+        return ""
+
+    if last_run_at is None:
+        detail = "No completed run found at all."
+    else:
+        detail = f"Last completed run finished {last_run_at.isoformat()} ({now - last_run_at} ago)."
+
+    log_notification(conn, "critical_alert_pipeline_stale", detail)
+    return (
+        f"<h2 style='color:#b91c1c'>Critical-review-alert pipeline looks stale</h2>"
+        f"<p>{detail} Expected a completed run at least every ~15 minutes (via the Vercel "
+        f"cron dispatch) or, at minimum, within ~{CRITICAL_ALERT_STALE_THRESHOLD}. Check the "
+        f"Vercel cron job (dashboard/api/google/[action].js's cron-critical-alert-check "
+        f"action) and confirm GitHub's own schedule trigger for critical-alert-check.yml is "
+        f"still enabled.</p>"
+    )
+
+
 def send_email(subject, html):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -180,7 +263,7 @@ def main():
     for row in reconciled:
         print(f"health_check.py: reconciled run #{row['id']} (started {row['started_at']}) as timed_out")
 
-    sections = [check_stuck_run(conn, now), check_stale_pipeline(conn, now)]
+    sections = [check_stuck_run(conn, now), check_stale_pipeline(conn, now), check_critical_alert_pipeline_stale(conn, now)]
     conn.commit()
 
     sections = [s for s in sections if s]

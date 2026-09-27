@@ -1,4 +1,4 @@
-// Confirms every one of the 19 routable dashboard/api/** routes (10
+// Confirms every one of the 20 routable dashboard/api/** routes (10
 // serverless functions total across the whole api/ tree -- the 4
 // /api/session/* routes share one [action].js file, and the 6
 // /api/actions/* routes (including 'rewrite', merged in by the PRYOR OS
@@ -59,6 +59,9 @@ const ROUTES = [
   ['/api/google/trigger-import', googleHandler, 'POST', { query: { action: 'trigger-import' } }],
   ['/api/google/trigger-sync', googleHandler, 'POST', { query: { action: 'trigger-sync' } }],
   ['/api/google/disconnect', googleHandler, 'POST', { query: { action: 'disconnect' } }],
+  // Two allowed methods (Vercel Cron sends GET; a manual/local invocation
+  // may use POST) -- see the Array.isArray(allowedMethod) branch below.
+  ['/api/google/cron-critical-alert-check', googleHandler, ['GET', 'POST'], { query: { action: 'cron-critical-alert-check' } }],
   ['/api/session/login', sessionHandler, 'POST', { query: { action: 'login' } }],
   ['/api/session/logout', sessionHandler, 'POST', { query: { action: 'logout' } }],
   ['/api/session/whoami', sessionHandler, 'GET', { query: { action: 'whoami' } }],
@@ -76,7 +79,8 @@ const ALL_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']
 async function testEveryRouteRejectsWrongMethods() {
   for (const [routeName, handler, allowedMethod, extra] of ROUTES) {
     for (const method of ALL_METHODS) {
-      if (method === allowedMethod) continue
+      const isAllowed = Array.isArray(allowedMethod) ? allowedMethod.includes(method) : method === allowedMethod
+      if (isAllowed) continue
       globalThis.fetch = async (url) => { throw new Error(`fetch must not be called for a rejected-method request: ${url}`) }
       const req = { method, body: {}, headers: {}, ...extra }
       const res = fakeRes()
