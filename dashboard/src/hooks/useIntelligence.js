@@ -16,12 +16,21 @@ export function isLocationScoped(account) {
   return Boolean(account) && account.locationIds !== '*'
 }
 
+// Dashboard-parity revision -- defense-in-depth: every query key here used
+// to be a bare literal (e.g. ['kpis']), shared across ANY tenant that ever
+// rendered in this browser tab. The actual tenant-switch flows (logout,
+// invite/reset-password acceptance, access-code entry) all force a real
+// `window.location.reload()`/navigation, which recreates the QueryClient
+// from scratch -- so this was never observed to leak one tenant's cached
+// response into another's session. Folding account.tenantId into every key
+// anyway removes the *possibility* rather than relying on every current and
+// future navigation path continuing to force a full reload.
 function useCompanyWideQuery(queryKey, path) {
   const account = useAccount()
-  return useQuery({ queryKey, queryFn: () => fetchJSON(path), enabled: !isLocationScoped(account), ...OPTS })
+  return useQuery({ queryKey: [...queryKey, account?.tenantId], queryFn: () => fetchJSON(path), enabled: !isLocationScoped(account), ...OPTS })
 }
 
-export function useMeta()               { return useQuery({ queryKey: ['meta'],               queryFn: () => fetchJSON('meta.json'),                                ...OPTS }) }
+export function useMeta()               { return useQuery({ queryKey: ['meta', useAccount()?.tenantId],               queryFn: () => fetchJSON('meta.json'),                                ...OPTS }) }
 export function useKPIs()               { return useCompanyWideQuery(['kpis'], 'analytics/kpis.json') }
 export function useMonthlyTrend()       { return useCompanyWideQuery(['monthly-trend'], 'analytics/monthly-trend.json') }
 export function useLocationStats()      { return useCompanyWideQuery(['location-stats'], 'analytics/location-stats.json') }
@@ -43,8 +52,9 @@ export function useSeasonalTrends()     { return useCompanyWideQuery(['seasonal-
 export function useExecutiveScores()    { return useCompanyWideQuery(['executive-scores'], 'intelligence/executive-scores.json') }
 
 export function useLocationDetail(slug) {
+  const account = useAccount()
   return useQuery({
-    queryKey: ['location-detail', slug],
+    queryKey: ['location-detail', slug, account?.tenantId],
     queryFn: () => fetchJSON(`intelligence/locations/${slug}.json`),
     enabled: !!slug,
     ...OPTS,
@@ -83,7 +93,7 @@ export function useGlobalPrefetch() {
         ]
     files.forEach(([key, path]) => {
       qc.prefetchQuery({
-        queryKey: [key],
+        queryKey: [key, account?.tenantId],
         queryFn: () => fetchJSON(path),
         staleTime: 1000 * 60 * 10,
       })
@@ -93,6 +103,7 @@ export function useGlobalPrefetch() {
 
 export function usePrefetchLocationDetails(stats) {
   const qc = useQueryClient()
+  const account = useAccount()
   useEffect(() => {
     if (!stats?.length) return
     stats.forEach(loc => {
@@ -105,12 +116,12 @@ export function usePrefetchLocationDetails(stats) {
       const slug = loc.slug
       if (!slug) return
       qc.prefetchQuery({
-        queryKey: ['location-detail', slug],
+        queryKey: ['location-detail', slug, account?.tenantId],
         queryFn: () => fetchJSON(`intelligence/locations/${slug}.json`),
         staleTime: 1000 * 60 * 10,
       })
     })
-  }, [stats, qc])
+  }, [stats, qc, account])
 }
 
 // Network-wide staff-mention data lives per-location, in intelligence/locations/{slug}.json
@@ -121,10 +132,11 @@ export function usePrefetchLocationDetails(stats) {
 export function useAllLocationDetails(stats) {
   // Multi-Tenant Phase 4P: same canonical-slug requirement as
   // usePrefetchLocationDetails() above -- see its comment.
+  const account = useAccount()
   const slugs = (stats ?? []).map(s => s.slug).filter(Boolean)
   const results = useQueries({
     queries: slugs.map(slug => ({
-      queryKey: ['location-detail', slug],
+      queryKey: ['location-detail', slug, account?.tenantId],
       queryFn: () => fetchJSON(`intelligence/locations/${slug}.json`),
       enabled: !!slug,
       ...OPTS,
@@ -137,8 +149,9 @@ export function useAllLocationDetails(stats) {
 }
 
 export function useLocationReviews(slug) {
+  const account = useAccount()
   return useQuery({
-    queryKey: ['location-reviews', slug],
+    queryKey: ['location-reviews', slug, account?.tenantId],
     queryFn: () => fetchJSON(`reviews/by-location/${slug}.json`),
     enabled: !!slug,
     ...OPTS,

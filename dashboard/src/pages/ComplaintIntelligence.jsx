@@ -4,7 +4,7 @@ import Badge from '../components/ui/Badge.jsx'
 import Skeleton from '../components/ui/Skeleton.jsx'
 import EmptyState from '../components/ui/EmptyState.jsx'
 import ErrorState from '../components/ui/ErrorState.jsx'
-import { useComplaintIntel } from '../hooks/useIntelligence.js'
+import { useComplaintIntel, useMeta } from '../hooks/useIntelligence.js'
 
 const SEV_LABEL = { 3: 'Critical', 2: 'Moderate', 1: 'Low' }
 const SEV_BADGE = { 3: 'danger',   2: 'warning',  1: 'info' }
@@ -158,10 +158,19 @@ function SectionHeader({ title, count, sub }) {
 
 export default function ComplaintIntelligence() {
   const { data: intel, isLoading, isError, refetch } = useComplaintIntel()
+  const { data: meta } = useMeta()
   const [tab, setTab] = useState('complaints')
 
   const complaints = intel?.complaints ?? []
   const praises    = intel?.praises    ?? []
+  const locationCount = meta?.locations?.length
+  // Dashboard-parity fix: this used to hardcode "all 21 locations" (LTA's
+  // own count) for every tenant. Omit the count entirely until meta has
+  // actually loaded, rather than defaulting to a number that would be
+  // wrong for any other tenant.
+  const scopeLabel = locationCount != null
+    ? `all ${locationCount} location${locationCount === 1 ? '' : 's'}`
+    : 'your locations'
 
   return (
     <div className="space-y-6 max-w-[900px]">
@@ -169,7 +178,7 @@ export default function ComplaintIntelligence() {
       <div>
         <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Complaint Intelligence</h1>
         <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
-          Operational issue classification across all 21 locations · last 30 days vs prior period
+          Operational issue classification across {scopeLabel} · last 30 days vs prior period
         </p>
       </div>
 
