@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { SESSION_EXPIRED_EVENT } from '../lib/dataClient.js'
+import { useAccount } from '../components/AuthGate.jsx'
 
 // Multi-Tenant Phase 4J -- reads GET /api/session/tenant-status, the ONE
 // endpoint that answers "what lifecycle state is MY OWN tenant in"
@@ -14,8 +15,6 @@ import { SESSION_EXPIRED_EVENT } from '../lib/dataClient.js'
 // runs provisioning/Initial Sync via GitHub Actions needs to notice the
 // transition without a manual reload, exactly like TenantOperations.jsx's
 // operator-facing poll for the same underlying state machine.
-const QK = ['tenant-status']
-
 async function fetchTenantStatus() {
   const res = await fetch('/api/session/tenant-status')
   if (res.status === 401) {
@@ -26,9 +25,16 @@ async function fetchTenantStatus() {
   return res.json()
 }
 
+// Dashboard-parity revision -- see useIntelligence.js's identical comment:
+// tenantId folded into the key as defense-in-depth. useAccount() safely
+// returns null (never throws) if called before AccountContext is provided
+// (e.g. from within AuthGate itself, above its own Provider) -- the key
+// then simply omits the tenantId suffix for that one call site, which is
+// harmless since nothing tenant-specific has loaded yet at that point.
 export function useTenantStatus({ enabled = true, refetchInterval } = {}) {
+  const account = useAccount()
   return useQuery({
-    queryKey: QK,
+    queryKey: ['tenant-status', account?.tenantId],
     queryFn: fetchTenantStatus,
     enabled,
     staleTime: 0,
@@ -84,8 +90,12 @@ export function useApproveLocations() {
       }
       return body
     },
+    // ['tenant-status'] (no tenantId) still invalidates the real
+    // ['tenant-status', tenantId] key above -- React Query's default
+    // invalidateQueries match is a PREFIX match, not exact, unless
+    // { exact: true } is passed.
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: QK })
+      qc.invalidateQueries({ queryKey: ['tenant-status'] })
     },
   })
 }
@@ -110,7 +120,7 @@ export function useRetryProvisioning() {
       return body
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: QK })
+      qc.invalidateQueries({ queryKey: ['tenant-status'] })
     },
   })
 }

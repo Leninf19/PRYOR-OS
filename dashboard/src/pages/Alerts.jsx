@@ -5,7 +5,7 @@ import EmptyState from '../components/ui/EmptyState.jsx'
 import ErrorState from '../components/ui/ErrorState.jsx'
 import {
   usePredictiveAlerts, useActionItems, useScraperStatusData,
-  useCompetitorIntel,
+  useCompetitorIntel, useMeta,
 } from '../hooks/useIntelligence.js'
 import { useGoogleOAuthStatus } from '../hooks/useGoogleOAuthStatus.js'
 
@@ -233,8 +233,18 @@ export default function Alerts() {
   const { data: scraperRuns, isLoading: loadS, isError: errS, refetch: refetchS }  = useScraperStatusData()
   const { data: competitorIntel, isLoading: loadC, isError: errC, refetch: refetchC } = useCompetitorIntel()
   const { data: googleStatusData, isLoading: googleStatusLoading } = useGoogleOAuthStatus()
+  const { data: meta } = useMeta()
   const googleStatus = { loading: googleStatusLoading, ...(googleStatusData ?? {}) }
   const [tab, setTab] = useState('all')
+
+  const locationCount = meta?.locations?.length
+  // Dashboard-parity fix: this used to hardcode "all 21 locations" (LTA's
+  // own count) for every tenant. Omit the count entirely until meta has
+  // actually loaded, rather than defaulting to a number that would be
+  // wrong for any other tenant.
+  const scopeLabel = locationCount != null
+    ? `all ${locationCount} location${locationCount === 1 ? '' : 's'}`
+    : 'your locations'
 
   const isLoading = loadP || loadA || loadS || loadC
   const isError = errP || errA || errS || errC
@@ -265,7 +275,7 @@ export default function Alerts() {
       <div>
         <h1 className="text-heading" style={{ color: 'var(--color-text-1)' }}>Alerts</h1>
         <p className="text-sm mt-0.5" style={{ color: 'var(--color-text-2)' }}>
-          Priority notifications from across all 21 locations
+          Priority notifications from across {scopeLabel}
         </p>
       </div>
 

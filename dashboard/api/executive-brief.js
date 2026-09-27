@@ -17,6 +17,7 @@ import { resolveTenantEntitlements } from './_lib/entitlements.js'
 import { requireFeature } from './_lib/featureAuthorization.js'
 import { getAiUsage, recordAiUsage, currentUsagePeriod, AiUsageStoreUnavailableError } from './_lib/aiUsageStore.js'
 import { calculateAiUsageUnits, resolveTokenCounts } from './_lib/aiUsageUnits.js'
+import { getTenantConfig } from './_lib/tenantConfigStore.js'
 
 const EXECUTIVE_BRIEF_MODEL = 'claude-sonnet-4-6'
 const EXECUTIVE_BRIEF_MAX_TOKENS = 400
@@ -91,6 +92,8 @@ export default async function handler(req, res) {
     })
   }
 
+  const tenantId = resolveTenantId(account)
+
   const {
     periodLabel, prevPeriodLabel, totalReviews, avgRating, avgRatingPrev,
     positivePct, negativePct, netSentiment, unanswered,
@@ -114,7 +117,25 @@ export default async function handler(req, res) {
   const fmtStars = v => (v == null ? 'N/A' : `${v}★`)
   const fmtDelta = v => (v == null ? 'N/A' : `${v > 0 ? '+' : ''}${v}★`)
 
-  const prompt = `You are an executive intelligence assistant for Los Tres Amigos, a Mexican restaurant group.
+  // Dashboard-parity fix: this prompt used to hardcode "Los Tres Amigos, a
+  // Mexican restaurant group" unconditionally -- every tenant's live brief
+  // opened by referencing LTA regardless of whose metrics were actually in
+  // the rest of the prompt. Resolved fresh per request (never cached
+  // client-side), same `config.displayName ?? tenantId` fallback
+  // convention already used by session/[action].js and admin/[action].js.
+  // getTenantConfig() THROWS (never returns null) when the store is
+  // unavailable -- caught here so a transient Redis outage degrades to a
+  // safe, non-cross-tenant fallback (this tenant's own id) rather than
+  // ever blocking or crashing the whole briefing feature.
+  let businessName = tenantId
+  try {
+    const tenantConfig = await getTenantConfig(tenantId)
+    businessName = tenantConfig?.displayName ?? tenantId
+  } catch (err) {
+    console.error(`[executive-brief] tenant config lookup failed for ${JSON.stringify(tenantId)} -- using tenantId as the business name: ${err.message}`)
+  }
+
+  const prompt = `You are an executive intelligence assistant for ${businessName}.
 
 Write a 4-6 sentence plain-English executive briefing covering what happened this period, why it happened, and what should be prioritized next. Present tense, specific numbers, no bullet points, no headers, no markdown, no preamble.
 
@@ -143,7 +164,7 @@ Write the briefing now:`
   // (billed) Anthropic call below, never a value captured earlier in the
   // request. See rewriteEngine.js's generateRewrite() for the identical
   // pattern and its own comment on the null/0 sentinel convention.
-  const tenantId = resolveTenantId(account)
+  // (tenantId itself was already resolved above, before prompt construction.)
   const period = currentUsagePeriod()
   const entitlements = await resolveTenantEntitlements(tenantId)
 

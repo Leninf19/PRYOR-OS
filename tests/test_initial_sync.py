@@ -584,6 +584,60 @@ class InitialSyncTestCase(unittest.TestCase):
             self.assertNotIn(lta_brand, meta_text)
 
     # ===================================================================
+    # Dashboard-parity revision: a BLOB-mode tenant (self-service, single
+    # location -- the exact shape a "Blue Seafood"-style tenant has) used
+    # to get ONLY meta.json/action-items.json/gbp-sync.json/the review-
+    # location index/per-location review chunks -- nothing Today/Locations/
+    # Insights/Studio/Reports actually depend on. These two tests lock in
+    # that the gap is fixed AND that fixing it did not reopen the
+    # cross-tenant-contamination guarantee the test just above this one
+    # already established for the original 5 artifacts.
+    # ===================================================================
+
+    def test_analytics_and_intelligence_artifacts_are_now_generated_for_a_blob_tenant(self):
+        self._provision(TENANT_A, [("accounts/1/locations/1", "Tenant A's Own Restaurant", "")])
+        locations = [_gbp_location("accounts/1/locations/1", "Tenant A's Own Restaurant")]
+        patches = self._mock_google(_account(), locations, {})
+        with patches[0], patches[1], patches[2], patches[3]:
+            outcome = isync.initial_sync(TENANT_A)
+        generation = outcome["artifactGeneration"]
+        # Each of these previously did not exist for a BLOB-mode tenant at
+        # all -- _artifact_json() itself asserts the Blob key exists, so a
+        # regression back to the old 5-artifact scope fails this test with
+        # a clear "expected a private-data Blob at ..." message rather than
+        # a confusing downstream KeyError.
+        kpis = self._artifact_json(TENANT_A, generation, "analytics/kpis.json")
+        self.assertIn("totalLocations", kpis)
+        self.assertEqual(kpis["totalLocations"], 1)
+        location_stats = self._artifact_json(TENANT_A, generation, "analytics/location-stats.json")
+        self.assertIsInstance(location_stats, list)
+        self.assertEqual(len(location_stats), 1)
+        complaint_intel = self._artifact_json(TENANT_A, generation, "intelligence/complaint-intelligence.json")
+        self.assertIn("complaints", complaint_intel)
+        self.assertIn("praises", complaint_intel)
+        action_center = self._artifact_json(TENANT_A, generation, "intelligence/action-center.json")
+        self.assertIsInstance(action_center, (list, dict))
+        weekly_summary = self._artifact_json(TENANT_A, generation, "reports/weekly-summary.json")
+        self.assertIsInstance(weekly_summary, dict)
+
+    def test_analytics_and_intelligence_artifacts_never_contain_lta_brand_or_location_names(self):
+        self._provision(TENANT_A, [("accounts/1/locations/1", "Tenant A's Own Restaurant", "")])
+        locations = [_gbp_location("accounts/1/locations/1", "Tenant A's Own Restaurant")]
+        patches = self._mock_google(_account(), locations, {})
+        with patches[0], patches[1], patches[2], patches[3]:
+            outcome = isync.initial_sync(TENANT_A)
+        generation = outcome["artifactGeneration"]
+        for rel_path in (
+            "analytics/kpis.json", "analytics/location-stats.json", "analytics/monthly-trend.json",
+            "analytics/rankings-30d.json", "intelligence/complaint-intelligence.json",
+            "intelligence/action-center.json", "intelligence/operations-impact.json",
+            "intelligence/executive-scores.json", "reports/weekly-summary.json",
+        ):
+            artifact_text = json.dumps(self._artifact_json(TENANT_A, generation, rel_path))
+            for lta_brand in db.BRANDS:
+                self.assertNotIn(lta_brand, artifact_text, f"{rel_path} contained LTA brand {lta_brand!r}")
+
+    # ===================================================================
     # DB conditional upload / ETag CAS (spec sections 6, 8, 13)
     # ===================================================================
 

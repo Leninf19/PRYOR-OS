@@ -7,17 +7,25 @@ import Tabs from '../components/ui/Tabs.jsx'
 import {
   useComplaintIntel, useCompetitorIntel, useMeta, useBestQuotes, useSeasonalTrends,
 } from '../hooks/useIntelligence.js'
+import { useTenantStatus } from '../hooks/useTenantStatus.js'
 
 // ── Caption templates ─────────────────────────────────────────────────────────
+// Dashboard-parity fix: both functions used to hardcode "Los Tres Amigos"
+// (a stray mid-word space in the original hashtag, "#LosT resAmigos", is
+// fixed here too) -- now take the tenant's own display name (from
+// useTenantStatus(), the same source Layout.jsx's sidebar branding
+// already uses) and derive a hashtag-safe handle from it, so this page
+// never names a specific restaurant group for any tenant.
 
-function buildCaptions(topPraise, secondPraise, thirdPraise, bestLoc) {
+function buildCaptions(businessName, topPraise, secondPraise, thirdPraise, bestLoc) {
   if (!topPraise) return null
   const item1 = topPraise
   const item2 = secondPraise ?? 'great food'
   const item3 = thirdPraise ?? 'friendly service'
   const loc   = bestLoc ?? 'one of our locations'
+  const handle = businessName.replace(/[^a-zA-Z0-9]/g, '')
   return {
-    facebook: `Our customers say it best — ${item1} keeps them coming back. Come try it for yourself this week. Tag us in your visit! 📸 #LosT resAmigos #Authentic${item1.replace(/\s/g, '')}`,
+    facebook: `Our customers say it best — ${item1} keeps them coming back. Come try it for yourself this week. Tag us in your visit! 📸 #${handle} #Authentic${item1.replace(/\s/g, '')}`,
     instagram: `${item1.toUpperCase()} ✨ Your favorite reason to come back. Come visit us — because ${item2} and ${item3} taste even better in person. 📍 ${loc}`,
     google: `Try our ${item1} — it's one of the most praised items by our guests. Stop in and share your experience with us.`,
     campaign: `"${item1}" — Your New Favorite`,
@@ -25,12 +33,12 @@ function buildCaptions(topPraise, secondPraise, thirdPraise, bestLoc) {
   }
 }
 
-function buildCampaign(praises) {
+function buildCampaign(businessName, praises) {
   if (!praises?.length) return null
   const top3 = praises.slice(0, 3).map(p => p.name)
   const focus = top3[0]
   return {
-    name: `"The Best of Los Tres Amigos" Campaign`,
+    name: `"The Best of ${businessName}" Campaign`,
     angle: `Highlight what customers already love most — ${top3.join(', ')} — and make it the centerpiece of your social and in-store presence.`,
     pillars: top3,
     photoIdeas: [
@@ -160,6 +168,8 @@ export default function MarketingIntelligence() {
   const { data: meta,       isLoading: lM, isError: eM, refetch: rM } = useMeta()
   const { data: quotes }   = useBestQuotes()
   const { data: seasonal } = useSeasonalTrends()
+  const { data: tenantStatus } = useTenantStatus()
+  const businessName = tenantStatus?.displayName || 'your restaurant'
   const [activeTab, setActiveTab] = useState('insights')
 
   const isLoading = lC || lR || lM
@@ -189,8 +199,8 @@ export default function MarketingIntelligence() {
 
   const top3 = praises.slice(0, 3)
   const bestLoc = rankings.sort((a, b) => (b.positiveRate ?? 0) - (a.positiveRate ?? 0))[0]
-  const captions = buildCaptions(top3[0]?.name, top3[1]?.name, top3[2]?.name, bestLoc?.name)
-  const campaign = buildCampaign(praises)
+  const captions = buildCaptions(businessName, top3[0]?.name, top3[1]?.name, top3[2]?.name, bestLoc?.name)
+  const campaign = buildCampaign(businessName, praises)
 
   const TABS = [
     { id: 'insights',  label: 'What Customers Love' },

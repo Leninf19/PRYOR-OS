@@ -1930,27 +1930,21 @@ def set_cache(conn, key: str, payload) -> None:
 CLASSIFY_LIMIT_PER_RUN = 300
 
 
-def main():
-    """Multi-Tenant Phase 4D revision: --tenant-id is REQUIRED, no default.
-    Resolved before any DB connection, so a missing/invalid/unregistered
-    tenant fails closed before touching anything."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tenant-id", required=True,
-                         help="Explicit tenant whose review database to analyze. REQUIRED -- no "
-                              "default. This script never infers a tenant on its own.")
-    args = parser.parse_args()
-    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
-        print(f"::error::refresh_analytics.py: invalid --tenant-id {args.tenant_id!r}")
-        sys.exit(1)
-    try:
-        db.DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
-    except tenant_paths.UnknownTenantError as e:
-        print(f"::error::refresh_analytics.py: {e}")
-        sys.exit(1)
+def run_analytics_refresh(conn, tenant_id: str) -> None:
+    """The real computation, extracted from main() (Multi-Tenant dashboard-
+    parity revision) so a caller that already has an open, tenant-bound
+    connection -- tenant_artifact_export.py's generate_tenant_artifacts(),
+    for a BLOB-mode tenant -- can run the exact same analytics pipeline
+    LTA's own update-reviews.yml cadence already runs, rather than a second,
+    independently-maintained computation that could silently drift from it.
+    Mirrors critical_alert_check.py's/nightly_digest.py's run(tenant_id)
+    convention.
 
-    conn = db.get_connection()
-    db.init_schema(conn)
-
+    Caller-managed connection, same contract as
+    tenant_artifact_export.generate_tenant_artifacts(): commits but does
+    NOT close `conn` -- main() (the CLI entrypoint below) closes it after
+    this returns; a caller chaining further work on the same connection
+    (e.g. export_chunks.py's export functions) needs it to stay open."""
     rows = conn.execute(
         """SELECT r.*, l.name AS location_name, l.city AS city, l.brand AS brand
            FROM reviews r JOIN locations l ON l.id = r.location_id
@@ -2238,13 +2232,18 @@ def main():
         loc_prev   = by_loc_prev[loc_id]
         loc_recent = by_loc_recent_90[loc_id]
         # Loop variable deliberately named `alert_args`, never `args` -- a
-        # `for` loop's target leaks into this function's own scope (unlike a
-        # comprehension), and `args` is already this function's own
-        # argparse.Namespace from `parser.parse_args()` near the top. Reusing
-        # that name here permanently shadowed it for everything below this
-        # loop -- exactly what broke ai_engine.batch_generate_drafts()'s
-        # tenant_id=args.tenant_id a few dozen lines down, since nothing
-        # before this fix ever read args.tenant_id again after this point.
+        # `for` loop's target leaks into the enclosing scope (unlike a
+        # comprehension). Historical incident (before this function was
+        # extracted from main(), see run_analytics_refresh()'s own docstring):
+        # `args` used to be this function's own argparse.Namespace from
+        # `parser.parse_args()`, and reusing that name here permanently
+        # shadowed it for everything below this loop -- exactly what broke
+        # ai_engine.batch_generate_drafts()'s tenant_id=args.tenant_id a few
+        # dozen lines down. `args` no longer exists in this function at all
+        # (main() below is now the only place that parses it), but the naming
+        # discipline is kept as-is rather than reverted, since it costs
+        # nothing and documents exactly why this loop's variable is never
+        # called `args`.
         for alert_fn, alert_args in (
             (rating_trend_alert,     (loc_all, loc["name"])),
             (negative_spike_alert,   (loc_recent, loc["name"])),  # recent window -- an old spike isn't "actionable today"
@@ -2309,7 +2308,7 @@ def main():
         ).fetchall()
     }
     loc_map = {loc_id: dict(loc) for loc_id, loc in locations.items()}
-    new_drafts = ai_engine.batch_generate_drafts(reviews, loc_map, existing_draft_keys, tenant_id=args.tenant_id)
+    new_drafts = ai_engine.batch_generate_drafts(reviews, loc_map, existing_draft_keys, tenant_id=tenant_id)
     for key, draft in new_drafts.items():
         set_cache(conn, key, draft)
     if new_drafts:
@@ -2327,8 +2326,31 @@ def main():
     set_cache(conn, "competitive_intelligence", comp_intel)
 
     conn.commit()
-    conn.close()
     print(f"Analytics refreshed: {len(reviews)} reviews, {len(locations)} locations | AI={'on' if ai_engine.is_available() else 'off'}")
+
+
+def main():
+    """CLI entrypoint. Multi-Tenant Phase 4D revision: --tenant-id is
+    REQUIRED, no default. Resolved before any DB connection, so a missing/
+    invalid/unregistered tenant fails closed before touching anything."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tenant-id", required=True,
+                         help="Explicit tenant whose review database to analyze. REQUIRED -- no "
+                              "default. This script never infers a tenant on its own.")
+    args = parser.parse_args()
+    if not tenant_keys.is_valid_tenant_id(args.tenant_id):
+        print(f"::error::refresh_analytics.py: invalid --tenant-id {args.tenant_id!r}")
+        sys.exit(1)
+    try:
+        db.DB_PATH = tenant_paths.resolve_review_db_path(args.tenant_id)
+    except tenant_paths.UnknownTenantError as e:
+        print(f"::error::refresh_analytics.py: {e}")
+        sys.exit(1)
+
+    conn = db.get_connection()
+    db.init_schema(conn)
+    run_analytics_refresh(conn, args.tenant_id)
+    conn.close()
 
 
 if __name__ == "__main__":

@@ -383,7 +383,7 @@ def apply_entitlement_change(tenant_id: str) -> dict:
         try:
             locations_by_id = {row["id"]: dict(row) for row in conn.execute("SELECT * FROM locations").fetchall()}
             review_count = conn.execute("SELECT COUNT(*) AS c FROM reviews WHERE is_deleted = 0").fetchone()["c"]
-            artifacts = tenant_artifact_export.generate_tenant_artifacts(conn)
+            artifacts = tenant_artifact_export.generate_tenant_artifacts(conn, tenant_id)
         finally:
             conn.close()
 
