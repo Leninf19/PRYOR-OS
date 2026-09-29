@@ -15,6 +15,7 @@
 import {
   isSafeHttpsUrl, usableItems, computeThumbnailLayout, countByType,
   computeSwipeTarget, computeArrowKeyTarget, MAX_VISIBLE_THUMBNAILS,
+  canDownloadItem, buildMediaDownloadUrl,
 } from '../dashboard/src/utils/reviewMediaGallery.js'
 
 function assert(cond, msg) {
@@ -93,6 +94,89 @@ function testVideoTypeOnlyWithSafeVideoUrl() {
 function testMalformedItemsIgnored() {
   const out = usableItems(['not-an-object', 42, null, {}])
   assert(out.length === 0)
+}
+
+// --- usableItems sortOrder preservation (Review Media View/Download feature) --
+// The download endpoint (dashboard/api/actions/[action].js's download-media
+// action) indexes directly into the review's own server-side `media` array
+// by position -- usableItems() must expose each surviving item's ORIGINAL
+// array index (before filtering), never a re-numbered post-filter position,
+// so the View/Download controls always reference the correct item even
+// when an earlier item was dropped.
+
+function testSortOrderMatchesOriginalArrayIndex() {
+  const out = usableItems([
+    { type: 'photo', thumbnailUrl: 'https://lh3.googleusercontent.com/p0' },
+    { type: 'photo', thumbnailUrl: 'https://lh3.googleusercontent.com/p1' },
+    { type: 'photo', thumbnailUrl: 'https://lh3.googleusercontent.com/p2' },
+  ])
+  assert(out.map(i => i.sortOrder).join(',') === '0,1,2', `expected sortOrder 0,1,2, got ${out.map(i => i.sortOrder).join(',')}`)
+}
+
+function testSortOrderSkipsDroppedItemsOriginalIndex() {
+  // The middle item (original index 1) has an unsafe thumbnail and is
+  // dropped -- the surviving items must keep THEIR OWN original indices
+  // (0 and 2), never be renumbered to 0 and 1.
+  const out = usableItems([
+    { type: 'photo', thumbnailUrl: 'https://lh3.googleusercontent.com/p0' },
+    { type: 'photo', thumbnailUrl: 'javascript:alert(1)' },
+    { type: 'photo', thumbnailUrl: 'https://lh3.googleusercontent.com/p2' },
+  ])
+  assert(out.length === 2, `expected 2 surviving items, got ${out.length}`)
+  assert(out[0].sortOrder === 0, `first surviving item must keep original index 0, got ${out[0].sortOrder}`)
+  assert(out[1].sortOrder === 2, `second surviving item must keep original index 2 (not renumbered to 1), got ${out[1].sortOrder}`)
+}
+
+function testSortOrderIgnoresRawItemsOwnSortOrderField() {
+  // Even if the raw item carries its own (possibly stale/wrong) sortOrder
+  // field, usableItems() must derive sortOrder from the ARRAY POSITION it
+  // was actually received at, never trust the raw field verbatim.
+  const out = usableItems([
+    { type: 'photo', thumbnailUrl: 'https://lh3.googleusercontent.com/p0', sortOrder: 99 },
+  ])
+  assert(out[0].sortOrder === 0, `must derive sortOrder from array position (0), not the raw item's own field (99), got ${out[0].sortOrder}`)
+}
+
+// --- canDownloadItem / buildMediaDownloadUrl (Review Media View/Download feature) --
+
+function testCanDownloadItemTrueForPhoto() {
+  assert(canDownloadItem({ type: 'photo' }) === true)
+}
+
+function testCanDownloadItemFalseForVideo() {
+  assert(canDownloadItem({ type: 'video' }) === false, 'video items must never offer a Download control -- View/Open only')
+}
+
+function testCanDownloadItemFalseForMissingItem() {
+  assert(canDownloadItem(null) === false)
+  assert(canDownloadItem(undefined) === false)
+}
+
+function testBuildMediaDownloadUrlHappyPath() {
+  const url = buildMediaDownloadUrl('abc123', 2)
+  assert(url === '/api/actions/download-media?reviewId=abc123&index=2', `unexpected url: ${url}`)
+}
+
+function testBuildMediaDownloadUrlEncodesReviewId() {
+  // A review id can be a review_url or a `${date}-${name}` fallback --
+  // either can contain characters that must be percent-encoded in a query
+  // string (e.g. '/', '&', spaces).
+  const url = buildMediaDownloadUrl('https://google.com/review?id=1&x=2', 0)
+  assert(url === `/api/actions/download-media?reviewId=${encodeURIComponent('https://google.com/review?id=1&x=2')}&index=0`, `unexpected url: ${url}`)
+  assert(!url.includes('&x=2'), 'an unencoded "&" from the reviewId must never inject a second query param')
+}
+
+function testBuildMediaDownloadUrlRejectsMissingReviewId() {
+  assert(buildMediaDownloadUrl('', 0) === null)
+  assert(buildMediaDownloadUrl(null, 0) === null)
+  assert(buildMediaDownloadUrl(undefined, 0) === null)
+}
+
+function testBuildMediaDownloadUrlRejectsInvalidIndex() {
+  assert(buildMediaDownloadUrl('abc123', -1) === null, 'a negative index must never be sent')
+  assert(buildMediaDownloadUrl('abc123', 1.5) === null, 'a non-integer index must never be sent')
+  assert(buildMediaDownloadUrl('abc123', NaN) === null)
+  assert(buildMediaDownloadUrl('abc123', null) === null)
 }
 
 // --- computeThumbnailLayout (five thumbnails / +N behavior) ------------------
@@ -178,6 +262,16 @@ async function main() {
     ['item with unsafe thumbnail dropped (never rendered broken)', testItemWithUnsafeThumbnailDropped],
     ['video type only with a safe videoUrl', testVideoTypeOnlyWithSafeVideoUrl],
     ['malformed items ignored', testMalformedItemsIgnored],
+    ['usableItems: sortOrder matches original array index', testSortOrderMatchesOriginalArrayIndex],
+    ['usableItems: sortOrder skips dropped items\' original index (never renumbered)', testSortOrderSkipsDroppedItemsOriginalIndex],
+    ['usableItems: sortOrder derived from array position, never the raw item\'s own field', testSortOrderIgnoresRawItemsOwnSortOrderField],
+    ['canDownloadItem: true for a photo', testCanDownloadItemTrueForPhoto],
+    ['canDownloadItem: false for a video (View/Open only)', testCanDownloadItemFalseForVideo],
+    ['canDownloadItem: false for a missing item', testCanDownloadItemFalseForMissingItem],
+    ['buildMediaDownloadUrl: happy path', testBuildMediaDownloadUrlHappyPath],
+    ['buildMediaDownloadUrl: encodes the reviewId', testBuildMediaDownloadUrlEncodesReviewId],
+    ['buildMediaDownloadUrl: rejects a missing reviewId', testBuildMediaDownloadUrlRejectsMissingReviewId],
+    ['buildMediaDownloadUrl: rejects an invalid index', testBuildMediaDownloadUrlRejectsInvalidIndex],
     ['five or fewer items -> no overflow', testFiveOrFewerItemsNoOverflow],
     ['more than five items -> +N overflow count', testMoreThanFiveItemsShowsOverflowCount],
     ['countByType splits photos/videos', testCountByType],

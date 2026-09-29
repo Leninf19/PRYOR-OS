@@ -2,7 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import useFocusTrap from '../hooks/useFocusTrap'
-import { usableItems, computeThumbnailLayout, countByType, computeSwipeTarget, computeArrowKeyTarget } from '../utils/reviewMediaGallery.js'
+import {
+  usableItems, computeThumbnailLayout, countByType, computeSwipeTarget, computeArrowKeyTarget,
+  canDownloadItem,
+} from '../utils/reviewMediaGallery.js'
+import { downloadReviewMedia } from '../services/reviewMediaService.js'
 
 // Review Media Feature -- Scale & No-Backfill Audit (Phase 9). Renders a
 // compact thumbnail strip for the SELECTED review's detail panel only --
@@ -48,13 +52,34 @@ function MediaThumb({ item, onBroken }) {
   )
 }
 
-function LightboxDialog({ items, index, onClose, onNavigate }) {
+// Review Media View/Download feature: PHOTOS ONLY, server-proxied through
+// dashboard/api/actions/[action].js's download-media action -- never a raw Google
+// URL is ever downloaded directly. A video item, or a photo the endpoint
+// itself rejects (oversized/invalid upstream response), falls back to
+// simply opening that item's own URL in a new tab -- "View/Open" rather
+// than a failed download, per this feature's spec.
+const DOWNLOAD_STATE = { IDLE: 'idle', DOWNLOADING: 'downloading', ERROR: 'error' }
+
+function openInNewTab(url) {
+  if (!url) return
+  window.open(url, '_blank', 'noopener,noreferrer')
+}
+
+function LightboxDialog({ items, index, reviewId, onClose, onNavigate }) {
   const panelRef = useRef(null)
   useFocusTrap(panelRef, true, onClose)
+  const [downloadState, setDownloadState] = useState(DOWNLOAD_STATE.IDLE)
 
   const current = items[index]
   const hasPrev = index > 0
   const hasNext = index < items.length - 1
+
+  // Never let a stale "download failed" message linger against a
+  // different item after the user navigates away from the one that
+  // produced it.
+  useEffect(() => {
+    setDownloadState(DOWNLOAD_STATE.IDLE)
+  }, [index])
 
   const handleKeyDown = useCallback((e) => {
     const target = computeArrowKeyTarget(e.key, index, items.length)
@@ -65,6 +90,22 @@ function LightboxDialog({ items, index, onClose, onNavigate }) {
     const target = computeSwipeTarget(index, items.length, info.offset.x, info.velocity.x)
     if (target !== null) onNavigate(target)
   }
+
+  const handleDownload = useCallback(async () => {
+    if (!current || !canDownloadItem(current) || !reviewId) return
+    setDownloadState(DOWNLOAD_STATE.DOWNLOADING)
+    try {
+      await downloadReviewMedia(reviewId, current.sortOrder)
+      setDownloadState(DOWNLOAD_STATE.IDLE)
+    } catch {
+      // A video item, an oversized/invalid upstream response, a timeout,
+      // etc. -- the endpoint already rejected it with a clear error, so
+      // fall back to View/Open (the item's own URL in a new tab) rather
+      // than leaving the user with nothing.
+      setDownloadState(DOWNLOAD_STATE.ERROR)
+      openInNewTab(current.thumbnailUrl)
+    }
+  }, [current, reviewId])
 
   if (typeof document === 'undefined' || !current) return null
 
@@ -150,6 +191,37 @@ function LightboxDialog({ items, index, onClose, onNavigate }) {
               ›
             </button>
           </div>
+
+          {/* PHOTOS ONLY -- a video item (or a photo the download endpoint
+              itself rejects) offers "Open in a new tab" instead, never a
+              failed/silent download attempt. */}
+          <div className="flex items-center gap-2">
+            {canDownloadItem(current) ? (
+              <button
+                type="button"
+                onClick={handleDownload}
+                disabled={downloadState === DOWNLOAD_STATE.DOWNLOADING || !reviewId}
+                className="px-3 py-1.5 rounded-full text-xs font-semibold disabled:opacity-50"
+                style={{ background: 'var(--color-surface)', color: 'var(--color-text-1)' }}
+              >
+                {downloadState === DOWNLOAD_STATE.DOWNLOADING ? 'Downloading…' : 'Download'}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => openInNewTab(current.videoUrl || current.thumbnailUrl)}
+                className="px-3 py-1.5 rounded-full text-xs font-semibold"
+                style={{ background: 'var(--color-surface)', color: 'var(--color-text-1)' }}
+              >
+                Open in new tab
+              </button>
+            )}
+            {downloadState === DOWNLOAD_STATE.ERROR && (
+              <span role="status" aria-live="polite" className="text-[11px]" style={{ color: 'var(--color-text-inverse, #fff)' }}>
+                Download unavailable — opened in a new tab instead.
+              </span>
+            )}
+          </div>
         </motion.div>
       </div>
     </AnimatePresence>,
@@ -157,7 +229,7 @@ function LightboxDialog({ items, index, onClose, onNavigate }) {
   )
 }
 
-export default function ReviewMediaGallery({ items }) {
+export default function ReviewMediaGallery({ items, reviewId }) {
   const safeItems = usableItems(items)
   const [lightboxIndex, setLightboxIndex] = useState(null)
 
@@ -175,10 +247,23 @@ export default function ReviewMediaGallery({ items }) {
 
   return (
     <div className="space-y-1.5">
-      <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>
-        {safeItems.length} media item{safeItems.length === 1 ? '' : 's'}
-        {photoCount > 0 && videoCount > 0 ? ` (${photoCount} photo${photoCount === 1 ? '' : 's'}, ${videoCount} video${videoCount === 1 ? '' : 's'})` : ''}
-      </p>
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: 'var(--color-text-3)' }}>
+          {safeItems.length} media item{safeItems.length === 1 ? '' : 's'}
+          {photoCount > 0 && videoCount > 0 ? ` (${photoCount} photo${photoCount === 1 ? '' : 's'}, ${videoCount} video${videoCount === 1 ? '' : 's'})` : ''}
+        </p>
+        {/* Explicit "View" affordance, in addition to clicking a thumbnail
+            directly (both open the same accessible lightbox) -- opens at
+            the first item. */}
+        <button
+          type="button"
+          onClick={() => setLightboxIndex(0)}
+          className="text-[10px] font-bold uppercase tracking-wider underline underline-offset-2"
+          style={{ color: 'var(--color-text-3)' }}
+        >
+          View
+        </button>
+      </div>
       <div className="flex gap-2">
         {visible.map((item, i) => {
           const isLastVisibleWithOverflow = i === visible.length - 1 && overflowCount > 0
@@ -219,6 +304,7 @@ export default function ReviewMediaGallery({ items }) {
         <LightboxDialog
           items={safeItems}
           index={lightboxIndex}
+          reviewId={reviewId}
           onClose={() => setLightboxIndex(null)}
           onNavigate={setLightboxIndex}
         />
