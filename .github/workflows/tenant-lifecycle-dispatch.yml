@@ -3,21 +3,32 @@ name: Tenant Lifecycle Dispatch (pinned)
 # WHY THIS FILE EXISTS: GitHub only allows a workflow_dispatch-triggered
 # workflow to be dispatched via the UI/API if the workflow FILE is present
 # on the repository's DEFAULT branch (main) -- this is true regardless of
-# which `ref:` a checkout step later uses. The real implementation lives
-# ONLY on feature/multi-tenant-pryor, which must NOT be merged to main
-# just to make this dispatchable -- main stays Los Tres Amigos's own,
-# untouched production branch. This file is the SMALLEST possible bridge:
-# it lives on main (so GitHub will dispatch it), but every actual line of
-# application code it runs is checked out from ONE hardcoded, reviewed,
-# immutable commit SHA on feature/multi-tenant-pryor -- never main's own
-# tree, never a caller-supplied ref of any kind.
+# which `ref:` a checkout step later uses. ORIGINALLY (through revision 12)
+# the real implementation lived only on feature/multi-tenant-pryor, kept
+# off main entirely, and this file's whole design was the smallest bridge
+# to make an off-main implementation dispatchable. As of revision 13
+# (below) that premise no longer holds -- feature/multi-tenant-pryor has
+# been fully absorbed by main, which is now the multi-tenant
+# implementation's own actively-developed home. The pin itself is
+# UNCHANGED in spirit and just as necessary as before, for a different,
+# still-valid reason: main receives ordinary automated data/housekeeping
+# commits on its own schedule, so a caller-supplied or dynamically-tracked
+# `ref: main` would make a production provisioning dispatch's exact code
+# nondeterministic run to run. Every actual line of application code this
+# workflow runs is still checked out from ONE hardcoded, reviewed,
+# immutable commit SHA -- never main's own moving tree, never a
+# caller-supplied ref of any kind -- it just now names a commit that is
+# ALSO reachable from main, rather than one that is not.
 #
-# PINNED COMMIT: 64fa6a38d3106fda60e110af843af841807aed93
-#   "Split encryption-key challenge probe into create/poll subcommands"
-#   (feature/multi-tenant-pryor, includes every prior approved multi-tenant
-#   phase through this create/poll split). To point this dispatcher at a
-#   newer approved commit later, this SHA is the ONLY line that changes --
-#   a small, reviewable, auditable diff, never automatic.
+# PINNED COMMIT (revision 13): 1204a998c1bc0695c9de6b378481eca6e2bea824
+#   "chore: critical-alert check housekeeping [skip ci]" -- main's own tip
+#   at the time revision 13 was authored, chosen specifically because it
+#   is a descendant of both 2d2778df (review-media all-tenant rollout) and
+#   0c35c352 (BLOB-tenant analytics/intelligence artifact parity) -- see
+#   revision 13's own comment below for the full investigation. To point
+#   this dispatcher at a newer approved commit later, this SHA (both here
+#   and in the `env:` block below) is the ONLY line that changes -- a
+#   small, reviewable, auditable diff, never automatic.
 #
 # SECURITY INVARIANT (revision 2): if "Validate inputs" fails for ANY
 # reason (malformed tenant_id, Los Tres Amigos, confirmation mismatch, or
@@ -222,6 +233,75 @@ name: Tenant Lifecycle Dispatch (pinned)
 # borrow a Preview value to keep running. A missing Preview secret
 # continues to fail closed earlier, at "Verify Preview isolation", before
 # either preview-tagged step can even attempt to run.
+#
+# revision 13 (production-correctness cleanup, pinned-checkout staleness
+# closed): this file's own original rationale (top of file) for pinning to
+# a commit on feature/multi-tenant-pryor -- "the real implementation lives
+# ONLY on feature/multi-tenant-pryor... which must NOT be merged to main"
+# -- is now factually obsolete. feature/multi-tenant-pryor has ZERO
+# commits that are not already on main; main is 548 commits AHEAD of it.
+# The multi-tenant Python implementation (provision_tenant.py,
+# initial_sync.py, apply_entitlement_change.py, tenant_config_store.py,
+# etc.) has been main's own, actively-developed code for some time --
+# confirmed by their ordinary presence in this checkout, the very thing
+# test_no_app_or_python_implementation_files_on_main() used to assert
+# could never happen (that test is removed in this revision; see below).
+#
+# CONSEQUENCE OF THE STALE PIN: the previous PINNED_LIFECYCLE_SHA
+# (f7201436535e8dea0730c045d25407437941ca4e, 2026-09-06, "Fix duplicate
+# location-name IntegrityError") was 5 commits and 21 days behind main by
+# the time this was investigated, missing two REAL behavioral fixes to the
+# exact scripts this workflow dispatches:
+#   - 2d2778df (2026-09-20, "Activate review media automatically for new
+#     tenants + all-tenant rollout"): initial_sync.py's final success CAS
+#     write now calls tenant_config_store.compute_media_capture_activation_patch()
+#     to auto-enroll a newly-activated tenant into review-media capture.
+#     The stale pin's initial_sync.py predates this call entirely.
+#   - 0c35c352 (2026-09-27, "Generate analytics/intelligence artifacts for
+#     BLOB-mode tenants + fix hardcoded LTA identity"): both initial_sync.py
+#     and apply_entitlement_change.py generate a tenant's private-data
+#     artifacts via tenant_artifact_export.generate_tenant_artifacts(),
+#     which now also runs refresh_analytics.run_analytics_refresh() and
+#     exports every analytics/intelligence file the dashboard's Today/
+#     Locations/Insights/Studio pages depend on. The stale pin's version
+#     of that function only ever produced the original Phase 4F/4F.1
+#     baseline 5 files -- the exact gap that broke Blue Seafood's
+#     dashboard and was fixed for existing tenants via a recurring-sync
+#     backfill (PR #21), but was NEVER fixed for this dispatcher itself.
+# (Three other commits since the old pin -- 4167d333, ae2fc68c, 3cf3cc62
+# -- were investigated too: their Python-side footprint on these exact
+# scripts is either purely cosmetic tenant_config shape-parity fields
+# (`commercial`/`creation`, always None from Python) or inert
+# "ships inactive" plumbing with no observable behavior at that revision;
+# their substantive content is Node/JS-side and already live via Vercel's
+# own main-tracked deployment, unaffected by this pin either way.)
+#
+# CONFIRMED AFFECTED TENANT: t_blue-seafood-grill-dldh5k's own
+# provision+initial_sync ran through this dispatcher on 2026-09-26 (runs
+# 36278485064/36278499436) -- AFTER 2d2778df merged, so its mediaCapture
+# was never auto-activated (recurring_sync.py's own header confirms it
+# deliberately never performs "the one-time status transition and
+# mediaCapture enrollment"), and the 2026-09-20 all-tenant rollout runs
+# predate this tenant's existence, so they could not have covered it
+# either. REMEDIATION (not run as part of this revision -- operator
+# decision): dispatch rollout-activate-review-media.yml without --apply
+# first to confirm this tenant shows would_activate rather than
+# already_active, then with --apply -- idempotent and safe for every
+# other already-active tenant regardless. This tenant's analytics/
+# intelligence artifacts were separately already backfilled via a
+# recurring-review-sync.yml dispatch after PR #21 merged, so that specific
+# gap does not apply retroactively to it, only prospectively to any other
+# tenant this dispatcher provisions before this revision merges.
+#
+# NEW PIN: the exact same mechanism, still an immutable, single-SHA,
+# checkout-by-commit pin (never a branch name, never main tracked
+# dynamically) -- main's own automated data/housekeeping commits make
+# tracking it live exactly the nondeterminism risk this file's pinning
+# discipline exists to prevent. Only the TARGET changed: from a stale
+# feature-branch commit to a specific, already-merged, already-tested
+# main commit containing both fixes above. Bumping this value again later
+# follows the same discipline every prior revision already established --
+# one reviewed, auditable line, never automatic.
 
 on:
   workflow_dispatch:
@@ -263,7 +343,7 @@ permissions:
   actions: write  # Multi-Tenant Phase 4O: lets the "Chain to Initial Sync" step dispatch a follow-up run using this run's own ambient GITHUB_TOKEN -- no new secret. Verified live before use (see that step's own comment).
 
 env:
-  PINNED_LIFECYCLE_SHA: f7201436535e8dea0730c045d25407437941ca4e
+  PINNED_LIFECYCLE_SHA: 1204a998c1bc0695c9de6b378481eca6e2bea824
 
 jobs:
   operate:
