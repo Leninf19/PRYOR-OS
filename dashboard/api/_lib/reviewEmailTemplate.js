@@ -23,13 +23,20 @@ export function buildDefaultSubject({ locationName, starRating }) {
 }
 
 // `review`: { locationName, city, starRating, reviewerName, reviewDate,
-//             reviewText, reviewUrl }. `internalReferenceUrl`: an absolute
-// link back to the dashboard (built by the caller from DASHBOARD_BASE_URL
-// -- see actions/[action].js), or null if no base URL is configured.
-// `internalNote`: optional marketing-authored note, also escaped.
+//             reviewText, reviewUrl, hasMedia }. `hasMedia` (Tenant Alert
+// Recipients & Media Emails revision): optional boolean -- true only when
+// the caller has confirmed this review has at least one sanitized/gated
+// media item (see actions/[action].js's validateReviewSnapshot()); never
+// inferred here, and never used to embed or link to the actual Google
+// photo/video -- only to show a small text indicator. `internalReferenceUrl`:
+// an absolute "View review in PRYOR" deep link back to this app's own
+// /reviews?reviewId=<id> route (built by the caller from DASHBOARD_BASE_URL
+// -- see actions/[action].js's buildInternalReferenceUrl()), or null if no
+// base URL is configured. `internalNote`: optional marketing-authored note,
+// also escaped.
 export function buildReviewEmail({ review, internalReferenceUrl, internalNote, replyToEmail }) {
   const {
-    locationName, city, starRating, reviewerName, reviewDate, reviewText, reviewUrl,
+    locationName, city, starRating, reviewerName, reviewDate, reviewText, reviewUrl, hasMedia,
   } = review
 
   const stars = '★'.repeat(Math.max(0, Math.min(5, starRating))) + '☆'.repeat(5 - Math.max(0, Math.min(5, starRating)))
@@ -54,8 +61,10 @@ export function buildReviewEmail({ review, internalReferenceUrl, internalNote, r
     <tr><td style="padding: 4px 0; color: #555;">Date</td><td style="padding: 4px 0;">${escapeHtml(reviewDate || 'Unknown')}</td></tr>
     <tr><td style="padding: 4px 0; color: #555;">Source</td><td style="padding: 4px 0;">Google</td></tr>
     ${reviewUrl ? `<tr><td style="padding: 4px 0; color: #555;">Review link</td><td style="padding: 4px 0;"><a href="${escapeHtml(reviewUrl)}">View on Google</a></td></tr>` : ''}
-    ${internalReferenceUrl ? `<tr><td style="padding: 4px 0; color: #555;">Internal reference</td><td style="padding: 4px 0;"><a href="${escapeHtml(internalReferenceUrl)}">Open in dashboard</a></td></tr>` : ''}
+    ${internalReferenceUrl ? `<tr><td style="padding: 4px 0; color: #555;">Internal reference</td><td style="padding: 4px 0;"><a href="${escapeHtml(internalReferenceUrl)}">View review in PRYOR</a></td></tr>` : ''}
   </table>
+
+  ${hasMedia ? `<p style="margin: 0 0 16px; font-size: 13px; color: #0369a1; font-weight: bold;">&#128247; Includes customer photo/video</p>` : ''}
 
   <div style="background: #f7f7f7; border-left: 4px solid #c62828; padding: 12px 16px; margin-bottom: 20px;">
     <p style="margin: 0; white-space: pre-wrap;">${escapeHtml(reviewText || '(no text provided)')}</p>
@@ -85,7 +94,8 @@ export function buildReviewEmail({ review, internalReferenceUrl, internalNote, r
     `Date: ${reviewDate || 'Unknown'}`,
     'Source: Google',
     reviewUrl ? `Review link: ${reviewUrl}` : null,
-    internalReferenceUrl ? `Internal reference: ${internalReferenceUrl}` : null,
+    internalReferenceUrl ? `View review in PRYOR: ${internalReferenceUrl}` : null,
+    hasMedia ? 'Includes customer photo/video' : null,
     '',
     'Review:',
     reviewText || '(no text provided)',

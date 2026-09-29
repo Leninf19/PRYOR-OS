@@ -1106,6 +1106,11 @@ function SendToRestaurantSection({ r }) {
           locationName: r.location_name, city: r.city ?? null, starRating: r.star_rating,
           reviewerName: r.reviewer_name ?? null, reviewDate: r.review_date ?? null,
           reviewText: r.review_text ?? null, reviewUrl: r.review_url ?? null,
+          // Tenant Alert Recipients & Media Emails revision -- a purely
+          // cosmetic flag for the email's "Includes customer photo/video"
+          // indicator; export_chunks.py's review_to_dict() is what exposes
+          // `media` on `r` in the first place (Review Media Feature).
+          hasMedia: Array.isArray(r.media) && r.media.length > 0,
         },
         subject,
         internalNote: internalNote || undefined,

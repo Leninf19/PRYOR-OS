@@ -17,6 +17,12 @@ that gate for manual/workflow_dispatch runs and testing.
 
 Dedup and "is this meaningful/critical" logic is shared with
 critical_alert_check.py via digest_filters.py, not reimplemented here.
+
+Tenant Alert Recipients revision: the recipient list is now resolved per
+tenant via tenant_config_store.resolve_review_alert_recipients() (the same
+shared resolver notify.py/critical_alert_check.py call) rather than this
+file's former hardcoded TO_ADDR constant -- see that function's own
+docstring for the LTA-only fallback / empty-for-everyone-else rule.
 """
 import argparse
 import html as _html
@@ -30,11 +36,15 @@ from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
 import db
+import tenant_config_store
 import tenant_keys
 import tenant_paths
-from digest_filters import already_notified, is_meaningful_review, is_already_escalated, log_notification
+from digest_filters import (
+    already_notified, is_meaningful_review, is_already_escalated, log_notification,
+    build_review_alert_extras_html,
+)
+from notify import _safe
 
-TO_ADDR = "advertising@l3amigos.com"
 FROM_ADDR = os.environ.get("GMAIL_USER", "")
 APP_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
 
@@ -60,9 +70,9 @@ VALID_HOURS_ET = {20, 21, 22, 23, 0, 1, 2, 3, 4}
 
 # ---- rendering helpers (mirrors notify.py's review-card style; only used
 # here now that the low-star section has moved out of notify.py) ----
-
-def _safe(s):
-    return _html.escape(str(s or ""), quote=False)
+# _safe() is notify.py's own HTML-escape helper, imported above rather than
+# redefined here a second time (Tenant Alert Recipients & Media Emails
+# revision -- this file used to carry its own byte-for-byte duplicate).
 
 
 def _stars_bar(n):
@@ -198,6 +208,8 @@ def _review_card(r, escalated: bool) -> str:
 
     review_body = _nl2p(text) if text else '<span style="color:#94a3b8;font-style:normal">Rating only — no written review.</span>'
 
+    extras_html = build_review_alert_extras_html(r)
+
     escalated_ribbon = (
         '<tr><td style="background:#eff6ff;border-bottom:1px solid #bfdbfe;padding:8px 22px">'
         '<span style="font-size:11px;font-weight:700;color:#1d4ed8">&#128276;&nbsp;PREVIOUSLY ESCALATED — '
@@ -255,6 +267,14 @@ def _review_card(r, escalated: bool) -> str:
         actions_section,
 
         f'<tr><td style="padding:14px 22px">{links}</td></tr>',
+
+        # Tenant Alert Recipients & Media Emails revision -- the SAME
+        # shared "media badge + View review in PRYOR link" fragment
+        # critical_alert_check.py's _build_html() uses, via
+        # digest_filters.build_review_alert_extras_html() (never a second,
+        # independently-drifting copy). Omitted entirely (no empty row)
+        # when the review has neither media nor a resolvable link id.
+        (f'<tr><td style="padding:0 22px 14px">{extras_html}</td></tr>' if extras_html else ''),
 
         '</table>',
     ])
@@ -344,15 +364,18 @@ def build_email(reviews: list, date_label: str) -> str:
     )
 
 
-def send_email(subject, html):
+def send_email(to_addrs: list[str], subject, html):
+    """`to_addrs` is a non-empty list -- run() below never calls this with
+    an empty/unresolved recipient list. Sends ONE message to every address
+    in the list, never just the first."""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = f"LTA Review Dashboard <{FROM_ADDR}>"
-    msg["To"] = TO_ADDR
+    msg["To"] = ", ".join(to_addrs)
     msg.attach(MIMEText(html, "html"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(FROM_ADDR, APP_PASS)
-        smtp.sendmail(FROM_ADDR, TO_ADDR, msg.as_string())
+        smtp.sendmail(FROM_ADDR, to_addrs, msg.as_string())
 
 
 def run(tenant_id: str, force: bool = False) -> dict:
@@ -380,6 +403,23 @@ def run(tenant_id: str, force: bool = False) -> dict:
 
     for r in reviews:
         r["_escalated"] = is_already_escalated(conn, r["id"])
+
+    # Tenant Alert Recipients revision: resolved via the ONE shared
+    # resolver tenant_config_store.resolve_review_alert_recipients() also
+    # calls for notify.py/critical_alert_check.py -- reads this tenant's
+    # own reviewAlertRecipients tenant_config setting, falling back to
+    # LTA's historical address ONLY for Los Tres Amigos. Checked BEFORE the
+    # credentials gate below and, unlike that gate, deliberately never logs
+    # these reviews as notified -- a missing recipient is a business-
+    # configuration gap that may be fixed at any time, and these reviews
+    # must stay eligible to be found and sent once it is, not be silently
+    # lost the way a permanent "no credentials yet" gap already
+    # legitimately is (see that gate's own comment below).
+    recipients = tenant_config_store.resolve_review_alert_recipients(tenant_id)
+    if not recipients:
+        conn.close()
+        print(f"[nightly_digest] stage=recipient_gate result=no_recipient_configured count={len(reviews)}")
+        return {"status": "no_recipient_configured", "count": len(reviews)}
 
     date_label = now_et.strftime("%B %d, %Y")
     html = build_email(reviews, date_label)
@@ -416,12 +456,13 @@ def run(tenant_id: str, force: bool = False) -> dict:
         + (f", {critical_n} critical" if critical_n else "")
         + ")"
     )
-    send_email(subject, html)  # raises on a genuine send failure -- nothing below runs, so these reviews remain eligible for the next run's retry
-    print(f"[nightly_digest] stage=send result=success count={len(reviews)} critical={critical_n}")
+    send_email(recipients, subject, html)  # raises on a genuine send failure -- nothing below runs, so these reviews remain eligible for the next run's retry
+    print(f"[nightly_digest] stage=send result=success count={len(reviews)} critical={critical_n} recipients={len(recipients)}")
 
+    recipient_str = ", ".join(recipients)
     for r in reviews:
         log_notification(conn, NOTIFICATION_TYPE, f"{r['star_rating']}★ at {r['location_name']}",
-                          related_review_id=r["id"])
+                          recipient=recipient_str, related_review_id=r["id"])
     conn.commit()
     conn.close()
     return {"status": "sent", "count": len(reviews), "critical": critical_n}

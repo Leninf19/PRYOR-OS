@@ -154,11 +154,18 @@ function sanitizeErrorMessage(message) {
   return out.slice(0, 300)
 }
 
+// Tenant Alert Recipients & Media Emails revision: targets /reviews
+// directly (the existing route dataUtils.js's reviewId() deep-links
+// select-by-id against -- see Reviews.jsx's own reviewId search-param
+// handling) rather than the old /explorer alias, which still exists only
+// as a redirect-preserving-search-params shim (App.jsx). Same
+// DASHBOARD_BASE_URL/VERCEL_URL fallback convention as
+// billingCustomer.js/billingPortal.js.
 function buildInternalReferenceUrl(reviewId) {
   const base = process.env.DASHBOARD_BASE_URL
     || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null)
   if (!base) return null
-  return `${base.replace(/\/$/, '')}/explorer?reviewId=${encodeURIComponent(reviewId)}`
+  return `${base.replace(/\/$/, '')}/reviews?reviewId=${encodeURIComponent(reviewId)}`
 }
 
 // Validates the client-supplied review-content snapshot used to render the
@@ -168,7 +175,7 @@ function buildInternalReferenceUrl(reviewId) {
 // authorization decision, which is what stays strictly server-resolved.
 function validateReviewSnapshot(review) {
   if (typeof review !== 'object' || review === null) return null
-  const { locationName, city, starRating, reviewerName, reviewDate, reviewText, reviewUrl } = review
+  const { locationName, city, starRating, reviewerName, reviewDate, reviewText, reviewUrl, hasMedia } = review
   if (typeof locationName !== 'string' || !locationName.trim()) return null
   if (!Number.isInteger(starRating) || starRating < 1 || starRating > 5) return null
   for (const [key, val] of Object.entries({ city, reviewerName, reviewDate, reviewText, reviewUrl })) {
@@ -182,6 +189,14 @@ function validateReviewSnapshot(review) {
     reviewDate: reviewDate ?? null,
     reviewText: reviewText ?? null,
     reviewUrl: reviewUrl ?? null,
+    // Tenant Alert Recipients & Media Emails revision: purely a display
+    // flag for buildReviewEmail()'s media indicator -- optional, defaults
+    // to false for any caller that omits it (this pipeline has no
+    // reviews.db access of its own, per this function's own header
+    // comment, so it can never verify this independently; the client is
+    // trusted for this ONE cosmetic boolean exactly like every other field
+    // here, never for a recipient/authorization decision).
+    hasMedia: hasMedia === true,
   }
 }
 

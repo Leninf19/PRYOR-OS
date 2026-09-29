@@ -77,6 +77,8 @@ const TESTS = [
   'test_google_oauth_auto_recovery.js',
   'test_settings_email_status_endpoint.js',
   'test_settings_send_test_email.js',
+  'test_settings_review_contact_endpoint.js',
+  'test_settings_review_alert_recipients_endpoint.js',
   'test_email_system_ui.js',
   'test_audit_log_ui.js',
   'test_google_business_profile_ui.js',

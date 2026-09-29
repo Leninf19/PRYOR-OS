@@ -113,6 +113,41 @@ function testNoInternalNoteOmitsTheSection() {
   assert(!text.includes('Internal note from marketing'))
 }
 
+// --- Tenant Alert Recipients & Media Emails revision -----------------------
+
+const GOOGLE_MEDIA_URL = 'https://lh3.googleusercontent.com/some-private-photo-id=w150-h150'
+
+function testReviewWithMediaShowsIndicatorAndPryorLinkNeverRawGoogleUrl() {
+  const { html, text } = buildReviewEmail({
+    review: { ...BASE_REVIEW, hasMedia: true },
+    internalReferenceUrl: 'https://dashboard.example.com/reviews?reviewId=abc',
+    internalNote: null, replyToEmail: null,
+  })
+  assert(html.includes('Includes customer photo/video'), 'a review with media must show the media indicator in HTML')
+  assert(text.includes('Includes customer photo/video'), 'a review with media must show the media indicator in plain text')
+  assert(html.includes('View review in PRYOR'), 'the PRYOR link anchor text must be present')
+  assert(html.includes('https://dashboard.example.com/reviews?reviewId=abc'), 'the PRYOR link URL must be present')
+  assert(!html.includes(GOOGLE_MEDIA_URL) && !text.includes(GOOGLE_MEDIA_URL), 'a raw Google media URL must never appear (none was ever passed in, but assert the email never fabricates one)')
+  assert(!html.includes('<img'), 'the email must never embed an actual photo/video')
+  assert(!html.includes('googleusercontent.com') && !text.includes('googleusercontent.com'), 'no Google media host must ever be printed')
+}
+
+function testReviewWithoutMediaOmitsIndicatorButKeepsLink() {
+  const { html, text } = buildReviewEmail({
+    review: { ...BASE_REVIEW, hasMedia: false },
+    internalReferenceUrl: 'https://dashboard.example.com/reviews?reviewId=abc',
+    internalNote: null, replyToEmail: null,
+  })
+  assert(!html.includes('Includes customer photo/video'), 'a review without media must not show the media indicator')
+  assert(!text.includes('Includes customer photo/video'))
+  assert(html.includes('View review in PRYOR'), 'the PRYOR link must still be present regardless of media')
+}
+
+function testHasMediaOmittedDefaultsToNoIndicator() {
+  const { html } = buildReviewEmail({ review: BASE_REVIEW, internalReferenceUrl: null, internalNote: null, replyToEmail: null })
+  assert(!html.includes('Includes customer photo/video'), 'omitting hasMedia entirely must never show the indicator')
+}
+
 const tests = [
   ['default subject format matches "Response Requested — [Location] — [Rating]-Star Customer Review"', testDefaultSubjectFormat],
   ['HTML contains every required field', testHtmlContainsAllRequiredFields],
@@ -122,6 +157,9 @@ const tests = [
   ['missing optional fields do not crash and never leak undefined/null', testMissingOptionalFieldsDoNotCrash],
   ['star rating renders the correct filled/empty star count', testStarRatingRendersCorrectFilledCount],
   ['no internal note omits that section entirely', testNoInternalNoteOmitsTheSection],
+  ['a review with media shows the indicator and the PRYOR link, never a raw Google media URL', testReviewWithMediaShowsIndicatorAndPryorLinkNeverRawGoogleUrl],
+  ['a review without media omits the indicator but keeps the PRYOR link', testReviewWithoutMediaOmitsIndicatorButKeepsLink],
+  ['omitting hasMedia entirely defaults to no indicator', testHasMediaOmittedDefaultsToNoIndicator],
 ]
 
 for (const [name, fn] of tests) run(name, fn)

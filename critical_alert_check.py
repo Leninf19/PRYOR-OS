@@ -24,10 +24,11 @@ import ai_engine
 import db
 import digest_filters
 import gbp_sync
+import tenant_config_store
 import tenant_keys
 import tenant_paths
+from notify import _safe
 
-TO_ADDR = "advertising@l3amigos.com"
 FROM_ADDR = os.environ.get("GMAIL_USER", "")
 APP_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
 
@@ -76,33 +77,38 @@ def _describe_sync_failure(sync_result: dict) -> str:
     return message
 
 
-def _send_email(subject: str, html: str) -> None:
+def _send_email(to_addrs: list[str], subject: str, html: str) -> None:
+    """`to_addrs` is a non-empty list -- run() below never calls this with
+    an empty/unresolved recipient list (see the recipient gate there).
+    Sends ONE message to every address in the list, never just the first."""
     if not FROM_ADDR or not APP_PASS:
         print("critical_alert_check.py: GMAIL_USER/GMAIL_APP_PASSWORD not set -- skipping send")
         return
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = f"LTA Review Dashboard <{FROM_ADDR}>"
-    msg["To"] = TO_ADDR
+    msg["To"] = ", ".join(to_addrs)
     msg.attach(MIMEText(html, "html"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(FROM_ADDR, APP_PASS)
-        smtp.sendmail(FROM_ADDR, TO_ADDR, msg.as_string())
+        smtp.sendmail(FROM_ADDR, to_addrs, msg.as_string())
 
 
 def _build_html(reviews: list) -> str:
     cards = ""
     for r in reviews:
         reason_html = (
-            f'<p style="margin:0;color:#991b1b"><strong>Why flagged:</strong> {r["ai_sentiment_reason"]}</p>'
+            f'<p style="margin:0;color:#991b1b"><strong>Why flagged:</strong> {_safe(r["ai_sentiment_reason"])}</p>'
             if r.get("ai_sentiment_reason") else ""
         )
+        extras_html = digest_filters.build_review_alert_extras_html(r)
         cards += f"""
         <div style="border:1px solid #f87171;border-radius:8px;padding:16px;margin-bottom:12px;background:#fef2f2">
-          <p style="margin:0 0 4px;font-weight:600">{r['location_name']} — {r['star_rating'] or '?'}★ from {r['reviewer_name'] or 'Anonymous'}</p>
-          <p style="margin:0 0 8px;color:#555">{r['review_date']}</p>
-          <p style="margin:0 0 8px">{r['review_text'] or ''}</p>
+          <p style="margin:0 0 4px;font-weight:600">{_safe(r['location_name'])} — {_safe(r['star_rating'] or '?')}★ from {_safe(r['reviewer_name'] or 'Anonymous')}</p>
+          <p style="margin:0 0 8px;color:#555">{_safe(r['review_date'])}</p>
+          <p style="margin:0 0 8px">{_safe(r['review_text'] or '')}</p>
           {reason_html}
+          {extras_html}
         </div>"""
     return f"""<html><body style="font-family:system-ui,sans-serif;max-width:640px;margin:0 auto">
       <div style="background:#991b1b;color:white;padding:20px">
@@ -172,6 +178,21 @@ def run(tenant_id: str) -> dict:
         print("critical_alert_check.py: no new critical reviews. Nothing to send.")
         return {"status": "ok", "sent": 0}
 
+    # Tenant Alert Recipients revision: resolved via the ONE shared resolver
+    # tenant_config_store.resolve_review_alert_recipients() also calls for
+    # notify.py/nightly_digest.py -- reads this tenant's own
+    # reviewAlertRecipients tenant_config setting, falling back to LTA's
+    # historical address ONLY for Los Tres Amigos. Checked BEFORE the
+    # credentials gate below (a business-configuration gap is a different,
+    # earlier failure than a missing SMTP credential) and, like
+    # notify.py's own "no recipient" path, deliberately never logs these
+    # reviews as notified -- they must stay eligible to be found and sent
+    # once a recipient is configured, not be silently lost.
+    recipients = tenant_config_store.resolve_review_alert_recipients(tenant_id)
+    if not recipients:
+        print(f"[critical_alert_check] stage=recipient_gate result=no_recipient_configured pending={len(critical)}")
+        return {"status": "no_recipient_configured", "sent": 0, "pending": len(critical)}
+
     subject = f"Critical Review Alert — {len(critical)} review(s) need immediate attention"
 
     # Root-cause fix (production audit): logging used to happen unconditionally
@@ -186,16 +207,17 @@ def run(tenant_id: str) -> dict:
         print(f"[critical_alert_check] stage=send result=no_credentials pending={len(critical)}")
         return {"status": "ready_no_credentials", "sent": 0, "pending": len(critical)}
 
-    _send_email(subject, _build_html(critical))
-    print(f"[critical_alert_check] stage=send result=success count={len(critical)}")
+    _send_email(recipients, subject, _build_html(critical))
+    print(f"[critical_alert_check] stage=send result=success count={len(critical)} recipients={len(recipients)}")
 
+    recipient_str = ", ".join(recipients)
     for r in critical:
         digest_filters.log_notification(
-            conn, "critical_review_immediate", subject,
+            conn, "critical_review_immediate", subject, recipient=recipient_str,
             related_review_id=r["id"], related_location_id=r["location_id"],
         )
     conn.commit()
-    print(f"critical_alert_check.py: sent immediate alert for {len(critical)} critical review(s).")
+    print(f"critical_alert_check.py: sent immediate alert for {len(critical)} critical review(s) to {recipient_str}.")
     return {"status": "ok", "sent": len(critical)}
 
 

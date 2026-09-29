@@ -31,6 +31,10 @@
 // POST /api/settings/update-user-role-locations -- change role/locationIds, bumps sessionVersion
 // POST /api/settings/disable-user           -- immediate; blocked for the last active Owner
 // POST /api/settings/enable-user            -- re-enable a disabled account
+// GET  /api/settings/review-contact                 -- public, customer-facing contact (owner/admin)
+// POST /api/settings/review-contact-upsert          -- upsert the public contact
+// GET  /api/settings/review-alert-recipients        -- internal team notification list (owner/admin)
+// POST /api/settings/review-alert-recipients-upsert -- upsert the internal notification list
 
 import { requireAuth, requireScopedAuth } from '../_lib/auth.js'
 import { roleHasPermission, Permission } from '../_lib/permissions.js'
@@ -530,6 +534,124 @@ async function reviewContactUpsertAction(req, res) {
     }
     if (err instanceof TenantConfigStoreUnavailableError) {
       console.error(`[settings/review-contact-upsert] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// Tenant Alert Recipients (Part B of the tenant-alert-recipients-and-
+// media-emails revision): the INTERNAL team notification list -- who on
+// the business's OWN team gets emailed about new/critical reviews
+// (notify.py's rating-drop alert, critical_alert_check.py's immediate
+// critical alert, nightly_digest.py's nightly digest -- all three now
+// resolve this via tenant_config_store.resolve_review_alert_recipients(),
+// see that function's own docstring for the LTA-only fallback rule). A
+// DIFFERENT, deliberately separate setting from reviewContact above (the
+// PUBLIC, customer-facing "how do I reach the business" address) -- never
+// reused, never merged, never read together. Modeled exactly on
+// reviewContactAction/reviewContactUpsertAction above: GET the raw
+// configured value, POST to upsert, owner/admin only, rate-limited,
+// audit-logged.
+//
+// A small restaurant-group ops team is realistically a handful of people
+// -- 10 is generous headroom while still catching an obvious mistake
+// (e.g. pasting an entire external mailing list) here rather than
+// silently emailing dozens of unintended addresses on every review.
+const REVIEW_ALERT_RECIPIENTS_MAX = 10
+
+// GET /api/settings/review-alert-recipients -- the raw configured array
+// (may be empty). Deliberately never surfaces LTA's read-time fallback
+// address here -- that is resolved server-side, tenant-by-tenant, only by
+// the Python alert scripts (tenant_config_store.py), never presented as if
+// it were this (or any) tenant's own configured setting.
+async function reviewAlertRecipientsAction(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, ['owner', 'admin'])
+  if (!account) return
+
+  const tenantId = resolveTenantId(account)
+  try {
+    const config = await getTenantConfig(tenantId)
+    const recipients = Array.isArray(config?.reviewAlertRecipients) ? config.reviewAlertRecipients : []
+    return res.status(200).json({ recipients })
+  } catch (err) {
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[settings/review-alert-recipients] ${err.message}`)
+      return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
+    }
+    throw err
+  }
+}
+
+// POST /api/settings/review-alert-recipients-upsert { recipients: string[] }
+// `recipients` REPLACES the tenant's whole list (never merges) -- an empty
+// array clears it back to "nothing configured" (LTA then falls back to its
+// historical address at read time; every other tenant simply stops
+// sending). Every entry is trimmed and validated against EMAIL_PATTERN
+// (the same check reviewContactUpsertAction above uses); the WHOLE request
+// is rejected with 400 if any entry doesn't look like a valid email --
+// this is a form a person is filling out, so clear feedback beats silently
+// dropping an address they thought they'd added. Duplicates (case-
+// insensitive) are removed, keeping the first-seen casing; the resulting
+// list is capped at REVIEW_ALERT_RECIPIENTS_MAX.
+async function reviewAlertRecipientsUpsertAction(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' })
+
+  const account = await requireAuth(req, res, ['owner', 'admin'])
+  if (!account) return
+
+  const allowed = await enforceRateLimit(req, res, `settings:review-alert-recipients-upsert:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
+
+  const rawList = req.body?.recipients
+  if (!Array.isArray(rawList)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'recipients must be an array of email addresses.' })
+  }
+  // Blank/whitespace-only entries (e.g. a trailing comma from a
+  // comma-separated input) are formatting artifacts, not content a person
+  // typed -- dropped silently before validation, never treated as an
+  // "invalid email" that would block the whole save. Anything that
+  // survives this trim-and-drop step is a real, non-blank entry the
+  // person entered, and is validated below.
+  const trimmed = rawList.map(e => (typeof e === 'string' ? e.trim() : '')).filter(Boolean)
+  for (const email of trimmed) {
+    if (!EMAIL_PATTERN.test(email)) {
+      return res.status(400).json({ error: 'invalid_request', message: `"${email}" does not look like a valid email address.` })
+    }
+  }
+  const seen = new Set()
+  const deduped = []
+  for (const email of trimmed) {
+    const key = email.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    deduped.push(email)
+  }
+  if (deduped.length > REVIEW_ALERT_RECIPIENTS_MAX) {
+    return res.status(400).json({ error: 'invalid_request', message: `No more than ${REVIEW_ALERT_RECIPIENTS_MAX} recipients are allowed.` })
+  }
+
+  const tenantId = resolveTenantId(account)
+  try {
+    const config = await getTenantConfig(tenantId)
+    if (!config) return res.status(404).json({ error: 'not_found' })
+    const updated = await upsertTenantConfig(tenantId, { reviewAlertRecipients: deduped }, { expectedVersion: config.configVersion })
+    await appendAuditEntry(tenantId, {
+      actorId: account.userId, actorName: account.displayName ?? account.email, actorEmail: account.email, ip: clientIp(req),
+      entity: 'tenant_review_alert_recipients', entityId: tenantId, action: 'review_alert_recipients.updated', changes: null, result: 'success',
+      message: deduped.length
+        ? `Updated the internal review-alert recipient list (${deduped.length} address${deduped.length === 1 ? '' : 'es'}).`
+        : 'Cleared the internal review-alert recipient list.',
+    })
+    return res.status(200).json({ recipients: updated.reviewAlertRecipients ?? [] })
+  } catch (err) {
+    if (err instanceof ConfigVersionConflictError) {
+      return res.status(409).json({ error: 'concurrent_update', message: 'Your changes could not be saved because this tenant\'s configuration changed at the same time. Please refresh and try again.' })
+    }
+    if (err instanceof TenantConfigStoreUnavailableError) {
+      console.error(`[settings/review-alert-recipients-upsert] ${err.message}`)
       return res.status(503).json({ error: 'service_unavailable', message: 'This is temporarily unavailable. Please try again shortly.' })
     }
     throw err
@@ -1510,6 +1632,8 @@ export default async function handler(req, res) {
     case 'contacts-send-test-email':        return sendTestEmailAction(req, res)
     case 'review-contact':                   return reviewContactAction(req, res)
     case 'review-contact-upsert':            return reviewContactUpsertAction(req, res)
+    case 'review-alert-recipients':          return reviewAlertRecipientsAction(req, res)
+    case 'review-alert-recipients-upsert':   return reviewAlertRecipientsUpsertAction(req, res)
     case 'audit-log':                       return auditLogAction(req, res)
     case 'email-status':                    return emailStatusAction(req, res)
     case 'invite-user':                     return inviteUserAction(req, res)

@@ -7,16 +7,20 @@ TWO independent digest emails, split by audience:
 - Platform-operational (scraper failures, structural/data-integrity bugs):
   always PLATFORM_TO_ADDR, regardless of which tenant this script runs
   for -- this is infrastructure/pipeline health, never tenant content.
-- Tenant-business (per-location rating shifts): recipient resolved per
-  tenant via resolve_business_recipient() -- Los Tres Amigos retains its
-  historical advertising@l3amigos.com; every other tenant has no
-  configured notification recipient yet (a full per-tenant notification-
-  settings feature is separate, future work) and is skipped with a logged
-  warning, NEVER defaulted to LTA's address. This is a different setting
-  from the public review-response contact (reviewContactService.js /
-  resolve_review_response_contact() in ai_engine.py) -- that is a
-  customer-facing "how do I reach the business" address; this is an
-  internal ops-alert recipient, and this file never reads or reuses it.
+- Tenant-business (per-location rating shifts): recipient LIST resolved per
+  tenant via resolve_business_recipient(), a thin wrapper around
+  tenant_config_store.resolve_review_alert_recipients() -- the ONE shared
+  resolver critical_alert_check.py and nightly_digest.py also call, reading
+  the tenant's own reviewAlertRecipients tenant_config setting (Tenant
+  Alert Recipients revision). Los Tres Amigos retains its historical
+  advertising@l3amigos.com as an explicit, LTA-only fallback when nothing
+  is configured; every other tenant with nothing configured is skipped
+  with a logged warning, NEVER defaulted to LTA's address. This is a
+  different setting from the public review-response contact
+  (reviewContactService.js / resolve_review_response_contact() in
+  ai_engine.py) -- that is a customer-facing "how do I reach the business"
+  address; this is an internal ops-alert recipient list, and this file
+  never reads or reuses it.
 
 Each category is dispatched independently via _dispatch_category(): its
 notifications_log rows are written ONLY after its own email send succeeds
@@ -52,6 +56,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import db
+import tenant_config_store
 import tenant_keys
 import tenant_paths
 
@@ -61,8 +66,13 @@ PLATFORM_TO_ADDR = "lenin@futuremark.studio"
 
 # Tenant-business alerts (rating shifts) -- LTA's own historical recipient.
 # Never used as a fallback for any other tenant -- see
-# resolve_business_recipient() below.
-LTA_BUSINESS_TO_ADDR = "advertising@l3amigos.com"
+# resolve_business_recipient() below. Defined FROM
+# tenant_config_store.LTA_FALLBACK_REVIEW_ALERT_RECIPIENT (not the reverse)
+# so there is exactly one literal shared by all three alert scripts, never
+# three that could silently drift; kept as a module-level name here too
+# since it is still used as log_notification()'s own default parameter
+# below and is a pre-existing public name of this module.
+LTA_BUSINESS_TO_ADDR = tenant_config_store.LTA_FALLBACK_REVIEW_ALERT_RECIPIENT
 
 FROM_ADDR = os.environ.get("GMAIL_USER", "")
 APP_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
@@ -73,18 +83,21 @@ RATING_DROP_RESEND_DAYS = 7
 STRUCTURAL_RESEND_HOURS = 24
 
 
-def resolve_business_recipient(tenant_id: str):
-    """Tenant-business (rating-drop) notification recipient. Los Tres
-    Amigos is the only tenant with a reviewed recipient today; every other
-    tenant has no configured notification-recipient setting yet (a full
-    per-tenant notification-settings feature is separate, future work), so
-    this returns None rather than ever defaulting to LTA's address.
-    Deliberately independent of resolve_review_response_contact() in
-    ai_engine.py -- that resolves the PUBLIC, customer-facing
-    review-response contact, an unrelated setting this never reads."""
-    if tenant_id == tenant_keys.DEFAULT_TENANT_ID:
-        return LTA_BUSINESS_TO_ADDR
-    return None
+def resolve_business_recipient(tenant_id: str) -> list[str]:
+    """Tenant-business (rating-drop) notification recipient LIST -- a thin
+    wrapper around tenant_config_store.resolve_review_alert_recipients(),
+    the ONE shared resolver critical_alert_check.py and nightly_digest.py
+    also call, so all three scripts' recipient logic can never
+    independently drift (Tenant Alert Recipients revision -- this used to
+    be a hardcoded, LTA-only constant; it now reads each tenant's own
+    reviewAlertRecipients tenant_config setting first). Los Tres Amigos
+    falls back to its historical advertising@l3amigos.com ONLY when it has
+    nothing configured; every other tenant with nothing configured gets
+    [], never a fallback to LTA's address. Deliberately independent of
+    resolve_review_response_contact() in ai_engine.py -- that resolves the
+    PUBLIC, customer-facing review-response contact, an unrelated setting
+    this never reads."""
+    return tenant_config_store.resolve_review_alert_recipients(tenant_id)
 
 
 def already_notified(conn, notification_type, *, related_review_id=None, related_location_id=None, since=None) -> bool:
@@ -104,14 +117,15 @@ def already_notified(conn, notification_type, *, related_review_id=None, related
 
 def log_notification(conn, notification_type, subject, recipient=LTA_BUSINESS_TO_ADDR, *,
                       related_review_id=None, related_location_id=None):
-    """recipient defaults to LTA_BUSINESS_TO_ADDR ONLY to preserve this
-    function's exact prior behavior for digest_filters.py's re-export
-    (`from notify import already_notified, log_notification`), which
-    critical_alert_check.py/nightly_digest.py call without ever passing a
-    recipient -- both are unchanged by this revision and previously relied
-    on this function's old hardcoded module-level TO_ADDR, which held this
-    same literal value. _dispatch_category below always passes an explicit
-    recipient for notify.py's own two categories."""
+    """recipient defaults to LTA_BUSINESS_TO_ADDR only as a safety net for
+    any caller that omits it -- every real caller in this codebase always
+    passes an explicit recipient string now: _dispatch_category below (for
+    notify.py's own two categories, joining the resolved recipient list
+    with ", "), and critical_alert_check.py/nightly_digest.py (via
+    digest_filters.py's re-export of this function -- Tenant Alert
+    Recipients revision: both now resolve and pass their own tenant's
+    recipient list explicitly, rather than relying on this default the way
+    they once did when this module had a single hardcoded TO_ADDR)."""
     conn.execute(
         """INSERT INTO notifications_log
            (sent_at, notification_type, recipient, subject, related_review_id, related_location_id)
@@ -368,15 +382,19 @@ def check_structural_issues(conn) -> tuple[str, list[dict]]:
     return html, log_calls
 
 
-def send_email(to_addr, subject, html):
+def send_email(to_addrs: list[str], subject, html):
+    """`to_addrs` is a non-empty list -- callers (_dispatch_category below)
+    never call this with an empty/None recipient list. Sends ONE message to
+    every address in the list (never just the first), matching
+    smtplib.sendmail()'s own native support for multiple recipients."""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = f"LTA Review Dashboard <{FROM_ADDR}>"
-    msg["To"] = to_addr
+    msg["To"] = ", ".join(to_addrs)
     msg.attach(MIMEText(html, "html"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(FROM_ADDR, APP_PASS)
-        smtp.sendmail(FROM_ADDR, to_addr, msg.as_string())
+        smtp.sendmail(FROM_ADDR, to_addrs, msg.as_string())
 
 
 def _build_digest_html(sections, *, brand_label, header_title, date_label, year_now):
@@ -413,22 +431,25 @@ def _build_digest_html(sections, *, brand_label, header_title, date_label, year_
     )
 
 
-def _dispatch_category(conn, *, category, to_addr, sections, log_calls, brand_label, header_title, date_label, year_now):
+def _dispatch_category(conn, *, category, to_addrs, sections, log_calls, brand_label, header_title, date_label, year_now):
     """Builds and sends one category's digest, only when it has reportable
-    content and a resolved recipient, and writes its notifications_log rows
-    ONLY after the send succeeds. Never raises -- a send failure is caught,
-    reported, and returned as "failed" so the OTHER category (a different
-    destination entirely) still gets its own independent attempt in the
-    same run; main()/run() exits non-zero afterward if either failed, so
-    the failure is still visible to CI.
+    content and a resolved recipient list, and writes its notifications_log
+    rows ONLY after the send succeeds. Never raises -- a send failure is
+    caught, reported, and returned as "failed" so the OTHER category (a
+    different destination entirely) still gets its own independent attempt
+    in the same run; main()/run() exits non-zero afterward if either
+    failed, so the failure is still visible to CI.
+
+    `to_addrs` is always a list (possibly empty -- resolve_business_recipient()
+    returns [] rather than None for "nothing configured").
 
     Returns one of: "sent" / "skipped_empty" / "skipped_no_credentials" /
     "skipped_no_recipient" / "failed"."""
     if not sections:
         return "skipped_empty"
-    if to_addr is None:
+    if not to_addrs:
         print(f"::warning::notify.py: {category} has {len(sections)} section(s) ready but no "
-              f"configured recipient for this tenant -- skipping (never falling back to another "
+              f"recipient configured for this tenant -- skipping (never falling back to another "
               f"tenant's address)")
         return "skipped_no_recipient"
     if not FROM_ADDR or not APP_PASS:
@@ -440,16 +461,17 @@ def _dispatch_category(conn, *, category, to_addr, sections, log_calls, brand_la
                                date_label=date_label, year_now=year_now)
     subject = f"{header_title} — {date_label}"
     try:
-        send_email(to_addr, subject, html)
+        send_email(to_addrs, subject, html)
     except Exception as e:
-        print(f"::error::notify.py: {category} email to {to_addr} failed to send -- "
+        print(f"::error::notify.py: {category} email to {', '.join(to_addrs)} failed to send -- "
               f"{len(log_calls)} pending notification(s) will retry next run: {e}")
         return "failed"
 
+    recipient_str = ", ".join(to_addrs)
     for call in log_calls:
-        log_notification(conn, recipient=to_addr, **call)
+        log_notification(conn, recipient=recipient_str, **call)
     conn.commit()
-    print(f"notify.py: {category}: sent to {to_addr} with {len(sections)} section(s)")
+    print(f"notify.py: {category}: sent to {recipient_str} with {len(sections)} section(s)")
     return "sent"
 
 
@@ -471,7 +493,7 @@ def run(tenant_id: str) -> dict:
 
     platform_sections = [s for s in (scraper_html, structural_html) if s]
     platform_outcome = _dispatch_category(
-        conn, category="platform-operational", to_addr=PLATFORM_TO_ADDR,
+        conn, category="platform-operational", to_addrs=[PLATFORM_TO_ADDR],
         sections=platform_sections, log_calls=scraper_log_calls + structural_log_calls,
         brand_label="PRYOR Platform Ops", header_title="Platform Health Alert",
         date_label=date_label, year_now=year_now,
@@ -479,7 +501,7 @@ def run(tenant_id: str) -> dict:
 
     business_sections = [s for s in (rating_html,) if s]
     business_outcome = _dispatch_category(
-        conn, category="business", to_addr=resolve_business_recipient(tenant_id),
+        conn, category="business", to_addrs=resolve_business_recipient(tenant_id),
         sections=business_sections, log_calls=rating_log_calls,
         brand_label="LTA Review Dashboard", header_title="Dashboard Alert",
         date_label=date_label, year_now=year_now,
