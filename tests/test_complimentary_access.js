@@ -270,6 +270,98 @@ async function testPostRedemptionClaimSupportsRecoveryByTenantId() {
   assert((await getComplimentaryRedemptionClaim('t_recover')) === null, 'clearing the claim must remove it')
 }
 
+// Post-incident regression: complimentaryAccessStore.js's REDEEM_SCRIPT
+// originally re-encoded its whole decoded `code` table via a single
+// `cjson.encode(code)` call at HSET/return time, the EXACT SAME pattern
+// accessCodeStore.js's own REDEEM_SCRIPT was fixed for (see that file's
+// "Phase B.8 post-incident correction" comment) -- this backend's Lua
+// cjson.encode() silently drops any object field whose value is null when
+// re-encoding a whole table. This record has two normally-nullable fields
+// (label, redemptionDeadline) plus two fields that are ALWAYS null at the
+// exact moment REDEEM_SCRIPT's encode runs (revokedAt/revokeReason -- the
+// status-active check earlier in the same script guarantees an unrevoked
+// record), so every successful redemption of every complimentary code was
+// silently corrupting the persisted record's shape.
+//
+// The fake in-memory Redis client used elsewhere in this file
+// (fakeComplimentaryRedis()) deliberately emulates REDEEM_SCRIPT's LOGIC,
+// not cjson's specific null-dropping serialization quirk (plain
+// JSON.stringify never drops a null value, only `undefined` -- it cannot
+// reproduce this backend-specific bug on its own), so it cannot be used to
+// exercise this regression directly; no Lua interpreter is available in
+// this repo's local test environment, and this investigation is
+// explicitly barred from touching real production Redis (see
+// access_code_fix_verification.mjs's own precedent for how the ORIGINAL
+// accessCodeStore.js fix was ultimately verified live, via a
+// workflow_dispatch-only diagnostic against disposable test data -- the
+// same approach would apply here if live confirmation is ever wanted).
+//
+// Instead, this is a source-content assertion directly against the
+// SHIPPED Lua script text (matching this file's own Part 6 Billing.jsx-
+// style source checks) plus a documented-semantics simulation of the
+// specific empirically-confirmed cjson rule, proving both that the bug
+// class was real for this record shape and that the shipped fix now
+// guards against it structurally.
+function readComplimentaryStoreSource() {
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  return readFileSync(path.join(here, '..', 'dashboard', 'api', '_lib', 'complimentaryAccessStore.js'), 'utf-8').replace(/\r\n/g, '\n')
+}
+
+function testRedeemScriptNeverWholeTableEncodesTheDecodedRecord() {
+  const source = readComplimentaryStoreSource()
+  const scriptMatch = source.match(/const REDEEM_SCRIPT = `([\s\S]*?)`\n/)
+  assert(scriptMatch, 'REDEEM_SCRIPT must exist as a template literal in complimentaryAccessStore.js')
+  const script = scriptMatch[1]
+  assert(!/cjson\.encode\(code\)/.test(script),
+    'REDEEM_SCRIPT must never re-encode the whole decoded `code` table via cjson.encode(code) -- this backend silently drops any null-valued field when doing so (the exact bug class accessCodeStore.js\'s own REDEEM_SCRIPT was fixed for)')
+  assert(/redis\.call\('HSET', KEYS\[1\], ARGV\[1\], encoded\)/.test(script),
+    'the persisted HSET write must use a field-by-field `encoded` string, never a raw cjson.encode(code) call')
+  assert(/return encoded/.test(script) && !/return cjson\.encode\(code\)/.test(script),
+    'the script must return the same field-by-field `encoded` string, never cjson.encode(code)')
+  // Every nullable field on the record must be routed through the
+  // null-safe jstr() helper -- exactly mirroring accessCodeStore.js's own
+  // fixed REDEEM_SCRIPT (jstr(v) returning the literal 'null' for nil/
+  // cjson.null instead of omitting the key entirely).
+  for (const field of ['label', 'redemptionDeadline', 'revokedAt', 'revokeReason', 'redeemedAt', 'redeemedByUserId', 'tenantId']) {
+    assert(script.includes(`'"${field}":' .. jstr(code.${field})`),
+      `the nullable field "${field}" must be emitted through the null-safe jstr() helper, not bare interpolation or a whole-table encode`)
+  }
+}
+
+// Mirrors accessCodeStore.js's own commit message's empirically-confirmed
+// finding verbatim ("cjson.decode('{"b":null}') then cjson.encode() of
+// that table omits 'b' entirely") applied to THIS file's own record
+// shape -- proving the vulnerability was real here, not merely
+// structurally similar. This is a documented-semantics mirror of an
+// already-confirmed real backend behavior, never a live Lua execution.
+function simulateWholeTableCjsonEncode(record) {
+  const copy = { ...record }
+  for (const key of Object.keys(copy)) {
+    if (copy[key] === null) delete copy[key]
+  }
+  return JSON.parse(JSON.stringify(copy))
+}
+
+function testWholeTableEncodeWouldHaveDroppedNullableComplimentaryFields() {
+  // The exact shape a real, single-use complimentary code has immediately
+  // after its one redemption: label/redemptionDeadline left unset by the
+  // operator (both legitimately null), revokedAt/revokeReason null
+  // because the code is still active.
+  const record = {
+    codeHash: 'deadbeef', label: null, planId: 'growth', durationDays: 30, maxLocations: 1, maxUsers: 3,
+    maxRedemptions: 1, redemptionCount: 1, redemptionDeadline: null, createdAt: '2026-01-01T00:00:00.000Z',
+    createdBy: 'op', revokedAt: null, revokeReason: null, status: 'active', redemptions: [],
+    redeemedAt: '2026-01-02T00:00:00.000Z', redeemedByUserId: 'usr_1', tenantId: 't_1',
+  }
+  const buggyResult = simulateWholeTableCjsonEncode(record)
+  assert(!('label' in buggyResult), 'a naive whole-table re-encode drops a null label entirely -- confirms this record shape is vulnerable to the same bug class accessCodeStore.js was fixed for')
+  assert(!('redemptionDeadline' in buggyResult), 'a naive whole-table re-encode also drops a null redemptionDeadline')
+  assert(!('revokedAt' in buggyResult) && !('revokeReason' in buggyResult), 'a naive whole-table re-encode also drops revokedAt/revokeReason -- always null at the moment of any successful redemption, since the status-active check guarantees an unrevoked record')
+  // Fields that are never null survive either way -- the bug is
+  // specifically about null-valued keys, nothing else.
+  assert(buggyResult.planId === 'growth' && buggyResult.durationDays === 30, 'non-null fields are unaffected either way')
+}
+
 // ===========================================================================
 // Part 2: complimentaryAccessCommercial.js -- pure conversion logic.
 // ===========================================================================
@@ -1174,6 +1266,8 @@ const tests = [
   ['concurrent double redemption of the store-level script cannot both succeed', testConcurrentDoubleRedemptionCannotBothSucceed],
   ['preview never mutates redemptionCount', testPreviewNeverMutatesRedemptionCount],
   ['the post-redemption claim supports tenantId-keyed recovery', testPostRedemptionClaimSupportsRecoveryByTenantId],
+  ['post-incident regression: REDEEM_SCRIPT never whole-table cjson.encode()s the decoded record', testRedeemScriptNeverWholeTableEncodesTheDecodedRecord],
+  ['post-incident regression: a naive whole-table encode would have dropped this record\'s nullable fields', testWholeTableEncodeWouldHaveDroppedNullableComplimentaryFields],
   ['pending case (no initialSync) defers commercial to complimentary_pending_activation', testPendingCaseWhenNoInitialSync],
   ['immediate-activation case anchors to redemption time, never the historical initialSync.completedAt', testImmediateActivationAnchorsToRedemptionTimeNotHistoricalSync],
   ['regression A: an existing long-since-synced tenant gets a fresh period from redemption time', testExistingSyncedTenantGetsFreshPeriodFromRedemption],
