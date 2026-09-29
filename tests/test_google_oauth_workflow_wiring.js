@@ -54,7 +54,6 @@ const WORKFLOWS_WITH_BARE_TRIPLE = [
   'update-reviews.yml',
   'critical-alert-check.yml',
   'historical-import.yml',
-  'diagnostic-gbp-locations.yml',
   'diagnostic-gbp-review-media.yml',
   'diagnostic-gbp-reply-reconciliation.yml',
 ]
