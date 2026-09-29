@@ -62,10 +62,6 @@ def top_complaint_words(reviews, n=8):
     return words.most_common(n)
 
 
-def stars_html(n):
-    return "&#9733;" * n + "&#9734;" * (5 - n)
-
-
 def build_html(data):  # noqa: C901
     week_str   = data["week_str"]
     total      = data["total_new"]

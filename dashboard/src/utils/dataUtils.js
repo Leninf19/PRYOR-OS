@@ -13,7 +13,6 @@ export function getBrand(name) {
   for (const b of BRANDS) if (name.startsWith(b)) return b
   return 'Other'
 }
-export function getBrandColor(brand) { return BRAND_COLORS[brand] || BRAND_COLORS.Other }
 
 export function isUnverified(locationName, city) {
   const knownBrand = BRANDS.some(b => locationName.startsWith(b))
@@ -73,10 +72,6 @@ export function getSentiment(reviews) {
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
-export function fmtPct(v) {
-  if (v == null || isNaN(v)) return '—'
-  return v.toFixed(1) + '%'
-}
 export function fmtRating(v) {
   if (v == null || isNaN(v)) return '—'
   return v.toFixed(2)

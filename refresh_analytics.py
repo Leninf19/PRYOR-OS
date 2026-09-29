@@ -1327,18 +1327,6 @@ NAME_DENYLIST = {
 _WORD_RE = re.compile(r"[^a-z0-9\s']")
 
 
-def tokenize(text: str) -> list:
-    text = _WORD_RE.sub(" ", text.lower())
-    return [w for w in text.split() if len(w) > 2 and w not in STOP_WORDS]
-
-
-def word_freq(texts: list, limit: int = 20) -> list:
-    freq = Counter()
-    for t in texts:
-        freq.update(tokenize(t))
-    return [{"word": w, "count": c} for w, c in freq.most_common(limit)]
-
-
 def find_menu_items(reviews: list, top_n: int = 8) -> list:
     found = {}
     for r in reviews:
