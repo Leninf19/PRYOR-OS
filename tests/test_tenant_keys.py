@@ -224,7 +224,6 @@ TENANT_AWARE_PYTHON_FILES = (
     "reconcile_gbp_replies.py",
     "gbp_reply_reconciliation_diagnostic.py",
     "gbp_reply_bridge_reconcile.py",
-    "gbp_location_diagnostic.py",
     "export_chunks.py",
     "critical_alert_check.py",
     "check_db_integrity.py",

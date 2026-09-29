@@ -32,7 +32,6 @@ TENANT_AWARE_SCRIPTS = (
     "critical_alert_check.py",
     "gbp_reply_bridge_reconcile.py",
     "gbp_import.py",
-    "gbp_location_diagnostic.py",
     "gbp_reply_reconciliation_diagnostic.py",
     "check_db_integrity.py",
     "validate.py",

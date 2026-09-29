@@ -61,9 +61,9 @@ class GBPProvider(Provider):
         default silently made every caller that forgot to pass a tenant
         operate as Los Tres Amigos, which is exactly the implicit-tenant
         behavior this architecture is required to prevent). Every caller
-        (gbp_sync.py, gbp_location_diagnostic.py, export_chunks.py,
-        sync_reviews.py, critical_alert_check.py) must resolve and pass its
-        own explicit tenant_id -- see each file's own --tenant-id handling."""
+        (gbp_sync.py, export_chunks.py, sync_reviews.py,
+        critical_alert_check.py) must resolve and pass its own explicit
+        tenant_id -- see each file's own --tenant-id handling."""
         tenant_keys.assert_valid_tenant_id(tenant_id, "GBPProvider.__init__")
         self.tenant_id = tenant_id
 
