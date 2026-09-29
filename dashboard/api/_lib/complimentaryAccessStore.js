@@ -239,6 +239,23 @@ export async function revokeComplimentaryCode(codeHash, { reason = null } = {}) 
 // "counted but unrecoverable" -- see getComplimentaryRedemptionClaim()'s
 // own header for why this matters (the subsequent tenant_config write is a
 // separate, potentially-failing step this store has no visibility into).
+//
+// Post-incident correction (mirrors accessCodeStore.js's own REDEEM_SCRIPT
+// fix exactly -- see that file's "Phase B.8 post-incident correction"
+// comment for the full, empirically-confirmed root cause): this backend's
+// Lua cjson.encode() silently DROPS any object field whose value is null
+// when re-encoding a whole table. This script decodes the whole
+// complimentary-code record and previously re-encoded the whole table via
+// a single `cjson.encode(code)` -- silently corrupting label/
+// redemptionDeadline (both nullable) on every redemption, both in the
+// value returned to the caller AND in what got persisted back to storage
+// via HSET, and also transiently dropping revokedAt/revokeReason (always
+// null at this point, since the status-active check above guarantees an
+// unrevoked record) until the next explicit revocation write restores
+// them. Fields are now emitted individually via explicit helpers that
+// never rely on this backend's null-in-table encode behavior, exactly
+// matching accessCodeStore.js's own fix. redemptions entries never contain
+// a null field, so cjson.encode is safe for that array alone.
 const REDEEM_SCRIPT = `
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then return false end
@@ -255,9 +272,40 @@ table.insert(code.redemptions, { tenantId = ARGV[2], userId = ARGV[3], redeemedA
 code.redeemedAt = ARGV[4]
 code.redeemedByUserId = ARGV[3]
 code.tenantId = ARGV[2]
-redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(code))
+
+local function jstr(v)
+  if v == nil or v == cjson.null then return 'null' end
+  return cjson.encode(v)
+end
+local function jnum(v)
+  if v == nil or v == cjson.null then return 'null' end
+  return tostring(v)
+end
+
+local encoded = '{'
+  .. '"codeHash":' .. jstr(code.codeHash) .. ','
+  .. '"label":' .. jstr(code.label) .. ','
+  .. '"planId":' .. jstr(code.planId) .. ','
+  .. '"durationDays":' .. jnum(code.durationDays) .. ','
+  .. '"maxLocations":' .. jnum(code.maxLocations) .. ','
+  .. '"maxUsers":' .. jnum(code.maxUsers) .. ','
+  .. '"maxRedemptions":' .. jnum(code.maxRedemptions) .. ','
+  .. '"redemptionCount":' .. jnum(code.redemptionCount) .. ','
+  .. '"redemptionDeadline":' .. jstr(code.redemptionDeadline) .. ','
+  .. '"createdAt":' .. jstr(code.createdAt) .. ','
+  .. '"createdBy":' .. jstr(code.createdBy) .. ','
+  .. '"revokedAt":' .. jstr(code.revokedAt) .. ','
+  .. '"revokeReason":' .. jstr(code.revokeReason) .. ','
+  .. '"status":' .. jstr(code.status) .. ','
+  .. '"redemptions":' .. cjson.encode(code.redemptions) .. ','
+  .. '"redeemedAt":' .. jstr(code.redeemedAt) .. ','
+  .. '"redeemedByUserId":' .. jstr(code.redeemedByUserId) .. ','
+  .. '"tenantId":' .. jstr(code.tenantId)
+  .. '}'
+
+redis.call('HSET', KEYS[1], ARGV[1], encoded)
 redis.call('SET', KEYS[2], ARGV[5], 'EX', ARGV[6])
-return cjson.encode(code)
+return encoded
 `
 
 export class ComplimentaryCodeInvalidError extends Error {}
