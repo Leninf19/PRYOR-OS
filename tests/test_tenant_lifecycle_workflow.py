@@ -293,6 +293,36 @@ def test_activate_billing_step_requires_main_ref_but_does_not_gate_initial_sync(
     assert "github.ref" not in sync_step["if"]
 
 
+def test_activate_billing_step_targets_the_real_path_segment_route_not_a_query_string():
+    """Regression guard for a real production incident (GitHub Actions run
+    36278499436, tenant t_blue-seafood-grill-dldh5k, 5/5 attempts HTTP 404):
+    'Activate billing' called "$APP_BASE_URL/api/session?action=billing-
+    activation-callback" -- a query string on the bare path /api/session.
+    dashboard/api/session/[action].js is a Vercel dynamic-route file that
+    only matches a URL PATH SEGMENT (/api/session/:action) -- a bare
+    /api/session with no trailing segment never matches it at all, so
+    Vercel's own platform router 404s before the function is ever invoked,
+    regardless of whether the handler code itself is deployed. This exact
+    workflow shares its curl script verbatim with tenant-lifecycle-
+    dispatch.yml's own 'Activate billing (production)'/'Activate billing
+    (preview)' steps -- see that file's own
+    test_tenant_lifecycle_dispatch_workflow.py regression test for the
+    same fix applied there."""
+    _text, data = _load()
+    steps = data["jobs"]["operate"]["steps"]
+    step = next((s for s in steps if s.get("name") == "Activate billing"), None)
+    assert step is not None, "expected an 'Activate billing' step"
+    run_script = step["run"]
+    assert "/api/session/billing-activation-callback" in run_script, (
+        "must POST to the path-segment route /api/session/billing-activation-callback "
+        "(Vercel's real routing convention for dashboard/api/session/[action].js), not a query string"
+    )
+    assert "/api/session?action=" not in run_script, (
+        "must never use a ?action= query string against [action].js -- "
+        "that URL shape never matches Vercel's dynamic route and 404s before the function is ever invoked"
+    )
+
+
 def main() -> int:
     run("workflow file exists and parses as valid YAML", test_workflow_file_exists_and_parses)
     run("dispatch inputs are exactly operation/tenant_id/confirmation, correctly typed", test_dispatch_inputs_are_exactly_as_required)
@@ -307,6 +337,7 @@ def main() -> int:
     run("no step uses continue-on-error", test_no_continue_on_error_anywhere)
     run("the job summary step runs always() without gating earlier steps' outcome", test_job_summary_step_runs_always_but_does_not_gate_earlier_steps)
     run("Activate billing requires github.ref == refs/heads/main; Run Initial Sync is unaffected", test_activate_billing_step_requires_main_ref_but_does_not_gate_initial_sync)
+    run("Activate billing targets the real path-segment route, never a ?action= query string", test_activate_billing_step_targets_the_real_path_segment_route_not_a_query_string)
 
     print()
     if all(results):

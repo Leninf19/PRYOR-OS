@@ -677,6 +677,43 @@ def test_preview_billing_callback_is_not_ref_restricted():
     )
 
 
+def test_activate_billing_steps_target_the_real_path_segment_route_not_a_query_string():
+    """Regression guard for a real production incident: GitHub Actions run
+    36278499436 got HTTP 404 on all 5 retry attempts calling the billing
+    activation callback for tenant t_blue-seafood-grill-dldh5k. Root cause:
+    both 'Activate billing' steps called
+    "$APP_BASE_URL/api/session?action=billing-activation-callback" -- a
+    QUERY STRING on the bare path /api/session. dashboard/api/session/
+    [action].js is a Vercel dynamic-route file that only matches a URL
+    PATH SEGMENT (/api/session/:action, i.e. req.query.action populated
+    from the URL segment, exactly like every other [action].js endpoint in
+    this codebase -- see actionWorkspaceService.js/contactsService.js/
+    useNotifications.js, and useNotifications.js's own
+    tests/test_notification_bell_ui.js regression test for the identical
+    bug class caught earlier in the SAME file convention). A bare
+    /api/session with no trailing segment never matches that route at all
+    -- Vercel's own platform router 404s before dashboard/api/session/
+    [action].js's switch(req.query.action) ever runs, which is exactly
+    why the deployed handler code being present (confirmed live 2 minutes
+    before the failing run) did not matter: the request never reached it.
+    Every other caller of this exact file (login/logout/whoami/
+    tenant-status/accounts/... in dashboard/src) already uses the correct
+    /api/session/<action> path-segment form; only these two workflow
+    steps used the broken ?action= form."""
+    _text, data = _load()
+    for name in ("Activate billing (production)", "Activate billing (preview)"):
+        step = _step(data, name)
+        run_script = step["run"]
+        assert "/api/session/billing-activation-callback" in run_script, (
+            f"{name}: must POST to the path-segment route /api/session/billing-activation-callback "
+            f"(Vercel's real routing convention for dashboard/api/session/[action].js), not a query string"
+        )
+        assert "/api/session?action=" not in run_script, (
+            f"{name}: must never use a ?action= query string against [action].js -- "
+            f"that URL shape never matches Vercel's dynamic route and 404s before the function is ever invoked"
+        )
+
+
 def test_activate_billing_steps_never_use_a_conditional_secret_expression():
     """Same revision-12 discipline as every other secret in this file --
     checked here explicitly for the new secret name too (also covered
@@ -938,6 +975,7 @@ def main() -> int:
     run("Run Initial Sync steps have ids for chaining", test_run_initial_sync_steps_have_ids_for_chaining)
     run("Activate billing (production) is gated correctly and uses BILLING_ACTIVATION_CALLBACK_SECRET", test_activate_billing_production_step_gating_and_env)
     run("Activate billing (preview) is gated correctly and uses PREVIEW_BILLING_ACTIVATION_CALLBACK_SECRET", test_activate_billing_preview_step_gating_and_env)
+    run("Activate billing steps target the real path-segment route, never a ?action= query string", test_activate_billing_steps_target_the_real_path_segment_route_not_a_query_string)
     run("Activate billing steps never use a conditional secret-selection expression", test_activate_billing_steps_never_use_a_conditional_secret_expression)
     run("the Production billing callback requires github.ref == refs/heads/main", test_production_billing_callback_requires_main_ref)
     run("the Preview billing callback is not ref-restricted", test_preview_billing_callback_is_not_ref_restricted)
