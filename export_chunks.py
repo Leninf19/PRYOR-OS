@@ -698,7 +698,26 @@ def export_location_detail_reviews(conn, locations: dict) -> None:
     """
     Export enriched per-location review lists including complaint tags so
     the Review Center can display category labels without re-computing them.
-    Already handled by export_reviews_by_location; this augments with tags.
+    This is the LIVE per-location review export (main() below and
+    tenant_artifact_export.py both call this, never export_reviews_by_location
+    -- see that function's own comment).
+
+    Review Media Feature fix (2026-09-29): this function used to build its
+    own independent field dict rather than reusing review_to_dict() -- the
+    SAME drift risk this codebase's "single source of truth" convention
+    exists to prevent elsewhere (e.g. provision_tenant.py/initial_sync.py
+    sharing _inspect_database_file()). That drift was real, not
+    theoretical: when this function was promoted from "augments
+    export_reviews_by_location" to "replaces" it (main() below), it never
+    picked up review_to_dict()'s later-added `media`, `gbp_reply_moderation_state`,
+    or `gbp_reply_policy_violation` fields -- silently dropping a
+    correctly-captured, correctly-gated, correctly-stored review's media
+    array at the very last step before it would have reached the
+    dashboard, for every tenant (LTA and every BLOB-mode tenant alike).
+    Now built ON TOP of review_to_dict()'s own dict (never a second,
+    independently-maintained copy of its field list), with only the two
+    fields genuinely unique to this export -- complaint_tags/praise_tags --
+    added afterward.
     """
     try:
         from refresh_analytics import classify_review
@@ -713,25 +732,11 @@ def export_location_detail_reviews(conn, locations: dict) -> None:
         ).fetchall()
         reviews_out = []
         for r in rows:
-            rd = dict(r)
-            tags = classify_review(rd.get("review_text") or "", rd.get("star_rating"))
-            reviews_out.append({
-                "locationId": loc["id"],
-                "location_name": loc["name"], "city": loc["city"],
-                "reviewer_name": rd.get("reviewer_name"), "review_date": rd.get("review_date"),
-                "star_rating": rd.get("star_rating"), "review_text": rd.get("review_text"),
-                "owner_response": rd.get("owner_response"),
-                "review_url": rd.get("review_url"),
-                "response_status": "responded" if (rd.get("owner_response") or "").strip() else "unanswered",
-                "review_id": db.canonical_review_id(rd.get("review_url") or "") or "",
-                "last_checked_at": rd.get("last_seen_at") or "",
-                "complaint_tags": tags["complaints"],
-                "praise_tags": tags["praises"],
-                "ai_sentiment": rd.get("ai_sentiment"),
-                "ai_sentiment_reason": rd.get("ai_sentiment_reason"),
-                "ai_priority": rd.get("ai_priority"),
-                "gbp_review_name": rd.get("gbp_review_name"),
-            })
+            tags = classify_review(r["review_text"] or "", r["star_rating"])
+            entry = review_to_dict(r, loc)
+            entry["complaint_tags"] = tags["complaints"]
+            entry["praise_tags"] = tags["praises"]
+            reviews_out.append(entry)
         write_json(f"reviews/by-location/{slug_map[loc_id]}.json", reviews_out)
 
 

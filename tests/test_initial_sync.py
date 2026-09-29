@@ -536,6 +536,53 @@ class InitialSyncTestCase(unittest.TestCase):
         self.assertEqual(len(by_location), 2)
         for row in by_location:
             self.assertEqual(row["locationId"], 1, "generated artifacts must refer to the stable tenant-local location id")
+            # 2026-09-29 review-media export fix: the live per-location
+            # export must expose whatever media a review actually has --
+            # both fixture reviews here have none, so both must export [].
+            self.assertEqual(row["media"], [], "the live export must include a media key even when empty")
+
+    def test_new_tenants_historical_import_never_captures_media_even_when_google_has_it(self):
+        """No-Backfill guarantee for a BRAND-NEW tenant: mediaCapture is
+        still 'inactive' for the ENTIRE duration of Initial Sync's Google
+        fetch (the final CAS write that flips it to 'active' with a fresh
+        startedAt happens strictly AFTER the sync completes) -- so even a
+        review with real reviewMediaItems, encountered during THIS tenant's
+        very first historical import, must never have its media captured.
+        Only a review encountered on a LATER, post-activation sync can ever
+        qualify -- confirmed structurally here, not just by reading the
+        code."""
+        self._provision(TENANT_A, [("accounts/1/locations/1", "Casa Test", "")])
+        locations = [_gbp_location("accounts/1/locations/1", "Casa Test")]
+        review_with_media = _gbp_review("r1", "Beautiful presentation", "FIVE")
+        review_with_media["reviewMediaItems"] = [
+            {"thumbnailUrl": "https://lh3.googleusercontent.com/historical-photo",
+             "thumbnailLabel": "", "mediaFormat": "PHOTO"},
+        ]
+        reviews = {"accounts/1/locations/1": [review_with_media]}
+        patches = self._mock_google(_account(), locations, reviews)
+        with patches[0], patches[1], patches[2], patches[3]:
+            outcome = isync.initial_sync(TENANT_A)
+
+        self.assertEqual(outcome["outcome"], "active")
+        config = self.fake_store.get(TENANT_A)
+        self.assertEqual(config["mediaCapture"]["status"], "active", "the tenant itself must still activate normally")
+
+        db_path = self._download_db(tenant_blob_keys.review_db_blob_key(TENANT_A))
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT gbp_review_media FROM reviews WHERE gbp_review_name LIKE '%r1'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertIn(row["gbp_review_media"], (None, "[]"), (
+            "a review encountered during THIS tenant's own historical import must never have media "
+            "captured, even though Google reported reviewMediaItems for it -- mediaCapture only "
+            "becomes 'active' after this same sync already finished"
+        ))
+
+        by_location = self._artifact_json(TENANT_A, outcome["artifactGeneration"], "reviews/by-location/casa-test.json")
+        self.assertEqual(by_location[0]["media"], [], "the exported artifact must also show no media for this historical review")
 
     def test_failed_initial_sync_never_activates_media_capture(self):
         self._provision(TENANT_A, [("accounts/1/locations/1", "A", "")])
