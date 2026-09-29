@@ -26,7 +26,7 @@
 // resolving an action's location is the same lookup publish() uses.
 
 import { requireAuth, requireScopedAuth, requireLocationAccess } from '../_lib/auth.js'
-import { Permission, roleHasPermission } from '../_lib/permissions.js'
+import { Permission } from '../_lib/permissions.js'
 import { resolveLocationIdForReview, resolveLocationIdForReviewOrDeny } from '../_lib/reviewLocationIndex.js'
 import { enforceRateLimit } from '../_lib/rateLimit.js'
 import { getAllActions, getAction, upsertAction, ActionStoreUnavailableError } from '../_lib/actionStore.js'

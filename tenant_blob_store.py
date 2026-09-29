@@ -69,12 +69,6 @@ class BlobPreconditionFailedError(Exception):
     StaleProvisioningAttemptError."""
 
 
-class BlobNotFoundError(Exception):
-    """Raised by delete_blob for a pathname that does not exist. head_blob/
-    get_blob use a plain None return for 'not found' instead, since that is
-    an expected, common outcome for those two, not an error condition."""
-
-
 def _resolve_token() -> str:
     token = os.environ.get("BLOB_READ_WRITE_TOKEN")
     if not token:

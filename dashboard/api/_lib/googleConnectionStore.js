@@ -37,7 +37,7 @@
 
 import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypto'
 import { Redis } from '@upstash/redis'
-import { isValidTenantId, DEFAULT_TENANT_ID } from './tenants.js'
+import { isValidTenantId } from './tenants.js'
 import {
   getStoredCredential, setStoredCredentialIfVersion, recordSyncOutcome, recordOAuthRefresh,
   clearStoredCredential, GoogleHealth, CredentialStoreUnavailableError, CredentialVersionConflictError,

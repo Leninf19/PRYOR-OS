@@ -13,7 +13,7 @@ import { useTasks } from '../hooks/useTasks.js'
 import { useCampaigns } from '../hooks/useContentLibrary.js'
 import { usePriorityDigest } from '../hooks/usePriorityDigest.js'
 import { useMeta } from '../hooks/useIntelligence.js'
-import { expandOccurrences, expandAllOccurrences } from '../utils/taskRecurrence.js'
+import { expandAllOccurrences } from '../utils/taskRecurrence.js'
 
 // Operations Calendar + Content Library milestone -- replaces the old
 // AI-bucket-heavy Actions page. Every task/event here comes from the new
