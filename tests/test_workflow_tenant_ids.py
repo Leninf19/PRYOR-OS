@@ -103,6 +103,26 @@ WORKFLOWS_WITH_NO_TENANT_AWARE_SCRIPT = {
     # One-off diagnostic: invokes diagnose_blue_seafood_provisioning.mjs
     # (Node), hardcoded to a single specific email, no --tenant-id.
     "diagnostic-blue-seafood-provisioning.yml",
+    # All-Tenant Rollout: invokes activate_review_media_rollout.py, which
+    # is NOT in TENANT_AWARE_SCRIPTS above -- it deliberately loops over
+    # every existing, legitimate, active Production tenant itself (via
+    # tenant_config_store's own hardened activate_media_capture()), unlike
+    # every script in that list (which each operate on exactly one fixed,
+    # reviewed tenant). workflow_dispatch only, no --tenant-id input at all.
+    "rollout-activate-review-media.yml",
+    # Multi-Tenant Phase 4H.1 pinned dispatch bridge: invokes
+    # provision_tenant.py, initial_sync.py, apply_entitlement_change.py,
+    # diagnose_google_status.py, redis_identity_probe.py,
+    # redis_credential_key_audit.py, and tenant_status_report.py -- NONE of
+    # which are (or should ever be) in TENANT_AWARE_SCRIPTS above. Same
+    # discipline as tenant-lifecycle.yml's own entry: these are all
+    # deliberately dispatch-driven, operator-chosen-tenant scripts (the
+    # workflow's own required `tenant_id` + `confirmation` inputs, validated
+    # against an explicit shell allowlist before any script runs), unlike
+    # every script in that list (which must NEVER accept a
+    # dispatch-supplied tenant id, since those all operate specifically on
+    # Los Tres Amigos's own fixed production pipeline).
+    "tenant-lifecycle-dispatch.yml",
 }
 
 results = []
