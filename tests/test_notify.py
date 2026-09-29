@@ -26,6 +26,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import notify
+import tenant_config_store
 import tenant_keys
 import tenant_paths
 
@@ -92,9 +93,29 @@ def _seed_rating_drop(conn, loc_name="Test Loc"):
 # --- Recipient resolution -----------------------------------------------
 
 def test_resolve_business_recipient_lta_only():
-    assert notify.resolve_business_recipient(tenant_keys.DEFAULT_TENANT_ID) == notify.LTA_BUSINESS_TO_ADDR
-    assert notify.resolve_business_recipient(OTHER_TENANT_ID) is None, \
-        "a tenant with no configured recipient must get None, never LTA's address"
+    assert notify.resolve_business_recipient(tenant_keys.DEFAULT_TENANT_ID) == [notify.LTA_BUSINESS_TO_ADDR]
+    assert notify.resolve_business_recipient(OTHER_TENANT_ID) == [], \
+        "a tenant with no configured recipient must get [], never LTA's address"
+
+
+def test_resolve_business_recipient_uses_configured_list_never_hardcoded_fallback():
+    """Tenant Alert Recipients revision: when a tenant (including LTA
+    itself) has its own reviewAlertRecipients configured, THAT list is
+    used -- the LTA-only hardcoded fallback only ever applies when nothing
+    is configured, never as an override."""
+    with mock.patch.object(
+        tenant_config_store, "get_tenant_config",
+        return_value={"reviewAlertRecipients": ["owner@lta.example", "manager@lta.example"]},
+    ):
+        assert notify.resolve_business_recipient(tenant_keys.DEFAULT_TENANT_ID) == \
+            ["owner@lta.example", "manager@lta.example"]
+
+    with mock.patch.object(
+        tenant_config_store, "get_tenant_config",
+        return_value={"reviewAlertRecipients": ["owner@other-tenant.example"]},
+    ):
+        assert notify.resolve_business_recipient(OTHER_TENANT_ID) == ["owner@other-tenant.example"], \
+            "a non-LTA tenant with its own configured recipients must receive exactly those"
 
 
 def test_never_reuses_the_public_review_response_contact():
@@ -139,8 +160,8 @@ def test_both_categories_send_independently_when_both_have_content():
 
     assert result == {"platform": "sent", "business": "sent"}, result
     assert mock_send.call_count == 2
-    sent_to = {c.args[0] for c in mock_send.call_args_list}
-    assert sent_to == {notify.PLATFORM_TO_ADDR, notify.LTA_BUSINESS_TO_ADDR}, sent_to
+    sent_to = {tuple(c.args[0]) for c in mock_send.call_args_list}
+    assert sent_to == {(notify.PLATFORM_TO_ADDR,), (notify.LTA_BUSINESS_TO_ADDR,)}, sent_to
 
     conn = db.get_connection()
     scraper_rows = conn.execute(
@@ -170,8 +191,8 @@ def test_platform_failure_does_not_block_or_duplicate_business_send():
     _seed_rating_drop(conn)
     conn.close()
 
-    def _fail_platform(to_addr, subject, html):
-        if to_addr == notify.PLATFORM_TO_ADDR:
+    def _fail_platform(to_addrs, subject, html):
+        if to_addrs == [notify.PLATFORM_TO_ADDR]:
             raise Exception("simulated SMTP failure")
 
     with mock.patch.object(notify, "FROM_ADDR", "sender@example.com"), \
@@ -203,7 +224,7 @@ def test_platform_failure_does_not_block_or_duplicate_business_send():
 
     assert retried == {"platform": "sent", "business": "skipped_empty"}, retried
     assert mock_send2.call_count == 1
-    assert mock_send2.call_args_list[0].args[0] == notify.PLATFORM_TO_ADDR
+    assert mock_send2.call_args_list[0].args[0] == [notify.PLATFORM_TO_ADDR]
 
 
 def test_business_failure_does_not_block_or_duplicate_platform_send():
@@ -214,8 +235,8 @@ def test_business_failure_does_not_block_or_duplicate_platform_send():
     _seed_rating_drop(conn)
     conn.close()
 
-    def _fail_business(to_addr, subject, html):
-        if to_addr == notify.LTA_BUSINESS_TO_ADDR:
+    def _fail_business(to_addrs, subject, html):
+        if to_addrs == [notify.LTA_BUSINESS_TO_ADDR]:
             raise Exception("simulated SMTP failure")
 
     with mock.patch.object(notify, "FROM_ADDR", "sender@example.com"), \
@@ -244,7 +265,7 @@ def test_business_failure_does_not_block_or_duplicate_platform_send():
 
     assert retried == {"platform": "skipped_empty", "business": "sent"}, retried
     assert mock_send2.call_count == 1
-    assert mock_send2.call_args_list[0].args[0] == notify.LTA_BUSINESS_TO_ADDR
+    assert mock_send2.call_args_list[0].args[0] == [notify.LTA_BUSINESS_TO_ADDR]
 
 
 # --- LTA-only business boundary -------------------------------------------
@@ -261,8 +282,10 @@ def test_non_lta_tenant_never_falls_back_to_ltas_business_address():
         result = notify.run(OTHER_TENANT_ID)
 
     assert result["business"] == "skipped_no_recipient", result
-    assert not any(c.args[0] == notify.LTA_BUSINESS_TO_ADDR for c in mock_send.call_args_list), \
+    assert not any(c.args[0] == [notify.LTA_BUSINESS_TO_ADDR] for c in mock_send.call_args_list), \
         "must never send a non-LTA tenant's business content to LTA's address"
+    assert not any(notify.LTA_BUSINESS_TO_ADDR in c.args[0] for c in mock_send.call_args_list), \
+        "LTA's address must never appear in any recipient list sent for a non-LTA tenant"
 
     conn = db.get_connection()
     logged = conn.execute("SELECT 1 FROM notifications_log WHERE notification_type = 'rating_drop'").fetchone()
@@ -285,7 +308,38 @@ def test_non_lta_tenants_platform_content_is_unaffected_by_missing_business_reci
         result = notify.run(OTHER_TENANT_ID)
 
     assert result["platform"] == "sent", result
-    assert mock_send.call_args_list[0].args[0] == notify.PLATFORM_TO_ADDR
+    assert mock_send.call_args_list[0].args[0] == [notify.PLATFORM_TO_ADDR]
+
+
+# --- Multiple recipients ---------------------------------------------------
+
+def test_multiple_configured_recipients_are_all_included_in_the_send():
+    """A tenant with several reviewAlertRecipients configured must have
+    EVERY one of them actually included in the send -- never just the
+    first."""
+    tenant_id = tenant_keys.DEFAULT_TENANT_ID
+    _fresh_db(tenant_id)
+    conn = db.get_connection()
+    _seed_rating_drop(conn)
+    conn.close()
+
+    configured = ["owner@lta.example", "manager1@lta.example", "manager2@lta.example"]
+    with mock.patch.object(tenant_config_store, "get_tenant_config",
+                            return_value={"reviewAlertRecipients": configured}), \
+         mock.patch.object(notify, "FROM_ADDR", "sender@example.com"), \
+         mock.patch.object(notify, "APP_PASS", "test-pass"), \
+         mock.patch.object(notify, "send_email") as mock_send:
+        result = notify.run(tenant_id)
+
+    assert result["business"] == "sent", result
+    business_calls = [c for c in mock_send.call_args_list if set(c.args[0]) == set(configured)]
+    assert len(business_calls) == 1, f"expected exactly one send to all {len(configured)} configured recipients, got {mock_send.call_args_list}"
+
+    conn = db.get_connection()
+    logged = conn.execute("SELECT recipient FROM notifications_log WHERE notification_type = 'rating_drop'").fetchone()
+    conn.close()
+    for email in configured:
+        assert email in logged["recipient"], f"{email} missing from logged recipient string {logged['recipient']!r}"
 
 
 # --- Missing credentials never permanently suppresses content ------------
@@ -317,6 +371,7 @@ def test_missing_credentials_skips_without_losing_content():
 def main():
     tests = [
         ("resolve_business_recipient resolves LTA only, never a fallback", test_resolve_business_recipient_lta_only),
+        ("resolve_business_recipient uses a configured list, never the hardcoded fallback, when present", test_resolve_business_recipient_uses_configured_list_never_hardcoded_fallback),
         ("notify.py never reuses the public review-response contact", test_never_reuses_the_public_review_response_contact),
         ("nothing to report sends nothing", test_nothing_to_report_sends_nothing),
         ("both categories send independently when both have content", test_both_categories_send_independently_when_both_have_content),
@@ -324,6 +379,7 @@ def main():
         ("a business send failure never blocks or duplicates the platform send", test_business_failure_does_not_block_or_duplicate_platform_send),
         ("a non-LTA tenant never falls back to LTA's business address", test_non_lta_tenant_never_falls_back_to_ltas_business_address),
         ("a non-LTA tenant's platform content is unaffected by a missing business recipient", test_non_lta_tenants_platform_content_is_unaffected_by_missing_business_recipient),
+        ("multiple configured recipients are all included in the send, not just the first", test_multiple_configured_recipients_are_all_included_in_the_send),
         ("missing credentials skip without losing content", test_missing_credentials_skips_without_losing_content),
     ]
     for name, fn in tests:

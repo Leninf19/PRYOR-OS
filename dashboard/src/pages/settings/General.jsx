@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
 import ThemeToggle from '../../components/ui/ThemeToggle.jsx'
 import Badge from '../../components/ui/Badge.jsx'
+import EmailFieldList from '../../components/ui/EmailFieldList.jsx'
 import { useCompanyGoals } from '../../hooks/useCompanyGoals.js'
 import { getReviewContact, upsertReviewContact } from '../../services/reviewContactService.js'
+import { getReviewAlertRecipients, upsertReviewAlertRecipients } from '../../services/reviewAlertRecipientsService.js'
 
 // Appearance + Company Goals + AI Rewrite, moved verbatim out of the old
 // flat Settings.jsx (Phase 8, Milestone 8.1) -- a pure reorganization, zero
@@ -197,8 +199,83 @@ function ReviewContactSection() {
   )
 }
 
+// Tenant Alert Recipients revision: this tenant's OWN internal team
+// notification list -- who gets emailed about new/critical reviews
+// (notify.py's rating-drop alert, critical_alert_check.py's immediate
+// critical alert, nightly_digest.py's nightly digest). A DIFFERENT,
+// deliberately separate setting from Review Response Contact above (the
+// PUBLIC, customer-facing address) -- never shown to a customer, and this
+// section never pre-fills or reuses that field's value. Owner/Admin only,
+// same auth scope as that section. Reuses EmailFieldList (Restaurant
+// Contacts' own CC-recipients editor), this codebase's existing pattern
+// for a list-of-emails input -- validation/dedup/format feedback all come
+// from that shared component; each add/remove saves immediately via the
+// settings API (which independently re-validates, dedups, and caps the
+// list server-side).
+function ReviewAlertRecipientsSection() {
+  const [loading, setLoading] = useState(true)
+  const [forbidden, setForbidden] = useState(false)
+  const [recipients, setRecipients] = useState([])
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState(null)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    getReviewAlertRecipients()
+      .then(result => { if (!cancelled) setRecipients(result.recipients ?? []) })
+      .catch(err => { if (!cancelled && err.message?.includes('403')) setForbidden(true) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [])
+
+  async function handleChange(next) {
+    const previous = recipients
+    setRecipients(next) // optimistic -- EmailFieldList already validated format/duplicates locally
+    setSaving(true)
+    setError(null)
+    setSaved(false)
+    try {
+      const result = await upsertReviewAlertRecipients(next)
+      setRecipients(result.recipients ?? [])
+      setSaved(true)
+      setTimeout(() => setSaved(false), 3000)
+    } catch (err) {
+      setRecipients(previous) // the server-side save failed -- do not leave the UI showing an unsaved state as if it succeeded
+      setError(err.message || 'Could not save the review-alert recipient list.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading) return null
+  if (forbidden) return null // Owner/Admin only -- silently absent for any other role, matching Review Response Contact's own pattern
+
+  return (
+    <div className="rounded-2xl border overflow-hidden"
+         style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <div className="px-6 py-5">
+        <p className="text-sm font-bold" style={{ color: 'var(--color-text-1)' }}>Review Alert Recipients</p>
+        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-3)' }}>
+          Your own team's internal notification list for new and critical review alerts — never shown to
+          customers. Distinct from the public Review Response Contact above.
+        </p>
+      </div>
+      <div className="px-6 pb-6 border-t pt-4" style={{ borderColor: 'var(--color-border)' }}>
+        <EmailFieldList label="Internal team emails" emails={recipients} onChange={handleChange} />
+        {error && <p className="text-xs mt-2" style={{ color: 'var(--color-danger, #dc2626)' }}>{error}</p>}
+        {(saving || saved) && (
+          <div className="flex items-center gap-3 pt-2">
+            {saving && <span className="text-xs" style={{ color: 'var(--color-text-3)' }}>Saving…</span>}
+            {!saving && saved && <span className="text-xs" style={{ color: 'var(--color-text-3)' }}>Saved</span>}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 const PLANNED = [
-  { title: 'Notification Preferences', desc: 'Choose which alerts to receive and how often.' },
   { title: 'Alert Thresholds',         desc: 'Set the rating drop or backlog size that triggers an alert.' },
   { title: 'Scraper Schedule',         desc: 'Configure how often locations are scraped.' },
   { title: 'Team Members',             desc: 'Add managers and control access per location.' },
@@ -240,7 +317,15 @@ export default function General() {
           AI Features
         </p>
         <AIRewriteSection />
+      </section>
+
+      <section className="space-y-3">
+        <p className="text-[10px] font-bold uppercase tracking-[0.18em]"
+           style={{ color: 'var(--color-text-3)' }}>
+          Notifications
+        </p>
         <ReviewContactSection />
+        <ReviewAlertRecipientsSection />
       </section>
 
       <section className="space-y-3">

@@ -295,6 +295,19 @@ def upsert_tenant_config(tenant_id: str, patch: dict, expected_version: int | No
         # this default is what makes that true from a tenant's very first
         # write onward, with no special-casing required anywhere else.
         "mediaCapture": {"status": "inactive", "startedAt": None},
+        # Tenant Alert Recipients revision: the internal team notification
+        # list for new/critical review alerts (rating-drop digests,
+        # critical_alert_check.py's immediate alert, nightly_digest.py's
+        # nightly digest) -- see resolve_review_alert_recipients() below,
+        # the ONE shared resolver all three scripts call instead of each
+        # hand-copying its own hardcoded TO_ADDR. Deliberately DISTINCT
+        # from reviewContact (the PUBLIC, customer-facing "how do I reach
+        # the business" contact) -- never reused, never merged, never read
+        # by resolve_review_alert_recipients(). Defaults to an empty array
+        # for EVERY tenant, including Los Tres Amigos -- LTA's own
+        # historical fallback is applied only at READ time (see below),
+        # never baked into this stored default.
+        "reviewAlertRecipients": [],
         **(existing or {}),
         "createdAt": (existing or {}).get("createdAt", now),
         **patch,
@@ -314,6 +327,8 @@ def upsert_tenant_config(tenant_id: str, patch: dict, expected_version: int | No
     media_capture = next_record.get("mediaCapture")
     if not isinstance(media_capture, dict) or media_capture.get("status") not in _VALID_MEDIA_CAPTURE_STATUSES:
         raise ValueError(f"upsert_tenant_config: invalid mediaCapture {media_capture!r}")
+    if not isinstance(next_record.get("reviewAlertRecipients"), list):
+        raise ValueError("upsert_tenant_config: reviewAlertRecipients must be a list")
 
     if expected_version is not None:
         if current_version != expected_version:
@@ -516,3 +531,71 @@ def list_tenant_ids() -> list[str]:
     if not isinstance(result, list):
         raise TenantConfigStoreUnavailableError(f"tenant config store returned a malformed HKEYS result: {result!r}")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Tenant Alert Recipients revision
+# ---------------------------------------------------------------------------
+# Replaces notify.py's/critical_alert_check.py's/nightly_digest.py's three
+# independently-hardcoded TO_ADDR / LTA_BUSINESS_TO_ADDR constants with one
+# real, tenant-configurable setting (reviewAlertRecipients, above) and ONE
+# shared resolver -- all three scripts import and call
+# resolve_review_alert_recipients() below rather than each hand-copying its
+# own recipient logic (matches this codebase's existing convention of one
+# shared implementation, e.g. digest_filters.py's already_notified()/
+# log_notification() re-exported from notify.py).
+
+# Los Tres Amigos's historical business-alert inbox -- applied ONLY as a
+# fallback, at READ time, for LTA specifically, when it has nothing
+# configured in reviewAlertRecipients. Every other tenant with nothing
+# configured gets an empty list, never this address. notify.py's own
+# LTA_BUSINESS_TO_ADDR constant is defined FROM this one (not the reverse)
+# so there is exactly one literal, never two that could silently drift.
+LTA_FALLBACK_REVIEW_ALERT_RECIPIENT = "advertising@l3amigos.com"
+
+
+def resolve_review_alert_recipients(tenant_id: str) -> list[str]:
+    """The ONE shared resolver for "who on this tenant's own team should be
+    emailed about new/critical reviews" -- called identically by notify.py
+    (rating-drop alerts), critical_alert_check.py (immediate critical-review
+    alerts), and nightly_digest.py (the nightly low-star digest).
+
+    Resolution order:
+      1. tenant_config:v1's own reviewAlertRecipients array, if it has at
+         least one usable (non-blank string) entry -- returned exactly as
+         configured, for EVERY tenant including Los Tres Amigos (a tenant
+         that has explicitly configured its own list is never silently
+         overridden by the LTA-only fallback below).
+      2. If empty (no tenant_config record at all, the field is missing/
+         empty, or the store is genuinely unreachable) AND tenant_id is Los
+         Tres Amigos (tenant_keys.DEFAULT_TENANT_ID): a single-element list
+         containing LTA_FALLBACK_REVIEW_ALERT_RECIPIENT -- an explicit,
+         LTA-only fallback, matching notify.py's own pre-existing precedent
+         (its former resolve_business_recipient()), never extended to any
+         other tenant.
+      3. Otherwise (empty, any other tenant): [] -- the caller must send
+         nothing and log only a generic "no recipient configured for this
+         tenant" message, never a specific address name.
+
+    A genuine store outage (TenantConfigStoreUnavailableError) is treated
+    exactly like "nothing configured yet," not re-raised -- this is a
+    notification-routing decision, not a data-integrity one, and a
+    transient Redis outage must never crash an alert script entirely (nor,
+    for LTA, ever suppress its own historical alert address, which this
+    same fallback already guarantees independent of the store's health).
+    Deliberately independent of reviewContact/resolve_review_response_contact()
+    in ai_engine.py -- that is the PUBLIC, customer-facing "how do I reach
+    the business" address; this function never reads reviewContact."""
+    tenant_keys.assert_valid_tenant_id(tenant_id, "resolve_review_alert_recipients")
+    try:
+        config = get_tenant_config(tenant_id)
+    except TenantConfigStoreUnavailableError:
+        config = None
+    raw = (config or {}).get("reviewAlertRecipients")
+    if isinstance(raw, list):
+        cleaned = [r.strip() for r in raw if isinstance(r, str) and r.strip()]
+        if cleaned:
+            return cleaned
+    if tenant_id == tenant_keys.DEFAULT_TENANT_ID:
+        return [LTA_FALLBACK_REVIEW_ALERT_RECIPIENT]
+    return []

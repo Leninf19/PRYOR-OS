@@ -8,6 +8,7 @@ production on 2026-07-15.
 
 Run directly: py tests/test_critical_alert_check.py
 """
+import json
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -19,16 +20,18 @@ import critical_alert_check as cac
 import db
 import digest_filters
 import gbp_sync
+import tenant_config_store
 import tenant_keys
 import tenant_paths
 
 TEST_TENANT_ID = tenant_keys.DEFAULT_TENANT_ID
+OTHER_TENANT_ID = "t_other-critical-alert-tenant"
 
 
-def _fresh_db():
+def _fresh_db(tenant_id=TEST_TENANT_ID):
     tmpdir = tempfile.mkdtemp(prefix="critical_alert_test_")
     db.DB_PATH = Path(tmpdir) / "reviews.db"
-    tenant_paths._set_review_db_path_for_tests(TEST_TENANT_ID, db.DB_PATH)
+    tenant_paths._set_review_db_path_for_tests(tenant_id, db.DB_PATH)
     conn = db.get_connection()
     db.init_schema(conn)
     conn.execute("INSERT INTO locations (name, city, brand) VALUES ('Test Loc', 'Testville', 'Casa Tequila')")
@@ -38,14 +41,16 @@ def _fresh_db():
     return loc_id
 
 
-def _add_review(loc_id, text, stars, priority, review_date, owner_response=None):
+def _add_review(loc_id, text, stars, priority, review_date, owner_response=None, review_url=None, media=None):
     conn = db.get_connection()
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """INSERT INTO reviews (location_id, reviewer_name, review_date, star_rating, review_text,
-           dedup_key, is_deleted, ai_priority, owner_response, first_seen_at, last_seen_at)
-           VALUES (?, 'Tester', ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
-        (loc_id, review_date, stars, text, text[:20] + review_date, priority, owner_response, now, now),
+           dedup_key, is_deleted, ai_priority, owner_response, review_url, gbp_review_media,
+           first_seen_at, last_seen_at)
+           VALUES (?, 'Tester', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
+        (loc_id, review_date, stars, text, text[:20] + review_date, priority, owner_response,
+         review_url, json.dumps(media) if media is not None else None, now, now),
     )
     conn.commit()
     review_id = conn.execute("SELECT id FROM reviews WHERE review_date = ?", (review_date,)).fetchone()["id"]
@@ -221,6 +226,126 @@ def test_fallback_database_check_still_runs_for_every_failure_classification():
         assert mock_send.called, f"{sync_result['error_type']}: expected the alert email path still invoked despite the sync failure"
 
 
+# --- Tenant Alert Recipients & Media Emails revision -----------------------
+
+def test_non_lta_tenant_with_no_recipient_configured_sends_nothing():
+    """A non-LTA tenant with nothing configured in reviewAlertRecipients
+    must send no email at all, and the pending critical review must NOT be
+    marked notified -- it stays eligible once a recipient is configured."""
+    loc_id = _fresh_db(OTHER_TENANT_ID)
+    today = datetime.now(timezone.utc).date().isoformat()
+    _add_review(loc_id, "Someone was seriously injured and needs immediate follow-up", 1, "critical", today)
+
+    with mock.patch.object(gbp_sync, "sync_all", return_value={"status": "skipped", "reason": "not configured"}), \
+         mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-app-password"), \
+         mock.patch("critical_alert_check._send_email") as mock_send:
+        result = cac.run(OTHER_TENANT_ID)
+
+    assert result["status"] == "no_recipient_configured", result
+    assert not mock_send.called, "must never send when no recipient is configured for this tenant"
+
+    conn = db.get_connection()
+    logged = conn.execute("SELECT 1 FROM notifications_log WHERE notification_type = 'critical_review_immediate'").fetchone()
+    conn.close()
+    assert logged is None, "an unsent critical review must not be marked notified"
+
+
+def test_lta_fallback_never_reaches_a_non_lta_tenant():
+    loc_id = _fresh_db(OTHER_TENANT_ID)
+    today = datetime.now(timezone.utc).date().isoformat()
+    _add_review(loc_id, "A customer reported a serious safety concern needing review", 1, "critical", today)
+
+    with mock.patch.object(gbp_sync, "sync_all", return_value={"status": "skipped", "reason": "not configured"}), \
+         mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-app-password"), \
+         mock.patch("critical_alert_check._send_email") as mock_send:
+        cac.run(OTHER_TENANT_ID)
+
+    assert not mock_send.called
+    # Belt-and-suspenders: even if _send_email HAD been called, LTA's
+    # address must never appear in its recipient list for another tenant.
+    for call in mock_send.call_args_list:
+        assert tenant_config_store.LTA_FALLBACK_REVIEW_ALERT_RECIPIENT not in call.args[0]
+
+
+def test_multiple_configured_recipients_all_included():
+    loc_id = _fresh_db(OTHER_TENANT_ID)
+    today = datetime.now(timezone.utc).date().isoformat()
+    _add_review(loc_id, "A serious incident occurred that needs urgent management attention", 1, "critical", today)
+
+    configured = ["owner@other.example", "manager@other.example"]
+    with mock.patch.object(gbp_sync, "sync_all", return_value={"status": "skipped", "reason": "not configured"}), \
+         mock.patch.object(tenant_config_store, "get_tenant_config", return_value={"reviewAlertRecipients": configured}), \
+         mock.patch.object(cac, "FROM_ADDR", "sender@example.com"), mock.patch.object(cac, "APP_PASS", "test-app-password"), \
+         mock.patch("critical_alert_check._send_email") as mock_send:
+        result = cac.run(OTHER_TENANT_ID)
+
+    assert result["status"] == "ok" and result["sent"] == 1, result
+    assert mock_send.called
+    assert set(mock_send.call_args_list[0].args[0]) == set(configured), \
+        f"expected all {len(configured)} configured recipients in the send, got {mock_send.call_args_list[0].args[0]}"
+
+
+def test_review_with_media_includes_indicator_and_link_never_raw_google_url():
+    loc_id = _fresh_db()
+    today = datetime.now(timezone.utc).date().isoformat()
+    google_media_url = "https://lh3.googleusercontent.com/some-private-photo-id=w150-h150"
+    _add_review(
+        loc_id, "Extremely dangerous situation, someone could have been hurt badly", 1, "critical", today,
+        review_url="https://www.google.com/maps/place/?q=place_id:ChIJabc123",
+        media=[{"mediaType": "photo", "googleUrl": google_media_url}],
+    )
+    critical = digest_filters.find_unescalated_critical_reviews(cnx := db.get_connection())
+    cnx.close()
+    html = cac._build_html(critical)
+
+    assert "Includes customer photo/video" in html, "a review with media must show the media indicator"
+    assert "View review in PRYOR" in html, "the PRYOR deep link must be present"
+    assert "/reviews?reviewId=" in html
+    assert google_media_url not in html, "the raw Google media URL must never appear in the email body"
+    assert "<img" not in html, "the email must never embed the actual Google photo/video"
+    assert "googleusercontent.com" not in html, "no Google media host must ever be printed in the email body"
+
+
+def test_review_without_media_omits_indicator_but_keeps_link():
+    loc_id = _fresh_db()
+    today = datetime.now(timezone.utc).date().isoformat()
+    _add_review(
+        loc_id, "A serious safety concern was raised that needs immediate review", 1, "critical", today,
+        review_url="https://www.google.com/maps/place/?q=place_id:ChIJnomedia",
+    )
+    critical = digest_filters.find_unescalated_critical_reviews(cnx := db.get_connection())
+    cnx.close()
+    html = cac._build_html(critical)
+
+    assert "Includes customer photo/video" not in html, "a review without media must not show the media indicator"
+    assert "View review in PRYOR" in html, "the PRYOR deep link must still be present"
+
+
+def test_html_meaningful_characters_are_escaped():
+    loc_id = _fresh_db()
+    today = datetime.now(timezone.utc).date().isoformat()
+    conn = db.get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    malicious_text = 'Terrible <b>service</b> & rude "staff" <script>alert(1)</script>'
+    conn.execute(
+        """INSERT INTO reviews (location_id, reviewer_name, review_date, star_rating, review_text,
+           dedup_key, is_deleted, ai_priority, first_seen_at, last_seen_at)
+           VALUES (?, '<script>x</script>', ?, 1, ?, 'xss-dedup-key', 0, 'critical', ?, ?)""",
+        (loc_id, today, malicious_text, now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    conn = db.get_connection()
+    critical = digest_filters.find_unescalated_critical_reviews(conn)
+    conn.close()
+    html = cac._build_html(critical)
+
+    assert "<script>" not in html, "a raw <script> tag from review content must never reach the email HTML"
+    assert "&lt;script&gt;" in html, "the escaped form of the malicious content must be present instead"
+    assert "&amp;" in html
+
+
 def main():
     tests = [
         ("critical reviews older than the lookback window are excluded", test_old_backlog_excluded_by_lookback_window),
@@ -233,6 +358,12 @@ def main():
         ("unexpected errors are never rendered as the literal string None", test_unexpected_errors_never_become_none),
         ("an unexpected error with no detail at all is still never None", test_unexpected_error_with_no_detail_at_all_is_still_never_none),
         ("the database fallback still runs for every failure classification (quota/auth/unexpected)", test_fallback_database_check_still_runs_for_every_failure_classification),
+        ("a non-LTA tenant with no recipient configured sends nothing and does not mark it notified", test_non_lta_tenant_with_no_recipient_configured_sends_nothing),
+        ("LTA's fallback address never reaches a non-LTA tenant", test_lta_fallback_never_reaches_a_non_lta_tenant),
+        ("multiple configured recipients are all included in the send", test_multiple_configured_recipients_all_included),
+        ("a review with media includes the indicator and the PRYOR link, never a raw Google media URL", test_review_with_media_includes_indicator_and_link_never_raw_google_url),
+        ("a review without media omits the indicator but keeps the PRYOR link", test_review_without_media_omits_indicator_but_keeps_link),
+        ("HTML-meaningful characters in review content are escaped in the email", test_html_meaningful_characters_are_escaped),
     ]
     results = [_run(name, fn) for name, fn in tests]
     print()

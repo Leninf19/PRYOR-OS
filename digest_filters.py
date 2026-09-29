@@ -7,11 +7,21 @@ of two independently-drifting copies.
 
 Reuses notify.py's existing notifications_log dedup helpers (already_notified/
 log_notification) rather than reimplementing them.
+
+Also hosts the shared "review-alert email extras" builder (media indicator +
+"View review in PRYOR" link) critical_alert_check.py's _build_html() and
+nightly_digest.py's _review_card() both call -- Tenant Alert Recipients &
+Media Emails revision -- so the two scripts' emails render this identically,
+matching this file's whole reason for existing (one shared implementation,
+never two independently-drifting copies).
 """
+import json
 import re
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from notify import already_notified, log_notification  # noqa: F401 (log_notification re-exported for callers)
+import db
+from notify import already_notified, log_notification, _safe  # noqa: F401 (log_notification/_safe re-exported for callers)
 
 # Bounds how far back "critical and unescalated" looks. Without this, the
 # very first run after this feature ships would immediately fire on every
@@ -143,3 +153,94 @@ def is_already_escalated(conn, review_id: int) -> bool:
     immediate critical-alert path? If so it should be labeled "Previously
     Escalated" rather than presented as a fresh alert."""
     return already_notified(conn, "critical_review_immediate", related_review_id=review_id)
+
+
+# ---------------------------------------------------------------------------
+# Tenant Alert Recipients & Media Emails revision -- shared review-alert
+# email extras (media indicator + "View review in PRYOR" link)
+# ---------------------------------------------------------------------------
+
+# A plain, reviewed literal -- NOT a secret. Mirrors
+# .github/workflows/tenant-lifecycle-dispatch.yml's own APP_BASE_URL
+# comment exactly: knowledge of the URL alone grants nothing. These
+# scripts run in GitHub Actions (cron), not Vercel, so there is no
+# DASHBOARD_BASE_URL/VERCEL_URL environment to read the way
+# dashboard/api/_lib/billingCustomer.js/billingPortal.js do on the Node
+# side -- a fixed literal is this codebase's existing precedent for
+# exactly this situation.
+APP_BASE_URL = "https://app.futuremark.studio"
+
+
+def _field(review, name, default=None):
+    """Works identically whether `review` is a plain dict (every caller in
+    this codebase passes dict(row) -- see critical_alert_check.py's/
+    nightly_digest.py's own find_*() functions) or a raw sqlite3.Row
+    (which has no .get()) -- same defensive pattern export_chunks.py's
+    review_to_dict() already uses for optional columns."""
+    return review[name] if name in review.keys() else default
+
+
+def review_has_media(review) -> bool:
+    """True if this review has any sanitized/gated media (Review Media
+    Feature) to show a badge for. Mirrors export_chunks.py's own
+    gbp_review_media parsing exactly -- NULL/missing/malformed all mean "no
+    media," never an error; this makes no eligibility decision of its own,
+    it only reads the already-sanitized, already-gated column."""
+    raw = _field(review, "gbp_review_media")
+    if not raw:
+        return False
+    try:
+        media = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(media, list) and len(media) > 0
+
+
+def review_link_id(review):
+    """Mirrors dashboard/src/utils/dataUtils.js's reviewId(r) exactly, so
+    the id computed here always matches what the frontend computes for the
+    SAME review once exported: the review's canonical id if present
+    (db.canonical_review_id(review_url) -- the same parse export_chunks.py's
+    own `review_id` field uses), else its raw review_url, else a
+    date+reviewer fallback. Returns None only if even the fallback fields
+    are unavailable (defensive; every real review row has review_date/
+    reviewer_name)."""
+    url = _field(review, "review_url")
+    canonical = db.canonical_review_id(url or "")
+    if canonical:
+        return canonical
+    if url:
+        return url
+    date = _field(review, "review_date")
+    reviewer = _field(review, "reviewer_name")
+    if date is None and reviewer is None:
+        return None
+    return f"{date}-{reviewer}"
+
+
+def build_review_alert_extras_html(review) -> str:
+    """The ONE shared HTML fragment (media badge + "View review in PRYOR"
+    deep link) appended to a review card in critical_alert_check.py's/
+    nightly_digest.py's alert emails -- never embeds the actual Google
+    photo/video, never prints a raw Google media URL, never attaches
+    anything: review_has_media() only ever yields a boolean, and the link
+    below points at THIS app's own /reviews route, never at Google. Every
+    value is routed through notify.py's _safe() (re-exported above) before
+    insertion, including the built URL itself (defense in depth -- the id
+    is already percent-encoded via urllib.parse.quote, so no raw
+    HTML-meaningful character from review content can reach the href in
+    the first place)."""
+    parts = []
+    if review_has_media(review):
+        parts.append(
+            '<p style="margin:6px 0 0;font-size:12px;color:#0369a1;font-weight:600">'
+            '&#128247;&nbsp;Includes customer photo/video</p>'
+        )
+    link_id = review_link_id(review)
+    if link_id is not None:
+        url = f"{APP_BASE_URL}/reviews?reviewId={urllib.parse.quote(str(link_id), safe='')}"
+        parts.append(
+            f'<p style="margin:6px 0 0;font-size:12px">'
+            f'<a href="{_safe(url)}" style="color:#0f172a;font-weight:600">View review in PRYOR</a></p>'
+        )
+    return "".join(parts)

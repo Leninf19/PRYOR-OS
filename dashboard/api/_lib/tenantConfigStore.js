@@ -454,6 +454,19 @@ export async function upsertTenantConfig(tenantId, patch, { expectedVersion, all
     // mediaCapture's own active status, never called by any
     // deploy/onboarding/sync path in this implementation.
     mediaCapture: { status: 'inactive', startedAt: null },
+    // Tenant Alert Recipients revision: the internal team notification
+    // list for new/critical review alerts (rating-drop digests,
+    // critical_alert_check.py's immediate alert, nightly_digest.py's
+    // nightly digest) -- see tenant_config_store.py's (Python)
+    // resolve_review_alert_recipients(), the ONE shared resolver all
+    // three Python alert scripts call, replacing each script's own
+    // previously-hardcoded TO_ADDR constant. Deliberately DISTINCT from
+    // reviewContact (the PUBLIC, customer-facing "how do I reach the
+    // business" contact, below) -- never reused, never merged. Defaults
+    // to an empty array for EVERY tenant, including Los Tres Amigos --
+    // LTA's own historical fallback is applied only at READ time by the
+    // Python resolver, never baked into this stored default.
+    reviewAlertRecipients: [],
     ...existing,
     createdAt: existing?.createdAt ?? now,
     ...patch,
@@ -496,6 +509,9 @@ export async function upsertTenantConfig(tenantId, patch, { expectedVersion, all
     (next.mediaCapture.status !== 'inactive' && next.mediaCapture.status !== 'active')
   ) {
     throw new Error(`upsertTenantConfig: invalid mediaCapture ${JSON.stringify(next.mediaCapture)}`)
+  }
+  if (!Array.isArray(next.reviewAlertRecipients)) {
+    throw new Error(`upsertTenantConfig: reviewAlertRecipients must be an array`)
   }
 
   if (expectedVersion !== undefined) {
