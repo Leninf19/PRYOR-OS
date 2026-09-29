@@ -23,7 +23,12 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "tenant-lifecycle-dispatch.yml"
-APPROVED_SHA = "f7201436535e8dea0730c045d25407437941ca4e"
+# revision 13: bumped from f7201436535e8dea0730c045d25407437941ca4e (stale
+# 21 days / 5 commits behind main, missing the review-media all-tenant
+# rollout and BLOB-tenant analytics/intelligence parity fixes -- see the
+# workflow file's own revision 13 comment for the full investigation) to
+# main's own tip at the time of that investigation.
+APPROVED_SHA = "1204a998c1bc0695c9de6b378481eca6e2bea824"
 
 results = []
 
@@ -848,21 +853,48 @@ def test_concurrency_remains_tenant_scoped():
 # Preserved-property checks (explicitly required to remain unchanged)
 # ===========================================================================
 
-def test_no_app_or_python_implementation_files_on_main():
-    """This test file's own existence proves tests/ already lives on main
-    (Los Tres Amigos's own pre-existing suite) -- but none of the
-    MULTI-TENANT implementation files may accompany the dispatcher."""
-    forbidden = [
-        REPO_ROOT / "provision_tenant.py",
-        REPO_ROOT / "initial_sync.py",
-        REPO_ROOT / "apply_entitlement_change.py",
-        REPO_ROOT / "diagnose_google_status.py",
-        REPO_ROOT / "tenant_config_store.py",
-        REPO_ROOT / "tenant_blob_store.py",
-        REPO_ROOT / "dashboard" / "api" / "_lib" / "tenantConfigStore.js",
-    ]
-    for path in forbidden:
-        assert not path.exists(), f"{path} must not be merged into main -- it must only ever be reached via the pinned checkout"
+def test_pinned_commit_family_contains_required_fixes():
+    """revision 13 replaces the old (now permanently obsolete)
+    test_no_app_or_python_implementation_files_on_main: that test asserted
+    provision_tenant.py/initial_sync.py/etc. could never be merged onto
+    main, which was true only through revision 12 -- feature/multi-tenant-
+    pryor has since been fully absorbed by main (zero commits on that
+    branch are missing from main; see the workflow file's own revision 13
+    comment), so those files are now main's own, ordinary, actively-
+    developed application code. Asserting their absence would be asserting
+    something now permanently false, not a regression guard.
+
+    What this test guards instead: this checkout's own application source
+    genuinely contains the two specific behavioral fixes revision 13's
+    pin bump was FOR (review-media all-tenant rollout auto-enrollment,
+    BLOB-tenant analytics/intelligence artifact parity) -- a lightweight,
+    dependency-free proxy (same static-text-scan discipline as every other
+    test in this file) against ever silently reverting either fix out of
+    the source tree this dispatcher's pin is meant to track. It does NOT
+    (and cannot, without a real checkout-by-SHA in CI, which this file's
+    own established no-live-action discipline deliberately avoids) prove
+    the EXACT pinned SHA itself contains them -- that specific commit's
+    ancestry was verified manually as part of the revision 13 investigation
+    and is recorded in the workflow file's own comment; re-verify with
+    `git merge-base --is-ancestor <required-commit> <new-pin>` before ever
+    changing PINNED_LIFECYCLE_SHA again."""
+    initial_sync_source = (REPO_ROOT / "initial_sync.py").read_text(encoding="utf-8")
+    assert "compute_media_capture_activation_patch" in initial_sync_source, (
+        "initial_sync.py must call tenant_config_store.compute_media_capture_activation_patch() "
+        "at its final success CAS write -- the review-media all-tenant rollout auto-enrollment fix "
+        "(commit 2d2778df) this pin bump was partly for"
+    )
+
+    artifact_export_source = (REPO_ROOT / "tenant_artifact_export.py").read_text(encoding="utf-8")
+    assert "refresh_analytics.run_analytics_refresh" in artifact_export_source, (
+        "tenant_artifact_export.generate_tenant_artifacts() must call "
+        "refresh_analytics.run_analytics_refresh() -- the BLOB-tenant analytics/intelligence "
+        "artifact parity fix (commit 0c35c352) this pin bump was partly for"
+    )
+    for required_export in ("export_analytics_cache", "export_location_analytics", "export_intelligence"):
+        assert required_export in artifact_export_source, (
+            f"tenant_artifact_export.generate_tenant_artifacts() must call export_chunks.{required_export}()"
+        )
 
 
 def test_permissions_are_the_minimum_deliberate_set():
@@ -918,7 +950,7 @@ def main() -> int:
     run("credential_key_audit receives ONLY TENANT_ID and the two Redis secrets", test_credential_audit_step_receives_only_tenant_id_and_redis_secrets)
     run("provisioning never receives Google secrets", test_provision_step_never_receives_google_secrets)
     run("concurrency remains tenant-scoped with cancel-in-progress: false", test_concurrency_remains_tenant_scoped)
-    run("no multi-tenant app/Python implementation file is merged onto main", test_no_app_or_python_implementation_files_on_main)
+    run("pinned commit family contains the review-media rollout and analytics-parity fixes", test_pinned_commit_family_contains_required_fixes)
     run("workflow requests only the minimum deliberate permission set (contents: read, actions: write)", test_permissions_are_the_minimum_deliberate_set)
 
     print()
