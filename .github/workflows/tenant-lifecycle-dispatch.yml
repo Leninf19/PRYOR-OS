@@ -580,7 +580,7 @@ jobs:
           for attempt in $(seq 1 "$ATTEMPTS"); do
             HTTP_STATUS=$(curl -sS -o /tmp/billing_activation_response.json -w '%{http_code}' \
               --max-time 15 \
-              -X POST "$APP_BASE_URL/api/session?action=billing-activation-callback" \
+              -X POST "$APP_BASE_URL/api/session/billing-activation-callback" \
               -H "Authorization: Bearer $BILLING_ACTIVATION_CALLBACK_SECRET" \
               -H "Content-Type: application/json" \
               -d "{\"tenantId\":\"$TENANT_ID\"}") || HTTP_STATUS="000"
@@ -611,7 +611,7 @@ jobs:
           for attempt in $(seq 1 "$ATTEMPTS"); do
             HTTP_STATUS=$(curl -sS -o /tmp/billing_activation_response.json -w '%{http_code}' \
               --max-time 15 \
-              -X POST "$APP_BASE_URL/api/session?action=billing-activation-callback" \
+              -X POST "$APP_BASE_URL/api/session/billing-activation-callback" \
               -H "Authorization: Bearer $BILLING_ACTIVATION_CALLBACK_SECRET" \
               -H "Content-Type: application/json" \
               -d "{\"tenantId\":\"$TENANT_ID\"}") || HTTP_STATUS="000"

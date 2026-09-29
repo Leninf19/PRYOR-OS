@@ -232,6 +232,84 @@ async function seedActiveTenant(tenantId, {
   return getTenantConfig(tenantId)
 }
 
+// Regression coverage (billing-activation-callback 404 investigation,
+// GitHub Actions run 36278499436 / tenant t_blue-seafood-grill-dldh5k):
+// mirrors accessCodeCommercial.js's buildAccessCodeCommercialWrite() "Case
+// 1 -- direct, non-trial grant" shape exactly -- a tenant whose plan was
+// granted immediately at access-code redemption (commercialStatus: 'active'
+// from the start, never 'trial_pending_activation', never touched by
+// maybeStartAccessCodeTrial()), with no Stripe customer/payment method ever
+// set up. This is Blue Seafood's own real commercial shape at the time of
+// the incident (active/growth/access_code-sourced/paymentRequired: false/
+// no trial/no billing record) -- the incident's root cause turned out to be
+// a URL-routing defect in the CALLING workflow (never reaching this
+// handler at all -- see tests/test_tenant_lifecycle_dispatch_workflow.py's
+// own new regression test), but this codebase should still prove the
+// handler's OWN behavior is correct for exactly this tenant shape if the
+// callback ever does reach it (recovery reruns, a future non-broken
+// caller, etc.).
+async function seedAccessCodeActiveTenant(tenantId, {
+  googleLocationId = `accounts/acc-${tenantId}/locations/loc-1`,
+  plan = 'growth',
+  initialSyncCompletedAt = new Date().toISOString(),
+} = {}) {
+  await upsertTenantConfig(tenantId, { status: 'onboarding', locationCatalogEnabled: true }, { allowCreate: true, creationSource: 'migration' })
+  await recordLocationApproval(tenantId, [{ googleLocationId, title: 'Primary Location', address: '' }])
+  const now = new Date().toISOString()
+  await upsertTenantConfig(tenantId, {
+    status: 'active',
+    initialSync: {
+      status: 'completed', startedAt: initialSyncCompletedAt, completedAt: initialSyncCompletedAt,
+      reviewCount: 0, locationCount: 1, lastError: null,
+    },
+    commercial: {
+      commercialStatus: 'active',
+      plan,
+      planSource: 'access_code',
+      trial: null,
+      limitsOverride: null, suspension: null, cancellation: null, overLimit: null,
+      accessCodeHash: 'test-access-code-hash',
+      discountPercent: null, discountFixedCents: null,
+      paymentRequired: false,
+      createdAt: now, updatedAt: now,
+    },
+    accessCodeGrant: null,
+  }, {})
+  return getTenantConfig(tenantId)
+}
+
+// Mirrors trialLifecycle.js's maybeStartComplimentaryAccess() own
+// newCommercial write shape exactly (commercialStatus: 'complimentary',
+// distinct from 'trial') -- the OTHER paymentRequired: false, no-Stripe-
+// customer shape this callback must safely no-op for.
+async function seedComplimentaryActiveTenant(tenantId, {
+  googleLocationId = `accounts/acc-${tenantId}/locations/loc-1`,
+  plan = 'growth',
+  initialSyncCompletedAt = new Date().toISOString(),
+} = {}) {
+  await upsertTenantConfig(tenantId, { status: 'onboarding', locationCatalogEnabled: true }, { allowCreate: true, creationSource: 'migration' })
+  await recordLocationApproval(tenantId, [{ googleLocationId, title: 'Primary Location', address: '' }])
+  const now = new Date().toISOString()
+  await upsertTenantConfig(tenantId, {
+    status: 'active',
+    initialSync: {
+      status: 'completed', startedAt: initialSyncCompletedAt, completedAt: initialSyncCompletedAt,
+      reviewCount: 0, locationCount: 1, lastError: null,
+    },
+    commercial: {
+      commercialStatus: 'complimentary',
+      plan,
+      planSource: 'complimentary_access',
+      trial: null,
+      complimentary: { status: 'active', startedAt: now, endsAt: null, consumedAt: now, maxLocations: null, maxUsers: null, codeHash: 'test-complimentary-code-hash' },
+      limitsOverride: null, suspension: null, cancellation: null, overLimit: null,
+      accessCodeHash: null, discountPercent: null, discountFixedCents: null, paymentRequired: false,
+      createdAt: now, updatedAt: now,
+    },
+  }, {})
+  return getTenantConfig(tenantId)
+}
+
 async function seedReadyBillingRecord(tenantId, { plan = 'growth' } = {}) {
   return createBillingRecord(tenantId, {
     stripeCustomerId: 'cus_test1', defaultPaymentMethodId: 'pm_testsavedcard', pendingPaidPlan: plan,
@@ -498,6 +576,57 @@ async function testWorkflowRetryDoesNotRestartTrialOrDuplicateSubscription() {
   assert(firstSubId === retrySubId, 'a retry must never create a duplicate subscription')
 }
 
+// ===========================================================================
+// 14/15 -- an access-code/complimentary-sourced (paymentRequired: false,
+// no Stripe customer) tenant's initial_sync completion must reach this
+// callback as a clean, idempotent no-op -- NEVER a 404, NEVER an attempt to
+// create a Stripe subscription for a tenant that was never meant to have
+// one. This is Blue Seafood's own real commercial shape (see
+// seedAccessCodeActiveTenant()'s header comment for the full incident
+// context) -- the actual root cause of the production 404 was a URL-
+// routing defect in the CALLING workflow, fixed separately in
+// .github/workflows/tenant-lifecycle-dispatch.yml and tenant-lifecycle.yml
+// (see tests/test_tenant_lifecycle_dispatch_workflow.py /
+// tests/test_tenant_lifecycle_workflow.py's own new regression tests for
+// that), but this handler's own behavior for this tenant shape is proven
+// correct here regardless of which caller reaches it.
+// ===========================================================================
+
+async function testAccessCodeActiveTenantCallbackIsCleanIdempotentNoOp() {
+  install()
+  const tenantId = freshTenantId()
+  await seedAccessCodeActiveTenant(tenantId)
+  const res = await invokeCallback({ tenantId, secret: PROD_SECRET })
+  assert(res.statusCode === 200, `expected a clean 200, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  assert(res.body.subscription.outcome === 'not_ready' && res.body.subscription.reason === 'no_active_pryor_trial', (
+    `an access-code-active tenant (commercialStatus: 'active', never 'trial') must never attempt Stripe subscription activation, got ${JSON.stringify(res.body.subscription)}`
+  ))
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'active' && config.commercial.paymentRequired === false, 'the callback must never mutate an access-code tenant\'s own commercial state')
+  const record = await getBillingRecord(tenantId)
+  assert(!record, 'the callback must never create a billing record for a tenant that never needed one')
+
+  // Idempotent: a second call (e.g. a workflow retry after the URL fix)
+  // must behave identically, never erroring, never drifting.
+  const replay = await invokeCallback({ tenantId, secret: PROD_SECRET })
+  assert(replay.statusCode === 200 && replay.body.subscription.outcome === 'not_ready' && replay.body.subscription.reason === 'no_active_pryor_trial')
+}
+
+async function testComplimentaryActiveTenantCallbackIsCleanIdempotentNoOp() {
+  install()
+  const tenantId = freshTenantId()
+  await seedComplimentaryActiveTenant(tenantId)
+  const res = await invokeCallback({ tenantId, secret: PROD_SECRET })
+  assert(res.statusCode === 200, `expected a clean 200, got ${res.statusCode}: ${JSON.stringify(res.body)}`)
+  assert(res.body.subscription.outcome === 'not_ready' && res.body.subscription.reason === 'no_active_pryor_trial', (
+    `a complimentary-access tenant (commercialStatus: 'complimentary', never 'trial') must never attempt Stripe subscription activation, got ${JSON.stringify(res.body.subscription)}`
+  ))
+  const config = await getTenantConfig(tenantId)
+  assert(config.commercial.commercialStatus === 'complimentary' && config.commercial.paymentRequired === false, 'the callback must never mutate a complimentary tenant\'s own commercial state')
+  const record = await getBillingRecord(tenantId)
+  assert(!record, 'the callback must never create a billing record for a tenant that never needed one')
+}
+
 const tests = [
   ['the callback works with no browser/session/cookie context at all', testCallbackWorksWithoutAnyBrowserOrSessionContext],
   ['the callback does not start a trial without a real initialSync.completedAt', testCallbackDoesNotStartTrialWithoutInitialSync],
@@ -515,6 +644,8 @@ const tests = [
   ['a Preview dispatch cannot fall back to the Production secret', testPreviewCannotFallBackToProductionSecret],
   ['an unsupported/absent VERCEL_ENV fails closed regardless of any secret presented', testUnsupportedVercelEnvFailsClosed],
   ['a workflow retry never restarts the trial or duplicates the subscription', testWorkflowRetryDoesNotRestartTrialOrDuplicateSubscription],
+  ['an access-code-active tenant (paymentRequired: false, no trial) gets a clean, idempotent no-op', testAccessCodeActiveTenantCallbackIsCleanIdempotentNoOp],
+  ['a complimentary-access tenant (paymentRequired: false, no trial) gets a clean, idempotent no-op', testComplimentaryActiveTenantCallbackIsCleanIdempotentNoOp],
 ]
 
 async function main() {
