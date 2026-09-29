@@ -1284,7 +1284,7 @@ function ReviewDetailContent({ r, draft, allReviews, wsEntry, bridgeEntry, onUpd
           (a pre-activation review, or a review with no media at all --
           the export layer never distinguishes these for display
           purposes). PRYOR does not analyze or describe media contents. */}
-      <ReviewMediaGallery items={r.media} />
+      <ReviewMediaGallery items={r.media} reviewId={reviewId(r)} />
 
       {/* AI reasoning ("why") */}
       {r.ai_sentiment_reason && (

@@ -38,8 +38,18 @@ import { buildDefaultSubject, buildReviewEmail } from '../_lib/reviewEmailTempla
 import { generateRewrite } from '../_lib/rewriteEngine.js'
 import { resolveTenantEntitlements } from '../_lib/entitlements.js'
 import { requireCommercialOperation, commercialDenialResponse, CommercialOperationClass } from '../_lib/commercialOperationPolicy.js'
+import { findReviewMedia } from '../_lib/reviewMediaLookup.js'
+import { fetchMediaBytes, isAllowedMediaUrl, buildSafeMediaFilename, MediaFetchError } from '../_lib/reviewMediaFetch.js'
 
 const REPLY_PERMISSIONS = [Permission.REPLY, Permission.REPLY_ASSIGNED]
+// Review Media View/Download feature: any authenticated role may VIEW/
+// DOWNLOAD media for a review their own location grant covers -- a read
+// capability, not a reply/export one, so this mirrors list()'s own "every
+// role holds at least one of these" permission pair (VIEW_ALL for owner/
+// admin/marketing, VIEW_ASSIGNED for location_manager/read_only too),
+// never REPLY/REPLY_ASSIGNED, which would wrongly exclude read_only from a
+// pure read action.
+const VIEW_PERMISSIONS = [Permission.VIEW_ALL, Permission.VIEW_ASSIGNED]
 
 // Mirrors ActionCenter.jsx's STATUSES exactly (dashboard/src/pages/ActionCenter.jsx).
 // Intentionally duplicated rather than shared across the frontend/backend
@@ -588,6 +598,123 @@ async function rewrite(req, res) {
   return res.status(200).json({ rewritten: result.rewritten, riskLevel: result.riskLevel ?? 'normal', riskCategories: result.riskCategories ?? [] })
 }
 
+function isNonNegativeInteger(n) {
+  return Number.isInteger(n) && n >= 0
+}
+
+// GET /api/actions/download-media?reviewId=...&index=...
+// Review Media View/Download feature -- the authenticated, server-side
+// proxy-download endpoint for a single review's own PHOTO media, PHOTOS
+// ONLY (video is explicitly out of scope -- the frontend uses the existing
+// lightbox/View path for a video item instead).
+//
+// The request NEVER supplies a URL -- only a review id (the same stable
+// identity dataUtils.js's reviewId() computes client-side) and a 0-based
+// media index (matching that review's own stored `media[i].sortOrder`,
+// which is always a dense 0..N-1 prefix of the SAME array -- see
+// media_sanitizer.py). The actual thumbnailUrl is resolved exclusively
+// from this tenant's own stored data via reviewMediaLookup.js, then
+// fetched through reviewMediaFetch.js's hardened SSRF-safe fetch (https +
+// *.googleusercontent.com allowlist, manual bounded redirect-following
+// re-validated at every hop, a request timeout, a Content-Type allowlist,
+// and a streaming size cap) -- never a client-supplied URL, never fetch()'s
+// own automatic redirect-following.
+async function downloadMedia(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' })
+
+  // requireScopedAuth authenticates, checks the role holds VIEW_ALL/
+  // VIEW_ASSIGNED, and (for a location-scoped account) denies with 404 --
+  // never 403, existence-hiding, matching this codebase's frozen API error
+  // contract for an out-of-scope location -- via the SAME
+  // resolveLocationIdForReviewOrDeny() primitive every other review-scoped
+  // action in this file already uses. tenantId is derived EXCLUSIVELY from
+  // the authenticated account inside that resolver, never from this
+  // request, so this can never be redirected at another tenant's data.
+  const scope = await requireScopedAuth(req, res, {
+    permission: VIEW_PERMISSIONS,
+    resolveLocationId: async (req, account) => resolveLocationIdForReviewOrDeny(req.query?.reviewId, account),
+  })
+  if (!scope) return
+  const { account } = scope
+
+  const reviewIdParam = typeof req.query?.reviewId === 'string' ? req.query.reviewId.trim() : ''
+  const index = Number(req.query?.index)
+  if (!reviewIdParam || !isNonNegativeInteger(index)) {
+    return res.status(400).json({ error: 'invalid_request', message: 'reviewId and a non-negative integer index are required.' })
+  }
+
+  // This makes a real outbound request to a third-party host -- rate
+  // limited per caller like every other action in this file that triggers
+  // real external network activity (send-review-email, rewrite), so a
+  // compromised/scripted session cannot use this as an amplification
+  // vector against Google's CDN.
+  const allowed = await enforceRateLimit(req, res, `actions:download-media:${account.userId}`, { requestsPerWindow: 20, windowSeconds: 60 })
+  if (!allowed) return
+
+  const tenantId = resolveTenantId(account)
+  const found = await findReviewMedia(reviewIdParam, tenantId)
+  if (!found) return res.status(404).json({ error: 'not_found' })
+
+  // Defense in depth, independent of the requireScopedAuth check above: a
+  // WILDCARD account's resolveLocationIdForReviewOrDeny() call can return
+  // null ("not location-scoped, always allow") when the review is
+  // unresolvable from the index alone -- this re-checks the caller's grant
+  // against the CONCRETE locationId findReviewMedia() actually resolved,
+  // so a wildcard account is still confined to its own tenant's real data
+  // (already guaranteed by findReviewMedia()'s own tenantId scoping) and a
+  // non-wildcard account's grant is verified a second, independent way.
+  if (!requireLocationAccess(account, found.locationId)) {
+    return res.status(404).json({ error: 'not_found' })
+  }
+
+  const item = found.media[index]
+  if (!item || typeof item !== 'object') {
+    return res.status(404).json({ error: 'not_found' })
+  }
+
+  // Video is explicitly out of scope for this action -- the frontend must
+  // use the existing lightbox/View path for a video item instead.
+  // Rejected BEFORE any network call, with a distinguishable error code so
+  // the frontend can react correctly (offer View, not a failed Download).
+  if (item.type === 'video') {
+    return res.status(400).json({ error: 'not_downloadable', message: 'Video items cannot be downloaded here -- open them in the viewer instead.' })
+  }
+
+  const sourceUrl = item.thumbnailUrl
+  if (!isAllowedMediaUrl(sourceUrl)) {
+    // Should never happen against genuinely sanitized data (media_sanitizer.py
+    // already enforces https + a well-formed host before this is ever
+    // persisted) -- this is the independent, unconditional re-check this
+    // action performs on ITS OWN before ever making a network call, per
+    // this feature's SSRF-safety requirement. Logged, never detailed to
+    // the caller.
+    console.error(`[actions/download-media] stored media URL failed the allowlist re-check for review ${JSON.stringify(reviewIdParam)} item ${index}`)
+    return res.status(502).json({ error: 'invalid_media_source', message: 'This media item could not be retrieved.' })
+  }
+
+  let result
+  try {
+    result = await fetchMediaBytes(sourceUrl)
+  } catch (err) {
+    if (err instanceof MediaFetchError) {
+      console.error(`[actions/download-media] ${err.code}: ${err.message}`)
+      return res.status(err.status).json({ error: err.code, message: 'This media item could not be retrieved.' })
+    }
+    console.error(`[actions/download-media] unexpected error: ${err.message}`)
+    return res.status(502).json({ error: 'media_unavailable', message: 'This media item could not be retrieved.' })
+  }
+
+  const filename = buildSafeMediaFilename(reviewIdParam, index, result.contentType)
+
+  // Never let a cached authenticated payload leak to the CDN or a shared
+  // browser cache -- same header data.js already sets for per-account data.
+  res.setHeader('Cache-Control', 'private, no-store')
+  res.setHeader('Content-Type', result.contentType)
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
+  res.setHeader('Content-Length', String(result.buffer.length))
+  return res.status(200).send(result.buffer)
+}
+
 export default async function handler(req, res) {
   switch (req.query?.action) {
     case 'list':                 return list(req, res)
@@ -596,6 +723,7 @@ export default async function handler(req, res) {
     case 'send-review-email':     return sendReviewEmailAction(req, res)
     case 'update-email-status':   return updateEmailStatus(req, res)
     case 'rewrite':               return rewrite(req, res)
+    case 'download-media':        return downloadMedia(req, res)
     default:                      return res.status(404).json({ error: 'not_found' })
   }
 }
