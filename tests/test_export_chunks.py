@@ -697,6 +697,47 @@ def test_export_location_detail_reviews_includes_locationId():
         assert payload[0]["locationId"] == loc_id
 
 
+def test_export_location_detail_reviews_includes_media():
+    """Regression test for the 2026-09-29 fix: this function used to build
+    its own independent field dict and never included `media` at all --
+    silently dropping a correctly-captured, correctly-stored review's
+    media array at the LIVE per-location export step, for every tenant.
+    A review with real, stored gbp_review_media must reach this export."""
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Detail Review Media Location")
+        _add_review(ex.conn, loc_id, "2026-01-01", reviewer_name="Has Media")
+        media = [{"type": "photo", "thumbnailUrl": "https://lh3.googleusercontent.com/p1",
+                  "thumbnailLabel": "", "videoUrl": None, "sortOrder": 0}]
+        ex.conn.execute("UPDATE reviews SET gbp_review_media = ? WHERE location_id = ?", (json.dumps(media), loc_id))
+        ex.conn.commit()
+        locations = _locations_dict(ex.conn)
+
+        export_chunks.export_location_detail_reviews(ex.conn, locations)
+        slug = db.slugify("Detail Review Media Location")
+        payload = ex.read_json(f"reviews/by-location/{slug}.json")
+        assert len(payload) == 1
+        assert payload[0]["media"] == media, f"media must survive this export, got {payload[0].get('media')!r}"
+
+
+def test_export_location_detail_reviews_includes_moderation_fields():
+    """Same drift class as the media regression above -- gbp_reply_moderation_state/
+    gbp_reply_policy_violation were also silently missing from this export."""
+    with ScratchExport() as ex:
+        loc_id = _add_location(ex.conn, "Detail Review Moderation Location")
+        _add_review(ex.conn, loc_id, "2026-01-01")
+        ex.conn.execute(
+            "UPDATE reviews SET gbp_reply_moderation_state = ? WHERE location_id = ?",
+            ("APPROVED", loc_id),
+        )
+        ex.conn.commit()
+        locations = _locations_dict(ex.conn)
+
+        export_chunks.export_location_detail_reviews(ex.conn, locations)
+        slug = db.slugify("Detail Review Moderation Location")
+        payload = ex.read_json(f"reviews/by-location/{slug}.json")
+        assert payload[0]["gbp_reply_moderation_state"] == "APPROVED"
+
+
 # --- restaurant bad-review email workflow: hasContact + location-contacts.json --
 
 def test_export_meta_has_contact_true_when_configured_and_active():
@@ -798,6 +839,8 @@ def main():
     run("export_intelligence(): does not clobber an already-present locationId", test_export_intelligence_does_not_clobber_existing_locationId)
     run("export_intelligence(): a stale slug with no matching location does not crash or get a guessed id", test_export_intelligence_handles_stale_slug_without_crashing)
     run("export_location_detail_reviews(): includes locationId (the live per-location review export)", test_export_location_detail_reviews_includes_locationId)
+    run("export_location_detail_reviews(): includes media", test_export_location_detail_reviews_includes_media)
+    run("export_location_detail_reviews(): includes moderation fields", test_export_location_detail_reviews_includes_moderation_fields)
     run("export_meta(): hasContact is true for a configured, active contact", test_export_meta_has_contact_true_when_configured_and_active)
     run("export_meta(): hasContact is false when unconfigured", test_export_meta_has_contact_false_when_unconfigured)
     run("export_meta(): hasContact is false when the contact is inactive", test_export_meta_has_contact_false_when_inactive)
